@@ -616,6 +616,18 @@ pub fn clone_expr_with(
             // via `OpKind::Copy` (e.g. `Result::branch`, `Option::take`, `mem::replace`). Only
             // emit the native-shape guard in functions that actually carry nested native carriers.
             match descriptor.meta.candidate {
+                RepresentationCandidate::Vec
+                    if nested_clone.native_vec
+                        && descriptor.meta.allocator
+                            == rcgjs_object::jir::types::AllocatorIdentity::Global =>
+                {
+                    clone_once(value, "$cv", |v| {
+                        jsast::object_of(vec![
+                            ("buf", jsast::member(v.clone(), "buf")),
+                            ("len", jsast::member(v, "len")),
+                        ])
+                    })
+                }
                 RepresentationCandidate::Vec if nested_clone.vec => clone_once(value, "$cv", |v| {
                     let nv = jsast::object_of(vec![
                         ("buf", jsast::member(v.clone(), "buf")),
@@ -1010,7 +1022,36 @@ pub fn is_slot(table: &TypeTable, pointer_ty: TypeId) -> bool {
 /// (`alloc_support.rs::zero_value`, over the type table instead of a scratch allocation).
 #[cfg(test)]
 pub fn zero_value(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<Expr> {
-    zero_value_at(table, interns, ty, 0, false)
+    zero_value_at(table, interns, ty, 0, false, false)
+}
+
+/// Empty universal flat `Vec<T, Global>` literal matching `NativeVecNew` (`{ buf, len }`).
+pub fn empty_native_vec_expr(table: &TypeTable, vec_ty: TypeId) -> Option<Expr> {
+    let elem = crate::analysis::heap::global_vec_elem_ty(table, vec_ty)?;
+    let elem_desc = table.get(elem)?;
+    if elem_desc.layout.zst {
+        return Some(jsast::object_of(vec![
+            ("buf", jsast::undefined()),
+            ("len", jsast::num(0)),
+        ]));
+    }
+    if let Some(k) = crate::analysis::heap::native_vec_ta_kind(table, elem) {
+        return Some(jsast::object_of(vec![
+            (
+                "buf",
+                jsast::rt_call("_nv_et", vec![jsast::num(f64::from(k))]),
+            ),
+            ("len", jsast::num(0)),
+        ]));
+    }
+    let align = elem_desc.layout.align.unwrap_or(1).max(1);
+    Some(jsast::object_of(vec![
+        (
+            "buf",
+            jsast::rt_call("_nv_ea", vec![jsast::num(align as f64)]),
+        ),
+        ("len", jsast::num(0)),
+    ]))
 }
 
 pub fn zero_value_for_heap(
@@ -1018,8 +1059,9 @@ pub fn zero_value_for_heap(
     interns: &Interns,
     ty: TypeId,
     native_string: bool,
+    native_vec: bool,
 ) -> Option<Expr> {
-    zero_value_at(table, interns, ty, 0, native_string)
+    zero_value_at(table, interns, ty, 0, native_string, native_vec)
 }
 
 fn zero_value_at(
@@ -1028,6 +1070,7 @@ fn zero_value_at(
     ty: TypeId,
     depth: u32,
     native_string: bool,
+    native_vec: bool,
 ) -> Option<Expr> {
     if depth > 16 {
         return None;
@@ -1045,8 +1088,20 @@ fn zero_value_at(
             ("cap", jsast::num(0)),
         ]));
     }
+    if native_vec && crate::analysis::heap::is_direct_global_vec_ty(table, ty) {
+        if let Some(empty) = empty_native_vec_expr(table, ty) {
+            return Some(empty);
+        }
+    }
     if let Some(inner) = descriptor.js.transparent {
-        if let Some(value) = zero_value_at(table, interns, inner.ty, depth + 1, native_string) {
+        if let Some(value) = zero_value_at(
+            table,
+            interns,
+            inner.ty,
+            depth + 1,
+            native_string,
+            native_vec,
+        ) {
             return Some(value);
         }
         // A transparent union (such as `MaybeUninit<&str>` inside `BTreeMap` `LeafNode::keys`)
@@ -1069,7 +1124,9 @@ fn zero_value_at(
         TypeKind::Integer { .. } => int_literal(table, ty, 0),
         // A zeroed pointer is the null address, which is the number zero.
         TypeKind::RawPointer { .. } | TypeKind::FnPtr { .. } => Some(jsast::num(0)),
-        TypeKind::Pattern(base) => zero_value_at(table, interns, *base, depth + 1, native_string),
+        TypeKind::Pattern(base) => {
+            zero_value_at(table, interns, *base, depth + 1, native_string, native_vec)
+        }
         TypeKind::Adt {
             form: NominalForm::Struct,
             variants,
@@ -1081,7 +1138,14 @@ fn zero_value_at(
                 let key = key_name(interns, field.key)?;
                 entries.push((
                     key,
-                    zero_value_at(table, interns, field.ty, depth + 1, native_string)?,
+                    zero_value_at(
+                        table,
+                        interns,
+                        field.ty,
+                        depth + 1,
+                        native_string,
+                        native_vec,
+                    )?,
                 ));
             }
             Some(jsast::object(entries))
@@ -1099,7 +1163,14 @@ fn zero_value_at(
                 let key = key_name(interns, field.key)?;
                 fields.push((
                     key,
-                    zero_value_at(table, interns, field.ty, depth + 1, native_string)?,
+                    zero_value_at(
+                        table,
+                        interns,
+                        field.ty,
+                        depth + 1,
+                        native_string,
+                        native_vec,
+                    )?,
                 ));
             }
             enum_value(table, interns, ty, index, fields)
@@ -1107,11 +1178,27 @@ fn zero_value_at(
         TypeKind::Tuple(elements) => Some(jsast::array(
             elements
                 .iter()
-                .map(|element| zero_value_at(table, interns, *element, depth + 1, native_string))
+                .map(|element| {
+                    zero_value_at(
+                        table,
+                        interns,
+                        *element,
+                        depth + 1,
+                        native_string,
+                        native_vec,
+                    )
+                })
                 .collect::<Option<Vec<_>>>()?,
         )),
         TypeKind::Array { element, length } => {
-            let zero = zero_value_at(table, interns, *element, depth + 1, native_string)?;
+            let zero = zero_value_at(
+                table,
+                interns,
+                *element,
+                depth + 1,
+                native_string,
+                native_vec,
+            )?;
             Some(jsast::array((0..*length).map(|_| zero.clone()).collect()))
         }
         _ => None,

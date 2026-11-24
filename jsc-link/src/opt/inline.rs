@@ -1234,6 +1234,7 @@ fn collect_sites(
                     if std_op.is_str()
                         || std_op.is_typed_heap()
                         || std_op.is_native_string()
+                        || std_op.is_native_vec()
                         || std_op.is_fast_str_op() =>
                 {
                     false
@@ -1320,10 +1321,16 @@ fn collect_sites(
                 stats.decline("inline.never");
                 continue;
             }
-            let is_string_drop_glue = speed
-                && crate::lower::bstr::enabled()
+            let is_nonempty_drop_glue = speed
                 && callee.as_str().starts_with("core$ptr$drop_glue$")
                 && callee_func.sig.arguments.len() == 1
+                && !(callee_func.blocks.len() == 1
+                    && callee_func.blocks[0].ops.is_empty()
+                    && matches!(
+                        callee_func.blocks[0].term,
+                        rcgjs_object::jir::repr::RTerm::Return(None)
+                    ));
+            let is_protected_drop_glue = is_nonempty_drop_glue
                 && callee_func
                     .sig
                     .arguments
@@ -1333,10 +1340,15 @@ fn collect_sites(
                     })
                     .and_then(|pt| callee_metadata.interns.types.get(pt))
                     .is_some_and(|d| {
-                        d.meta.candidate
-                            == rcgjs_object::jir::types::RepresentationCandidate::String
+                        (crate::lower::bstr::enabled()
+                            && d.meta.candidate
+                                == rcgjs_object::jir::types::RepresentationCandidate::String)
+                            || (d.meta.candidate
+                                == rcgjs_object::jir::types::RepresentationCandidate::Vec
+                                && d.meta.allocator
+                                    == rcgjs_object::jir::types::AllocatorIdentity::Global)
                     });
-            if is_string_drop_glue
+            if is_protected_drop_glue
                 || items
                     .get(&callee_func.item)
                     .and_then(|entry| entry.standard)
@@ -1350,6 +1362,7 @@ fn collect_sites(
                             )
                             || op.is_typed_heap()
                             || op.is_native_string()
+                            || op.is_native_vec()
                             || op.is_fast_str_op()
                     })
             {

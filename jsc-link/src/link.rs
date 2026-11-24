@@ -485,7 +485,10 @@ fn resolve(
             }
         }
         let pre_synth = reachable.len();
-        crate::lower::bstr::synthesize_converters(&mut table, &mut reachable);
+        let native_vec_enabled = lane_run
+            .as_ref()
+            .is_some_and(|run| run.native_vec_enabled());
+        crate::lower::bstr::synthesize_converters(&mut table, &mut reachable, native_vec_enabled);
         let added_bstr = !facades.is_empty() || reachable.len() != pre_synth;
         let dedup = crate::profile::time("link.dedup", || {
             crate::link_dedup::merge_duplicates(

@@ -1258,12 +1258,14 @@ fn child_val_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_decl(
     table: &TypeTable,
     interns: &Interns,
     name: &JsName,
     target: ConvTarget,
     dir: Crossing,
+    native_vec: bool,
     cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
     pending: &mut Vec<(ConvTarget, Crossing)>,
 ) -> Result<Stmt, String> {
@@ -1550,6 +1552,50 @@ fn build_decl(
                         form: NominalForm::Struct,
                         variants,
                         ..
+                    } if native_vec && crate::analysis::heap::is_global_vec_ty(table, info.cur) => {
+                        let elem = vec_elem_ty(table, info.cur)
+                            .ok_or_else(|| "a native Vec without element type".to_owned())?;
+                        if mode == Mode::Ref {
+                            let buf_pair = target_pair_expr(
+                                table,
+                                interns,
+                                ConvTarget::ArrayBuf(elem),
+                                cache,
+                                pending,
+                            )?
+                            .ok_or_else(|| "a native Vec buffer with no conversion".to_owned())?;
+                            let spec = jsast::object_of(vec![
+                                ("k", jsast::string("o")),
+                                ("f", jsast::object(vec![("buf".to_owned(), buf_pair)])),
+                            ]);
+                            body.push(jsast::ret(ref_call(spec)));
+                        } else {
+                            let buf_conv = target_name(
+                                table,
+                                interns,
+                                ConvTarget::ArrayBuf(elem),
+                                dir,
+                                cache,
+                            )?
+                            .map(|cname| {
+                                pending.push((ConvTarget::ArrayBuf(elem), dir));
+                                jsast::call(
+                                    jsast::id(cname.as_str().to_owned()),
+                                    vec![jsast::member(p(), "buf")],
+                                )
+                            })
+                            .unwrap_or_else(|| jsast::member(p(), "buf"));
+                            let entries = vec![
+                                ("buf".to_owned(), buf_conv),
+                                ("len".to_owned(), jsast::member(p(), "len")),
+                            ];
+                            body.push(jsast::ret(jsast::object(entries)));
+                        }
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Struct,
+                        variants,
+                        ..
                     } => {
                         let [variant] = variants.as_slice() else {
                             return Err("a struct with no single variant".to_owned());
@@ -1713,7 +1759,11 @@ fn make_link_item(name: JsName, decl: Stmt) -> LinkItem {
 
 /// Synthesizes deduplicated `$bstr$out$...` and `$bstr$in$...` converter [`LinkItem`]s into
 /// `table` (and appends them to `reachable`) for every `$bstr$` helper called by reachable items.
-pub fn synthesize_converters(table: &mut BTreeMap<JsName, LinkItem>, reachable: &mut Vec<JsName>) {
+pub fn synthesize_converters(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+    native_vec: bool,
+) {
     let mut needed: BTreeSet<JsName> = BTreeSet::new();
     for name in reachable.iter() {
         let Some(item) = table.get(name) else {
@@ -1799,6 +1849,7 @@ pub fn synthesize_converters(table: &mut BTreeMap<JsName, LinkItem>, reachable: 
                         &cur_name,
                         cur_target,
                         cur_dir,
+                        native_vec,
                         &mut cache,
                         &mut pending,
                     ) {
@@ -3760,6 +3811,7 @@ mod tests {
             &JsName::new("slot_fn".to_owned()),
             ConvTarget::Type(slot_ref_id, Mode::Val),
             Crossing::Out,
+            false,
             &mut cache,
             &mut pending,
         )
@@ -3777,6 +3829,7 @@ mod tests {
             &JsName::new("slice_fn".to_owned()),
             ConvTarget::Type(ref_slice_id, Mode::Val),
             Crossing::Out,
+            false,
             &mut cache,
             &mut pending,
         )

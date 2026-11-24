@@ -1532,7 +1532,15 @@ impl Intrinsic<'_, '_> {
     fn read_via_copy(&self) -> Res<Expr> {
         let cx = self.cx;
         let pointee = self.type_at(0)?;
-        let read = cx.deref_read(pointee, self.arg(0)?);
+        let read = if self
+            .args
+            .first()
+            .is_some_and(|v| cx.is_direct_ref_copy_cast(*v))
+        {
+            self.arg(0)?
+        } else {
+            cx.deref_read(pointee, self.arg(0)?)
+        };
         Ok(if cx.table.needs_clone(pointee) {
             value::clone_expr_with(cx.table, cx.interns, pointee, read, cx.nested_clone)
         } else {
@@ -1544,16 +1552,47 @@ impl Intrinsic<'_, '_> {
     fn typed_swap(&self) -> Res<Outcome> {
         let cx = self.cx;
         let pointee = self.type_at(0)?;
-        let (x, y) = (self.arg(0)?, self.arg(1)?);
-        let read = cx.deref_read(pointee, x.clone());
+        let x_direct = self
+            .args
+            .first()
+            .is_some_and(|v| cx.is_direct_ref_copy_cast(*v));
+        let y_direct = self
+            .args
+            .get(1)
+            .is_some_and(|v| cx.is_direct_ref_copy_cast(*v));
+        let (mut x, mut y) = (self.arg(0)?, self.arg(1)?);
+        if x_direct && !matches!(x, Expr::Ident(_)) {
+            x = self.temp(x);
+        }
+        if y_direct && !matches!(y, Expr::Ident(_)) {
+            y = self.temp(y);
+        }
+        let read = if x_direct {
+            x.clone()
+        } else {
+            cx.deref_read(pointee, x.clone())
+        };
         let copy = if cx.table.needs_clone(pointee) {
             value::clone_expr_with(cx.table, cx.interns, pointee, read, cx.nested_clone)
         } else {
             read
         };
         let saved = self.temp(copy);
-        let mut statements = cx.deref_write(pointee, x, cx.deref_read(pointee, y.clone()))?;
-        statements.extend(cx.deref_write(pointee, y, saved)?);
+        let y_val = if y_direct {
+            y.clone()
+        } else {
+            cx.deref_read(pointee, y.clone())
+        };
+        let mut statements = if x_direct {
+            cx.write_indirect(pointee, x, y_val)?
+        } else {
+            cx.deref_write(pointee, x, y_val)?
+        };
+        statements.extend(if y_direct {
+            cx.write_indirect(pointee, y, saved)?
+        } else {
+            cx.deref_write(pointee, y, saved)?
+        });
         Ok(Outcome::Done(statements))
     }
 
@@ -1620,6 +1659,7 @@ impl Intrinsic<'_, '_> {
                 self.cx.interns,
                 peeled,
                 self.cx.heap().native_string_enabled,
+                self.cx.heap().native_vec_enabled,
             ) else {
                 return vec![jsast::expr_stmt(self.cx.zombie(
                     "`write_bytes` is not supported by rustc_codegen_js for this pointee: a byte \

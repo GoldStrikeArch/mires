@@ -1383,6 +1383,9 @@ fn thread_variant_switches(
 /// and retargets every threadable edge. Reports whether it did anything.
 fn thread_one_merge(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witness>) -> bool {
     let built = built_unpinned(func, table);
+    if built.is_empty() {
+        return false;
+    }
 
     for merge_index in 1..func.blocks.len() {
         let merge_id = RBlockId(merge_index as u32);
@@ -1694,59 +1697,99 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    for merge_index in 1..func.blocks.len() {
+    if agg_fields.is_empty() {
+        return false;
+    }
+
+    // Pre-index all merge-block parameters, their uses, and incoming block edges in one linear
+    // pass over `func.blocks` instead of scanning every op in the function per parameter.
+    let n_values = func.values.len();
+    let mut is_merge_param = vec![false; n_values];
+    for block in func.blocks.iter().skip(1) {
+        for &param in &block.params {
+            if func.values[param.0 as usize].carrier == Carrier::Baseline {
+                is_merge_param[param.0 as usize] = true;
+            }
+        }
+    }
+    let mut invalid = vec![false; n_values];
+    let mut param_variant: Vec<Option<u32>> = vec![None; n_values];
+    type ProjList = Vec<(usize, usize, u32, ValueId, crate::jir::origin::OriginId)>;
+    let mut param_projs: BTreeMap<ValueId, ProjList> = BTreeMap::new();
+    let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); func.blocks.len()];
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        for (op_index, op) in block.ops.iter().enumerate() {
+            if let OpKind::Field {
+                base,
+                variant: Some(k),
+                field,
+            } = &op.kind
+            {
+                let idx = base.0 as usize;
+                if is_merge_param[idx] {
+                    if !invalid[idx] {
+                        if *param_variant[idx].get_or_insert(*k) != *k {
+                            invalid[idx] = true;
+                        } else if let Some(result) = op.result {
+                            if func.values[result.0 as usize].carrier != Carrier::Baseline {
+                                invalid[idx] = true;
+                            } else {
+                                param_projs.entry(*base).or_default().push((
+                                    block_index,
+                                    op_index,
+                                    *field,
+                                    result,
+                                    op.origin,
+                                ));
+                            }
+                        } else {
+                            invalid[idx] = true;
+                        }
+                    }
+                    continue;
+                }
+            }
+            for used in op.kind.uses() {
+                let idx = used.0 as usize;
+                if is_merge_param[idx] {
+                    invalid[idx] = true;
+                }
+            }
+        }
+        for (edge, (target, args)) in block.term.edges().into_iter().enumerate() {
+            incoming[target.0 as usize].push((block_index, edge));
+            for &arg in args {
+                let idx = arg.0 as usize;
+                if is_merge_param[idx] {
+                    invalid[idx] = true;
+                }
+            }
+        }
+        match &block.term {
+            RTerm::Switch { scrut, .. } if is_merge_param[scrut.0 as usize] => {
+                invalid[scrut.0 as usize] = true;
+            }
+            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) if is_merge_param[v.0 as usize] => {
+                invalid[v.0 as usize] = true;
+            }
+            _ => {}
+        }
+    }
+
+    for (merge_index, merge_incoming) in incoming.iter().enumerate().skip(1) {
         let merge_id = RBlockId(merge_index as u32);
         'params: for position in 0..func.blocks[merge_index].params.len() {
             let param = func.blocks[merge_index].params[position];
-            if func.values[param.0 as usize].carrier != Carrier::Baseline {
+            let p_idx = param.0 as usize;
+            if !is_merge_param[p_idx] || invalid[p_idx] {
                 continue;
             }
             // Every use must be a `Field` of one same downcast variant; anything else — another
             // op, an edge argument, a scrutinee, a return — keeps the object whole.
-            let mut variant: Option<u32> = None;
-            // (block, op, field, result, origin) per projection, in program order.
-            let mut projections: Vec<(usize, usize, u32, ValueId, crate::jir::origin::OriginId)> =
-                Vec::new();
-            for (block_index, block) in func.blocks.iter().enumerate() {
-                for (op_index, op) in block.ops.iter().enumerate() {
-                    if let OpKind::Field {
-                        base,
-                        variant: Some(k),
-                        field,
-                    } = &op.kind
-                    {
-                        if *base == param {
-                            if *variant.get_or_insert(*k) != *k {
-                                continue 'params;
-                            }
-                            let Some(result) = op.result else {
-                                continue 'params;
-                            };
-                            if func.values[result.0 as usize].carrier != Carrier::Baseline {
-                                continue 'params;
-                            }
-                            projections.push((block_index, op_index, *field, result, op.origin));
-                            continue;
-                        }
-                    }
-                    if op.kind.uses().contains(&param) {
-                        continue 'params;
-                    }
-                }
-                for (_, args) in block.term.edges() {
-                    if args.contains(&param) {
-                        continue 'params;
-                    }
-                }
-                match &block.term {
-                    RTerm::Switch { scrut, .. } if *scrut == param => continue 'params,
-                    RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) if *v == param => {
-                        continue 'params
-                    }
-                    _ => {}
-                }
-            }
-            let Some(k) = variant else {
+            let Some(k) = param_variant[p_idx] else {
+                continue;
+            };
+            let Some(projections) = param_projs.get(&param) else {
                 continue;
             };
 
@@ -1761,61 +1804,58 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
             }
             let mut plans: Vec<(usize, usize, Plan)> = Vec::new();
             let mut direct = false;
-            for (pred_index, pred) in func.blocks.iter().enumerate() {
-                for (edge, (target, args)) in pred.term.edges().into_iter().enumerate() {
-                    if target != merge_id {
-                        continue;
-                    }
-                    let Some(&arg) = args.get(position) else {
-                        continue 'params;
-                    };
-                    if let Some((built_variant, fields)) = agg_fields.get(&arg) {
-                        if *built_variant != k {
-                            continue 'params;
-                        }
-                        let Some(values) = projections
-                            .iter()
-                            .map(|&(_, _, field, _, _)| fields.get(field as usize).copied())
-                            .collect::<Option<Vec<ValueId>>>()
-                        else {
-                            continue 'params;
-                        };
-                        plans.push((pred_index, edge, Plan::Direct(values)));
-                        direct = true;
-                        continue;
-                    }
-                    // A switch proves only the discriminant. It does not prove that storage
-                    // reachable through the opaque value stayed unchanged before this edge.
-                    if pinned[arg.0 as usize] {
+            for &(pred_index, edge) in merge_incoming {
+                let pred = &func.blocks[pred_index];
+                let (_, args) = pred.term.edges()[edge];
+                let Some(&arg) = args.get(position) else {
+                    continue 'params;
+                };
+                if let Some((built_variant, fields)) = agg_fields.get(&arg) {
+                    if *built_variant != k {
                         continue 'params;
                     }
-                    // A `Switch` case over the argument's own discriminant proves the variant on
-                    // that edge; the default edge names no variant and refuses.
-                    let RTerm::Switch {
-                        scrut,
-                        scrut_ty,
-                        cases,
-                        ..
-                    } = &pred.term
+                    let Some(values) = projections
+                        .iter()
+                        .map(|&(_, _, field, _, _)| fields.get(field as usize).copied())
+                        .collect::<Option<Vec<ValueId>>>()
                     else {
                         continue 'params;
                     };
-                    if discr_base.get(scrut) != Some(&arg) || edge >= cases.len() {
-                        continue 'params;
-                    }
-                    let arg_ty = func.values[arg.0 as usize].ty;
-                    let variants = table.variants(table.peeled(arg_ty));
-                    let Some(discr) = variants.get(k as usize).map(|v| v.logical_discr) else {
-                        continue 'params;
-                    };
-                    let width = table
-                        .int_info(*scrut_ty)
-                        .map_or(16, |(_, bits)| (bits / 8) as u8);
-                    if mask(cases[edge].0, width) != mask(discr as u128, width) {
-                        continue 'params;
-                    }
-                    plans.push((pred_index, edge, Plan::Split { arg }));
+                    plans.push((pred_index, edge, Plan::Direct(values)));
+                    direct = true;
+                    continue;
                 }
+                // A switch proves only the discriminant. It does not prove that storage
+                // reachable through the opaque value stayed unchanged before this edge.
+                if pinned[arg.0 as usize] {
+                    continue 'params;
+                }
+                // A `Switch` case over the argument's own discriminant proves the variant on
+                // that edge; the default edge names no variant and refuses.
+                let RTerm::Switch {
+                    scrut,
+                    scrut_ty,
+                    cases,
+                    ..
+                } = &pred.term
+                else {
+                    continue 'params;
+                };
+                if discr_base.get(scrut) != Some(&arg) || edge >= cases.len() {
+                    continue 'params;
+                }
+                let arg_ty = func.values[arg.0 as usize].ty;
+                let variants = table.variants(table.peeled(arg_ty));
+                let Some(discr) = variants.get(k as usize).map(|v| v.logical_discr) else {
+                    continue 'params;
+                };
+                let width = table
+                    .int_info(*scrut_ty)
+                    .map_or(16, |(_, bits)| (bits / 8) as u8);
+                if mask(cases[edge].0, width) != mask(discr as u128, width) {
+                    continue 'params;
+                }
+                plans.push((pred_index, edge, Plan::Split { arg }));
             }
             if !direct || projections.is_empty() {
                 continue;
@@ -1832,7 +1872,7 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
                 .params
                 .splice(position..=position, new_params);
             let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            for &(block_index, op_index, _, _, _) in &projections {
+            for &(block_index, op_index, _, _, _) in projections {
                 by_block.entry(block_index).or_default().push(op_index);
             }
             for (block_index, mut ops) in by_block {
@@ -1859,7 +1899,7 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
                             func.blocks[pred_index].term.edges()[edge].1.to_vec();
                         let mut values = Vec::with_capacity(projections.len());
                         let mut ops = Vec::with_capacity(projections.len());
-                        for &(_, _, field, result, _) in &projections {
+                        for &(_, _, field, result, _) in projections {
                             let value = ValueId(func.values.len() as u32);
                             func.values.push(ValueDef {
                                 ty: func.values[result.0 as usize].ty,

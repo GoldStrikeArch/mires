@@ -1,0 +1,194 @@
+--- a/library/alloc/src/rc.rs
++++ b/library/alloc/src/rc.rs
+@@ -2317,17 +2317,63 @@
+     }
+ }
+ 
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_rc_alloc_slice"]
++unsafe fn rcgjs_rc_alloc_slice<T>(len: usize) -> *mut RcInner<[T]> {
++    unsafe {
++        Rc::<[T]>::allocate_for_layout(
++            Layout::array::<T>(len).unwrap(),
++            |layout| Global.allocate(layout),
++            |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
++        )
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++trait RcSliceAlloc<T>: Allocator {
++    unsafe fn alloc_rc_slice(&self, len: usize) -> *mut RcInner<[T]>;
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T, A: Allocator> RcSliceAlloc<T> for A {
++    #[inline]
++    default unsafe fn alloc_rc_slice(&self, len: usize) -> *mut RcInner<[T]> {
++        unsafe {
++            Rc::<[T]>::allocate_for_layout(
++                Layout::array::<T>(len).unwrap(),
++                |layout| self.allocate(layout),
++                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
++            )
++        }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T> RcSliceAlloc<T> for Global {
++    #[inline]
++    unsafe fn alloc_rc_slice(&self, len: usize) -> *mut RcInner<[T]> {
++        let _ = rc_inner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_rc_alloc_slice::<T>(len) }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T> RcSliceAlloc<T> for &Global {
++    #[inline]
++    unsafe fn alloc_rc_slice(&self, len: usize) -> *mut RcInner<[T]> {
++        let _ = rc_inner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_rc_alloc_slice::<T>(len) }
++    }
++}
++
+ impl<T> Rc<[T]> {
+     /// Allocates an `RcInner<[T]>` with the given length.
+     #[cfg(not(no_global_oom_handling))]
+     unsafe fn allocate_for_slice(len: usize) -> *mut RcInner<[T]> {
+-        unsafe {
+-            Self::allocate_for_layout(
+-                Layout::array::<T>(len).unwrap(),
+-                |layout| Global.allocate(layout),
+-                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
+-            )
+-        }
++        let _ = rc_inner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_rc_alloc_slice::<T>(len) }
+     }
+ 
+     /// Copy elements from slice into newly allocated `Rc<[T]>`
+@@ -2364,7 +2410,7 @@
+                     let slice = from_raw_parts_mut(self.elems, self.n_elems);
+                     ptr::drop_in_place(slice);
+ 
+-                    Global.deallocate(self.mem, self.layout);
++                    crate::alloc::ManagedDealloc::deallocate_managed(&Global, self.mem, self.layout);
+                 }
+             }
+         }
+@@ -2398,13 +2444,7 @@
+     #[inline]
+     #[cfg(not(no_global_oom_handling))]
+     unsafe fn allocate_for_slice_in(len: usize, alloc: &A) -> *mut RcInner<[T]> {
+-        unsafe {
+-            Rc::<[T]>::allocate_for_layout(
+-                Layout::array::<T>(len).unwrap(),
+-                |layout| alloc.allocate(layout),
+-                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
+-            )
+-        }
++        unsafe { <A as RcSliceAlloc<T>>::alloc_rc_slice(alloc, len) }
+     }
+ }
+ 
+--- a/library/alloc/src/sync.rs
++++ b/library/alloc/src/sync.rs
+@@ -2262,17 +2262,63 @@
+     }
+ }
+ 
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_arc_alloc_slice"]
++unsafe fn rcgjs_arc_alloc_slice<T>(len: usize) -> *mut ArcInner<[T]> {
++    unsafe {
++        Arc::<[T]>::allocate_for_layout(
++            Layout::array::<T>(len).unwrap(),
++            |layout| Global.allocate(layout),
++            |mem| mem.cast::<T>().cast_slice(len) as *mut ArcInner<[T]>,
++        )
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++trait ArcSliceAlloc<T>: Allocator {
++    unsafe fn alloc_arc_slice(&self, len: usize) -> *mut ArcInner<[T]>;
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T, A: Allocator> ArcSliceAlloc<T> for A {
++    #[inline]
++    default unsafe fn alloc_arc_slice(&self, len: usize) -> *mut ArcInner<[T]> {
++        unsafe {
++            Arc::allocate_for_layout(
++                Layout::array::<T>(len).unwrap(),
++                |layout| self.allocate(layout),
++                |mem| mem.cast::<T>().cast_slice(len) as *mut ArcInner<[T]>,
++            )
++        }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T> ArcSliceAlloc<T> for Global {
++    #[inline]
++    unsafe fn alloc_arc_slice(&self, len: usize) -> *mut ArcInner<[T]> {
++        let _ = arcinner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_arc_alloc_slice::<T>(len) }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++impl<T> ArcSliceAlloc<T> for &Global {
++    #[inline]
++    unsafe fn alloc_arc_slice(&self, len: usize) -> *mut ArcInner<[T]> {
++        let _ = arcinner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_arc_alloc_slice::<T>(len) }
++    }
++}
++
+ impl<T> Arc<[T]> {
+     /// Allocates an `ArcInner<[T]>` with the given length.
+     #[cfg(not(no_global_oom_handling))]
+     unsafe fn allocate_for_slice(len: usize) -> *mut ArcInner<[T]> {
+-        unsafe {
+-            Self::allocate_for_layout(
+-                Layout::array::<T>(len).unwrap(),
+-                |layout| Global.allocate(layout),
+-                |mem| mem.cast::<T>().cast_slice(len) as *mut ArcInner<[T]>,
+-            )
+-        }
++        let _ = arcinner_layout_for_value_layout(Layout::array::<T>(len).unwrap());
++        unsafe { rcgjs_arc_alloc_slice::<T>(len) }
+     }
+ 
+     /// Copy elements from slice into newly allocated `Arc<[T]>`
+@@ -2311,7 +2357,7 @@
+                     let slice = from_raw_parts_mut(self.elems, self.n_elems);
+                     ptr::drop_in_place(slice);
+ 
+-                    Global.deallocate(self.mem, self.layout);
++                    crate::alloc::ManagedDealloc::deallocate_managed(&Global, self.mem, self.layout);
+                 }
+             }
+         }
+@@ -2345,13 +2391,7 @@
+     #[inline]
+     #[cfg(not(no_global_oom_handling))]
+     unsafe fn allocate_for_slice_in(len: usize, alloc: &A) -> *mut ArcInner<[T]> {
+-        unsafe {
+-            Arc::allocate_for_layout(
+-                Layout::array::<T>(len).unwrap(),
+-                |layout| alloc.allocate(layout),
+-                |mem| mem.cast::<T>().cast_slice(len) as *mut ArcInner<[T]>,
+-            )
+-        }
++        unsafe { <A as ArcSliceAlloc<T>>::alloc_arc_slice(alloc, len) }
+     }
+ }
+ 

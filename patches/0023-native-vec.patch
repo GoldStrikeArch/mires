@@ -1,0 +1,1079 @@
+diff -ruN a/library/alloc/src/macros.rs b/library/alloc/src/macros.rs
+--- a/library/alloc/src/macros.rs	2026-11-07 12:07:47
++++ b/library/alloc/src/macros.rs	2026-11-24 13:56:53
+@@ -56,9 +56,7 @@
+         //
+         // `box_assume_init_into_vec_unsafe` isn't actually safe but the way we use it here is. We
+         // can't use an unsafe block as that would also wrap `$x`.
+-        $crate::boxed::box_assume_init_into_vec_unsafe(
+-            $crate::intrinsics::write_box_via_move($crate::boxed::Box::new_uninit(), [$($x),+])
+-        )
++        $crate::vec::rcgjs_vec_from_array([$($x),+])
+     );
+ }
+ 
+diff -ruN a/library/alloc/src/vec/mod.rs b/library/alloc/src/vec/mod.rs
+--- a/library/alloc/src/vec/mod.rs	2026-11-24 13:36:06
++++ b/library/alloc/src/vec/mod.rs	2026-11-24 13:56:53
+@@ -438,6 +438,608 @@
+     len: usize,
+ }
+ 
++
++// Compiler-recognized universal flat `Vec<T, Global>` hooks (`ReleaseSpeed` + `Default` allocator
++// + `!byte_views` + `!non_rc_raw_alloc_reachable`). Every fallback body implements the exact
++// upstream `RawVec` behavior so non-`ReleaseSpeed`, custom allocators, `Vec<T, &Global>`, and
++// fallback builds preserve 100% standard `RawVec` semantics.
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_new"]
++pub(crate) const fn rcgjs_vec_new<T>() -> Vec<T> {
++    Vec { buf: RawVec::new(), len: 0 }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_with_capacity"]
++pub(crate) fn rcgjs_vec_with_capacity<T>(capacity: usize) -> Vec<T> {
++    Vec { buf: RawVec::with_capacity_in(capacity, Global), len: 0 }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_from_elem_zeroed"]
++pub(crate) fn rcgjs_vec_from_elem_zeroed<T>(n: usize) -> Vec<T> {
++    Vec { buf: RawVec::with_capacity_zeroed_in(n, Global), len: n }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[unstable(feature = "liballoc_internals", issue = "none")]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_from_array"]
++pub fn rcgjs_vec_from_array<T, const N: usize>(arr: [T; N]) -> Vec<T> {
++    crate::boxed::box_assume_init_into_vec_unsafe(
++        crate::intrinsics::write_box_via_move(Box::new_uninit(), arr),
++    )
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_from_raw_parts"]
++pub(crate) const unsafe fn rcgjs_vec_from_raw_parts<T>(
++    ptr: *mut T,
++    length: usize,
++    capacity: usize,
++) -> Vec<T> {
++    unsafe { Vec { buf: RawVec::from_raw_parts_in(ptr, capacity, Global), len: length } }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_capacity"]
++pub(crate) const fn rcgjs_vec_capacity<T>(v: &Vec<T>) -> usize {
++    v.buf.capacity()
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_as_ptr"]
++pub(crate) const fn rcgjs_vec_as_ptr<T>(v: &Vec<T>) -> *const T {
++    v.buf.ptr()
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_as_mut_ptr"]
++pub(crate) const fn rcgjs_vec_as_mut_ptr<T>(v: &mut Vec<T>) -> *mut T {
++    v.buf.ptr()
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_as_slice"]
++#[rustc_allow_const_fn_unstable(core_intrinsics)]
++pub(crate) const fn rcgjs_vec_as_slice<T>(v: &Vec<T>) -> &[T] {
++    unsafe { &*core::intrinsics::aggregate_raw_ptr::<*const [T], _, _>(v.buf.ptr().cast_const(), v.len) }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_as_mut_slice"]
++#[rustc_allow_const_fn_unstable(core_intrinsics)]
++pub(crate) const fn rcgjs_vec_as_mut_slice<T>(v: &mut Vec<T>) -> &mut [T] {
++    unsafe { &mut *core::intrinsics::aggregate_raw_ptr::<*mut [T], _, _>(v.buf.ptr(), v.len) }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_reserve"]
++pub(crate) fn rcgjs_vec_reserve<T>(v: &mut Vec<T>, used_len: usize, additional: usize) {
++    v.buf.reserve(used_len, additional);
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_reserve_exact"]
++pub(crate) fn rcgjs_vec_reserve_exact<T>(v: &mut Vec<T>, used_len: usize, additional: usize) {
++    v.buf.reserve_exact(used_len, additional);
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_try_reserve"]
++pub(crate) fn rcgjs_vec_try_reserve<T>(v: &mut Vec<T>, used_len: usize, additional: usize) -> bool {
++    v.buf.try_reserve(used_len, additional).is_ok()
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_try_reserve_exact"]
++pub(crate) fn rcgjs_vec_try_reserve_exact<T>(
++    v: &mut Vec<T>,
++    used_len: usize,
++    additional: usize,
++) -> bool {
++    v.buf.try_reserve_exact(used_len, additional).is_ok()
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_shrink_to"]
++pub(crate) fn rcgjs_vec_shrink_to<T>(v: &mut Vec<T>, target_cap: usize) {
++    v.buf.shrink_to_fit(target_cap);
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_try_shrink_to"]
++pub(crate) fn rcgjs_vec_try_shrink_to<T>(v: &mut Vec<T>, target_cap: usize) -> bool {
++    v.buf.try_shrink_to_fit(target_cap).is_ok()
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_grow_one"]
++pub(crate) fn rcgjs_vec_grow_one<T>(v: &mut Vec<T>) {
++    v.buf.grow_one();
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_push"]
++pub(crate) fn rcgjs_vec_push<T>(v: &mut Vec<T>, value: T) {
++    let len = v.len;
++    if len == v.buf.capacity() {
++        v.buf.grow_one();
++    }
++    unsafe {
++        let end = v.buf.ptr().add(len);
++        ptr::write(end, value);
++        v.len = len + 1;
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_push_mut"]
++pub(crate) fn rcgjs_vec_push_mut<T>(v: &mut Vec<T>, value: T) -> &mut T {
++    let len = v.len;
++    if len == v.buf.capacity() {
++        v.buf.grow_one();
++    }
++    unsafe {
++        let end = v.buf.ptr().add(len);
++        ptr::write(end, value);
++        v.len = len + 1;
++        &mut *end
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_pop"]
++pub(crate) fn rcgjs_vec_pop<T>(v: &mut Vec<T>) -> Option<T> {
++    if v.len == 0 {
++        None
++    } else {
++        unsafe {
++            v.len -= 1;
++            core::hint::assert_unchecked(v.len < v.buf.capacity());
++            Some(ptr::read(v.buf.ptr().add(v.len)))
++        }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_vec_into_boxed_slice"]
++pub(crate) fn rcgjs_vec_into_boxed_slice<T>(mut v: Vec<T>) -> Box<[T]> {
++    unsafe {
++        if v.buf.capacity() > v.len {
++            v.buf.shrink_to_fit(v.len);
++        }
++        let me = ManuallyDrop::new(v);
++        let buf = ptr::read(&me.buf);
++        let len = me.len;
++        buf.into_box(len).assume_init()
++    }
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++pub(super) const trait ConstNativeVecOps<T>: Allocator + Sized {
++    fn vec_new_in(alloc: Self) -> Vec<T, Self>;
++    unsafe fn vec_from_raw_parts_in(
++        ptr: *mut T,
++        length: usize,
++        capacity: usize,
++        alloc: Self,
++    ) -> Vec<T, Self>;
++    fn vec_capacity(v: &Vec<T, Self>) -> usize;
++    fn vec_as_ptr(v: &Vec<T, Self>) -> *const T;
++    fn vec_as_mut_ptr(v: &mut Vec<T, Self>) -> *mut T;
++    fn vec_as_non_null(v: &mut Vec<T, Self>) -> NonNull<T>;
++    fn vec_as_slice(v: &Vec<T, Self>) -> &[T];
++    fn vec_as_mut_slice(v: &mut Vec<T, Self>) -> &mut [T];
++    fn vec_allocator(v: &Vec<T, Self>) -> &Self;
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T, A: Allocator> ConstNativeVecOps<T> for A {
++    #[inline]
++    default fn vec_new_in(alloc: Self) -> Vec<T, Self> {
++        Vec { buf: RawVec::new_in(alloc), len: 0 }
++    }
++    #[inline]
++    default unsafe fn vec_from_raw_parts_in(
++        ptr: *mut T,
++        length: usize,
++        capacity: usize,
++        alloc: Self,
++    ) -> Vec<T, Self> {
++        unsafe { Vec { buf: RawVec::from_raw_parts_in(ptr, capacity, alloc), len: length } }
++    }
++    #[inline]
++    default fn vec_capacity(v: &Vec<T, Self>) -> usize {
++        v.buf.capacity()
++    }
++    #[inline]
++    default fn vec_as_ptr(v: &Vec<T, Self>) -> *const T {
++        v.buf.ptr()
++    }
++    #[inline]
++    default fn vec_as_mut_ptr(v: &mut Vec<T, Self>) -> *mut T {
++        v.buf.ptr()
++    }
++    #[inline]
++    default fn vec_as_non_null(v: &mut Vec<T, Self>) -> NonNull<T> {
++        v.buf.non_null()
++    }
++    #[inline]
++    #[rustc_allow_const_fn_unstable(core_intrinsics)]
++    default fn vec_as_slice(v: &Vec<T, Self>) -> &[T] {
++        unsafe { &*core::intrinsics::aggregate_raw_ptr::<*const [T], _, _>(v.buf.ptr().cast_const(), v.len) }
++    }
++    #[inline]
++    #[rustc_allow_const_fn_unstable(core_intrinsics)]
++    default fn vec_as_mut_slice(v: &mut Vec<T, Self>) -> &mut [T] {
++        unsafe { &mut *core::intrinsics::aggregate_raw_ptr::<*mut [T], _, _>(v.buf.ptr(), v.len) }
++    }
++    #[inline]
++    default fn vec_allocator(v: &Vec<T, Self>) -> &Self {
++        v.buf.allocator()
++    }
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T> ConstNativeVecOps<T> for Global {
++    #[inline]
++    fn vec_new_in(_alloc: Self) -> Vec<T, Self> {
++        rcgjs_vec_new()
++    }
++    #[inline]
++    unsafe fn vec_from_raw_parts_in(
++        ptr: *mut T,
++        length: usize,
++        capacity: usize,
++        _alloc: Self,
++    ) -> Vec<T, Self> {
++        unsafe { rcgjs_vec_from_raw_parts(ptr, length, capacity) }
++    }
++    #[inline]
++    fn vec_capacity(v: &Vec<T, Self>) -> usize {
++        rcgjs_vec_capacity(v)
++    }
++    #[inline]
++    fn vec_as_ptr(v: &Vec<T, Self>) -> *const T {
++        rcgjs_vec_as_ptr(v)
++    }
++    #[inline]
++    fn vec_as_mut_ptr(v: &mut Vec<T, Self>) -> *mut T {
++        rcgjs_vec_as_mut_ptr(v)
++    }
++    #[inline]
++    fn vec_as_non_null(v: &mut Vec<T, Self>) -> NonNull<T> {
++        unsafe { NonNull::new_unchecked(rcgjs_vec_as_mut_ptr(v)) }
++    }
++    #[inline]
++    fn vec_as_slice(v: &Vec<T, Self>) -> &[T] {
++        rcgjs_vec_as_slice(v)
++    }
++    #[inline]
++    fn vec_as_mut_slice(v: &mut Vec<T, Self>) -> &mut [T] {
++        rcgjs_vec_as_mut_slice(v)
++    }
++    #[inline]
++    fn vec_allocator(_v: &Vec<T, Self>) -> &Self {
++        const { &Global }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++pub(super) const trait ConstAllocVecOps<T>: [const] Allocator + [const] Destruct + Sized {
++    fn vec_with_capacity_in(capacity: usize, alloc: Self) -> Vec<T, Self>;
++    fn vec_push(v: &mut Vec<T, Self>, value: T);
++    fn vec_push_mut(v: &mut Vec<T, Self>, value: T) -> &mut T;
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T, A: [const] Allocator + [const] Destruct> ConstAllocVecOps<T> for A {
++    #[inline]
++    default fn vec_with_capacity_in(capacity: usize, alloc: Self) -> Vec<T, Self> {
++        Vec { buf: RawVec::with_capacity_in(capacity, alloc), len: 0 }
++    }
++    #[inline]
++    default fn vec_push(v: &mut Vec<T, Self>, value: T) {
++        let _ = Self::vec_push_mut(v, value);
++    }
++    #[inline]
++    default fn vec_push_mut(v: &mut Vec<T, Self>, value: T) -> &mut T {
++        let len = v.len;
++        if len == v.buf.capacity() {
++            v.buf.grow_one();
++        }
++        unsafe {
++            let end = v.as_mut_ptr().add(len);
++            ptr::write(end, value);
++            v.len = len + 1;
++            &mut *end
++        }
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T> ConstAllocVecOps<T> for Global {
++    #[inline]
++    fn vec_with_capacity_in(capacity: usize, _alloc: Self) -> Vec<T, Self> {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(capacity: usize) -> Vec<T> {
++            Vec { buf: RawVec::with_capacity_in(capacity, Global), len: 0 }
++        }
++        #[inline]
++        fn rt<T>(capacity: usize) -> Vec<T> {
++            rcgjs_vec_with_capacity(capacity)
++        }
++        core::intrinsics::const_eval_select((capacity,), ct::<T>, rt::<T>)
++    }
++    #[inline]
++    fn vec_push(v: &mut Vec<T, Self>, value: T) {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(v: &mut Vec<T>, value: T) {
++            let len = v.len;
++            if len == v.buf.capacity() {
++                v.buf.grow_one();
++            }
++            unsafe {
++                let end = v.buf.ptr().add(len);
++                ptr::write(end, value);
++                v.len = len + 1;
++            }
++        }
++        #[inline]
++        fn rt<T>(v: &mut Vec<T>, value: T) {
++            rcgjs_vec_push(v, value);
++        }
++        core::intrinsics::const_eval_select((v, value), ct::<T>, rt::<T>)
++    }
++    #[inline]
++    fn vec_push_mut(v: &mut Vec<T, Self>, value: T) -> &mut T {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(v: &mut Vec<T>, value: T) -> &mut T {
++            let len = v.len;
++            if len == v.buf.capacity() {
++                v.buf.grow_one();
++            }
++            unsafe {
++                let end = v.buf.ptr().add(len);
++                ptr::write(end, value);
++                v.len = len + 1;
++                &mut *end
++            }
++        }
++        #[inline]
++        fn rt<T>(v: &mut Vec<T>, value: T) -> &mut T {
++            rcgjs_vec_push_mut(v, value)
++        }
++        core::intrinsics::const_eval_select((v, value), ct::<T>, rt::<T>)
++    }
++}
++
++pub(super) trait NativeVecOps<T>: Allocator + Sized {
++    fn vec_try_with_capacity_in(capacity: usize, alloc: Self) -> Result<Vec<T, Self>, TryReserveError>;
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_from_elem_zeroed(n: usize, alloc: Self) -> Vec<T, Self>;
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_reserve(v: &mut Vec<T, Self>, used_len: usize, additional: usize);
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_reserve_exact(v: &mut Vec<T, Self>, used_len: usize, additional: usize);
++    fn vec_try_reserve(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError>;
++    fn vec_try_reserve_exact(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError>;
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_shrink_to(v: &mut Vec<T, Self>, target_cap: usize);
++    fn vec_try_shrink_to(v: &mut Vec<T, Self>, target_cap: usize) -> Result<(), TryReserveError>;
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_grow_one(v: &mut Vec<T, Self>);
++    fn vec_pop(v: &mut Vec<T, Self>) -> Option<T>;
++    #[cfg(not(no_global_oom_handling))]
++    fn vec_into_boxed_slice(v: Vec<T, Self>) -> Box<[T], Self>;
++}
++
++impl<T, A: Allocator> NativeVecOps<T> for A {
++    #[inline]
++    default fn vec_try_with_capacity_in(
++        capacity: usize,
++        alloc: Self,
++    ) -> Result<Vec<T, Self>, TryReserveError> {
++        Ok(Vec { buf: RawVec::try_with_capacity_in(capacity, alloc)?, len: 0 })
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_from_elem_zeroed(n: usize, alloc: Self) -> Vec<T, Self> {
++        Vec { buf: RawVec::with_capacity_zeroed_in(n, alloc), len: n }
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_reserve(v: &mut Vec<T, Self>, used_len: usize, additional: usize) {
++        v.buf.reserve(used_len, additional);
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_reserve_exact(v: &mut Vec<T, Self>, used_len: usize, additional: usize) {
++        v.buf.reserve_exact(used_len, additional);
++    }
++    #[inline]
++    default fn vec_try_reserve(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError> {
++        v.buf.try_reserve(used_len, additional)
++    }
++    #[inline]
++    default fn vec_try_reserve_exact(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError> {
++        v.buf.try_reserve_exact(used_len, additional)
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_shrink_to(v: &mut Vec<T, Self>, target_cap: usize) {
++        v.buf.shrink_to_fit(target_cap);
++    }
++    #[inline]
++    default fn vec_try_shrink_to(
++        v: &mut Vec<T, Self>,
++        target_cap: usize,
++    ) -> Result<(), TryReserveError> {
++        v.buf.try_shrink_to_fit(target_cap)
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_grow_one(v: &mut Vec<T, Self>) {
++        v.buf.grow_one();
++    }
++    #[inline]
++    default fn vec_pop(v: &mut Vec<T, Self>) -> Option<T> {
++        if v.len == 0 {
++            None
++        } else {
++            unsafe {
++                v.len -= 1;
++                core::hint::assert_unchecked(v.len < v.capacity());
++                Some(ptr::read(v.as_ptr().add(v.len())))
++            }
++        }
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    default fn vec_into_boxed_slice(mut v: Vec<T, Self>) -> Box<[T], Self> {
++        unsafe {
++            v.shrink_to_fit();
++            let me = ManuallyDrop::new(v);
++            let buf = ptr::read(&me.buf);
++            let len = me.len();
++            buf.into_box(len).assume_init()
++        }
++    }
++}
++
++impl<T> NativeVecOps<T> for Global {
++    #[inline]
++    fn vec_try_with_capacity_in(
++        capacity: usize,
++        _alloc: Self,
++    ) -> Result<Vec<T, Self>, TryReserveError> {
++        let mut v = rcgjs_vec_new();
++        if capacity > 0 && !rcgjs_vec_try_reserve_exact(&mut v, 0, capacity) {
++            return Err(crate::collections::TryReserveErrorKind::CapacityOverflow.into());
++        }
++        Ok(v)
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_from_elem_zeroed(n: usize, _alloc: Self) -> Vec<T, Self> {
++        rcgjs_vec_from_elem_zeroed(n)
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_reserve(v: &mut Vec<T, Self>, used_len: usize, additional: usize) {
++        rcgjs_vec_reserve(v, used_len, additional);
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_reserve_exact(v: &mut Vec<T, Self>, used_len: usize, additional: usize) {
++        rcgjs_vec_reserve_exact(v, used_len, additional);
++    }
++    #[inline]
++    fn vec_try_reserve(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError> {
++        if rcgjs_vec_try_reserve(v, used_len, additional) {
++            Ok(())
++        } else {
++            Err(crate::collections::TryReserveErrorKind::CapacityOverflow.into())
++        }
++    }
++    #[inline]
++    fn vec_try_reserve_exact(
++        v: &mut Vec<T, Self>,
++        used_len: usize,
++        additional: usize,
++    ) -> Result<(), TryReserveError> {
++        if rcgjs_vec_try_reserve_exact(v, used_len, additional) {
++            Ok(())
++        } else {
++            Err(crate::collections::TryReserveErrorKind::CapacityOverflow.into())
++        }
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_shrink_to(v: &mut Vec<T, Self>, target_cap: usize) {
++        rcgjs_vec_shrink_to(v, target_cap);
++    }
++    #[inline]
++    fn vec_try_shrink_to(
++        v: &mut Vec<T, Self>,
++        target_cap: usize,
++    ) -> Result<(), TryReserveError> {
++        if rcgjs_vec_try_shrink_to(v, target_cap) {
++            Ok(())
++        } else {
++            Err(crate::collections::TryReserveErrorKind::CapacityOverflow.into())
++        }
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_grow_one(v: &mut Vec<T, Self>) {
++        rcgjs_vec_grow_one(v);
++    }
++    #[inline]
++    fn vec_pop(v: &mut Vec<T, Self>) -> Option<T> {
++        rcgjs_vec_pop(v)
++    }
++    #[cfg(not(no_global_oom_handling))]
++    #[inline]
++    fn vec_into_boxed_slice(v: Vec<T, Self>) -> Box<[T], Self> {
++        rcgjs_vec_into_boxed_slice(v)
++    }
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // Inherent methods
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -459,7 +1061,7 @@
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[must_use]
+     pub const fn new() -> Self {
+-        Vec { buf: RawVec::new(), len: 0 }
++        rcgjs_vec_new()
+     }
+ 
+     /// Constructs a new, empty `Vec<T>` with at least the specified capacity.
+@@ -972,7 +1574,7 @@
+     #[inline]
+     #[unstable(feature = "allocator_api", issue = "32838")]
+     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+-        Vec { buf: RawVec::with_capacity_in(capacity, alloc), len: 0 }
++        <A as ConstAllocVecOps<T>>::vec_with_capacity_in(capacity, alloc)
+     }
+ 
+     /// Appends an element to the back of a collection.
+@@ -999,7 +1601,7 @@
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[rustc_confusables("push_back", "put", "append")]
+     pub fn push(&mut self, value: T) {
+-        let _ = self.push_mut(value);
++        <A as ConstAllocVecOps<T>>::vec_push(self, value);
+     }
+ 
+     /// Appends an element to the back of a collection, returning a reference to it.
+@@ -1031,20 +1633,7 @@
+     #[stable(feature = "push_mut", since = "1.95.0")]
+     #[must_use = "if you don't need a reference to the value, use `Vec::push` instead"]
+     pub fn push_mut(&mut self, value: T) -> &mut T {
+-        // Inform codegen that the length does not change across grow_one().
+-        let len = self.len;
+-        // This will panic or abort if we would allocate > isize::MAX bytes
+-        // or if the length increment would overflow for zero-sized types.
+-        if len == self.buf.capacity() {
+-            self.buf.grow_one();
+-        }
+-        unsafe {
+-            let end = self.as_mut_ptr().add(len);
+-            ptr::write(end, value);
+-            self.len = len + 1;
+-            // SAFETY: We just wrote a value to the pointer that will live the lifetime of the reference.
+-            &mut *end
+-        }
++        <A as ConstAllocVecOps<T>>::vec_push_mut(self, value)
+     }
+ }
+ 
+@@ -1064,8 +1653,9 @@
+     /// ```
+     #[inline]
+     #[unstable(feature = "allocator_api", issue = "32838")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     pub const fn new_in(alloc: A) -> Self {
+-        Vec { buf: RawVec::new_in(alloc), len: 0 }
++        <A as ConstNativeVecOps<T>>::vec_new_in(alloc)
+     }
+ 
+     /// Constructs a new, empty `Vec<T, A>` with at least the specified capacity
+@@ -1083,7 +1673,7 @@
+     #[unstable(feature = "allocator_api", issue = "32838")]
+     // #[unstable(feature = "try_with_capacity", issue = "91913")]
+     pub fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
+-        Ok(Vec { buf: RawVec::try_with_capacity_in(capacity, alloc)?, len: 0 })
++        <A as NativeVecOps<T>>::vec_try_with_capacity_in(capacity, alloc)
+     }
+ 
+     /// Creates a `Vec<T, A>` directly from a pointer, a length, a capacity,
+@@ -1188,6 +1778,7 @@
+     #[inline]
+     #[unstable(feature = "allocator_api", issue = "32838")]
+     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     pub const unsafe fn from_raw_parts_in(
+         ptr: *mut T,
+         length: usize,
+@@ -1199,7 +1790,7 @@
+             "Vec::from_raw_parts_in requires that length <= capacity",
+             (length: usize = length, capacity: usize = capacity) => length <= capacity
+         );
+-        unsafe { Vec { buf: RawVec::from_raw_parts_in(ptr, capacity, alloc), len: length } }
++        unsafe { <A as ConstNativeVecOps<T>>::vec_from_raw_parts_in(ptr, length, capacity, alloc) }
+     }
+ 
+     #[doc(alias = "from_non_null_parts_in")]
+@@ -1303,6 +1894,7 @@
+     #[inline]
+     #[unstable(feature = "allocator_api", issue = "32838")]
+     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     // #[unstable(feature = "box_vec_non_null", issue = "130364")]
+     pub const unsafe fn from_parts_in(
+         ptr: NonNull<T>,
+@@ -1315,7 +1907,14 @@
+             "Vec::from_parts_in requires that length <= capacity",
+             (length: usize = length, capacity: usize = capacity) => length <= capacity
+         );
+-        unsafe { Vec { buf: RawVec::from_nonnull_in(ptr, capacity, alloc), len: length } }
++        unsafe {
++            <A as ConstNativeVecOps<T>>::vec_from_raw_parts_in(
++                ptr.as_ptr(),
++                length,
++                capacity,
++                alloc,
++            )
++        }
+     }
+ 
+     /// Decomposes a `Vec<T>` into its raw components: `(pointer, length, capacity, allocator)`.
+@@ -1441,8 +2040,9 @@
+     #[inline]
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[rustc_const_stable(feature = "const_vec_string_slice", since = "1.87.0")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     pub const fn capacity(&self) -> usize {
+-        self.buf.capacity()
++        <A as ConstNativeVecOps<T>>::vec_capacity(self)
+     }
+ 
+     /// Reserves capacity for at least `additional` more elements to be inserted
+@@ -1466,7 +2066,7 @@
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[rustc_diagnostic_item = "vec_reserve"]
+     pub fn reserve(&mut self, additional: usize) {
+-        self.buf.reserve(self.len, additional);
++        <A as NativeVecOps<T>>::vec_reserve(self, self.len, additional);
+     }
+ 
+     /// Reserves the minimum capacity for at least `additional` more elements to
+@@ -1496,7 +2096,7 @@
+     #[cfg(not(no_global_oom_handling))]
+     #[stable(feature = "rust1", since = "1.0.0")]
+     pub fn reserve_exact(&mut self, additional: usize) {
+-        self.buf.reserve_exact(self.len, additional);
++        <A as NativeVecOps<T>>::vec_reserve_exact(self, self.len, additional);
+     }
+ 
+     /// Tries to reserve capacity for at least `additional` more elements to be inserted
+@@ -1533,7 +2133,7 @@
+     /// ```
+     #[stable(feature = "try_reserve", since = "1.57.0")]
+     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+-        self.buf.try_reserve(self.len, additional)
++        <A as NativeVecOps<T>>::vec_try_reserve(self, self.len, additional)
+     }
+ 
+     /// Tries to reserve the minimum capacity for at least `additional`
+@@ -1576,7 +2176,7 @@
+     /// ```
+     #[stable(feature = "try_reserve", since = "1.57.0")]
+     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+-        self.buf.try_reserve_exact(self.len, additional)
++        <A as NativeVecOps<T>>::vec_try_reserve_exact(self, self.len, additional)
+     }
+ 
+     /// Shrinks the capacity of the vector as much as possible.
+@@ -1604,7 +2204,7 @@
+         // they are equal, so we can avoid the panic case in `RawVec::shrink_to_fit`
+         // by only calling it with a greater capacity.
+         if self.capacity() > self.len {
+-            self.buf.shrink_to_fit(self.len);
++            <A as NativeVecOps<T>>::vec_shrink_to(self, self.len);
+         }
+     }
+ 
+@@ -1630,7 +2230,7 @@
+     #[stable(feature = "shrink_to", since = "1.56.0")]
+     pub fn shrink_to(&mut self, min_capacity: usize) {
+         if self.capacity() > min_capacity {
+-            self.buf.shrink_to_fit(cmp::max(self.len, min_capacity));
++            <A as NativeVecOps<T>>::vec_shrink_to(self, cmp::max(self.len, min_capacity));
+         }
+     }
+ 
+@@ -1662,7 +2262,7 @@
+     #[unstable(feature = "vec_fallible_shrink", issue = "152350")]
+     #[inline]
+     pub fn try_shrink_to_fit(&mut self) -> Result<(), TryReserveError> {
+-        if self.capacity() > self.len { self.buf.try_shrink_to_fit(self.len) } else { Ok(()) }
++        if self.capacity() > self.len { <A as NativeVecOps<T>>::vec_try_shrink_to(self, self.len) } else { Ok(()) }
+     }
+ 
+     /// Shrinks the capacity of the vector with a lower bound.
+@@ -1695,7 +2295,7 @@
+     #[inline]
+     pub fn try_shrink_to(&mut self, min_capacity: usize) -> Result<(), TryReserveError> {
+         if self.capacity() > min_capacity {
+-            self.buf.try_shrink_to_fit(cmp::max(self.len, min_capacity))
++            <A as NativeVecOps<T>>::vec_try_shrink_to(self, cmp::max(self.len, min_capacity))
+         } else {
+             Ok(())
+         }
+@@ -1728,14 +2328,8 @@
+     /// ```
+     #[cfg(not(no_global_oom_handling))]
+     #[stable(feature = "rust1", since = "1.0.0")]
+-    pub fn into_boxed_slice(mut self) -> Box<[T], A> {
+-        unsafe {
+-            self.shrink_to_fit();
+-            let me = ManuallyDrop::new(self);
+-            let buf = ptr::read(&me.buf);
+-            let len = me.len();
+-            buf.into_box(len).assume_init()
+-        }
++    pub fn into_boxed_slice(self) -> Box<[T], A> {
++        <A as NativeVecOps<T>>::vec_into_boxed_slice(self)
+     }
+ 
+     /// Converts the Vec into a boxed array. This conversion will discard any spare capacity,
+@@ -1853,25 +2447,9 @@
+     #[stable(feature = "vec_as_slice", since = "1.7.0")]
+     #[rustc_diagnostic_item = "vec_as_slice"]
+     #[rustc_const_stable(feature = "const_vec_string_slice", since = "1.87.0")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     pub const fn as_slice(&self) -> &[T] {
+-        // SAFETY: `slice::from_raw_parts` requires pointee is a contiguous, aligned buffer of size
+-        // `len` containing properly-initialized `T`s. Data must not be mutated for the returned
+-        // lifetime. Further, `len * size_of::<T>` <= `isize::MAX`, and allocation does not
+-        // "wrap" through overflowing memory addresses.
+-        //
+-        // * Vec API guarantees that self.buf:
+-        //      * contains only properly-initialized items within 0..len
+-        //      * is aligned, contiguous, and valid for `len` reads
+-        //      * obeys size and address-wrapping constraints
+-        //
+-        // * We only construct `&mut` references to `self.buf` through `&mut self` methods; borrow-
+-        //   check ensures that it is not possible to mutably alias `self.buf` within the
+-        //   returned lifetime.
+-        unsafe {
+-            // normally this would use `slice::from_raw_parts`, but it's
+-            // instantiated often enough that avoiding the UB check is worth it
+-            &*core::intrinsics::aggregate_raw_ptr::<*const [T], _, _>(self.as_ptr(), self.len)
+-        }
++        <A as ConstNativeVecOps<T>>::vec_as_slice(self)
+     }
+ 
+     /// Extracts a mutable slice of the entire vector.
+@@ -1889,28 +2467,9 @@
+     #[stable(feature = "vec_as_slice", since = "1.7.0")]
+     #[rustc_diagnostic_item = "vec_as_mut_slice"]
+     #[rustc_const_stable(feature = "const_vec_string_slice", since = "1.87.0")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     pub const fn as_mut_slice(&mut self) -> &mut [T] {
+-        // SAFETY: `BufWriter::flush_buf` assumes that this will not
+-        // de-initialize any elements of the spare capacity.
+-
+-        // SAFETY: `slice::from_raw_parts_mut` requires pointee is a contiguous, aligned buffer of
+-        // size `len` containing properly-initialized `T`s. Data must not be accessed through any
+-        // other pointer for the returned lifetime. Further, `len * size_of::<T>` <=
+-        // `isize::MAX` and allocation does not "wrap" through overflowing memory addresses.
+-        //
+-        // * Vec API guarantees that self.buf:
+-        //      * contains only properly-initialized items within 0..len
+-        //      * is aligned, contiguous, and valid for `len` reads
+-        //      * obeys size and address-wrapping constraints
+-        //
+-        // * We only construct references to `self.buf` through `&self` and `&mut self` methods;
+-        //   borrow-check ensures that it is not possible to construct a reference to `self.buf`
+-        //   within the returned lifetime.
+-        unsafe {
+-            // normally this would use `slice::from_raw_parts_mut`, but it's
+-            // instantiated often enough that avoiding the UB check is worth it
+-            &mut *core::intrinsics::aggregate_raw_ptr::<*mut [T], _, _>(self.as_mut_ptr(), self.len)
+-        }
++        <A as ConstNativeVecOps<T>>::vec_as_mut_slice(self)
+     }
+ 
+     /// Returns a raw pointer to the vector's buffer, or a dangling raw pointer
+@@ -1968,13 +2527,14 @@
+     /// [`as_non_null`]: Vec::as_non_null
+     #[stable(feature = "vec_as_ptr", since = "1.37.0")]
+     #[rustc_const_stable(feature = "const_vec_string_slice", since = "1.87.0")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     #[rustc_never_returns_null_ptr]
+     #[rustc_as_ptr]
+     #[inline]
+     pub const fn as_ptr(&self) -> *const T {
+         // We shadow the slice method of the same name to avoid going through
+         // `deref`, which creates an intermediate reference.
+-        self.buf.ptr()
++        <A as ConstNativeVecOps<T>>::vec_as_ptr(self)
+     }
+ 
+     /// Returns a raw mutable pointer to the vector's buffer, or a dangling
+@@ -2052,13 +2612,14 @@
+     /// [`ManuallyDrop`]: core::mem::ManuallyDrop
+     #[stable(feature = "vec_as_ptr", since = "1.37.0")]
+     #[rustc_const_stable(feature = "const_vec_string_slice", since = "1.87.0")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     #[rustc_never_returns_null_ptr]
+     #[rustc_as_ptr]
+     #[inline]
+     pub const fn as_mut_ptr(&mut self) -> *mut T {
+         // We shadow the slice method of the same name to avoid going through
+         // `deref_mut`, which creates an intermediate reference.
+-        self.buf.ptr()
++        <A as ConstNativeVecOps<T>>::vec_as_mut_ptr(self)
+     }
+ 
+     /// Returns a `NonNull` pointer to the vector's buffer, or a dangling
+@@ -2119,17 +2680,19 @@
+     /// [`as_non_null`]: Vec::as_non_null
+     #[unstable(feature = "box_vec_non_null", issue = "130364")]
+     #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     #[inline]
+     pub const fn as_non_null(&mut self) -> NonNull<T> {
+-        self.buf.non_null()
++        <A as ConstNativeVecOps<T>>::vec_as_non_null(self)
+     }
+ 
+     /// Returns a reference to the underlying allocator.
+     #[unstable(feature = "allocator_api", issue = "32838")]
+     #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++    #[rustc_allow_const_fn_unstable(const_trait_impl, const_heap)]
+     #[inline]
+     pub const fn allocator(&self) -> &A {
+-        self.buf.allocator()
++        <A as ConstNativeVecOps<T>>::vec_allocator(self)
+     }
+ 
+     /// Forces the length of the vector to `new_len`.
+@@ -2352,8 +2915,8 @@
+         }
+ 
+         // space for the new element
+-        if len == self.buf.capacity() {
+-            self.buf.grow_one();
++        if len == self.capacity() {
++            <A as NativeVecOps<T>>::vec_grow_one(self);
+         }
+ 
+         unsafe {
+@@ -2840,7 +3403,7 @@
+     #[inline]
+     #[unstable(feature = "vec_push_within_capacity", issue = "100486")]
+     pub fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T> {
+-        if self.len == self.buf.capacity() {
++        if self.len == self.capacity() {
+             return Err(value);
+         }
+ 
+@@ -2877,15 +3440,7 @@
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[rustc_diagnostic_item = "vec_pop"]
+     pub fn pop(&mut self) -> Option<T> {
+-        if self.len == 0 {
+-            None
+-        } else {
+-            unsafe {
+-                self.len -= 1;
+-                core::hint::assert_unchecked(self.len < self.capacity());
+-                Some(ptr::read(self.as_ptr().add(self.len())))
+-            }
+-        }
++        <A as NativeVecOps<T>>::vec_pop(self)
+     }
+ 
+     /// Removes and returns the last element from a vector if the predicate
+@@ -3310,7 +3865,7 @@
+         unsafe {
+             slice::from_raw_parts_mut(
+                 self.as_mut_ptr().add(self.len) as *mut MaybeUninit<T>,
+-                self.buf.capacity() - self.len,
++                self.capacity() - self.len,
+             )
+         }
+     }
+@@ -3388,7 +3943,7 @@
+         // uninitialized
+         let spare_ptr = unsafe { ptr.add(self.len) };
+         let spare_ptr = spare_ptr.cast_uninit();
+-        let spare_len = self.buf.capacity() - self.len;
++        let spare_len = self.capacity() - self.len;
+ 
+         // SAFETY:
+         // - `ptr` is guaranteed to be valid for `self.len` elements
+@@ -3441,7 +3996,7 @@
+ 
+         let cap_remainder = cap % N;
+         if !T::IS_ZST && cap_remainder != 0 {
+-            self.buf.shrink_to_fit(cap - cap_remainder);
++            <A as NativeVecOps<T>>::vec_shrink_to(&mut self, cap - cap_remainder);
+         }
+ 
+         let (ptr, _, _, alloc) = self.into_raw_parts_with_alloc();
+@@ -4029,11 +4584,11 @@
+     #[inline]
+     fn into_iter(self) -> Self::IntoIter {
+         unsafe {
+-            let me = ManuallyDrop::new(self);
++            let mut me = ManuallyDrop::new(self);
+             let alloc = ManuallyDrop::new(ptr::read(me.allocator()));
+-            let buf = me.buf.non_null();
++            let buf = me.as_non_null();
+             let end = me.len();
+-            let cap = me.buf.capacity();
++            let cap = me.capacity();
+             IntoIter { buf, phantom: PhantomData, cap, alloc, pos: 0, end }
+         }
+     }
+diff -ruN a/library/alloc/src/vec/spec_from_elem.rs b/library/alloc/src/vec/spec_from_elem.rs
+--- a/library/alloc/src/vec/spec_from_elem.rs	2026-11-24 13:36:06
++++ b/library/alloc/src/vec/spec_from_elem.rs	2026-11-24 13:56:53
+@@ -2,7 +2,7 @@
+ 
+ use super::{IsZero, Vec};
+ use crate::alloc::{Allocator, Global};
+-use crate::raw_vec::RawVec;
++use super::NativeVecOps;
+ 
+ // Specialization trait for global `Vec::from_elem`: preserves O(1) `IsZero` / `()`
+ // zeroed allocations for baseline Vecs while routing non-`IsZero` `Clone` elements
+@@ -51,7 +51,7 @@
+     #[inline]
+     default fn from_elem<A: Allocator>(elem: T, n: usize, alloc: A) -> Vec<T, A> {
+         if elem.is_zero() {
+-            return Vec { buf: RawVec::with_capacity_zeroed_in(n, alloc), len: n };
++            return <A as NativeVecOps<T>>::vec_from_elem_zeroed(n, alloc);
+         }
+         let mut v = Vec::with_capacity_in(n, alloc);
+         v.extend_with(n, elem);
+@@ -63,7 +63,7 @@
+     #[inline]
+     fn from_elem<A: Allocator>(elem: i8, n: usize, alloc: A) -> Vec<i8, A> {
+         if elem == 0 {
+-            return Vec { buf: RawVec::with_capacity_zeroed_in(n, alloc), len: n };
++            return <A as NativeVecOps<i8>>::vec_from_elem_zeroed(n, alloc);
+         }
+         let mut v = Vec::with_capacity_in(n, alloc);
+         unsafe {
+@@ -78,7 +78,7 @@
+     #[inline]
+     fn from_elem<A: Allocator>(elem: u8, n: usize, alloc: A) -> Vec<u8, A> {
+         if elem == 0 {
+-            return Vec { buf: RawVec::with_capacity_zeroed_in(n, alloc), len: n };
++            return <A as NativeVecOps<u8>>::vec_from_elem_zeroed(n, alloc);
+         }
+         let mut v = Vec::with_capacity_in(n, alloc);
+         unsafe {
+diff -ruN a/library/alloc/src/vec/splice.rs b/library/alloc/src/vec/splice.rs
+--- a/library/alloc/src/vec/splice.rs	2026-11-07 12:07:47
++++ b/library/alloc/src/vec/splice.rs	2026-11-24 13:56:53
+@@ -123,7 +123,7 @@
+     unsafe fn move_tail(&mut self, additional: usize) {
+         let vec = unsafe { self.vec.as_mut() };
+         let len = self.tail_start + self.tail_len;
+-        vec.buf.reserve(len, additional);
++        <A as super::NativeVecOps<T>>::vec_reserve(vec, len, additional);
+ 
+         let new_tail_start = self.tail_start + additional;
+         unsafe {

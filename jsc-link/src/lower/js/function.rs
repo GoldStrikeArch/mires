@@ -39,11 +39,22 @@ pub fn lower_with_ascii(
     let physical = input
         .abi
         .and_then(|abi| abi.target_signature(input.name, func.item));
-    if input.heap.is_some_and(|h| h.native_string_enabled) {
+    if let Some(heap) = input.heap {
         if let BodySemantic::DropGlue(ty) = input.body.semantic {
-            if input.table.get(ty).is_some_and(|d| {
-                d.meta.candidate == rcgjs_object::jir::types::RepresentationCandidate::String
-            }) {
+            let is_noop_str = heap.native_string_enabled
+                && input.table.get(ty).is_some_and(|d| {
+                    d.meta.candidate == rcgjs_object::jir::types::RepresentationCandidate::String
+                });
+            let is_noop_vec = heap.native_vec_enabled
+                && !heap.non_rc_raw_alloc_reachable
+                && crate::analysis::heap::is_direct_global_vec_ty(input.table, ty)
+                && !crate::analysis::heap::ty_effectively_needs_drop(
+                    input.table,
+                    ty,
+                    heap.native_string_enabled,
+                    true,
+                );
+            if is_noop_str || is_noop_vec {
                 let params: Vec<String> =
                     (0..func.params.len()).map(|i| format!("$p{i}")).collect();
                 let decl = jsast::function(input.name.as_str(), params, Vec::new());

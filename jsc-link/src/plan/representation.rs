@@ -2626,6 +2626,11 @@ impl Planner<'_> {
             let native = if forced.contains(&index)
                 || (self.cx.heap.native_string_enabled
                     && problem.nodes[index].family == Some(CandidateKind::String))
+                || (self.cx.heap.native_vec_enabled
+                    && problem.nodes[index].family == Some(CandidateKind::Vec))
+                || (self.cx.heap.native_vec_enabled
+                    && !self.cx.heap.native_string_enabled
+                    && problem.nodes[index].family == Some(CandidateKind::String))
             {
                 INF
             } else {

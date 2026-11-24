@@ -37,7 +37,8 @@ mod tests;
 /// | 18 | `AbiSignature::{inline_hint, inline_always}` preserves `#[inline]` hints and `Terminator::Assert::track_caller` records resolved MIR-inlined `#[track_caller]` locations. |
 /// | 19 | Phase 3 typed native `RawVec`/`Box` allocation hooks (`TypedAlloc`, `TypedRealloc`, `TypedDealloc`, `BoxNew`, `TypedDeallocRaw`). |
 /// | 20 | Phase 5 native `{ s, cap }` `String` hooks (`NativeStr*`). |
-pub const JIR_SCHEMA: u16 = 20;
+/// | 21 | v4 Phase 3 typed `Rc<[T]>`/`Arc<[T]>` slice allocation hooks (`RcAllocSlice`, `ArcAllocSlice`). |
+pub const JIR_SCHEMA: u16 = 21;
 
 use serde::{Deserialize, Serialize};
 

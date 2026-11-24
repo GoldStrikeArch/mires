@@ -469,6 +469,13 @@ impl<'a> JsCx<'a> {
                 ("cap", jsast::num(0)),
             ]));
         }
+        if self.heap().native_vec_enabled
+            && crate::analysis::heap::is_direct_global_vec_ty(table, ty)
+        {
+            if let Some(empty) = value::empty_native_vec_expr(table, ty) {
+                return Ok(empty);
+            }
+        }
         match &descriptor.kind {
             TypeKind::Adt {
                 form: NominalForm::Struct,

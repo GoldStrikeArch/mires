@@ -375,9 +375,15 @@ pub(crate) struct LaneRun {
     added_items: bool,
     /// Whole-program lazy byte-view policy.
     byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Whether universal flat `Vec<T, Global>` representation was active.
+    native_vec_enabled: bool,
 }
 
 impl LaneRun {
+    /// Whether universal flat `Vec<T, Global>` representation was active.
+    pub(crate) fn native_vec_enabled(&self) -> bool {
+        self.native_vec_enabled
+    }
     /// The items the lowerer declined. The exit gate's number.
     pub(crate) fn fallback_count(&self) -> usize {
         self.outcomes
@@ -727,6 +733,7 @@ fn run_with_opts(
     ctx.byte_views = byte_views;
     ctx.heap = heap;
     let pre_repr_native_string = ctx.heap.native_string_enabled;
+    let pre_repr_native_vec = ctx.heap.native_vec_enabled;
 
     // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
     // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
@@ -776,6 +783,7 @@ fn run_with_opts(
     }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
     if opts.analyzes(OptimizerPass::AstDce) {
+        prune_noop_heap_drop_glues(&planning_table, &mut planned_funcs, &ctx.heap);
         let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
         for name in planned_repr
             .bodies
@@ -838,10 +846,10 @@ fn run_with_opts(
         byte_views,
     );
     if !repr.bodies.is_empty() {
-        // `repr.bodies` were emitted against `pre_repr_native_string`; keep the post-repr heap
-        // plan in lockstep so native bodies (e.g. `NativeMap<String, _>`) and lowered items
-        // agree on `String`'s layout.
+        // `repr.bodies` were emitted against `pre_repr_native_string` / `pre_repr_native_vec`;
+        // keep the post-repr heap plan in lockstep so native bodies and lowered items agree.
         heap.native_string_enabled &= pre_repr_native_string;
+        heap.native_vec_enabled &= pre_repr_native_vec;
     }
     ctx.byte_views = byte_views;
     ctx.heap = heap;
@@ -1067,6 +1075,7 @@ fn run_with_opts(
             );
             if !repr.bodies.is_empty() {
                 heap.native_string_enabled &= pre_repr_native_string;
+                heap.native_vec_enabled &= pre_repr_native_vec;
             }
             ctx.byte_views = byte_views;
             ctx.heap = heap;
@@ -1310,6 +1319,172 @@ fn run_with_opts(
         plan_retries,
         added_items,
         byte_views,
+        native_vec_enabled: ctx.heap.native_vec_enabled,
+    }
+}
+
+/// Empties provably no-op `DropGlue(String)` and `DropGlue(Vec<T, Global>)` JIR `Func` bodies
+/// (plus rustc-elaborated `.buf` / no-op `OpKind::Drop`s and transitive pure-drop-only
+/// `DropGlue`s) right before post-repr `o_group_with_mode`, so `prune_invoke`, `witness`,
+/// `inline`, and `dce` eliminate dead `try/catch` unwind landing pads automatically.
+fn prune_noop_heap_drop_glues(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    heap: &crate::analysis::heap::HeapPlan,
+) {
+    use rcgjs_object::jir::repr::{OpKind, RBlock, RBlockId, RTerm};
+    use rcgjs_object::jir::semantic::{BodySemantic, DropGlue};
+
+    let nstr = heap.native_string_enabled;
+    let nvec = heap.native_vec_enabled && !heap.non_rc_raw_alloc_reachable;
+    if !nstr && !nvec {
+        return;
+    }
+
+    let empty_blocks = |func: &Func| {
+        vec![RBlock {
+            id: RBlockId(0),
+            params: func
+                .blocks
+                .first()
+                .map(|b| b.params.clone())
+                .unwrap_or_default(),
+            ops: Vec::new(),
+            term: RTerm::Return(None),
+        }]
+    };
+
+    let mut noop_funcs: BTreeSet<JsName> = BTreeSet::new();
+    for (name, res) in funcs.iter_mut() {
+        let Ok(func) = res else { continue };
+        let item = table.get(name);
+        let is_noop_str = nstr && crate::analysis::heap::is_string_drop_glue(item);
+        let is_noop_vec =
+            nvec && crate::analysis::heap::is_noop_global_vec_drop_glue(item, nstr, nvec);
+        if is_noop_str || is_noop_vec {
+            func.blocks = empty_blocks(func);
+            noop_funcs.insert(name.clone());
+            continue;
+        }
+        let Some(interns) = item.and_then(|i| i.jir.interns()) else {
+            continue;
+        };
+        // Strip rustc-elaborated no-op `OpKind::Drop` sites (e.g., `String.vec`, `Vec.buf`,
+        // `Vec<POD>`) to `DropGlue::None` so `prune_invoke` sees empty unwind chains.
+        let mut to_clear: Vec<(usize, usize)> = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (oi, op) in block.ops.iter().enumerate() {
+                if let OpKind::Drop {
+                    root,
+                    path,
+                    glue: DropGlue::Direct { .. },
+                } = &op.kind
+                {
+                    let noop = (nstr
+                        && crate::analysis::heap::drop_targets_native_string(
+                            func,
+                            &interns.types,
+                            root,
+                            path,
+                        ))
+                        || (nvec
+                            && crate::analysis::heap::drop_targets_noop_native_vec(
+                                func,
+                                &interns.types,
+                                interns,
+                                root,
+                                path,
+                                nstr,
+                                nvec,
+                            ));
+                    if noop {
+                        to_clear.push((bi, oi));
+                    }
+                }
+            }
+        }
+        for (bi, oi) in to_clear {
+            if let OpKind::Drop { glue, .. } = &mut func.blocks[bi].ops[oi].kind {
+                *glue = DropGlue::None;
+            }
+        }
+        if func.blocks.len() == 1
+            && func.blocks[0].ops.is_empty()
+            && matches!(func.blocks[0].term, RTerm::Return(None))
+        {
+            noop_funcs.insert(name.clone());
+        }
+    }
+
+    // Fixpoint: collapse composite `DropGlue`s (e.g. `Option<String>`, `struct S { v: Vec<u32> }`)
+    // whose only remaining operations are pure projections and drops targeting `noop_funcs`.
+    for _ in 0..4 {
+        let mut newly_empty: Vec<JsName> = Vec::new();
+        for (name, res) in funcs.iter() {
+            if noop_funcs.contains(name) {
+                continue;
+            }
+            let Ok(func) = res else { continue };
+            let Some(item) = table.get(name) else {
+                continue;
+            };
+            if !matches!(
+                item.jir.body.as_ref().map(|b| b.semantic),
+                Some(BodySemantic::DropGlue(_))
+            ) {
+                continue;
+            }
+            let Some(interns) = item.jir.interns() else {
+                continue;
+            };
+            let is_pure_noop = func.blocks.iter().all(|b| {
+                let ops_ok = b.ops.iter().all(|op| match &op.kind {
+                    OpKind::Copy(_)
+                    | OpKind::Move(_)
+                    | OpKind::Const(_)
+                    | OpKind::Discriminant(_)
+                    | OpKind::Field { .. }
+                    | OpKind::BorrowView { .. }
+                    | OpKind::RawView { .. }
+                    | OpKind::CellLoad(_)
+                    | OpKind::Unary { .. } => true,
+                    OpKind::Binary { op, .. } => !matches!(
+                        op,
+                        rcgjs_object::jir::semantic::BinaryOp::Div
+                            | rcgjs_object::jir::semantic::BinaryOp::Rem
+                    ),
+                    OpKind::Drop { glue, .. } => match glue {
+                        DropGlue::None => true,
+                        DropGlue::Direct { link_name, .. } => interns
+                            .str(*link_name)
+                            .is_some_and(|s| noop_funcs.contains(&JsName::new(s.to_owned()))),
+                        DropGlue::Dynamic => false,
+                    },
+                    _ => false,
+                });
+                let term_ok = matches!(
+                    b.term,
+                    RTerm::Return(None)
+                        | RTerm::Goto(_, _)
+                        | RTerm::Switch { .. }
+                        | RTerm::Invoke { .. }
+                        | RTerm::Throw(None)
+                );
+                ops_ok && term_ok
+            });
+            if is_pure_noop {
+                newly_empty.push(name.clone());
+            }
+        }
+        if newly_empty.is_empty() {
+            break;
+        }
+        for name in newly_empty {
+            if let Some(Ok(func)) = funcs.get_mut(&name) {
+                func.blocks = empty_blocks(func);
+            }
+            noop_funcs.insert(name);
+        }
     }
 }
 

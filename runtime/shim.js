@@ -7522,3 +7522,236 @@ globalThis.__rt.bstr_rfind_str = (s, start, end, p) => {
   const i = s.lastIndexOf(p, lim);
   return i >= start ? i : 4294967295;
 };
+
+// Mires v4 Phase 3 universal flat `Vec<T, Global>` helpers (`ReleaseSpeed` + `Default` allocator
+// + `!byte_views` + `!non_rc_raw_alloc_reachable`).
+globalThis.__rt._nv_ctors = [
+  Uint8Array,
+  Int8Array,
+  Uint16Array,
+  Int16Array,
+  Uint32Array,
+  Int32Array,
+  Float32Array,
+  Float64Array,
+];
+globalThis.__rt._nv_et_bufs = [];
+globalThis.__rt._nv_et = (k) => {
+  let b = globalThis.__rt._nv_et_bufs[k];
+  if (b === undefined) {
+    const Ctor = globalThis.__rt._nv_ctors[k];
+    b = new Ctor(0);
+    globalThis.__rt._nv_et_bufs[k] = b;
+    globalThis.__rt._dangling_of.set(b, Ctor.BYTES_PER_ELEMENT);
+  }
+  return b;
+};
+globalThis.__rt._nv_ea = (align) => {
+  let buf = globalThis.__rt._dangling_bufs[align];
+  if (buf === undefined) {
+    buf = Object.freeze([]);
+    globalThis.__rt._dangling_bufs[align] = buf;
+    globalThis.__rt._dangling_of.set(buf, align);
+  }
+  return buf;
+};
+globalThis.__rt.nv_with_cap_ta = (cap, k, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(k), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  return { buf: new Ctor(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_arr = (cap, align, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Array(cap), len: 0 };
+};
+globalThis.__rt.nv_zeroed_ta = (n, k, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(k), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  return { buf: new Ctor(n), len: n };
+};
+globalThis.__rt.nv_zeroed_arr = (n, align, maxElems, val) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = new Array(n);
+  for (let i = 0; i < n; i++) b[i] = val;
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_zeroed_arr_fn = (n, align, maxElems, mk) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = new Array(n);
+  for (let i = 0; i < n; i++) b[i] = mk();
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_zeroed_arr_fn_tracked = (n, align, maxElems, mk) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const e = mk();
+    b[i] = e;
+    if (e !== null && typeof e === "object") globalThis.__rt._boxes.set(e, { buf: b, off: i });
+  }
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_box_track_arr = (b) => {
+  for (let i = 0; i < b.length; i++) {
+    const x = b[i];
+    if (x !== null && typeof x === "object") globalThis.__rt._boxes.set(x, { buf: b, off: i });
+  }
+  return b;
+};
+globalThis.__rt.nv_box_track_slot = (b, i, x) => {
+  b[i] = x;
+  if (x !== null && typeof x === "object") globalThis.__rt._boxes.set(x, { buf: b, off: i });
+};
+globalThis.__rt.nv_from_raw_ta = (ptr, len, cap, k) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(k), len: 0 };
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  if (
+    ptr &&
+    typeof ptr === "object" &&
+    ptr.off === 0 &&
+    ptr.buf instanceof Ctor &&
+    ptr.buf.length === cap
+  ) {
+    return { buf: ptr.buf, len: len };
+  }
+  const nb = new Ctor(cap);
+  if (len > 0) {
+    const src = ptr.buf;
+    const off = ptr.off | 0;
+    for (let i = 0; i < len; i++) nb[i] = src[off + i];
+  }
+  return { buf: nb, len: len };
+};
+globalThis.__rt.nv_from_raw_arr = (ptr, len, cap, align) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
+  if (
+    ptr &&
+    typeof ptr === "object" &&
+    ptr.off === 0 &&
+    Array.isArray(ptr.buf) &&
+    ptr.buf.length === cap
+  ) {
+    return { buf: ptr.buf, len: len };
+  }
+  const nb = new Array(cap);
+  if (len > 0) {
+    const src = ptr.buf;
+    const off = ptr.off | 0;
+    for (let i = 0; i < len; i++) nb[i] = src[off + i];
+  }
+  return { buf: nb, len: len };
+};
+globalThis.__rt.nv_grow_one_ta = (v, minCap, k, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  const nb = new Ctor(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_one_arr = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  if (old === 0) v.buf = new Array(next);
+  else v.buf.length = next;
+};
+globalThis.__rt.nv_reserve_ta = (v, used, add, minCap, exact, k, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  const nb = new Ctor(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_arr = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  if (old === 0) v.buf = new Array(next);
+  else v.buf.length = next;
+};
+globalThis.__rt.nv_try_reserve_ta = (v, used, add, minCap, exact, k, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return true;
+  if (req > maxElems) return false;
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const Ctor = globalThis.__rt._nv_ctors[k];
+  const nb = new Ctor(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+  return true;
+};
+globalThis.__rt.nv_try_reserve_arr = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return true;
+  if (req > maxElems) return false;
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  if (old === 0) v.buf = new Array(next);
+  else v.buf.length = next;
+  return true;
+};
+globalThis.__rt.nv_shrink_ta = (v, target, k) => {
+  if (target >= v.buf.length) return;
+  v.buf = target === 0 ? globalThis.__rt._nv_et(k) : v.buf.slice(0, target);
+};
+globalThis.__rt.nv_shrink_arr = (v, target, align) => {
+  if (target >= v.buf.length) return;
+  if (target === 0) v.buf = globalThis.__rt._nv_ea(align);
+  else v.buf.length = target;
+};
+globalThis.__rt.nstr_into_nvec = (s) => {
+  const str = s.s;
+  const len = str.length;
+  const cap = s.cap > len ? s.cap : len;
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(0), len: 0 };
+  const buf = new Uint8Array(cap);
+  for (let i = 0; i < len; i++) buf[i] = str.charCodeAt(i);
+  return { buf: buf, len: len };
+};

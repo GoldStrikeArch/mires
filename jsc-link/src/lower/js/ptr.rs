@@ -190,10 +190,18 @@ impl<'a> JsCx<'a> {
                 variants,
                 ..
             } => {
-                if self.heap().native_string_enabled
+                let flat_keys: Option<Vec<String>> = if self.heap().native_string_enabled
                     && desc.meta.candidate == RepresentationCandidate::String
                 {
-                    let keys = vec!["s".to_owned(), "cap".to_owned()];
+                    Some(vec!["s".to_owned(), "cap".to_owned()])
+                } else if self.heap().native_vec_enabled
+                    && crate::analysis::heap::is_direct_global_vec_ty(self.table, peeled)
+                {
+                    Some(vec!["buf".to_owned(), "len".to_owned()])
+                } else {
+                    None
+                };
+                if let Some(keys) = flat_keys {
                     if let Expr::Object(ref entries) = value {
                         let mut unique = std::collections::HashSet::with_capacity(entries.len());
                         let matches_exact = entries.len() == keys.len()
@@ -675,6 +683,20 @@ impl<'a> JsCx<'a> {
     /// `&*raw` (`ptr.rs::raw_to_ref`).
     pub fn raw_to_ref(&self, pointee: TypeId, raw: Expr) -> Expr {
         if self.table.unsized_tail(pointee).is_some() {
+            let heap = self.heap();
+            if heap.typed_heap_enabled
+                && !heap.raw_alloc_reachable
+                && !heap.needs_box_tracking(self.table, pointee)
+            {
+                let (setup, raw_ref) = self.reread(raw, &["ptr", "meta"]);
+                let ptr_slot = jsast::member(raw_ref.clone(), "ptr");
+                let record = jsast::index(ptr::slot_buf(ptr_slot.clone()), ptr::slot_off(ptr_slot));
+                let fat = jsast::object_of(vec![
+                    ("ptr", record),
+                    ("meta", jsast::member(raw_ref, "meta")),
+                ]);
+                return sequenced(setup, fat);
+            }
             return jsast::rt_call("tail_ref", vec![raw]);
         }
         if self.needs_byte_slice_ref() {
@@ -712,6 +734,7 @@ impl<'a> JsCx<'a> {
             self.interns,
             ty,
             self.heap().native_string_enabled,
+            self.heap().native_vec_enabled,
         ) {
             Some(value) => jsast::arrow(Vec::new(), value),
             None => jsast::null(),
@@ -742,6 +765,7 @@ impl<'a> JsCx<'a> {
                     self.interns,
                     field.ty,
                     self.heap().native_string_enabled,
+                    self.heap().native_vec_enabled,
                 ),
                 value::key_name(self.interns, field.key),
             ) else {
@@ -1564,6 +1588,7 @@ impl<'a> JsCx<'a> {
             self.interns,
             ty,
             self.heap().native_string_enabled,
+            self.heap().native_vec_enabled,
         )?;
         (jsast::expr_to_string(&value) != "0").then(|| jsast::arrow(Vec::new(), value))
     }

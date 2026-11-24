@@ -74,6 +74,7 @@ pub struct NestedClone {
     pub string: bool,
     pub map: bool,
     pub native_string: bool,
+    pub native_vec: bool,
 }
 
 /// Link-time call-target overrides for one native-version caller.

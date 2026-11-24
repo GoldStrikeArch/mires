@@ -383,6 +383,52 @@ pub enum StandardOperation {
     BstrFindStr,
     /// `core::str::pattern::rcgjs_str_rfind_str(haystack: &str, start: usize, end: usize, needle: &str) -> usize`.
     BstrRfindStr,
+    /// `alloc::rc::rcgjs_rc_alloc_slice<T>(len: usize) -> *mut RcInner<[T]>`.
+    RcAllocSlice,
+    /// `alloc::sync::rcgjs_arc_alloc_slice<T>(len: usize) -> *mut ArcInner<[T]>`.
+    ArcAllocSlice,
+    /// `alloc::vec::rcgjs_vec_new<T>() -> Vec<T>`.
+    NativeVecNew,
+    /// `alloc::vec::rcgjs_vec_with_capacity<T>(cap: usize) -> Vec<T>`.
+    NativeVecWithCapacity,
+    /// `alloc::vec::rcgjs_vec_from_elem_zeroed<T>(n: usize) -> Vec<T>`.
+    NativeVecFromElemZeroed,
+    /// `alloc::vec::rcgjs_vec_from_array<T, const N: usize>(arr: [T; N]) -> Vec<T>`.
+    NativeVecFromArray,
+    /// `alloc::vec::rcgjs_vec_from_raw_parts<T>(ptr: *mut T, len: usize, cap: usize) -> Vec<T>`.
+    NativeVecFromRawParts,
+    /// `alloc::vec::rcgjs_vec_capacity<T>(v: &Vec<T>) -> usize`.
+    NativeVecCapacity,
+    /// `alloc::vec::rcgjs_vec_as_ptr<T>(v: &Vec<T>) -> *const T`.
+    NativeVecAsPtr,
+    /// `alloc::vec::rcgjs_vec_as_mut_ptr<T>(v: &mut Vec<T>) -> *mut T`.
+    NativeVecAsMutPtr,
+    /// `alloc::vec::rcgjs_vec_as_slice<T>(v: &Vec<T>) -> &[T]`.
+    NativeVecAsSlice,
+    /// `alloc::vec::rcgjs_vec_as_mut_slice<T>(v: &mut Vec<T>) -> &mut [T]`.
+    NativeVecAsMutSlice,
+    /// `alloc::vec::rcgjs_vec_reserve<T>(v: &mut Vec<T>, used_len: usize, add: usize)`.
+    NativeVecReserve,
+    /// `alloc::vec::rcgjs_vec_reserve_exact<T>(v: &mut Vec<T>, used_len: usize, add: usize)`.
+    NativeVecReserveExact,
+    /// `alloc::vec::rcgjs_vec_try_reserve<T>(v: &mut Vec<T>, used_len: usize, add: usize) -> bool`.
+    NativeVecTryReserve,
+    /// `alloc::vec::rcgjs_vec_try_reserve_exact<T>(v: &mut Vec<T>, used_len: usize, add: usize) -> bool`.
+    NativeVecTryReserveExact,
+    /// `alloc::vec::rcgjs_vec_shrink_to<T>(v: &mut Vec<T>, target_cap: usize)`.
+    NativeVecShrinkTo,
+    /// `alloc::vec::rcgjs_vec_try_shrink_to<T>(v: &mut Vec<T>, target_cap: usize) -> bool`.
+    NativeVecTryShrinkTo,
+    /// `alloc::vec::rcgjs_vec_grow_one<T>(v: &mut Vec<T>)`.
+    NativeVecGrowOne,
+    /// `alloc::vec::rcgjs_vec_push<T>(v: &mut Vec<T>, val: T)`.
+    NativeVecPush,
+    /// `alloc::vec::rcgjs_vec_push_mut<T>(v: &mut Vec<T>, val: T) -> &mut T`.
+    NativeVecPushMut,
+    /// `alloc::vec::rcgjs_vec_pop<T>(v: &mut Vec<T>) -> Option<T>`.
+    NativeVecPop,
+    /// `alloc::vec::rcgjs_vec_into_boxed_slice<T>(v: Vec<T>) -> Box<[T]>`.
+    NativeVecIntoBoxedSlice,
 }
 
 impl StandardOperation {
@@ -395,6 +441,8 @@ impl StandardOperation {
                 | Self::TypedDealloc
                 | Self::BoxNew
                 | Self::TypedDeallocRaw
+                | Self::RcAllocSlice
+                | Self::ArcAllocSlice
         )
     }
 
@@ -422,6 +470,34 @@ impl StandardOperation {
                 | Self::NativeStrToAsciiLowercase
                 | Self::NativeStrToAsciiUppercase
                 | Self::NativeStrRepeat
+        )
+    }
+
+    /// Whether this is one of the universal flat `Vec<T, Global>` hooks.
+    pub fn is_native_vec(self) -> bool {
+        matches!(
+            self,
+            Self::NativeVecNew
+                | Self::NativeVecWithCapacity
+                | Self::NativeVecFromElemZeroed
+                | Self::NativeVecFromArray
+                | Self::NativeVecFromRawParts
+                | Self::NativeVecCapacity
+                | Self::NativeVecAsPtr
+                | Self::NativeVecAsMutPtr
+                | Self::NativeVecAsSlice
+                | Self::NativeVecAsMutSlice
+                | Self::NativeVecReserve
+                | Self::NativeVecReserveExact
+                | Self::NativeVecTryReserve
+                | Self::NativeVecTryReserveExact
+                | Self::NativeVecShrinkTo
+                | Self::NativeVecTryShrinkTo
+                | Self::NativeVecGrowOne
+                | Self::NativeVecPush
+                | Self::NativeVecPushMut
+                | Self::NativeVecPop
+                | Self::NativeVecIntoBoxedSlice
         )
     }
 

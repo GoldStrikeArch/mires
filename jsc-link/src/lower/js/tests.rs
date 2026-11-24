@@ -10635,6 +10635,7 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
     let tier_a = crate::analysis::heap::HeapPlan {
         typed_heap_enabled: true,
         native_string_enabled: false,
+        native_vec_enabled: false,
         raw_alloc_reachable: false,
         non_rc_raw_alloc_reachable: false,
         any_boxed: false,
@@ -10936,6 +10937,7 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
     let tier_a = crate::analysis::heap::HeapPlan {
         typed_heap_enabled: true,
         native_string_enabled: false,
+        native_vec_enabled: false,
         raw_alloc_reachable: false,
         non_rc_raw_alloc_reachable: false,
         any_boxed: false,

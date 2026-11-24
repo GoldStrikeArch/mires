@@ -24,11 +24,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rcgjs_object::jir::decline::Decline;
 use rcgjs_object::jir::interns::Interns;
-use rcgjs_object::jir::repr::{Carrier, Func, OpKind, Proj, RTerm, Root, ValueId};
+use rcgjs_object::jir::repr::{Carrier, Func, OpKind, Proj, Root, ValueId};
 use rcgjs_object::jir::semantic::{
     BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, DefinitionId, DropGlue,
 };
-use rcgjs_object::jir::types::{RepresentationCandidate, TypeId, TypeKind, TypeTable};
+use rcgjs_object::jir::types::{
+    AllocatorIdentity, FieldKey, RepresentationCandidate, TypeId, TypeKind, TypeTable,
+};
 use rcgjs_object::jsast;
 use rcgjs_object::late_ir::AllocatorProvider;
 use rcgjs_object::object::ItemKind;
@@ -79,6 +81,10 @@ pub struct HeapPlan {
     /// Whether `ReleaseSpeed` + `js-str=bytes` universal native `{ s, cap }` `String` is active
     /// (proven zero direct `.vec` / `Aggregate` / `Transmute` access to `String` internals).
     pub native_string_enabled: bool,
+    /// Whether `ReleaseSpeed` universal flat `Vec<T, Global>` (`{ buf, len }` / `{ buf, len, cap }`)
+    /// is active (proven zero direct `.buf` / `Aggregate` / `Transmute` access to `Vec<T, Global>`
+    /// internals and `!non_rc_raw_alloc_reachable`).
+    pub native_vec_enabled: bool,
     /// Whether any reachable non-hook item reaches raw `__rust_alloc` / `__rust_alloc_zeroed` /
     /// `__rust_realloc` / `__rust_dealloc` (including `alloc::rc` / `alloc::sync` unsized allocs).
     pub raw_alloc_reachable: bool,
@@ -101,6 +107,7 @@ pub struct HeapPlan {
 pub static DEFAULT_HEAP_PLAN: HeapPlan = HeapPlan {
     typed_heap_enabled: false,
     native_string_enabled: false,
+    native_vec_enabled: false,
     raw_alloc_reachable: true,
     non_rc_raw_alloc_reachable: true,
     any_boxed: true,
@@ -189,12 +196,16 @@ pub fn filter_live_for_repr(
 ) -> BTreeSet<JsName> {
     let skip_typed = heap.typed_heap_enabled;
     let skip_nstr = heap.native_string_enabled;
-    if !skip_typed && !skip_nstr {
+    let skip_nvec = heap.native_vec_enabled;
+    if !skip_typed && !skip_nstr && !skip_nvec {
         return live.clone();
     }
     let is_skipped_hook = |item: Option<&LinkItem>| {
         (skip_typed && is_typed_heap_hook_item(item))
             || (skip_nstr && (is_native_string_hook_item(item) || is_string_drop_glue(item)))
+            || (skip_nvec
+                && (is_native_vec_hook_item(item)
+                    || is_noop_global_vec_drop_glue(item, skip_nstr, skip_nvec)))
     };
 
     let mut visited: BTreeSet<JsName> = BTreeSet::new();
@@ -229,7 +240,7 @@ pub fn filter_live_for_repr(
         }
         let func_opt = funcs.get(&name).and_then(|r| r.as_ref().ok());
         if let (Some(func), Some(interns)) = (func_opt, item.jir.interns()) {
-            for callee in jir_callees(func, interns, skip_typed, skip_nstr) {
+            for callee in jir_callees(func, interns, skip_typed, skip_nstr, skip_nvec) {
                 if live.contains(&callee)
                     && !is_skipped_hook(table.get(&callee))
                     && visited.insert(callee.clone())
@@ -239,6 +250,12 @@ pub fn filter_live_for_repr(
             }
             for r in &item.refs {
                 if !live.contains(r) || is_skipped_hook(table.get(r)) {
+                    continue;
+                }
+                if skip_nvec
+                    && is_global_vec_drop_glue(Some(item))
+                    && is_raw_vec_drop_glue(table.get(r))
+                {
                     continue;
                 }
                 if skip_typed
@@ -281,25 +298,27 @@ pub fn analyze_reachable(
         && allocator_provider == AllocatorProvider::Default
         && !byte_views.raw_byte_derefs
         && byte_views.elide_scale_scalar;
-    let try_native_string = typed_heap_enabled && crate::lower::bstr::enabled();
+    let mut skip_native_string = typed_heap_enabled && crate::lower::bstr::enabled();
+    let mut skip_native_vec = typed_heap_enabled;
 
-    let (plan, string_internally_accessed) = run_reachability(
-        table,
-        funcs,
-        native_bodies,
-        opts,
-        typed_heap_enabled,
-        try_native_string,
-    );
-    if try_native_string && !string_internally_accessed {
-        plan
-    } else if try_native_string {
-        // Sound fallback: a reachable non-hook body accesses `String.vec` / `Aggregate` /
-        // `Transmute`, so disable native String and re-run reachability over the fallback `Vec<u8>`
-        // bodies of `rcgjs_str_*` and `DropGlue(String)`.
-        run_reachability(table, funcs, native_bodies, opts, typed_heap_enabled, false).0
-    } else {
-        plan
+    loop {
+        let (plan, string_internally_accessed, vec_internally_accessed) = run_reachability(
+            table,
+            funcs,
+            native_bodies,
+            opts,
+            typed_heap_enabled,
+            skip_native_string,
+            skip_native_vec,
+        );
+        let next_string = skip_native_string && !string_internally_accessed;
+        let next_vec =
+            skip_native_vec && !vec_internally_accessed && !plan.non_rc_raw_alloc_reachable;
+        if next_string == skip_native_string && next_vec == skip_native_vec {
+            return plan;
+        }
+        skip_native_string = next_string;
+        skip_native_vec = next_vec;
     }
 }
 
@@ -310,7 +329,8 @@ fn run_reachability(
     opts: &Opts,
     typed_heap_enabled: bool,
     skip_native_string: bool,
-) -> (HeapPlan, bool) {
+    skip_native_vec: bool,
+) -> (HeapPlan, bool, bool) {
     // Two-colour reachability: `(item, from_non_rc)` so we distinguish raw alloc calls that
     // originate solely inside `alloc::rc` / `alloc::sync` (`Rc<[T]>`) from user / general raw
     // allocations (`alloc::alloc::alloc`, `Vec::from_raw_parts`, etc.).
@@ -330,7 +350,9 @@ fn run_reachability(
     let mut non_rc_raw_alloc_reachable = false;
     let mut boxed = BoxedSet::default();
     let mut copy_one_boxed = BoxedSet::default();
+    let mut tail_adts = BoxedSet::default();
     let mut string_internally_accessed = false;
+    let mut vec_internally_accessed = false;
     let mut scanned_funcs: BTreeSet<JsName> = BTreeSet::new();
 
     while let Some((name, from_non_rc)) = queue.pop_front() {
@@ -359,6 +381,12 @@ fn run_reachability(
         };
         if skip_native_string
             && (is_native_string_hook_item(Some(item)) || is_string_drop_glue(Some(item)))
+        {
+            continue;
+        }
+        if skip_native_vec
+            && (is_native_vec_hook_item(Some(item))
+                || is_noop_global_vec_drop_glue(Some(item), skip_native_string, skip_native_vec))
         {
             continue;
         }
@@ -399,15 +427,37 @@ fn run_reachability(
                     interns,
                     &mut boxed,
                     &mut copy_one_boxed,
+                    &mut tail_adts,
                 );
                 if skip_native_string && func_uses_string_internals(func, &interns.types, interns) {
                     string_internally_accessed = true;
                 }
+                if skip_native_vec
+                    && !is_global_vec_drop_glue(Some(item))
+                    && func_uses_vec_internals(func, &interns.types, interns)
+                {
+                    vec_internally_accessed = true;
+                }
             }
             // Traverse callees from JIR so we skip dead fallback bodies of intercepted
-            // `StandardOperation::is_typed_heap()` / `is_native_string()` calls when enabled.
-            for callee in jir_callees(func, interns, typed_heap_enabled, skip_native_string) {
+            // `StandardOperation::is_typed_heap()` / `is_native_string()` / `is_native_vec()` calls when enabled.
+            for callee in jir_callees(
+                func,
+                interns,
+                typed_heap_enabled,
+                skip_native_string,
+                skip_native_vec,
+            ) {
                 if skip_native_string && is_string_drop_glue(table.get(&callee)) {
+                    continue;
+                }
+                if skip_native_vec
+                    && is_noop_global_vec_drop_glue(
+                        table.get(&callee),
+                        skip_native_string,
+                        skip_native_vec,
+                    )
+                {
                     continue;
                 }
                 if is_raw_alloc_shim_name(callee.as_str()) {
@@ -439,6 +489,18 @@ fn run_reachability(
                 if skip_native_string
                     && (is_native_string_hook_item(table.get(r))
                         || is_string_drop_glue(table.get(r)))
+                {
+                    continue;
+                }
+                if skip_native_vec
+                    && (is_native_vec_hook_item(table.get(r))
+                        || is_noop_global_vec_drop_glue(
+                            table.get(r),
+                            skip_native_string,
+                            skip_native_vec,
+                        )
+                        || (is_global_vec_drop_glue(Some(item))
+                            && is_raw_vec_drop_glue(table.get(r))))
                 {
                     continue;
                 }
@@ -493,6 +555,14 @@ fn run_reachability(
                 {
                     string_internally_accessed = true;
                 }
+                if skip_native_vec
+                    && item.kind == ItemKind::Fn
+                    && (item.debug_path.contains("alloc::vec")
+                        || item.name.as_str().contains("alloc$vec$")
+                        || item.js.contains(".buf"))
+                {
+                    vec_internally_accessed = true;
+                }
             }
             for r in &item.refs {
                 if !table.contains_key(r) {
@@ -501,6 +571,16 @@ fn run_reachability(
                 if skip_native_string
                     && (is_native_string_hook_item(table.get(r))
                         || is_string_drop_glue(table.get(r)))
+                {
+                    continue;
+                }
+                if skip_native_vec
+                    && (is_native_vec_hook_item(table.get(r))
+                        || is_noop_global_vec_drop_glue(
+                            table.get(r),
+                            skip_native_string,
+                            skip_native_vec,
+                        ))
                 {
                     continue;
                 }
@@ -518,6 +598,9 @@ fn run_reachability(
     if !typed_heap_enabled || non_rc_raw_alloc_reachable {
         boxed.merge(copy_one_boxed);
     }
+    if raw_alloc_reachable {
+        boxed.merge(tail_adts);
+    }
     let any_boxed = boxed.all_adts_boxed
         || boxed.all_non_adt_boxed
         || !boxed.boxed_defs.is_empty()
@@ -526,6 +609,9 @@ fn run_reachability(
         HeapPlan {
             typed_heap_enabled,
             native_string_enabled: skip_native_string && !string_internally_accessed,
+            native_vec_enabled: skip_native_vec
+                && !vec_internally_accessed
+                && !non_rc_raw_alloc_reachable,
             raw_alloc_reachable,
             non_rc_raw_alloc_reachable,
             any_boxed,
@@ -535,6 +621,7 @@ fn run_reachability(
             all_adts_boxed: boxed.all_adts_boxed,
         },
         string_internally_accessed,
+        vec_internally_accessed,
     )
 }
 
@@ -650,7 +737,7 @@ fn is_direct_string_ty(table: &TypeTable, ty: TypeId) -> bool {
         .is_some_and(|d| d.meta.candidate == RepresentationCandidate::String)
 }
 
-fn is_string_drop_glue(item: Option<&LinkItem>) -> bool {
+pub fn is_string_drop_glue(item: Option<&LinkItem>) -> bool {
     let Some(item) = item else {
         return false;
     };
@@ -932,11 +1019,423 @@ fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns)
     false
 }
 
+fn is_native_vec_hook_item(item: Option<&LinkItem>) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    if matches!(
+        item.jir.body.as_ref().map(|b| b.semantic),
+        Some(BodySemantic::Standard(op)) if op.is_native_vec()
+    ) {
+        return true;
+    }
+    let name = item.name.as_str();
+    let dp = item.debug_path.as_str();
+    let matches_any = |s: &str| {
+        s.contains("rcgjs_vec_new")
+            || s.contains("rcgjs_vec_with_capacity")
+            || s.contains("rcgjs_vec_from_elem_zeroed")
+            || s.contains("rcgjs_vec_from_array")
+            || s.contains("rcgjs_vec_from_raw_parts")
+            || s.contains("rcgjs_vec_capacity")
+            || s.contains("rcgjs_vec_as_ptr")
+            || s.contains("rcgjs_vec_as_mut_ptr")
+            || s.contains("rcgjs_vec_as_slice")
+            || s.contains("rcgjs_vec_as_mut_slice")
+            || s.contains("rcgjs_vec_reserve")
+            || s.contains("rcgjs_vec_try_reserve")
+            || s.contains("rcgjs_vec_shrink_to")
+            || s.contains("rcgjs_vec_try_shrink_to")
+            || s.contains("rcgjs_vec_grow_one")
+            || s.contains("rcgjs_vec_push")
+            || s.contains("rcgjs_vec_pop")
+            || s.contains("rcgjs_vec_into_boxed_slice")
+    };
+    matches_any(name) || matches_any(dp)
+}
+
+/// Whether `ty` (after peeling transparent wrappers) is `alloc::vec::Vec<T, Global>`.
+pub fn is_global_vec_ty(table: &TypeTable, ty: TypeId) -> bool {
+    table.get(table.peeled(ty)).is_some_and(|d| {
+        d.meta.candidate == RepresentationCandidate::Vec
+            && d.meta.allocator == AllocatorIdentity::Global
+    })
+}
+
+/// Whether `ty` is *directly* `alloc::vec::Vec<T, Global>` without peeling transparent wrappers.
+pub fn is_direct_global_vec_ty(table: &TypeTable, ty: TypeId) -> bool {
+    table.get(ty).is_some_and(|d| {
+        d.meta.candidate == RepresentationCandidate::Vec
+            && d.meta.allocator == AllocatorIdentity::Global
+    })
+}
+
+/// Extracts the element `TypeId` `T` of a `Vec<T, Global>` (peeling transparent wrappers).
+pub fn global_vec_elem_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    let peeled = table.peeled(ty);
+    let desc = table.get(peeled)?;
+    if desc.meta.candidate != RepresentationCandidate::Vec
+        || desc.meta.allocator != AllocatorIdentity::Global
+    {
+        return None;
+    }
+    match &desc.kind {
+        TypeKind::Adt { args, .. } => args.first().copied(),
+        _ => None,
+    }
+}
+
+/// ES2018 TypedArray kind tag (`0..8`) for a universal flat `Vec<T, Global>` element `T`.
+/// Checks unpeeled `elem` (matching `TypedAlloc`) so `#[repr(transparent)]` host-handle
+/// wrappers around `usize`/`u32` (such as `mires_js::collections::Map`) stay plain JS `Array`s.
+pub fn native_vec_ta_kind(table: &TypeTable, elem: TypeId) -> Option<u8> {
+    table
+        .get(elem)
+        .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+}
+
+/// Conservative check whether dropping `ty` can execute any observable drop effect when
+/// `native_string_enabled` / `native_vec_enabled` (with `!non_rc_raw_alloc_reachable`) hold.
+/// Recurses ONLY into built-in structural types (`Vec<T, Global>`, `String`, tuples, arrays,
+/// slices) known to have no user custom `Drop` implementation.
+pub fn ty_effectively_needs_drop(
+    table: &TypeTable,
+    ty: TypeId,
+    native_string: bool,
+    native_vec_no_raw: bool,
+) -> bool {
+    fn go(
+        table: &TypeTable,
+        ty: TypeId,
+        native_string: bool,
+        native_vec_no_raw: bool,
+        seen: &mut BTreeSet<TypeId>,
+    ) -> bool {
+        let peeled = table.peeled(ty);
+        let Some(desc) = table.get(peeled) else {
+            return true;
+        };
+        if !desc.layout.needs_drop {
+            return false;
+        }
+        if !seen.insert(peeled) {
+            return true;
+        }
+        if native_string && desc.meta.candidate == RepresentationCandidate::String {
+            return false;
+        }
+        if native_vec_no_raw
+            && desc.meta.candidate == RepresentationCandidate::Vec
+            && desc.meta.allocator == AllocatorIdentity::Global
+        {
+            return match &desc.kind {
+                TypeKind::Adt { args, .. } => args
+                    .first()
+                    .is_none_or(|&elem| go(table, elem, native_string, native_vec_no_raw, seen)),
+                _ => true,
+            };
+        }
+        match &desc.kind {
+            TypeKind::Tuple(elems) => elems
+                .iter()
+                .any(|&e| go(table, e, native_string, native_vec_no_raw, seen)),
+            TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+                go(table, *element, native_string, native_vec_no_raw, seen)
+            }
+            _ => true,
+        }
+    }
+    let mut seen = BTreeSet::new();
+    go(table, ty, native_string, native_vec_no_raw, &mut seen)
+}
+
+pub fn is_global_vec_drop_glue(item: Option<&LinkItem>) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    match item.jir.body.as_ref().map(|b| b.semantic) {
+        Some(BodySemantic::DropGlue(ty)) => item
+            .jir
+            .interns()
+            .is_some_and(|interns| is_direct_global_vec_ty(&interns.types, ty)),
+        _ => false,
+    }
+}
+
+/// Whether `item` is `DropGlue(Vec<T, Global>)` whose element drop is a provable no-op.
+pub fn is_noop_global_vec_drop_glue(
+    item: Option<&LinkItem>,
+    native_string: bool,
+    native_vec_no_raw: bool,
+) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    match item.jir.body.as_ref().map(|b| b.semantic) {
+        Some(BodySemantic::DropGlue(ty)) => item.jir.interns().is_some_and(|interns| {
+            is_direct_global_vec_ty(&interns.types, ty)
+                && !ty_effectively_needs_drop(&interns.types, ty, native_string, native_vec_no_raw)
+        }),
+        _ => false,
+    }
+}
+
+fn is_raw_vec_drop_glue(item: Option<&LinkItem>) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    if !matches!(
+        item.jir.body.as_ref().map(|b| b.semantic),
+        Some(BodySemantic::DropGlue(_))
+    ) {
+        return false;
+    }
+    item.debug_path.contains("raw_vec::RawVec") || item.name.as_str().contains("raw_vec$RawVec")
+}
+
+fn is_vec_len_field(table: &TypeTable, interns: &Interns, ty: TypeId, field: u32) -> bool {
+    table
+        .field(ty, None, field)
+        .is_some_and(|f| matches!(f.key, FieldKey::Name(id) if interns.str(id) == Some("len")))
+}
+
+fn place_ty_and_vec_buf_proj(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    root: &Root,
+    path: &[Proj],
+) -> (Option<TypeId>, bool) {
+    let Some(mut cur) = root_ty(func, root) else {
+        return (None, false);
+    };
+    for proj in path {
+        let peeled = table.peeled(cur);
+        match proj {
+            Proj::Deref => {
+                let Some(pt) = value::pointee_of(table, peeled) else {
+                    return (None, false);
+                };
+                cur = pt;
+            }
+            Proj::Downcast { .. } => {}
+            Proj::Field { field, ty } => {
+                if is_direct_global_vec_ty(table, cur)
+                    && !is_vec_len_field(table, interns, cur, *field)
+                {
+                    return (None, true);
+                }
+                cur = *ty;
+            }
+            Proj::Index(_) | Proj::ConstantIndex { .. } => {
+                let next = match table.get(peeled).map(|d| &d.kind) {
+                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
+                        Some(*element)
+                    }
+                    _ => None,
+                };
+                let Some(next) = next else {
+                    return (None, false);
+                };
+                cur = next;
+            }
+            Proj::Subslice { .. } => {}
+        }
+    }
+    (Some(cur), false)
+}
+
+/// Whether `OpKind::Drop` is a complete no-op under `native_vec_enabled` (either dropping `.buf`
+/// on `Vec<T, Global>` or dropping a `Vec<T, Global>` whose element `T` effectively needs no drop).
+pub fn drop_targets_noop_native_vec(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    root: &Root,
+    path: &[Proj],
+    native_string: bool,
+    native_vec_no_raw: bool,
+) -> bool {
+    let (ty, crosses_vec_buf) = place_ty_and_vec_buf_proj(func, table, interns, root, path);
+    if crosses_vec_buf {
+        return true;
+    }
+    ty.is_some_and(|t| {
+        is_direct_global_vec_ty(table, t)
+            && !ty_effectively_needs_drop(table, t, native_string, native_vec_no_raw)
+    })
+}
+
+fn ty_contains_global_vec_by_value(
+    table: &TypeTable,
+    ty: TypeId,
+    seen: &mut BTreeSet<TypeId>,
+) -> bool {
+    let peeled = table.peeled(ty);
+    if !seen.insert(peeled) {
+        return false;
+    }
+    if is_global_vec_ty(table, peeled) {
+        return true;
+    }
+    let Some(desc) = table.get(peeled) else {
+        return false;
+    };
+    match &desc.kind {
+        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+            ty_contains_global_vec_by_value(table, *element, seen)
+        }
+        TypeKind::Tuple(elems) => elems
+            .iter()
+            .any(|e| ty_contains_global_vec_by_value(table, *e, seen)),
+        TypeKind::Adt { variants, .. } => variants.iter().any(|v| {
+            v.fields
+                .iter()
+                .any(|f| ty_contains_global_vec_by_value(table, f.ty, seen))
+        }),
+        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => upvars
+            .iter()
+            .any(|u| ty_contains_global_vec_by_value(table, *u, seen)),
+        _ => false,
+    }
+}
+
+fn transmute_exposes_global_vec_layout(table: &TypeTable, from: TypeId, to: TypeId) -> bool {
+    let f = table.peeled(from);
+    let t = table.peeled(to);
+    if f == t {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    if ty_contains_global_vec_by_value(table, f, &mut seen) {
+        return true;
+    }
+    seen.clear();
+    if ty_contains_global_vec_by_value(table, t, &mut seen) {
+        return true;
+    }
+    let pt_f = peel_ptr_pointee(table, f);
+    let pt_t = peel_ptr_pointee(table, t);
+    match (pt_f, pt_t) {
+        (Some(a), Some(b)) if a != b => {
+            let a_vec = is_global_vec_ty(table, a);
+            let b_vec = is_global_vec_ty(table, b);
+            (a_vec && !table.is_zst(b)) || (b_vec && !table.is_zst(a))
+        }
+        _ => false,
+    }
+}
+
+fn const_has_nonempty_global_vec(table: &TypeTable, tree: &ConstTree, ty: TypeId) -> bool {
+    let peeled = table.peeled(ty);
+    if is_global_vec_ty(table, peeled) {
+        return !const_is_zero_vec_string(tree);
+    }
+    match (tree, table.get(peeled).map(|d| &d.kind)) {
+        (ConstTree::Aggregate(fields), Some(TypeKind::Adt { variants, .. })) => {
+            variants.first().is_some_and(|v| {
+                fields
+                    .iter()
+                    .zip(&v.fields)
+                    .any(|(f, fd)| const_has_nonempty_global_vec(table, f, fd.ty))
+            })
+        }
+        (ConstTree::Aggregate(fields), Some(TypeKind::Tuple(elems))) => fields
+            .iter()
+            .zip(elems)
+            .any(|(f, et)| const_has_nonempty_global_vec(table, f, *et)),
+        (ConstTree::Aggregate(fields), Some(TypeKind::Array { element, .. })) => fields
+            .iter()
+            .any(|f| const_has_nonempty_global_vec(table, f, *element)),
+        (ConstTree::Variant { variant, fields }, Some(TypeKind::Adt { variants, .. })) => {
+            variants.get(*variant as usize).is_some_and(|v| {
+                fields
+                    .iter()
+                    .zip(&v.fields)
+                    .any(|(f, fd)| const_has_nonempty_global_vec(table, f, fd.ty))
+            })
+        }
+        (
+            ConstTree::Reference(inner),
+            Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }),
+        ) => const_has_nonempty_global_vec(table, inner, *pointee),
+        _ => false,
+    }
+}
+
+fn func_uses_vec_internals(func: &Func, table: &TypeTable, interns: &Interns) -> bool {
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
+                    if val_ty(func, *base).is_some_and(|ty| {
+                        is_direct_global_vec_ty(table, ty)
+                            && !is_vec_len_field(table, interns, ty, *field)
+                    }) {
+                        return true;
+                    }
+                }
+                OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+                    if place_ty_and_vec_buf_proj(func, table, interns, root, path).1 {
+                        return true;
+                    }
+                }
+                OpKind::Aggregate { ty, .. } => {
+                    if is_direct_global_vec_ty(table, *ty) {
+                        return true;
+                    }
+                }
+                OpKind::Cast {
+                    kind: CastKind::Transmute,
+                    from,
+                    to,
+                    ..
+                } => {
+                    if transmute_exposes_global_vec_layout(table, *from, *to) {
+                        return true;
+                    }
+                }
+                OpKind::Intrinsic { name, types, .. } => {
+                    if matches!(
+                        interns.str(*name),
+                        Some("transmute" | "transmute_unchecked")
+                    ) {
+                        if let [from, to] = types.as_slice() {
+                            if transmute_exposes_global_vec_layout(table, *from, *to) {
+                                return true;
+                            }
+                        } else {
+                            for &t in types {
+                                let mut seen = BTreeSet::new();
+                                if ty_contains_global_vec_by_value(table, t, &mut seen) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                OpKind::Const(tree) => {
+                    if let Some(res) = op.result {
+                        if let Some(ty) = val_ty(func, res) {
+                            if const_has_nonempty_global_vec(table, tree, ty) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 fn jir_callees(
     func: &Func,
     interns: &Interns,
     skip_typed_heap_hooks: bool,
     skip_native_string: bool,
+    skip_native_vec: bool,
 ) -> Vec<JsName> {
     let mut out = Vec::new();
     for block in &func.blocks {
@@ -956,6 +1455,11 @@ fn jir_callees(
                     }
                     if skip_native_string
                         && matches!(semantic, CallSemantic::Standard(op) if op.is_native_string())
+                    {
+                        continue;
+                    }
+                    if skip_native_vec
+                        && matches!(semantic, CallSemantic::Standard(op) if op.is_native_vec())
                     {
                         continue;
                     }
@@ -987,6 +1491,19 @@ fn jir_callees(
                 } => {
                     if skip_native_string
                         && drop_targets_native_string(func, &interns.types, root, path)
+                    {
+                        continue;
+                    }
+                    if skip_native_vec
+                        && drop_targets_noop_native_vec(
+                            func,
+                            &interns.types,
+                            interns,
+                            root,
+                            path,
+                            skip_native_string,
+                            skip_native_vec,
+                        )
                     {
                         continue;
                     }
@@ -1059,138 +1576,162 @@ impl BoxedSet {
     }
 }
 
-/// Returns the set of `OpKind::Cast` result `ValueId`s (from `&T`/`&mut T` to `*const T`/`*mut T`
-/// with the exact same indirect non-array non-DST pointee `T`) whose sole use in `func` is as the
-/// `src` operand of a constant-1 `copy`/`copy_nonoverlapping` intrinsic.
+/// Returns the set of `OpKind::Cast`/`OpKind::RawView` result `ValueId`s (from `&T`/`&mut T` to
+/// `*const T`/`*mut T` with the exact same non-union indirect non-array non-DST pointee `T`) whose
+/// every use in `func` only reads/writes the object in place (`copy`/`copy_nonoverlapping` with
+/// count 1 as `src`, `typed_swap_nonoverlapping`, `read_via_copy`, `Deref`, or `StoreThrough`).
 ///
-/// Under Tier A without non-RC raw allocs, those casts can pass the bare reference directly into
-/// the single-element copy without calling `__rt.box(o)` (avoiding `_boxes` WeakMap tracking for
-/// `T` across the entire program).
+/// Under Tier A without non-RC raw allocs, those pointers can stay as the bare reference without
+/// calling `__rt.box(o)` (avoiding `_boxes` WeakMap tracking for `T` across the entire program).
 pub fn direct_ref_copy_one_casts(
     func: &Func,
     table: &TypeTable,
     interns: &Interns,
 ) -> BTreeSet<ValueId> {
-    let mut use_counts: BTreeMap<ValueId, u32> = BTreeMap::new();
     let mut defs: BTreeMap<ValueId, &OpKind> = BTreeMap::new();
+    let mut bad_uses: BTreeSet<ValueId> = BTreeSet::new();
+    let mut good_uses: BTreeMap<ValueId, u32> = BTreeMap::new();
     for block in &func.blocks {
         for op in &block.ops {
             if let Some(res) = op.result {
                 defs.insert(res, &op.kind);
             }
-            for u in op.kind.uses() {
-                *use_counts.entry(u).or_insert(0) += 1;
-            }
         }
-        match &block.term {
-            RTerm::Goto(_, args) => {
-                for &a in args {
-                    *use_counts.entry(a).or_insert(0) += 1;
+    }
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Deref(ptr) => {
+                    *good_uses.entry(*ptr).or_insert(0) += 1;
                 }
-            }
-            RTerm::Switch {
-                scrut,
-                cases,
-                default,
-                ..
-            } => {
-                *use_counts.entry(*scrut).or_insert(0) += 1;
-                for (_, _, args) in cases {
-                    for &a in args {
-                        *use_counts.entry(a).or_insert(0) += 1;
+                OpKind::StoreThrough { ptr, v } => {
+                    *good_uses.entry(*ptr).or_insert(0) += 1;
+                    bad_uses.insert(*v);
+                }
+                OpKind::Intrinsic { name, args, .. } => match interns.str(*name) {
+                    Some("copy_nonoverlapping" | "copy") if args.len() >= 3 => {
+                        let count_is_one = matches!(
+                            defs.get(&args[2]),
+                            Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+                        );
+                        if count_is_one {
+                            *good_uses.entry(args[0]).or_insert(0) += 1;
+                            for &other in &args[1..] {
+                                bad_uses.insert(other);
+                            }
+                        } else {
+                            for &u in args {
+                                bad_uses.insert(u);
+                            }
+                        }
+                    }
+                    Some("typed_swap_nonoverlapping") if args.len() >= 2 => {
+                        *good_uses.entry(args[0]).or_insert(0) += 1;
+                        *good_uses.entry(args[1]).or_insert(0) += 1;
+                        for &other in &args[2..] {
+                            bad_uses.insert(other);
+                        }
+                    }
+                    Some("read_via_copy") if !args.is_empty() => {
+                        *good_uses.entry(args[0]).or_insert(0) += 1;
+                        for &other in &args[1..] {
+                            bad_uses.insert(other);
+                        }
+                    }
+                    _ => {
+                        for u in op.kind.uses() {
+                            bad_uses.insert(u);
+                        }
+                    }
+                },
+                _ => {
+                    for u in op.kind.uses() {
+                        bad_uses.insert(u);
                     }
                 }
-                for &a in &default.1 {
-                    *use_counts.entry(a).or_insert(0) += 1;
-                }
             }
-            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => {
-                *use_counts.entry(*v).or_insert(0) += 1;
-            }
-            RTerm::Invoke { normal, unwind } => {
-                for &a in normal.1.iter().chain(&unwind.1) {
-                    *use_counts.entry(a).or_insert(0) += 1;
-                }
-            }
-            RTerm::Return(None) | RTerm::Throw(None) | RTerm::Unreachable => {}
+        }
+        for u in block.term.uses() {
+            bad_uses.insert(u);
         }
     }
 
     let mut out = BTreeSet::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            let OpKind::Intrinsic { name, args, .. } = &op.kind else {
-                continue;
-            };
-            if !matches!(interns.str(*name), Some("copy_nonoverlapping" | "copy")) || args.len() < 3
-            {
-                continue;
-            }
-            let src = args[0];
-            let count = args[2];
-            if use_counts.get(&src).copied() != Some(1) {
-                continue;
-            }
-            if !matches!(
-                defs.get(&count),
-                Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
-            ) {
-                continue;
-            }
-            let (ref_val, from_ty, to_ty) = match defs.get(&src) {
-                Some(OpKind::Cast {
-                    kind: CastKind::PtrToPtr | CastKind::PointerCoercion,
-                    v,
-                    from,
-                    to,
-                }) => (*v, *from, *to),
-                Some(OpKind::RawView {
-                    root: Root::Value(v),
-                    path,
-                    ..
-                }) if matches!(path.as_slice(), [Proj::Deref]) => {
-                    let (Some(from), Some(to)) = (val_ty(func, *v), val_ty(func, src)) else {
-                        continue;
-                    };
-                    (*v, from, to)
-                }
-                _ => continue,
-            };
-            if func
-                .values
-                .get(src.0 as usize)
-                .is_none_or(|d| d.carrier != Carrier::Baseline)
-                || func
-                    .values
-                    .get(ref_val.0 as usize)
-                    .is_none_or(|d| d.carrier != Carrier::Baseline)
-            {
-                continue;
-            }
-            let (Some(from_pt), Some(to_pt)) = (
-                value::pointee_of(table, from_ty),
-                value::pointee_of(table, to_ty),
-            ) else {
-                continue;
-            };
-            if value::is_raw(table, from_ty) || !value::is_raw(table, to_ty) {
-                continue;
-            }
-            let peeled = table.peeled(from_pt);
-            if peeled != table.peeled(to_pt)
-                || !table.is_indirect(peeled)
-                || !value::is_slot_pointee(table, peeled)
-                || table.unsized_tail(peeled).is_some()
-                || value::is_str(table, peeled)
-                || matches!(
-                    table.get(peeled).map(|d| &d.kind),
-                    Some(TypeKind::Array { .. })
-                )
-            {
-                continue;
-            }
-            out.insert(src);
+    for (&cand, &count) in &good_uses {
+        if count == 0 || bad_uses.contains(&cand) {
+            continue;
         }
+        let (ref_val, from_ty, to_ty) = match defs.get(&cand) {
+            Some(OpKind::Cast {
+                kind: CastKind::PtrToPtr | CastKind::PointerCoercion,
+                v,
+                from,
+                to,
+            }) => (*v, *from, *to),
+            Some(OpKind::RawView {
+                root: Root::Value(v),
+                path,
+                ..
+            }) if matches!(path.as_slice(), [Proj::Deref]) => {
+                let (Some(from), Some(to)) = (val_ty(func, *v), val_ty(func, cand)) else {
+                    continue;
+                };
+                (*v, from, to)
+            }
+            _ => continue,
+        };
+        if func
+            .values
+            .get(cand.0 as usize)
+            .is_none_or(|d| d.carrier != Carrier::Baseline)
+            || func
+                .values
+                .get(ref_val.0 as usize)
+                .is_none_or(|d| d.carrier != Carrier::Baseline)
+        {
+            continue;
+        }
+        let (Some(from_pt), Some(to_pt)) = (
+            value::pointee_of(table, from_ty),
+            value::pointee_of(table, to_ty),
+        ) else {
+            continue;
+        };
+        if value::is_raw(table, from_ty)
+            || !value::is_raw(table, to_ty)
+            || table.pointer_form(from_ty) != Some(rcgjs_object::jir::types::PointerForm::Thin)
+        {
+            continue;
+        }
+        if table
+            .get(from_pt)
+            .is_none_or(|d| d.js.crosses_transparent_union)
+            || table
+                .get(to_pt)
+                .is_none_or(|d| d.js.crosses_transparent_union)
+        {
+            continue;
+        }
+        let peeled = table.peeled(from_pt);
+        if peeled != table.peeled(to_pt)
+            || !table.is_indirect(peeled)
+            || !value::is_slot_pointee(table, peeled)
+            || table.unsized_tail(peeled).is_some()
+            || value::is_str(table, peeled)
+            || matches!(
+                table.get(peeled).map(|d| &d.kind),
+                Some(
+                    TypeKind::Array { .. }
+                        | TypeKind::Adt {
+                            form: rcgjs_object::jir::types::NominalForm::Union,
+                            ..
+                        }
+                )
+            )
+        {
+            continue;
+        }
+        out.insert(cand);
     }
     out
 }
@@ -1268,9 +1809,11 @@ fn raw_view_may_box(func: &Func, table: &TypeTable, root: &Root, path: &[Proj]) 
     };
     let mut variant: Option<u32> = None;
     let mut identity = false;
+    let mut raw_identity = false;
 
     for proj in path {
         identity = false;
+        raw_identity = false;
         object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
         match proj {
             Proj::Downcast { variant: v } => {
@@ -1288,6 +1831,7 @@ fn raw_view_may_box(func: &Func, table: &TypeTable, root: &Root, path: &[Proj]) 
                     }
                     _ if table.unsized_tail(shape).is_some() => {
                         identity = true;
+                        raw_identity = value::is_raw(table, ty);
                         has_storage = false;
                     }
                     _ if value::is_slot(table, ty) => {
@@ -1338,6 +1882,9 @@ fn raw_view_may_box(func: &Func, table: &TypeTable, root: &Root, path: &[Proj]) 
         return false;
     }
     if identity {
+        if raw_identity {
+            return false;
+        }
         return table.unsized_tail(ty).is_some()
             || (value::is_slot_pointee(table, ty) && table.is_indirect(ty));
     }
@@ -1353,6 +1900,7 @@ fn scan_func_for_boxes(
     interns: &Interns,
     boxed: &mut BoxedSet,
     copy_one_boxed: &mut BoxedSet,
+    tail_adts: &mut BoxedSet,
 ) {
     let direct_copy_casts = direct_ref_copy_one_casts(func, table, interns);
     macro_rules! mark {
@@ -1361,12 +1909,13 @@ fn scan_func_for_boxes(
         };
     }
 
-    // Any ADT with an unsized tail (e.g. `RcInner<[T]>`, custom slice-tail DST) may be queried
-    // through `__rt.tail_ref` / `__rt.tail_slice` via `_boxes`.
+    // Unsized-tail ADTs (e.g. `RcInner<[T]>`, custom slice-tail DST) only need `_boxes` when
+    // `retype_rc` (`raw_alloc_reachable`) may exist in the program; otherwise only actual
+    // `&UnsizedTail as *const UnsizedTail` (`tail_raw`) conversions mark them below.
     for v in &func.values {
         if let Some(pt) = value::pointee_of(table, v.ty) {
             if table.unsized_tail(pt).is_some() {
-                mark!(pt);
+                tail_adts.record(table, pt);
             }
         }
     }
@@ -1390,8 +1939,9 @@ fn scan_func_for_boxes(
                                 && !value::is_raw(table, *to);
                             if from_is_ref
                                 && !to_is_ref
-                                && table.is_indirect(from_pt)
-                                && value::is_slot_pointee(table, from_pt)
+                                && ((table.is_indirect(from_pt)
+                                    && value::is_slot_pointee(table, from_pt))
+                                    || table.unsized_tail(from_pt).is_some())
                             {
                                 if op.result.is_some_and(|r| direct_copy_casts.contains(&r)) {
                                     copy_one_boxed.record(table, from_pt);
@@ -1410,8 +1960,9 @@ fn scan_func_for_boxes(
                             let to_is_ref = to_pt.is_some() && !value::is_raw(table, *to);
                             if from_is_ref
                                 && !to_is_ref
-                                && table.is_indirect(from_pt)
-                                && value::is_slot_pointee(table, from_pt)
+                                && ((table.is_indirect(from_pt)
+                                    && value::is_slot_pointee(table, from_pt))
+                                    || table.unsized_tail(from_pt).is_some())
                             {
                                 if op.result.is_some_and(|r| direct_copy_casts.contains(&r)) {
                                     copy_one_boxed.record(table, from_pt);
@@ -2032,16 +2583,19 @@ mod tests {
 
         let mut boxed = BoxedSet::default();
         let mut copy_one_boxed = BoxedSet::default();
+        let mut tail_adts = BoxedSet::default();
         scan_func_for_boxes(
             &func,
             &interns.types,
             &interns,
             &mut boxed,
             &mut copy_one_boxed,
+            &mut tail_adts,
         );
         let plan = HeapPlan {
             typed_heap_enabled: true,
             native_string_enabled: false,
+            native_vec_enabled: false,
             raw_alloc_reachable: false,
             non_rc_raw_alloc_reachable: false,
             any_boxed: boxed.all_adts_boxed
@@ -2217,16 +2771,19 @@ mod tests {
 
         let mut boxed = BoxedSet::default();
         let mut copy_one_boxed = BoxedSet::default();
+        let mut tail_adts = BoxedSet::default();
         scan_func_for_boxes(
             &func,
             &interns.types,
             &interns,
             &mut boxed,
             &mut copy_one_boxed,
+            &mut tail_adts,
         );
         let plan = HeapPlan {
             typed_heap_enabled: true,
             native_string_enabled: false,
+            native_vec_enabled: false,
             raw_alloc_reachable: false,
             non_rc_raw_alloc_reachable: false,
             any_boxed: true,

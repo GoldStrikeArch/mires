@@ -2499,6 +2499,12 @@ fn jir_standard_operation(tcx: TyCtxt<'_>, definition: DefId) -> Option<Standard
     if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_dealloc_raw"), definition) {
         return Some(StandardOperation::TypedDeallocRaw);
     }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_rc_alloc_slice"), definition) {
+        return Some(StandardOperation::RcAllocSlice);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_arc_alloc_slice"), definition) {
+        return Some(StandardOperation::ArcAllocSlice);
+    }
     const NATIVE_STR_ITEMS: &[(&str, StandardOperation)] = &[
         ("rcgjs_str_new", StandardOperation::NativeStrNew),
         (
@@ -2556,6 +2562,57 @@ fn jir_standard_operation(tcx: TyCtxt<'_>, definition: DefId) -> Option<Standard
         ("rcgjs_str_rfind_char", StandardOperation::BstrRfindChar),
         ("rcgjs_str_find_str", StandardOperation::BstrFindStr),
         ("rcgjs_str_rfind_str", StandardOperation::BstrRfindStr),
+        ("rcgjs_vec_new", StandardOperation::NativeVecNew),
+        (
+            "rcgjs_vec_with_capacity",
+            StandardOperation::NativeVecWithCapacity,
+        ),
+        (
+            "rcgjs_vec_from_elem_zeroed",
+            StandardOperation::NativeVecFromElemZeroed,
+        ),
+        (
+            "rcgjs_vec_from_array",
+            StandardOperation::NativeVecFromArray,
+        ),
+        (
+            "rcgjs_vec_from_raw_parts",
+            StandardOperation::NativeVecFromRawParts,
+        ),
+        ("rcgjs_vec_capacity", StandardOperation::NativeVecCapacity),
+        ("rcgjs_vec_as_ptr", StandardOperation::NativeVecAsPtr),
+        ("rcgjs_vec_as_mut_ptr", StandardOperation::NativeVecAsMutPtr),
+        ("rcgjs_vec_as_slice", StandardOperation::NativeVecAsSlice),
+        (
+            "rcgjs_vec_as_mut_slice",
+            StandardOperation::NativeVecAsMutSlice,
+        ),
+        ("rcgjs_vec_reserve", StandardOperation::NativeVecReserve),
+        (
+            "rcgjs_vec_reserve_exact",
+            StandardOperation::NativeVecReserveExact,
+        ),
+        (
+            "rcgjs_vec_try_reserve",
+            StandardOperation::NativeVecTryReserve,
+        ),
+        (
+            "rcgjs_vec_try_reserve_exact",
+            StandardOperation::NativeVecTryReserveExact,
+        ),
+        ("rcgjs_vec_shrink_to", StandardOperation::NativeVecShrinkTo),
+        (
+            "rcgjs_vec_try_shrink_to",
+            StandardOperation::NativeVecTryShrinkTo,
+        ),
+        ("rcgjs_vec_grow_one", StandardOperation::NativeVecGrowOne),
+        ("rcgjs_vec_push", StandardOperation::NativeVecPush),
+        ("rcgjs_vec_push_mut", StandardOperation::NativeVecPushMut),
+        ("rcgjs_vec_pop", StandardOperation::NativeVecPop),
+        (
+            "rcgjs_vec_into_boxed_slice",
+            StandardOperation::NativeVecIntoBoxedSlice,
+        ),
     ];
     for &(sym, op) in NATIVE_STR_ITEMS {
         if tcx.is_diagnostic_item(Symbol::intern(sym), definition) {

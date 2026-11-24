@@ -2623,6 +2623,20 @@ impl<'a> JsCx<'a> {
                 return self.walk_place(root, path);
             }
         }
+        if self.is_direct_ref_copy_cast(pointer) {
+            let ty = self.ty_of(pointer)?;
+            if let Some(pointee) = value::pointee_of(self.table, ty) {
+                let expr = self.expr_of(pointer)?;
+                return Ok(super::place::Walk {
+                    place: super::place::JsPlace::Deref(expr),
+                    ty: pointee,
+                    identity: None,
+                    object: super::place::is_object(self.table, pointee),
+                    str_mutable: false,
+                    str_from_mut: false,
+                });
+            }
+        }
         self.walk_place(
             &Root::Value(pointer),
             &[rcgjs_object::jir::repr::Proj::Deref],

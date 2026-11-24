@@ -270,6 +270,33 @@ fn fold_expr(expr: &mut Expr) -> bool {
 
     // Apply local expression reductions.
     let replacement: Option<Expr> = match expr {
+        // `({ k1: v1, k2: v2 }).k1` -> `v1` when all other property values are pure (collapses
+        // inline `tail_ref` `{ ptr: e.ptr.buf[e.ptr.off], meta: e.meta }.ptr` in `Rc::clone`).
+        Expr::Member(obj, prop) => {
+            if let Expr::Object(entries) = obj.as_ref() {
+                let mut found: Option<&Expr> = None;
+                let mut ok = true;
+                for (k, v) in entries {
+                    if k == prop {
+                        if found.is_some() {
+                            ok = false;
+                            break;
+                        }
+                        found = Some(v);
+                    } else if loop_opt::expr_has_side_effect(v) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    found.cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
         // `[c0, c1, ...][k]` where every element is a pure literal -> `c_k`
         Expr::Index(arr, idx) => {
             if let (Expr::Array(items), Some(k)) = (arr.as_ref(), exact_u32(idx)) {

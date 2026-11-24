@@ -332,6 +332,9 @@ impl<'a> JsCx<'a> {
         if self.heap().native_string_enabled {
             self.nested_clone.native_string = true;
         }
+        if self.heap().native_vec_enabled {
+            self.nested_clone.native_vec = true;
+        }
         self
     }
 
@@ -393,6 +396,9 @@ impl<'a> JsCx<'a> {
     pub fn with_nested_clone(mut self, mut nested_clone: crate::lower::NestedClone) -> Self {
         if self.heap().native_string_enabled {
             nested_clone.native_string = true;
+        }
+        if self.heap().native_vec_enabled {
+            nested_clone.native_vec = true;
         }
         self.nested_clone = nested_clone;
         self

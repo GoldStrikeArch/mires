@@ -1828,13 +1828,9 @@ fn collect_escaped_idents_stmts(stmts: &[Stmt], escaped: &mut HashSet<String>) {
             }
             Stmt::If(c, a, b) => {
                 collect_escaped_idents_expr(c, escaped);
-                if !stmts_definitely_diverge(a) {
-                    collect_escaped_idents_stmts(a, escaped);
-                }
+                collect_escaped_idents_stmts(a, escaped);
                 if let Some(b) = b {
-                    if !stmts_definitely_diverge(b) {
-                        collect_escaped_idents_stmts(b, escaped);
-                    }
+                    collect_escaped_idents_stmts(b, escaped);
                 }
             }
             Stmt::Switch(d, cases) => {
@@ -3418,7 +3414,7 @@ fn stmts_have_mutating_nested_fn(stmts: &[Stmt]) -> bool {
     })
 }
 
-fn expr_has_side_effect(expr: &Expr) -> bool {
+pub(super) fn expr_has_side_effect(expr: &Expr) -> bool {
     match expr {
         Expr::Assign(..) | Expr::CompoundAssign(..) | Expr::New(..) | Expr::Raw(_) => true,
         Expr::Call(callee, args) => {
@@ -3478,18 +3474,16 @@ fn expr_has_non_panic_call(expr: &Expr) -> bool {
 
 fn stmts_have_non_panic_call(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) | Stmt::Const(_, e) => {
-            expr_has_non_panic_call(e)
-        }
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Const(_, e) => expr_has_non_panic_call(e),
+        Stmt::Throw(_) => false,
         Stmt::Let(_, Some(e)) => expr_has_non_panic_call(e),
         Stmt::Lets(decls) => decls
             .iter()
             .any(|(_, init)| init.as_ref().is_some_and(expr_has_non_panic_call)),
         Stmt::If(c, a, b) => {
             expr_has_non_panic_call(c)
-                || (!stmts_definitely_diverge(a) && stmts_have_non_panic_call(a))
-                || b.as_ref()
-                    .is_some_and(|b| !stmts_definitely_diverge(b) && stmts_have_non_panic_call(b))
+                || stmts_have_non_panic_call(a)
+                || b.as_ref().is_some_and(|b| stmts_have_non_panic_call(b))
         }
         Stmt::Switch(d, cases) => {
             expr_has_non_panic_call(d) || cases.iter().any(|c| stmts_have_non_panic_call(&c.body))

@@ -415,7 +415,27 @@ impl<'a> JsCx<'a> {
                 "a struct with a non-slice unsized tail",
             ));
         }
-        let key_str = jsast::string(value::key_name(self.interns, key).expect("tail field key"));
+        let key_name = value::key_name(self.interns, key).expect("tail field key");
+        let heap = self.heap();
+        if heap.typed_heap_enabled && !heap.raw_alloc_reachable {
+            if let Some(raw_ptr) = raw_tail {
+                let (setup, rp) = self.reread(raw_ptr, &["ptr", "meta"]);
+                let slot = jsast::member(rp.clone(), "ptr");
+                let rec = jsast::index(ptr::slot_buf(slot.clone()), ptr::slot_off(slot));
+                let slice = ptr::fat_slice(
+                    value::field_expr(self.interns, rec, key),
+                    jsast::num(0),
+                    jsast::member(rp, "meta"),
+                );
+                return Ok(JsPlace::Deref(super::ptr::sequenced(setup, slice)));
+            }
+            return Ok(JsPlace::Deref(ptr::fat_slice(
+                value::field_expr(self.interns, record, key),
+                jsast::num(0),
+                tail,
+            )));
+        }
+        let key_str = jsast::string(key_name);
         if let Some(raw_ptr) = raw_tail {
             return Ok(JsPlace::Deref(jsast::rt_call(
                 "tail_slice_raw",
@@ -822,7 +842,7 @@ impl<'a> JsCx<'a> {
 
 /// Whether a raw pointer to a place of type `ty` held as a value is the object's `__rt.box`
 /// (`ptr.rs::ref_to_raw`): a sized, non-zero-sized aggregate whose reference is the object itself.
-fn is_object(table: &TypeTable, ty: TypeId) -> bool {
+pub(super) fn is_object(table: &TypeTable, ty: TypeId) -> bool {
     table.is_indirect(ty) && is_slot_pointee(table, ty) && table.unsized_tail(ty).is_none()
 }
 

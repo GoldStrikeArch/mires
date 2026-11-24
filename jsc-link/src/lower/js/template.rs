@@ -1112,6 +1112,29 @@ impl KeyedCollectionLane {
             _ => return Ok(callable),
         };
         let value = jsast::call(callable, Vec::new());
+        if cx.heap().native_vec_enabled && crate::analysis::heap::is_global_vec_ty(cx.table, vector)
+        {
+            let v = "$v".to_owned();
+            let vid = jsast::id(v.clone());
+            let elem = crate::analysis::heap::global_vec_elem_ty(cx.table, vector);
+            let buf_expr = if elem.is_some_and(|e| cx.table.is_zst(e)) {
+                let align = elem
+                    .and_then(|e| cx.table.get(e))
+                    .and_then(|d| d.layout.align)
+                    .unwrap_or(1)
+                    .max(1);
+                jsast::num(align as f64)
+            } else {
+                jsast::member(vid.clone(), "buf")
+            };
+            let slice = jsast::object_of(vec![
+                ("buf", buf_expr),
+                ("off", jsast::num(0)),
+                ("len", jsast::member(vid, "len")),
+            ]);
+            let body = vec![jsast::const_(v, value), jsast::ret(slice)];
+            return Ok(jsast::arrow_block(Vec::new(), body));
+        }
         let view = super::adapters::convert(
             cx.table,
             cx.interns,

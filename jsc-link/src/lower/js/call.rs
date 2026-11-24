@@ -262,6 +262,16 @@ impl JsCx<'_> {
             }
         }
 
+        // Mires v4 Phase 3 universal flat `Vec<T, Global>` hooks (`ReleaseSpeed` + `Default`
+        // allocator + `!byte_views` + `!non_rc_raw_alloc_reachable`).
+        if let CallSemantic::Standard(operation) = semantic {
+            if operation.is_native_vec() && self.heap().native_vec_enabled {
+                if let Some(lowered) = self.lower_native_vec_call(op, *operation, args)? {
+                    return Ok(lowered);
+                }
+            }
+        }
+
         // Tier A typed managed heap (`ReleaseSpeed && Default allocator && !byte_views`): lower
         // `Global` `RawVec`/`Box`/`BTreeMap`/`Rc` allocation hooks directly to zero-WeakMap
         // TypedArrays / plain Arrays and no-op deallocations.
@@ -1091,8 +1101,14 @@ impl JsCx<'_> {
                         let buf = jsast::new(jsast::id("Array"), vec![cap]);
                         return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
                     }
-                    let shell_expr =
-                        uninit_shell(table, self.interns, elem, 0, heap.native_string_enabled);
+                    let shell_expr = uninit_shell(
+                        table,
+                        self.interns,
+                        elem,
+                        0,
+                        heap.native_string_enabled,
+                        heap.native_vec_enabled,
+                    );
                     if const_u128(*cap_v) == Some(1) {
                         if let Some(shell) = shell_expr {
                             let slot = if tracked {
@@ -1194,6 +1210,109 @@ impl JsCx<'_> {
                     "t_dealloc_maybe",
                     vec![p],
                 ))])))
+            }
+            StandardOperation::RcAllocSlice | StandardOperation::ArcAllocSlice => {
+                let [len_v] = args else {
+                    return Ok(None);
+                };
+                let Some(rc_inner_ty) = result_pointee() else {
+                    return Ok(None);
+                };
+                let Some(tail_info) = table.unsized_tail(rc_inner_ty) else {
+                    return Ok(None);
+                };
+                let tail_idx = tail_info.field as usize;
+                let Some(rcgjs_object::jir::types::TypeKind::Adt { variants, .. }) =
+                    value::kind(table, rc_inner_ty)
+                else {
+                    return Ok(None);
+                };
+                let [variant] = variants.as_slice() else {
+                    return Ok(None);
+                };
+                let Some(tail_field) = variant.fields.get(tail_idx) else {
+                    return Ok(None);
+                };
+                let Some(rcgjs_object::jir::types::TypeKind::Slice(elem_ty)) =
+                    value::kind(table, tail_field.ty)
+                else {
+                    return Ok(None);
+                };
+                let elem_peeled = table.peeled(*elem_ty);
+                let len_expr = self.expr_of(*len_v)?;
+                let (setup, len_ref) = self.reread(len_expr, &[]);
+                let tail_buf = if table.is_zst(elem_peeled) {
+                    let align = table
+                        .get(*elem_ty)
+                        .and_then(|d| d.layout.align)
+                        .unwrap_or(1)
+                        .max(1);
+                    jsast::num(align as f64)
+                } else if let Some(k) = table
+                    .get(*elem_ty)
+                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                {
+                    jsast::new(jsast::id(TA_CTORS[k as usize]), vec![len_ref.clone()])
+                } else {
+                    jsast::new(jsast::id("Array"), vec![len_ref.clone()])
+                };
+
+                let mut fields: Vec<(String, Expr)> = Vec::with_capacity(variant.fields.len());
+                for (idx, field) in variant.fields.iter().enumerate() {
+                    let Some(key_name) = value::key_name(self.interns, field.key) else {
+                        return Ok(None);
+                    };
+                    if idx == tail_idx {
+                        fields.push((key_name, tail_buf.clone()));
+                        continue;
+                    }
+                    // Header counter field (`Cell<usize>` peels to `usize` -> `1`;
+                    // `AtomicUsize { v: Atomic<usize>(UnsafeCell<usize>) }` -> `{ v: { _0: 1 } }`).
+                    fn init_counter_one(
+                        table: &rcgjs_object::jir::types::TypeTable,
+                        interns: &rcgjs_object::jir::Interns,
+                        ty: rcgjs_object::jir::types::TypeId,
+                        depth: u8,
+                    ) -> Option<Expr> {
+                        if depth > 4 {
+                            return None;
+                        }
+                        let peeled = table.peeled(ty);
+                        match value::kind(table, peeled) {
+                            Some(rcgjs_object::jir::types::TypeKind::Integer { .. }) => {
+                                Some(jsast::num(1))
+                            }
+                            Some(rcgjs_object::jir::types::TypeKind::Adt { variants, .. }) => {
+                                let [v] = variants.as_slice() else {
+                                    return None;
+                                };
+                                let mut real_fields =
+                                    v.fields.iter().filter(|f| !table.is_zst(f.ty));
+                                let inner_f = real_fields.next()?;
+                                if real_fields.next().is_some() {
+                                    return None;
+                                }
+                                let ik = value::key_name(interns, inner_f.key)?;
+                                let iv = init_counter_one(table, interns, inner_f.ty, depth + 1)?;
+                                Some(Expr::Object(vec![(ik, iv)]))
+                            }
+                            _ => None,
+                        }
+                    }
+                    let Some(init) = init_counter_one(table, self.interns, field.ty, 0) else {
+                        return Ok(None);
+                    };
+                    fields.push((key_name, init));
+                }
+
+                let record = Expr::Object(fields);
+                let slot = if heap.needs_box_tracking(table, rc_inner_ty) {
+                    jsast::rt_call("t_box_new_tracked", vec![record])
+                } else {
+                    ptr::slot(jsast::array(vec![record]), jsast::num(0))
+                };
+                let fat = jsast::object_of(vec![("ptr", slot), ("meta", len_ref)]);
+                Ok(Some(Lowered::value(super::ptr::sequenced(setup, fat))))
             }
             _ => Ok(None),
         }
@@ -1399,9 +1518,22 @@ impl JsCx<'_> {
                 };
                 let mut setup = Vec::new();
                 let v = bind_if_needed(self.expr_of(*vec_v)?, &mut setup);
-                let inner = jsast::member(jsast::member(v.clone(), "buf"), "inner");
+                let len = jsast::member(v.clone(), "len");
+                if self.heap().native_vec_enabled {
+                    let buf = jsast::member(v, "buf");
+                    let s_expr = jsast::cond(
+                        jsast::binary(jsast::BinOp::StrictEq, len.clone(), jsast::num(0)),
+                        jsast::string(""),
+                        jsast::rt_call("bstr_of", vec![buf.clone(), jsast::num(0), len]),
+                    );
+                    let obj = jsast::object_of(vec![
+                        ("s", s_expr),
+                        ("cap", jsast::member(buf, "length")),
+                    ]);
+                    return Ok(Some(Lowered::Value(setup, obj)));
+                }
+                let inner = jsast::member(jsast::member(v, "buf"), "inner");
                 let ptr = jsast::member(inner.clone(), "ptr");
-                let len = jsast::member(v, "len");
                 let s_expr = jsast::cond(
                     jsast::binary(jsast::BinOp::StrictEq, len.clone(), jsast::num(0)),
                     jsast::string(""),
@@ -1423,10 +1555,12 @@ impl JsCx<'_> {
                     return Ok(None);
                 };
                 let s = self.expr_of(*s_v)?;
-                Ok(Some(Lowered::value(jsast::rt_call(
-                    "nstr_into_vec",
-                    vec![s],
-                ))))
+                let helper = if self.heap().native_vec_enabled {
+                    "nstr_into_nvec"
+                } else {
+                    "nstr_into_vec"
+                };
+                Ok(Some(Lowered::value(jsast::rt_call(helper, vec![s]))))
             }
             StandardOperation::NativeStrReplaceSlice => {
                 let [s_v, start_v, end_v, rep_v] = args else {
@@ -1530,6 +1664,845 @@ impl JsCx<'_> {
                 let obj =
                     jsast::object_of(vec![("s", t.clone()), ("cap", jsast::member(t, "length"))]);
                 Ok(Some(Lowered::Value(vec![bind], obj)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Lowers Mires v4 Phase 3 universal flat `Vec<T, Global>` hooks
+    /// (`StandardOperation::is_native_vec`) directly at call sites when
+    /// `self.heap().native_vec_enabled` holds.
+    fn lower_native_vec_call(
+        &self,
+        op: &Op,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        use rcgjs_object::jir::types::{NominalForm, PointerForm, TypeKind};
+        const TA_CTORS: [&str; 8] = [
+            "Uint8Array",
+            "Int8Array",
+            "Uint16Array",
+            "Int16Array",
+            "Uint32Array",
+            "Int32Array",
+            "Float32Array",
+            "Float64Array",
+        ];
+
+        let table = self.table;
+        let heap = self.heap();
+
+        let const_u128 = |v: ValueId| -> Option<u128> {
+            match self.def_of(v).map(|d| &d.kind) {
+                Some(OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar {
+                    bits,
+                    ..
+                })) => Some(*bits),
+                _ => None,
+            }
+        };
+
+        let bind_if_needed = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
+            if matches!(expr, Expr::Ident(_)) {
+                expr
+            } else {
+                let (bind, id) = self.temp(expr);
+                setup.push(bind);
+                id
+            }
+        };
+
+        let vec_ty = match operation {
+            StandardOperation::NativeVecNew
+            | StandardOperation::NativeVecWithCapacity
+            | StandardOperation::NativeVecFromElemZeroed
+            | StandardOperation::NativeVecFromArray
+            | StandardOperation::NativeVecFromRawParts => {
+                let Some(res) = op.result else {
+                    return Ok(None);
+                };
+                self.ty_of(res)?
+            }
+            StandardOperation::NativeVecIntoBoxedSlice => {
+                let Some(&v0) = args.first() else {
+                    return Ok(None);
+                };
+                self.ty_of(v0)?
+            }
+            _ => {
+                let Some(&v0) = args.first() else {
+                    return Ok(None);
+                };
+                let arg_ty = self.ty_of(v0)?;
+                let Some(pt) = value::pointee_of(table, arg_ty) else {
+                    return Ok(None);
+                };
+                pt
+            }
+        };
+
+        let Some(elem_ty) = crate::analysis::heap::global_vec_elem_ty(table, vec_ty) else {
+            return Ok(None);
+        };
+        let Some(elem_desc) = table.get(elem_ty) else {
+            return Ok(None);
+        };
+        let is_zst = elem_desc.layout.zst;
+        let elem_size = elem_desc.layout.size.unwrap_or(0);
+        let align = elem_desc.layout.align.unwrap_or(1).max(1);
+        let ta_kind = if is_zst {
+            None
+        } else {
+            crate::analysis::heap::native_vec_ta_kind(table, elem_ty)
+        };
+        let min_cap: u64 = if elem_size == 1 {
+            8
+        } else if elem_size <= 1024 {
+            4
+        } else {
+            1
+        };
+        let max_elems: u64 = 2_147_483_647u64
+            .checked_div(elem_size)
+            .unwrap_or(4_294_967_295);
+        let peeled_elem = table.peeled(elem_ty);
+        let tracked = !is_zst
+            && ta_kind.is_none()
+            && heap.needs_box_tracking(table, elem_ty)
+            && table.is_indirect(peeled_elem)
+            && value::is_slot_pointee(table, peeled_elem);
+
+        match operation {
+            StandardOperation::NativeVecNew => {
+                let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                    return Ok(None);
+                };
+                Ok(Some(Lowered::value(empty)))
+            }
+            StandardOperation::NativeVecWithCapacity => {
+                let [cap_v] = args else {
+                    return Ok(None);
+                };
+                if is_zst {
+                    let cap_e = self.expr_of(*cap_v)?;
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&cap_e) {
+                        setup.push(jsast::expr_stmt(cap_e));
+                    }
+                    return Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::object_of(vec![("buf", jsast::undefined()), ("len", jsast::num(0))]),
+                    )));
+                }
+                if let Some(c) = const_u128(*cap_v) {
+                    if c == 0 {
+                        let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                            return Ok(None);
+                        };
+                        return Ok(Some(Lowered::value(empty)));
+                    }
+                    if c <= u128::from(max_elems) {
+                        if let Some(k) = ta_kind {
+                            return Ok(Some(Lowered::value(jsast::object_of(vec![
+                                (
+                                    "buf",
+                                    jsast::new(
+                                        jsast::id(TA_CTORS[k as usize]),
+                                        vec![jsast::num(c as f64)],
+                                    ),
+                                ),
+                                ("len", jsast::num(0)),
+                            ]))));
+                        }
+                        return Ok(Some(Lowered::value(jsast::object_of(vec![
+                            (
+                                "buf",
+                                jsast::new(jsast::id("Array"), vec![jsast::num(c as f64)]),
+                            ),
+                            ("len", jsast::num(0)),
+                        ]))));
+                    }
+                }
+                let cap = self.expr_of(*cap_v)?;
+                if let Some(k) = ta_kind {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_with_cap_ta",
+                        vec![cap, jsast::num(f64::from(k)), jsast::num(max_elems as f64)],
+                    ))))
+                } else {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_with_cap_arr",
+                        vec![cap, jsast::num(align as f64), jsast::num(max_elems as f64)],
+                    ))))
+                }
+            }
+            StandardOperation::NativeVecFromElemZeroed => {
+                let [n_v] = args else {
+                    return Ok(None);
+                };
+                if is_zst {
+                    let n = self.expr_of(*n_v)?;
+                    return Ok(Some(Lowered::value(jsast::object_of(vec![
+                        ("buf", jsast::undefined()),
+                        ("len", n),
+                    ]))));
+                }
+                if let Some(k) = ta_kind {
+                    if let Some(c) = const_u128(*n_v) {
+                        if c == 0 {
+                            let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                                return Ok(None);
+                            };
+                            return Ok(Some(Lowered::value(empty)));
+                        }
+                        if c <= u128::from(max_elems) {
+                            return Ok(Some(Lowered::value(jsast::object_of(vec![
+                                (
+                                    "buf",
+                                    jsast::new(
+                                        jsast::id(TA_CTORS[k as usize]),
+                                        vec![jsast::num(c as f64)],
+                                    ),
+                                ),
+                                ("len", jsast::num(c as f64)),
+                            ]))));
+                        }
+                    }
+                    let n = self.expr_of(*n_v)?;
+                    return Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_zeroed_ta",
+                        vec![n, jsast::num(f64::from(k)), jsast::num(max_elems as f64)],
+                    ))));
+                }
+                let Some(zero) = value::zero_value_for_heap(
+                    table,
+                    self.interns,
+                    elem_ty,
+                    heap.native_string_enabled,
+                    heap.native_vec_enabled,
+                ) else {
+                    return Ok(None);
+                };
+                let n = self.expr_of(*n_v)?;
+                if !table.is_indirect(peeled_elem) {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_zeroed_arr",
+                        vec![
+                            n,
+                            jsast::num(align as f64),
+                            jsast::num(max_elems as f64),
+                            zero,
+                        ],
+                    ))))
+                } else {
+                    let helper = if tracked {
+                        "nv_zeroed_arr_fn_tracked"
+                    } else {
+                        "nv_zeroed_arr_fn"
+                    };
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        helper,
+                        vec![
+                            n,
+                            jsast::num(align as f64),
+                            jsast::num(max_elems as f64),
+                            jsast::arrow(Vec::new(), zero),
+                        ],
+                    ))))
+                }
+            }
+            StandardOperation::NativeVecFromArray => {
+                let [arr_v] = args else {
+                    return Ok(None);
+                };
+                let arr_ty = self.ty_of(*arr_v)?;
+                let Some(TypeKind::Array { length, .. }) =
+                    table.get(table.peeled(arr_ty)).map(|d| &d.kind)
+                else {
+                    return Ok(None);
+                };
+                let len = *length;
+                if is_zst {
+                    let arr_e = self.expr_of(*arr_v)?;
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&arr_e) {
+                        setup.push(jsast::expr_stmt(arr_e));
+                    }
+                    return Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::object_of(vec![
+                            ("buf", jsast::undefined()),
+                            ("len", jsast::num(len as f64)),
+                        ]),
+                    )));
+                }
+                if len == 0 {
+                    let arr_e = self.expr_of(*arr_v)?;
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&arr_e) {
+                        setup.push(jsast::expr_stmt(arr_e));
+                    }
+                    let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(Lowered::Value(setup, empty)));
+                }
+                let arr_expr = self.expr_of(*arr_v)?;
+                if let Some(k) = ta_kind {
+                    return Ok(Some(Lowered::value(jsast::object_of(vec![
+                        (
+                            "buf",
+                            jsast::new(jsast::id(TA_CTORS[k as usize]), vec![arr_expr]),
+                        ),
+                        ("len", jsast::num(len as f64)),
+                    ]))));
+                }
+                let fresh_aggregate = matches!(
+                    self.def_of(*arr_v).map(|d| &d.kind),
+                    Some(OpKind::Aggregate { .. })
+                );
+                let mut owned_arr = if fresh_aggregate {
+                    arr_expr
+                } else {
+                    value::clone_expr_with(table, self.interns, arr_ty, arr_expr, self.nested_clone)
+                };
+                if tracked {
+                    owned_arr = jsast::rt_call("nv_box_track_arr", vec![owned_arr]);
+                }
+                Ok(Some(Lowered::value(jsast::object_of(vec![
+                    ("buf", owned_arr),
+                    ("len", jsast::num(len as f64)),
+                ]))))
+            }
+            StandardOperation::NativeVecFromRawParts => {
+                let [ptr_v, len_v, cap_v] = args else {
+                    return Ok(None);
+                };
+                let ptr = self.expr_of(*ptr_v)?;
+                let len = self.expr_of(*len_v)?;
+                let cap = self.expr_of(*cap_v)?;
+                if is_zst {
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&ptr) {
+                        setup.push(jsast::expr_stmt(ptr));
+                    }
+                    if !jsast::is_droppable(&cap) {
+                        setup.push(jsast::expr_stmt(cap));
+                    }
+                    return Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::object_of(vec![("buf", jsast::undefined()), ("len", len)]),
+                    )));
+                }
+                if let Some(k) = ta_kind {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_from_raw_ta",
+                        vec![ptr, len, cap, jsast::num(f64::from(k))],
+                    ))))
+                } else {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_from_raw_arr",
+                        vec![ptr, len, cap, jsast::num(align as f64)],
+                    ))))
+                }
+            }
+            StandardOperation::NativeVecCapacity => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                if is_zst {
+                    let ve = self.expr_of(*v_v)?;
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&ve) {
+                        setup.push(jsast::expr_stmt(ve));
+                    }
+                    return Ok(Some(Lowered::Value(setup, jsast::num(4_294_967_295.0))));
+                }
+                let v = self.expr_of(*v_v)?;
+                Ok(Some(Lowered::value(jsast::member(
+                    jsast::member(v, "buf"),
+                    "length",
+                ))))
+            }
+            StandardOperation::NativeVecAsPtr | StandardOperation::NativeVecAsMutPtr => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                if is_zst {
+                    let ve = self.expr_of(*v_v)?;
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&ve) {
+                        setup.push(jsast::expr_stmt(ve));
+                    }
+                    return Ok(Some(Lowered::Value(setup, jsast::num(align as f64))));
+                }
+                let v = self.expr_of(*v_v)?;
+                Ok(Some(Lowered::value(ptr::slot(
+                    jsast::member(v, "buf"),
+                    jsast::num(0),
+                ))))
+            }
+            StandardOperation::NativeVecAsSlice | StandardOperation::NativeVecAsMutSlice => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let buf = if is_zst {
+                    jsast::num(align as f64)
+                } else {
+                    jsast::member(v.clone(), "buf")
+                };
+                let slice = jsast::object_of(vec![
+                    ("buf", buf),
+                    ("off", jsast::num(0)),
+                    ("len", jsast::member(v, "len")),
+                ]);
+                Ok(Some(Lowered::Value(setup, slice)))
+            }
+            StandardOperation::NativeVecReserve | StandardOperation::NativeVecReserveExact => {
+                let [v_v, used_v, add_v] = args else {
+                    return Ok(None);
+                };
+                let exact = operation == StandardOperation::NativeVecReserveExact;
+                let v = self.expr_of(*v_v)?;
+                let used = self.expr_of(*used_v)?;
+                let add = self.expr_of(*add_v)?;
+                if is_zst {
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&v) {
+                        setup.push(jsast::expr_stmt(v));
+                    }
+                    setup.push(jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::Gt,
+                            jsast::binary(jsast::BinOp::Add, used, add),
+                            jsast::num(4_294_967_295.0),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "js_abort",
+                            vec![jsast::string("capacity overflow")],
+                        ))],
+                    ));
+                    return Ok(Some(Lowered::Done(setup)));
+                }
+                if let Some(k) = ta_kind {
+                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                        "nv_reserve_ta",
+                        vec![
+                            v,
+                            used,
+                            add,
+                            jsast::num(min_cap as f64),
+                            Expr::Bool(exact),
+                            jsast::num(f64::from(k)),
+                            jsast::num(max_elems as f64),
+                        ],
+                    ))])))
+                } else {
+                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                        "nv_reserve_arr",
+                        vec![
+                            v,
+                            used,
+                            add,
+                            jsast::num(min_cap as f64),
+                            Expr::Bool(exact),
+                            jsast::num(max_elems as f64),
+                        ],
+                    ))])))
+                }
+            }
+            StandardOperation::NativeVecTryReserve
+            | StandardOperation::NativeVecTryReserveExact => {
+                let [v_v, used_v, add_v] = args else {
+                    return Ok(None);
+                };
+                let exact = operation == StandardOperation::NativeVecTryReserveExact;
+                let v = self.expr_of(*v_v)?;
+                let used = self.expr_of(*used_v)?;
+                let add = self.expr_of(*add_v)?;
+                if is_zst {
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&v) {
+                        setup.push(jsast::expr_stmt(v));
+                    }
+                    return Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::binary(
+                            jsast::BinOp::Le,
+                            jsast::binary(jsast::BinOp::Add, used, add),
+                            jsast::num(4_294_967_295.0),
+                        ),
+                    )));
+                }
+                if let Some(k) = ta_kind {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_try_reserve_ta",
+                        vec![
+                            v,
+                            used,
+                            add,
+                            jsast::num(min_cap as f64),
+                            Expr::Bool(exact),
+                            jsast::num(f64::from(k)),
+                            jsast::num(max_elems as f64),
+                        ],
+                    ))))
+                } else {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "nv_try_reserve_arr",
+                        vec![
+                            v,
+                            used,
+                            add,
+                            jsast::num(min_cap as f64),
+                            Expr::Bool(exact),
+                            jsast::num(max_elems as f64),
+                        ],
+                    ))))
+                }
+            }
+            StandardOperation::NativeVecShrinkTo | StandardOperation::NativeVecTryShrinkTo => {
+                let [v_v, target_v] = args else {
+                    return Ok(None);
+                };
+                let is_try = operation == StandardOperation::NativeVecTryShrinkTo;
+                let v = self.expr_of(*v_v)?;
+                let target = self.expr_of(*target_v)?;
+                let mut setup = Vec::new();
+                if is_zst {
+                    if !jsast::is_droppable(&v) {
+                        setup.push(jsast::expr_stmt(v));
+                    }
+                    if !jsast::is_droppable(&target) {
+                        setup.push(jsast::expr_stmt(target));
+                    }
+                } else if let Some(k) = ta_kind {
+                    setup.push(jsast::expr_stmt(jsast::rt_call(
+                        "nv_shrink_ta",
+                        vec![v, target, jsast::num(f64::from(k))],
+                    )));
+                } else {
+                    setup.push(jsast::expr_stmt(jsast::rt_call(
+                        "nv_shrink_arr",
+                        vec![v, target, jsast::num(align as f64)],
+                    )));
+                }
+                if is_try {
+                    Ok(Some(Lowered::Value(setup, Expr::Bool(true))))
+                } else {
+                    Ok(Some(Lowered::Done(setup)))
+                }
+            }
+            StandardOperation::NativeVecGrowOne => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                let v = self.expr_of(*v_v)?;
+                if is_zst {
+                    return Ok(Some(Lowered::Done(vec![jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            jsast::member(v, "len"),
+                            jsast::num(4_294_967_295.0),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "js_abort",
+                            vec![jsast::string("capacity overflow")],
+                        ))],
+                    )])));
+                }
+                if let Some(k) = ta_kind {
+                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                        "nv_grow_one_ta",
+                        vec![
+                            v,
+                            jsast::num(min_cap as f64),
+                            jsast::num(f64::from(k)),
+                            jsast::num(max_elems as f64),
+                        ],
+                    ))])))
+                } else {
+                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                        "nv_grow_one_arr",
+                        vec![v, jsast::num(min_cap as f64), jsast::num(max_elems as f64)],
+                    ))])))
+                }
+            }
+            StandardOperation::NativeVecPush | StandardOperation::NativeVecPushMut => {
+                let [v_v, val_v] = args else {
+                    return Ok(None);
+                };
+                let is_mut = operation == StandardOperation::NativeVecPushMut;
+                let mut setup = Vec::new();
+                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let val_expr = self.expr_of(*val_v)?;
+                if is_zst {
+                    if !jsast::is_droppable(&val_expr) {
+                        setup.push(jsast::expr_stmt(val_expr));
+                    }
+                    let (bl, l) = self.temp(jsast::member(v.clone(), "len"));
+                    setup.push(bl);
+                    setup.push(jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            l.clone(),
+                            jsast::num(4_294_967_295.0),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "js_abort",
+                            vec![jsast::string("capacity overflow")],
+                        ))],
+                    ));
+                    setup.push(jsast::assign_stmt(
+                        jsast::member(v, "len"),
+                        jsast::binary(
+                            jsast::BinOp::UShr,
+                            jsast::binary(jsast::BinOp::Add, l, jsast::num(1)),
+                            jsast::num(0),
+                        ),
+                    ));
+                    return if is_mut {
+                        Ok(Some(Lowered::Value(setup, jsast::num(align as f64))))
+                    } else {
+                        Ok(Some(Lowered::Done(setup)))
+                    };
+                }
+                let val = if is_mut || tracked {
+                    bind_if_needed(val_expr, &mut setup)
+                } else {
+                    val_expr
+                };
+                let (bl, l) = self.temp(jsast::member(v.clone(), "len"));
+                setup.push(bl);
+                if let Some(k) = ta_kind {
+                    setup.push(jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            l.clone(),
+                            jsast::member(jsast::member(v.clone(), "buf"), "length"),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "nv_grow_one_ta",
+                            vec![
+                                v.clone(),
+                                jsast::num(min_cap as f64),
+                                jsast::num(f64::from(k)),
+                                jsast::num(max_elems as f64),
+                            ],
+                        ))],
+                    ));
+                    setup.push(jsast::assign_stmt(
+                        jsast::index(jsast::member(v.clone(), "buf"), l.clone()),
+                        val.clone(),
+                    ));
+                } else {
+                    setup.push(jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            l.clone(),
+                            jsast::member(jsast::member(v.clone(), "buf"), "length"),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "nv_grow_one_arr",
+                            vec![
+                                v.clone(),
+                                jsast::num(min_cap as f64),
+                                jsast::num(max_elems as f64),
+                            ],
+                        ))],
+                    ));
+                    if tracked {
+                        setup.push(jsast::expr_stmt(jsast::rt_call(
+                            "nv_box_track_slot",
+                            vec![jsast::member(v.clone(), "buf"), l.clone(), val.clone()],
+                        )));
+                    } else {
+                        setup.push(jsast::assign_stmt(
+                            jsast::index(jsast::member(v.clone(), "buf"), l.clone()),
+                            val.clone(),
+                        ));
+                    }
+                }
+                setup.push(jsast::assign_stmt(
+                    jsast::member(v.clone(), "len"),
+                    jsast::binary(
+                        jsast::BinOp::UShr,
+                        jsast::binary(jsast::BinOp::Add, l.clone(), jsast::num(1)),
+                        jsast::num(0),
+                    ),
+                ));
+                if !is_mut {
+                    return Ok(Some(Lowered::Done(setup)));
+                }
+                let Some(res) = op.result else {
+                    return Ok(None);
+                };
+                let ret_ty = self.ty_of(res)?;
+                let ret_expr = match table.pointer_form(ret_ty) {
+                    Some(PointerForm::Thin) => val,
+                    Some(PointerForm::Slot) => ptr::slot(jsast::member(v, "buf"), l),
+                    _ => return Ok(None),
+                };
+                Ok(Some(Lowered::Value(setup, ret_expr)))
+            }
+            StandardOperation::NativeVecPop => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                let Some(res) = op.result else {
+                    return Ok(None);
+                };
+                let ret_ty = self.ty_of(res)?;
+                let peeled_ret = table.peeled(ret_ty);
+                let Some(TypeKind::Adt {
+                    form: NominalForm::Enum,
+                    variants,
+                    ..
+                }) = table.get(peeled_ret).map(|d| &d.kind)
+                else {
+                    return Ok(None);
+                };
+                let mut none_idx = None;
+                let mut some_info = None;
+                for (i, var) in variants.iter().enumerate() {
+                    if var.fields.is_empty() {
+                        none_idx = Some(i as u32);
+                    } else if var.fields.len() == 1 {
+                        some_info = Some((i as u32, var.fields[0].key));
+                    }
+                }
+                let (Some(none_idx), Some((some_idx, some_key))) = (none_idx, some_info) else {
+                    return Ok(None);
+                };
+                let Some(none_expr) =
+                    value::enum_value(table, self.interns, ret_ty, none_idx, Vec::new())
+                else {
+                    return Ok(None);
+                };
+
+                let mut setup = Vec::new();
+                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let (_, res_id) = self.temp(jsast::undefined());
+
+                let mut some_body = Vec::new();
+                let (bl, l) = self.temp(jsast::binary(
+                    jsast::BinOp::UShr,
+                    jsast::binary(
+                        jsast::BinOp::Sub,
+                        jsast::member(v.clone(), "len"),
+                        jsast::num(1),
+                    ),
+                    jsast::num(0),
+                ));
+                some_body.push(bl);
+                some_body.push(jsast::assign_stmt(
+                    jsast::member(v.clone(), "len"),
+                    l.clone(),
+                ));
+                let elem_expr = if is_zst {
+                    jsast::undefined()
+                } else {
+                    let (be, e) =
+                        self.temp(jsast::index(jsast::member(v.clone(), "buf"), l.clone()));
+                    some_body.push(be);
+                    if ta_kind.is_none() && elem_desc.layout.needs_drop {
+                        some_body.push(jsast::assign_stmt(
+                            jsast::index(jsast::member(v.clone(), "buf"), l),
+                            jsast::undefined(),
+                        ));
+                    }
+                    e
+                };
+                let some_fields = match value::key_name(self.interns, some_key) {
+                    Some(k) => vec![(k, elem_expr)],
+                    None => Vec::new(),
+                };
+                let Some(some_expr) =
+                    value::enum_value(table, self.interns, ret_ty, some_idx, some_fields)
+                else {
+                    return Ok(None);
+                };
+                some_body.push(jsast::assign_stmt(res_id.clone(), some_expr));
+
+                setup.push(jsast::if_else(
+                    jsast::binary(
+                        jsast::BinOp::StrictEq,
+                        jsast::member(v, "len"),
+                        jsast::num(0),
+                    ),
+                    vec![jsast::assign_stmt(res_id.clone(), none_expr)],
+                    some_body,
+                ));
+                Ok(Some(Lowered::Value(setup, res_id)))
+            }
+            StandardOperation::NativeVecIntoBoxedSlice => {
+                let [v_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                if is_zst {
+                    return Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::object_of(vec![
+                            ("buf", jsast::num(align as f64)),
+                            ("off", jsast::num(0)),
+                            ("len", jsast::member(v, "len")),
+                        ]),
+                    )));
+                }
+                let (bl, l) = self.temp(jsast::member(v.clone(), "len"));
+                setup.push(bl);
+                let buf = if let Some(k) = ta_kind {
+                    let (bb, b) = self.temp(jsast::member(v, "buf"));
+                    setup.push(bb);
+                    let (bo, out) = self.temp(jsast::cond(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            jsast::member(b.clone(), "length"),
+                            l.clone(),
+                        ),
+                        b.clone(),
+                        jsast::cond(
+                            jsast::binary(jsast::BinOp::StrictEq, l.clone(), jsast::num(0)),
+                            jsast::rt_call("_nv_et", vec![jsast::num(f64::from(k))]),
+                            jsast::method_call(b, "slice", vec![jsast::num(0), l.clone()]),
+                        ),
+                    ));
+                    setup.push(bo);
+                    out
+                } else {
+                    let (_, b_id) = self.temp(jsast::undefined());
+                    setup.push(jsast::if_else(
+                        jsast::binary(jsast::BinOp::StrictEq, l.clone(), jsast::num(0)),
+                        vec![jsast::assign_stmt(
+                            b_id.clone(),
+                            jsast::rt_call("_nv_ea", vec![jsast::num(align as f64)]),
+                        )],
+                        vec![
+                            jsast::assign_stmt(b_id.clone(), jsast::member(v, "buf")),
+                            jsast::if_(
+                                jsast::binary(
+                                    jsast::BinOp::Gt,
+                                    jsast::member(b_id.clone(), "length"),
+                                    l.clone(),
+                                ),
+                                vec![jsast::assign_stmt(
+                                    jsast::member(b_id.clone(), "length"),
+                                    l.clone(),
+                                )],
+                            ),
+                        ],
+                    ));
+                    b_id
+                };
+                Ok(Some(Lowered::Value(
+                    setup,
+                    jsast::object_of(vec![("buf", buf), ("off", jsast::num(0)), ("len", l)]),
+                )))
             }
             _ => Ok(None),
         }
@@ -1783,9 +2756,20 @@ impl JsCx<'_> {
 
     /// A `Drop` op (`base.rs::codegen_drop`): the glue called with a reference to the place.
     fn lower_drop(&self, root: &Root, path: &[Proj], glue: DropGlue) -> Res<Lowered> {
-        if self.heap().native_string_enabled
-            && crate::analysis::heap::drop_targets_native_string(self.func, self.table, root, path)
-        {
+        let drop_noop_nstr = self.heap().native_string_enabled
+            && crate::analysis::heap::drop_targets_native_string(self.func, self.table, root, path);
+        let drop_noop_nvec = self.heap().native_vec_enabled
+            && !self.heap().non_rc_raw_alloc_reachable
+            && crate::analysis::heap::drop_targets_noop_native_vec(
+                self.func,
+                self.table,
+                self.interns,
+                root,
+                path,
+                self.heap().native_string_enabled,
+                true,
+            );
+        if drop_noop_nstr || drop_noop_nvec {
             let mut stmts = Vec::new();
             if path.is_empty() {
                 if let Root::Value(v) = root {
@@ -1914,6 +2898,7 @@ fn uninit_shell(
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
     native_string: bool,
+    native_vec: bool,
 ) -> Option<Expr> {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     if depth > 4 {
@@ -1932,11 +2917,16 @@ fn uninit_shell(
             ("cap", jsast::num(0)),
         ]));
     }
+    if native_vec && crate::analysis::heap::is_direct_global_vec_ty(table, peeled) {
+        if let Some(empty) = value::empty_native_vec_expr(table, peeled) {
+            return Some(empty);
+        }
+    }
     match &desc.kind {
         TypeKind::Array { element, length } => {
             if depth == 0 {
                 if let Some(k) = table
-                    .get(table.peeled(*element))
+                    .get(*element)
                     .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
                 {
                     const TA_CTORS: [&str; 8] = [
@@ -1971,7 +2961,16 @@ fn uninit_shell(
                 Some(jsast::array(
                     elems
                         .iter()
-                        .map(|e| uninit_field_shell(table, interns, *e, depth + 1, native_string))
+                        .map(|e| {
+                            uninit_field_shell(
+                                table,
+                                interns,
+                                *e,
+                                depth + 1,
+                                native_string,
+                                native_vec,
+                            )
+                        })
                         .collect(),
                 ))
             } else {
@@ -1992,7 +2991,14 @@ fn uninit_shell(
                 let key = value::key_name(interns, field.key)?;
                 entries.push((
                     key,
-                    uninit_field_shell(table, interns, field.ty, depth + 1, native_string),
+                    uninit_field_shell(
+                        table,
+                        interns,
+                        field.ty,
+                        depth + 1,
+                        native_string,
+                        native_vec,
+                    ),
                 ));
             }
             Some(jsast::object(entries))
@@ -2011,6 +3017,7 @@ fn uninit_field_shell(
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
     native_string: bool,
+    native_vec: bool,
 ) -> Expr {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     let peeled = table.peeled(ty);
@@ -2022,7 +3029,7 @@ fn uninit_field_shell(
                 form: NominalForm::Struct,
                 ..
             },
-        ) => uninit_shell(table, interns, peeled, depth, native_string)
+        ) => uninit_shell(table, interns, peeled, depth, native_string, native_vec)
             .unwrap_or_else(jsast::undefined),
         _ => jsast::undefined(),
     }
