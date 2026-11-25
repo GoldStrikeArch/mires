@@ -304,10 +304,25 @@ fn format_display_text(
 /// Concatenate static template pieces with already-lowered argument texts (the call-site kernel's
 /// runtime, shared here so wave 2 has one spelling).
 pub fn concat_format_pieces(pieces: &[String], texts: &[Expr]) -> Expr {
+    concat_format_pieces_with_bytes(pieces, texts, crate::lower::bstr::enabled())
+}
+
+/// [`concat_format_pieces`] with an explicit byte-string mode flag (so universal `NativeString`
+/// always encodes non-ASCII template literals as UTF-8 byte strings even if invoked in isolation).
+pub fn concat_format_pieces_with_bytes(
+    pieces: &[String],
+    texts: &[Expr],
+    byte_strings: bool,
+) -> Expr {
     let mut parts = Vec::new();
     for (index, piece) in pieces.iter().enumerate() {
         if !piece.is_empty() {
-            parts.push(crate::lower::bstr::literal(piece));
+            let lit = if byte_strings {
+                jsast::string(crate::lower::bstr::byte_string(piece))
+            } else {
+                jsast::string(piece)
+            };
+            parts.push(lit);
         }
         if let Some(text) = texts.get(index) {
             parts.push(text.clone());

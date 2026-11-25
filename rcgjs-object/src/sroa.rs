@@ -1347,6 +1347,23 @@ fn small_extended_shape(
             .iter()
             .all(|field| matches!(field.as_str(), "buf" | "off" | "len" | "sc"));
     if pointer_or_slice {
+        // Two scaled byte-view pointers (`sc`) compared with `__rt.ptr_eq` can alias the same
+        // heap block through different JS buffers/scales (e.g. a raw `Uint8Array` with `sc:
+        // undefined` vs a retyped `typed` array with `sc: 8`). Rewriting `__rt.ptr_eq` into
+        // `buf === buf && off === off && sc === sc` returns `false` on equal pointers, so keep
+        // scaled `ptr_eq` components whole and let `__rt.ptr_eq` resolve block identity.
+        let has_pointer_eq = component
+            .iter()
+            .any(|name| !uses[name].pointer_eq.is_empty());
+        let written_has_sc = component.iter().any(|name| {
+            uses[name]
+                .written
+                .iter()
+                .any(|w| w.iter().any(|f| f == "sc"))
+        });
+        if has_pointer_eq && written_has_sc {
+            return false;
+        }
         return true;
     }
     if fields.len() > 3 {
@@ -2775,6 +2792,43 @@ mod tests {
         );
         assert!(!printed.contains("{ buf:"), "{printed}");
         assert!(printed.contains("cursor$off = 4;"), "{printed}");
+    }
+
+    #[test]
+    fn scaled_pointer_eq_keeps_rt_ptr_eq_call() {
+        let mk_scaled = |name: &str, base: &str| {
+            jsast::assign_stmt(
+                jsast::id(name),
+                jsast::object(vec![
+                    ("buf".to_owned(), jsast::member(jsast::id(base), "buf")),
+                    (
+                        "off".to_owned(),
+                        jsast::binary(
+                            BinOp::Add,
+                            jsast::member(jsast::id(base), "off"),
+                            jsast::num(8.0),
+                        ),
+                    ),
+                    ("sc".to_owned(), jsast::member(jsast::id(base), "sc")),
+                ]),
+            )
+        };
+        let printed = split(
+            &["lhs", "rhs"],
+            &["a", "b"],
+            vec![
+                mk_scaled("lhs", "a"),
+                mk_scaled("rhs", "b"),
+                Stmt::Return(Some(jsast::rt_call(
+                    "ptr_eq",
+                    vec![jsast::id("lhs"), jsast::id("rhs")],
+                ))),
+            ],
+        );
+        assert!(
+            printed.contains("__rt.ptr_eq(lhs, rhs)"),
+            "scaled ptr_eq must not be lowered to raw field === comparison: {printed}"
+        );
     }
 
     #[test]

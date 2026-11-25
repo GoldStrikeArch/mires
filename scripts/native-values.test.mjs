@@ -1275,3 +1275,135 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   rt.u8array_into_bytes(sub, { buf: arrDst, off: 1, len: 3 });
   assert.deepEqual(arrDst, [0, 1, 2, 3, 0]);
 });
+
+test("Phase 1B monomorphic TypedArray helpers, packed zeroed arrays, 32-elem copy fast path, and minimal-shim tree-shaking", async () => {
+  const shimSrc = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const kinds = [
+    ["u8", Uint8Array, 0, 8, 2147483647],
+    ["i8", Int8Array, 1, 8, 2147483647],
+    ["u16", Uint16Array, 2, 4, 1073741823],
+    ["i16", Int16Array, 3, 4, 1073741823],
+    ["u32", Uint32Array, 4, 4, 536870911],
+    ["i32", Int32Array, 5, 4, 536870911],
+    ["f32", Float32Array, 6, 4, 536870911],
+    ["f64", Float64Array, 7, 4, 268435455],
+  ];
+
+  // 1. All 8 monomorphic TypedArray constructors, zeroed, grow, and reserve helpers
+  for (const [suffix, Ctor, k, minCap, maxElems] of kinds) {
+    const emptyCap = rt[`nv_with_cap_${suffix}`](0, maxElems);
+    assert.equal(emptyCap.buf, rt._nv_et(k));
+    assert.equal(emptyCap.len, 0);
+
+    const withCap = rt[`nv_with_cap_${suffix}`](6, maxElems);
+    assert.equal(withCap.buf instanceof Ctor, true);
+    assert.equal(withCap.buf.length, 6);
+    assert.equal(withCap.len, 0);
+    assert.throws(
+      () => rt[`nv_with_cap_${suffix}`](maxElems + 1, maxElems),
+      (e) => rt.is_abort(e) && /capacity overflow/.test(e.message),
+    );
+
+    const emptyZ = rt[`nv_zeroed_${suffix}`](0, maxElems);
+    assert.equal(emptyZ.buf, rt._nv_et(k));
+    assert.equal(emptyZ.len, 0);
+
+    const zeroed = rt[`nv_zeroed_${suffix}`](5, maxElems);
+    assert.equal(zeroed.buf instanceof Ctor, true);
+    assert.equal(zeroed.buf.length, 5);
+    assert.equal(zeroed.len, 5);
+    assert.deepEqual(Array.from(zeroed.buf), [0, 0, 0, 0, 0]);
+    assert.throws(
+      () => rt[`nv_zeroed_${suffix}`](maxElems + 1, maxElems),
+      (e) => rt.is_abort(e) && /capacity overflow/.test(e.message),
+    );
+
+    // Grow from empty -> minCap -> 2 * minCap
+    const vg = { buf: rt._nv_et(k), len: 0 };
+    rt[`nv_grow_${suffix}`](vg, minCap, maxElems);
+    assert.equal(vg.buf instanceof Ctor, true);
+    assert.equal(vg.buf.length, minCap);
+    for (let i = 0; i < minCap; i++) vg.buf[i] = i + 1;
+    rt[`nv_grow_${suffix}`](vg, minCap, maxElems);
+    assert.equal(vg.buf.length, minCap * 2);
+    for (let i = 0; i < minCap; i++) assert.equal(vg.buf[i], i + 1);
+    assert.throws(
+      () => rt[`nv_grow_${suffix}`](vg, minCap, vg.buf.length),
+      (e) => rt.is_abort(e) && /capacity overflow/.test(e.message),
+    );
+
+    // Reserve amortized + exact + no-op when already large enough
+    const vr = { buf: rt._nv_et(k), len: 0 };
+    rt[`nv_reserve_${suffix}`](vr, 0, 1, minCap, false, maxElems);
+    assert.equal(vr.buf instanceof Ctor, true);
+    assert.equal(vr.buf.length, minCap);
+    vr.buf[0] = 7;
+    const prevBuf = vr.buf;
+    rt[`nv_reserve_${suffix}`](vr, 1, minCap - 1, minCap, false, maxElems);
+    assert.equal(vr.buf, prevBuf);
+    rt[`nv_reserve_${suffix}`](vr, minCap, 3, minCap, true, maxElems);
+    assert.equal(vr.buf.length, minCap + 3);
+    assert.equal(vr.buf[0], 7);
+    assert.throws(
+      () => rt[`nv_reserve_${suffix}`](vr, maxElems, 1, minCap, false, maxElems),
+      (e) => rt.is_abort(e) && /capacity overflow/.test(e.message),
+    );
+  }
+
+  // 2. Dense packed zeroed array helpers (both non-packed `_nv_ea` on 0 and packed `_p` fresh `[]`)
+  const za0 = rt.nv_zeroed_arr(0, 8, 100, 42);
+  assert.equal(za0.buf, rt._nv_ea(8));
+  const za = rt.nv_zeroed_arr(4, 8, 100, 42);
+  assert.deepEqual(za, { buf: [42, 42, 42, 42], len: 4 });
+  for (let i = 0; i < 4; i++) assert.equal(i in za.buf, true);
+
+  const zap0 = rt.nv_zeroed_arr_p(0, 100, 42);
+  assert.equal(Object.isFrozen(zap0.buf), false);
+  zap0.buf.push(99);
+  assert.deepEqual(zap0.buf, [99]);
+  const zap = rt.nv_zeroed_arr_p(3, 100, 7);
+  assert.deepEqual(zap, { buf: [7, 7, 7], len: 3 });
+
+  const zafp = rt.nv_zeroed_arr_fn_p(2, 100, () => ({ v: 1 }));
+  assert.equal(zafp.len, 2);
+  assert.notEqual(zafp.buf[0], zafp.buf[1]);
+  const zafp0 = rt.nv_zeroed_arr_fn_p(0, 100, () => ({ v: 1 }));
+  assert.equal(Object.isFrozen(zafp0.buf), false);
+
+  const zaftp = rt.nv_zeroed_arr_fn_tracked_p(2, 100, () => ({ v: 2 }));
+  assert.equal(rt._boxes.get(zaftp.buf[0]).buf, zaftp.buf);
+  assert.equal(rt._boxes.get(zaftp.buf[1]).off, 1);
+
+  // 3. copy & copy_nonoverlapping across <= 32 loop and > 32 subarray thresholds
+  for (const n of [1, 8, 20, 32, 33, 64]) {
+    const src = new Uint8Array(n + 4);
+    for (let i = 0; i < src.length; i++) src[i] = (i * 13 + 5) & 255;
+    const d1 = new Uint8Array(n + 4);
+    const d2 = new Uint8Array(n + 4);
+    rt.copy_nonoverlapping({ buf: d1, off: 2 }, { buf: src, off: 1 }, n);
+    rt.copy({ buf: d2, off: 2 }, { buf: src, off: 1 }, n);
+    assert.deepEqual(Array.from(d1.subarray(2, 2 + n)), Array.from(src.subarray(1, 1 + n)));
+    assert.deepEqual(Array.from(d2.subarray(2, 2 + n)), Array.from(src.subarray(1, 1 + n)));
+  }
+
+  // 4. minimal-shim tree-shaking isolates each monomorphic TypedArray helper cleanly
+  const growU8Only = minimalShim(["__rt.nv_grow_u8(v, 8, 2147483647);"], shimSrc, { module: true });
+  assert.deepEqual(growU8Only.names.includes("nv_grow_u8"), true);
+  assert.deepEqual(growU8Only.names.includes("nv_grow_u32"), false);
+  assert.deepEqual(growU8Only.names.includes("nv_grow_f64"), false);
+  assert.deepEqual(growU8Only.names.includes("_nv_ctors"), false);
+  assert.deepEqual(growU8Only.names.includes("_nv_et"), false);
+
+  const packedZeroOnly = minimalShim(["__rt.nv_zeroed_arr_p(n, 100, 0);"], shimSrc, { module: true });
+  assert.deepEqual(packedZeroOnly.names.includes("nv_zeroed_arr_p"), true);
+  assert.deepEqual(packedZeroOnly.names.includes("_nv_ea"), false);
+  assert.deepEqual(packedZeroOnly.names.includes("_dangling_of"), false);
+
+  const mod = await import(
+    `data:text/javascript;base64,${Buffer.from(growU8Only.source).toString("base64")}`
+  );
+  const mv = { buf: new Uint8Array(0), len: 0 };
+  mod.nv_grow_u8(mv, 8, 2147483647);
+  assert.equal(mv.buf instanceof Uint8Array, true);
+  assert.equal(mv.buf.length, 8);
+});

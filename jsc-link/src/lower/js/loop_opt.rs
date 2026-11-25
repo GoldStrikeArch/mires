@@ -1882,16 +1882,86 @@ fn propagate_loop_slice_aliases_stmts(
     }
 }
 
-fn extract_iter0_guard_and_bases(loop_inner: &Stmt) -> Option<(Expr, HashSet<String>)> {
-    let (guard, body0): (&Expr, &[Stmt]) = match loop_inner {
-        Stmt::While(c, b) if !expr_has_side_effect(c) => (c, b.as_slice()),
+/// Collects object identifiers whose property is unconditionally evaluated before any possible
+/// exception, short-circuit, or side effect when `expr` begins executing. Returns `true` iff
+/// evaluating `expr` completed without any possible exception or short-circuit.
+fn collect_first_eval_prop_bases_expr(
+    expr: &Expr,
+    local_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> bool {
+    match expr {
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined => true,
+        Expr::Ident(id) => local_names.contains(id),
+        Expr::Member(obj, _) => {
+            if !collect_first_eval_prop_bases_expr(obj, local_names, out) {
+                return false;
+            }
+            if let Expr::Ident(id) = obj.as_ref() {
+                if local_names.contains(id) {
+                    if out.contains(id) {
+                        return true;
+                    }
+                    out.insert(id.clone());
+                }
+            }
+            false
+        }
+        Expr::Index(obj, idx) => {
+            if !collect_first_eval_prop_bases_expr(obj, local_names, out) {
+                return false;
+            }
+            collect_first_eval_prop_bases_expr(idx, local_names, out);
+            false
+        }
+        Expr::Unary(_, inner) => collect_first_eval_prop_bases_expr(inner, local_names, out),
+        Expr::Binary(op, l, r) => {
+            if !collect_first_eval_prop_bases_expr(l, local_names, out) {
+                return false;
+            }
+            if matches!(op, BinOp::And | BinOp::Or) {
+                return false;
+            }
+            collect_first_eval_prop_bases_expr(r, local_names, out)
+        }
+        Expr::Assign(lhs, rhs) if matches!(lhs.as_ref(), Expr::Ident(id) if local_names.contains(id)) => {
+            collect_first_eval_prop_bases_expr(rhs, local_names, out)
+        }
+        _ => false,
+    }
+}
+
+fn extract_iter0_guard_and_bases(
+    loop_label: Option<&str>,
+    loop_inner: &Stmt,
+) -> Option<(Expr, HashSet<String>)> {
+    let (guard, body0): (Expr, &[Stmt]) = match loop_inner {
+        Stmt::While(c, b) if !expr_has_side_effect(c) => (c.clone(), b.as_slice()),
         Stmt::LoopForever(_, b) => match b.as_slice() {
-            [Stmt::If(c, then_b, Some(_))] if !expr_has_side_effect(c) => (c, then_b.as_slice()),
+            [Stmt::If(c, then_b, Some(_))] if !expr_has_side_effect(c) => {
+                (c.clone(), then_b.as_slice())
+            }
             [Stmt::ExprStmt(Expr::Assign(fl, fr)), Stmt::If(Expr::Ident(fu), then_b, Some(_))]
                 if matches!(fl.as_ref(), Expr::Ident(fn_) if fn_ == fu)
                     && !expr_has_side_effect(fr) =>
             {
-                (fr.as_ref(), then_b.as_slice())
+                (fr.as_ref().clone(), then_b.as_slice())
+            }
+            [Stmt::If(c, exit_b, None), rest @ ..]
+                if !rest.is_empty()
+                    && !expr_has_side_effect(c)
+                    && stmts_definitely_exit_loop(exit_b, loop_label) =>
+            {
+                let neg = match c {
+                    Expr::Unary(UnOp::Not, inner) => (**inner).clone(),
+                    other => Expr::Unary(UnOp::Not, Box::new(other.clone())),
+                };
+                (neg, rest)
             }
             _ => return None,
         },
@@ -1915,19 +1985,26 @@ fn extract_iter0_guard_and_bases(loop_inner: &Stmt) -> Option<(Expr, HashSet<Str
     if bases.is_empty() {
         None
     } else {
-        Some((guard.clone(), bases))
+        Some((guard, bases))
     }
 }
 
-fn extract_iter0_then_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
-    let inner = match stmt {
-        Stmt::Labeled(_, inner) => inner.as_mut(),
-        other => other,
+fn extract_iter0_then_body_mut(stmt: &mut Stmt) -> Option<&mut [Stmt]> {
+    let (loop_label, inner) = match stmt {
+        Stmt::Labeled(lbl, inner) => (Some(lbl.as_str()), inner.as_mut()),
+        other => (None, other),
     };
     match inner {
-        Stmt::While(_, b) => Some(b),
+        Stmt::While(_, b) => Some(b.as_mut_slice()),
         Stmt::LoopForever(_, b) => match b.as_mut_slice() {
-            [Stmt::If(_, then_b, Some(_))] | [_, Stmt::If(_, then_b, Some(_))] => Some(then_b),
+            [Stmt::If(_, then_b, Some(_))] | [_, Stmt::If(_, then_b, Some(_))] => {
+                Some(then_b.as_mut_slice())
+            }
+            [Stmt::If(_, exit_b, None), rest @ ..]
+                if !rest.is_empty() && stmts_definitely_exit_loop(exit_b, loop_label) =>
+            {
+                Some(rest)
+            }
             _ => None,
         },
         _ => None,
@@ -2320,6 +2397,46 @@ fn hoist_props_in_block(
                 i += 1;
                 continue;
             }
+            Stmt::Let(n, init) => {
+                if let Some(rhs) = init {
+                    state.record_unconditional_expr(rhs);
+                    let guaranteed_nn = is_guaranteed_non_null_rhs(rhs);
+                    state.invalidate_ident(n);
+                    if guaranteed_nn {
+                        state.non_null.insert(n.clone());
+                    }
+                } else {
+                    state.invalidate_ident(n);
+                }
+                i += 1;
+                continue;
+            }
+            Stmt::Const(n, rhs) => {
+                state.record_unconditional_expr(rhs);
+                let guaranteed_nn = is_guaranteed_non_null_rhs(rhs);
+                state.invalidate_ident(n);
+                if guaranteed_nn {
+                    state.non_null.insert(n.clone());
+                }
+                i += 1;
+                continue;
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    if let Some(rhs) = init {
+                        state.record_unconditional_expr(rhs);
+                        let guaranteed_nn = is_guaranteed_non_null_rhs(rhs);
+                        state.invalidate_ident(n);
+                        if guaranteed_nn {
+                            state.non_null.insert(n.clone());
+                        }
+                    } else {
+                        state.invalidate_ident(n);
+                    }
+                }
+                i += 1;
+                continue;
+            }
             Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
                 state.record_unconditional_expr(e);
                 let mut written = HashSet::new();
@@ -2341,9 +2458,9 @@ fn hoist_props_in_block(
         let mut props_written_in_loop = HashSet::new();
         let mut any_prop_name_written = HashSet::new();
         let mut field_prop_reads: HashMap<(String, String), usize> = HashMap::new();
-        let loop_inner = match &stmts[i] {
-            Stmt::Labeled(_, inner) => inner.as_ref(),
-            other => other,
+        let (loop_label_owned, loop_inner) = match &stmts[i] {
+            Stmt::Labeled(lbl, inner) => (Some(lbl.clone()), inner.as_ref()),
+            other => (None, other),
         };
         let has_non_panic = match loop_inner {
             Stmt::LoopForever(_, b) => {
@@ -2366,8 +2483,35 @@ fn hoist_props_in_block(
             }
             _ => unreachable!(),
         };
-        let has_panic = stmt_has_panic_call(&stmts[i]);
         let mut loop_non_null = state.non_null.clone();
+        // Any object unconditionally dereferenced on loop entry (e.g. `while (g < a.len)` or
+        // leading straight-line statements of `for (;;)`) is non-null on entry.
+        match loop_inner {
+            Stmt::While(c, _) => {
+                collect_first_eval_prop_bases_expr(c, local_names, &mut loop_non_null);
+            }
+            Stmt::LoopForever(_, b) => {
+                for s in b {
+                    match s {
+                        Stmt::ExprStmt(e) => {
+                            if !collect_first_eval_prop_bases_expr(
+                                e,
+                                local_names,
+                                &mut loop_non_null,
+                            ) {
+                                break;
+                            }
+                        }
+                        Stmt::If(c, _, _) => {
+                            collect_first_eval_prop_bases_expr(c, local_names, &mut loop_non_null);
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
+        }
         if let Some(c) = detect_loop_counter(stmts, i, &assigned_in_loop, None) {
             if let (Some(c_start), Some(c_end)) = (c.iv_min, exact_u32(&c.bound)) {
                 if c_start < c_end {
@@ -2441,7 +2585,8 @@ fn hoist_props_in_block(
             }
         }
 
-        // Round 2: hoist invariant `.buf`/`.off`/`.len` property loads.
+        // Round 2: hoist invariant `.buf`/`.off`/`.len` property loads (including single-use loads
+        // inside panic-free hot loops like `fflate::framing::gzip_sync`).
         let mut prop_reads: HashMap<(String, String), usize> = HashMap::new();
         let loop_inner_after = match &stmts[i] {
             Stmt::Labeled(_, inner) => inner.as_ref(),
@@ -2456,17 +2601,23 @@ fn hoist_props_in_block(
             _ => unreachable!(),
         }
         let iter0_guard = if !has_non_panic {
-            extract_iter0_guard_and_bases(loop_inner_after)
+            extract_iter0_guard_and_bases(loop_label_owned.as_deref(), loop_inner_after)
         } else {
             None
         };
 
         let mut uncond_cands: Vec<(String, String)> = Vec::new();
         let mut guarded_cands: Vec<(String, String)> = Vec::new();
-        for ((obj, prop), count) in prop_reads {
+        for ((obj, prop), _count) in prop_reads {
             if !is_slice_prop(&prop)
                 || assigned_in_loop.contains(&obj)
                 || props_written_in_loop.contains(&(obj.clone(), prop.clone()))
+            {
+                continue;
+            }
+            if any_prop_name_written.contains(&prop)
+                && escaped_locals.contains(&obj)
+                && !immutable_slices.contains(&obj)
             {
                 continue;
             }
@@ -2474,9 +2625,6 @@ fn hoist_props_in_block(
                 && !immutable_slices.contains(&obj)
                 && (!local_names.contains(&obj) || escaped_locals.contains(&obj))
             {
-                continue;
-            }
-            if !(count >= 2 || has_panic) {
                 continue;
             }
             if loop_non_null.contains(&obj) {
@@ -4259,6 +4407,1378 @@ fn strip_provable_checks_with_defs(
 }
 
 // =================================================================================================
+// 7. Counted Loop Step Smi-ization (`i = i + 1 >>> 0` -> `i = i + 1 | 0`)
+// =================================================================================================
+
+pub(super) fn smi_ize_counted_loop_steps(stmts: &mut [Stmt]) {
+    if stmts_have_mutating_nested_fn(stmts) {
+        return;
+    }
+    let mut smi_bounds: HashSet<String> = HashSet::new();
+    let mut nonneg_i31: HashSet<String> = HashSet::new();
+    smi_ize_in_block(stmts, &mut smi_bounds, &mut nonneg_i31);
+}
+
+fn is_known_smi_bound_expr(expr: &Expr, smi_bounds: &HashSet<String>) -> bool {
+    if exact_u32(expr).is_some_and(|c| c <= 0x7fff_ffff)
+        || super::post_opt::is_proven_nonneg_i31(expr)
+    {
+        return true;
+    }
+    match expr {
+        Expr::Member(_, prop) => prop == "length" || prop == "len",
+        Expr::Ident(id) => smi_bounds.contains(id),
+        Expr::Binary(BinOp::Sub, l, r) => {
+            is_known_smi_bound_expr(l, smi_bounds) && exact_u32(r).is_some()
+        }
+        Expr::Call(callee, args) if args.len() == 2 => {
+            let is_min = matches!(
+                callee.as_ref(),
+                Expr::Member(obj, prop)
+                    if matches!(obj.as_ref(), Expr::Ident(m) if m == "Math") && prop == "min"
+            );
+            is_min
+                && (is_known_smi_bound_expr(&args[0], smi_bounds)
+                    || is_known_smi_bound_expr(&args[1], smi_bounds))
+        }
+        _ => false,
+    }
+}
+
+fn is_known_nonneg_i31_expr(expr: &Expr, nonneg_i31: &HashSet<String>) -> bool {
+    if super::post_opt::is_proven_nonneg_i31(expr) {
+        return true;
+    }
+    matches!(expr, Expr::Ident(id) if nonneg_i31.contains(id))
+}
+
+fn expr_reads_any_in(expr: &Expr, set: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Ident(id) => set.contains(id),
+        Expr::Member(o, _) | Expr::Unary(_, o) => expr_reads_any_in(o, set),
+        Expr::Binary(_, l, r)
+        | Expr::Index(l, r)
+        | Expr::Assign(l, r)
+        | Expr::CompoundAssign(_, l, r) => expr_reads_any_in(l, set) || expr_reads_any_in(r, set),
+        Expr::Cond(c, t, e) => {
+            expr_reads_any_in(c, set) || expr_reads_any_in(t, set) || expr_reads_any_in(e, set)
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            expr_reads_any_in(c, set) || args.iter().any(|a| expr_reads_any_in(a, set))
+        }
+        Expr::Array(items) | Expr::Seq(items) => items.iter().any(|x| expr_reads_any_in(x, set)),
+        Expr::Object(entries) => entries.iter().any(|(_, v)| expr_reads_any_in(v, set)),
+        _ => false,
+    }
+}
+
+/// Extracts `(iv, max_step)` from a loop continuation condition proving `iv + max_step <= 0x7fff_ffff`.
+fn extract_smi_loop_guard(
+    cond: &Expr,
+    assigned_in_loop: &HashSet<String>,
+    smi_bounds: &HashSet<String>,
+) -> Option<(String, u32)> {
+    // Normalize `bound > lhs` / `bound >= lhs` into `lhs < bound` / `lhs <= bound`.
+    let (lhs, rhs, strict) = match cond {
+        Expr::Binary(BinOp::Lt, l, r) => (l.as_ref(), r.as_ref(), true),
+        Expr::Binary(BinOp::Le, l, r) => (l.as_ref(), r.as_ref(), false),
+        Expr::Binary(BinOp::Gt, l, r) => (r.as_ref(), l.as_ref(), true),
+        Expr::Binary(BinOp::Ge, l, r) => (r.as_ref(), l.as_ref(), false),
+        _ => return None,
+    };
+    if expr_reads_any_in(rhs, assigned_in_loop) {
+        return None;
+    }
+    match lhs {
+        Expr::Ident(iv) => {
+            if expr_reads_ident(rhs, iv) {
+                return None;
+            }
+            if strict {
+                if is_known_smi_bound_expr(rhs, smi_bounds) {
+                    return Some((iv.clone(), 1));
+                }
+            } else if exact_u32(rhs).is_some_and(|c| c <= 0x7fff_fffe) {
+                return Some((iv.clone(), 1));
+            }
+            None
+        }
+        Expr::Binary(BinOp::Add, a, b) => {
+            let (iv, k) = match (a.as_ref(), b.as_ref()) {
+                (Expr::Ident(iv), other) => (iv, exact_u32(other)?),
+                (other, Expr::Ident(iv)) => (iv, exact_u32(other)?),
+                _ => return None,
+            };
+            if k == 0 || k > 0x7fff_ffff || expr_reads_ident(rhs, iv) {
+                return None;
+            }
+            if is_known_smi_bound_expr(rhs, smi_bounds) {
+                Some((iv.clone(), k))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn invert_comparison_for_exit(cond: &Expr) -> Option<Expr> {
+    match cond {
+        Expr::Unary(UnOp::Not, inner) => Some((**inner).clone()),
+        Expr::Binary(op, l, r) => {
+            let inv = match op {
+                BinOp::Ge => BinOp::Lt,
+                BinOp::Gt => BinOp::Le,
+                BinOp::Le => BinOp::Gt,
+                BinOp::Lt => BinOp::Ge,
+                _ => return None,
+            };
+            Some(Expr::Binary(inv, l.clone(), r.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Returns `Some(step)` if `expr` is `(iv + step) >>> 0`, `(iv + step) | 0`, or `iv + step`
+/// with `1 <= step <= max_step`.
+fn match_iv_add_step(expr: &Expr, iv: &str, max_step: u32) -> Option<(u32, bool)> {
+    let (inner, is_ushr_zero) = match expr {
+        Expr::Binary(BinOp::UShr, l, r) if exact_u32(r) == Some(0) => (l.as_ref(), true),
+        Expr::Binary(BinOp::BitOr, l, r) if exact_i32(r) == Some(0) => (l.as_ref(), false),
+        other => (other, false),
+    };
+    let Expr::Binary(BinOp::Add, l, r) = inner else {
+        return None;
+    };
+    let step = match (l.as_ref(), r.as_ref()) {
+        (Expr::Ident(id), other) if id == iv => exact_u32(other)?,
+        (other, Expr::Ident(id)) if id == iv => exact_u32(other)?,
+        _ => return None,
+    };
+    (step >= 1 && step <= max_step).then_some((step, is_ushr_zero))
+}
+
+/// Checks that every write to `iv` in `stmts` is a monotonic `+ step` (`1 <= step <= max_step`)
+/// and returns the maximum number of writes to `iv` along any single path through `stmts`.
+/// Returns `None` if any non-step write to `iv` exists or if `iv` is written inside an inner loop.
+fn max_step_writes_per_iter(stmts: &[Stmt], iv: &str, max_step: u32) -> Option<usize> {
+    fn check(
+        stmts: &[Stmt],
+        iv: &str,
+        max_step: u32,
+        local_steps: &mut HashSet<String>,
+    ) -> Option<usize> {
+        let mut total = 0usize;
+        for s in stmts {
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if expr_writes_ident(rhs, iv) {
+                        return None;
+                    }
+                    if let Expr::Ident(id) = lhs.as_ref() {
+                        if id == iv {
+                            let ok = match_iv_add_step(rhs, iv, max_step).is_some()
+                                || matches!(rhs.as_ref(), Expr::Ident(n) if local_steps.contains(n));
+                            if !ok {
+                                return None;
+                            }
+                            total += 1;
+                            local_steps.clear();
+                        } else if match_iv_add_step(rhs, iv, max_step).is_some() {
+                            local_steps.insert(id.clone());
+                        } else {
+                            local_steps.remove(id);
+                        }
+                    } else if expr_writes_ident(lhs, iv) {
+                        return None;
+                    }
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    if expr_writes_ident(e, iv) {
+                        return None;
+                    }
+                    let mut w = HashSet::new();
+                    collect_written_idents_expr(e, &mut w);
+                    for k in w {
+                        local_steps.remove(&k);
+                    }
+                }
+                Stmt::If(c, a, b) => {
+                    if expr_writes_ident(c, iv) {
+                        return None;
+                    }
+                    let mut a_ls = local_steps.clone();
+                    let a_n = check(a, iv, max_step, &mut a_ls)?;
+                    let b_n = if let Some(b) = b {
+                        let mut b_ls = local_steps.clone();
+                        check(b, iv, max_step, &mut b_ls)?
+                    } else {
+                        0
+                    };
+                    total += a_n.max(b_n);
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(a, &mut w, true);
+                    if let Some(b) = b {
+                        collect_written_idents_stmts(b, &mut w, true);
+                    }
+                    if w.contains(iv) {
+                        local_steps.clear();
+                    } else {
+                        for k in w {
+                            local_steps.remove(&k);
+                        }
+                    }
+                }
+                Stmt::Block(b) => {
+                    total += check(b, iv, max_step, local_steps)?;
+                }
+                Stmt::Labeled(_, inner) => {
+                    total += check(
+                        std::slice::from_ref(inner.as_ref()),
+                        iv,
+                        max_step,
+                        local_steps,
+                    )?;
+                }
+                Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(b, &mut w, true);
+                    if w.contains(iv) {
+                        return None;
+                    }
+                    for k in w {
+                        local_steps.remove(&k);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    if expr_writes_ident(d, iv) {
+                        return None;
+                    }
+                    for c in cases {
+                        let mut w = HashSet::new();
+                        collect_written_idents_stmts(&c.body, &mut w, true);
+                        if w.contains(iv) {
+                            return None;
+                        }
+                    }
+                    local_steps.clear();
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(body, &mut w, false);
+                    collect_written_idents_stmts(handler, &mut w, false);
+                    if w.contains(iv) {
+                        return None;
+                    }
+                    local_steps.clear();
+                }
+                _ => {}
+            }
+        }
+        Some(total)
+    }
+    let mut local_steps = HashSet::new();
+    check(stmts, iv, max_step, &mut local_steps)
+}
+
+/// Rewrites `(iv + step) >>> 0` to `(iv + step) | 0` on paths prior to the single update of `iv`.
+fn rewrite_iv_steps_in_body(stmts: &mut [Stmt], iv: &str, max_step: u32, iv_updated: &mut bool) {
+    for stmt in stmts.iter_mut() {
+        if *iv_updated {
+            return;
+        }
+        match stmt {
+            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                if let Some((_, true)) = match_iv_add_step(rhs, iv, max_step) {
+                    if let Expr::Binary(op, _, _) = rhs.as_mut() {
+                        *op = BinOp::BitOr;
+                    }
+                }
+                if matches!(lhs.as_ref(), Expr::Ident(id) if id == iv) {
+                    *iv_updated = true;
+                }
+            }
+            Stmt::If(_, a, b) => {
+                let mut a_upd = *iv_updated;
+                rewrite_iv_steps_in_body(a, iv, max_step, &mut a_upd);
+                let mut b_upd = *iv_updated;
+                if let Some(b) = b {
+                    rewrite_iv_steps_in_body(b, iv, max_step, &mut b_upd);
+                }
+                if a_upd || b_upd {
+                    *iv_updated = true;
+                }
+            }
+            Stmt::Block(b) => rewrite_iv_steps_in_body(b, iv, max_step, iv_updated),
+            Stmt::Labeled(_, inner) => {
+                rewrite_iv_steps_in_body(
+                    std::slice::from_mut(inner.as_mut()),
+                    iv,
+                    max_step,
+                    iv_updated,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn try_smi_ize_loop(
+    stmts: &mut [Stmt],
+    idx: usize,
+    smi_bounds: &HashSet<String>,
+    nonneg_i31: &HashSet<String>,
+) {
+    let mut assigned_in_loop = HashSet::new();
+    let (loop_label, loop_inner) = match &stmts[idx] {
+        Stmt::Labeled(lbl, inner) => (Some(lbl.clone()), inner.as_ref()),
+        other => (None, other),
+    };
+    match loop_inner {
+        Stmt::While(c, b) => {
+            collect_written_idents_expr(c, &mut assigned_in_loop);
+            collect_written_idents_stmts(b, &mut assigned_in_loop, true);
+        }
+        Stmt::LoopForever(_, b) => {
+            collect_written_idents_stmts(b, &mut assigned_in_loop, true);
+        }
+        _ => return,
+    }
+    let guard_expr: Option<Expr> = match loop_inner {
+        Stmt::While(c, _) => Some(c.clone()),
+        Stmt::LoopForever(_, b) => match b.as_slice() {
+            [Stmt::If(c, _, Some(else_b))]
+                if stmts_definitely_exit_loop(else_b, loop_label.as_deref()) =>
+            {
+                Some(c.clone())
+            }
+            [Stmt::ExprStmt(Expr::Assign(fl, fr)), Stmt::If(Expr::Ident(fu), _, Some(else_b))]
+                if matches!(fl.as_ref(), Expr::Ident(fn_) if fn_ == fu)
+                    && stmts_definitely_exit_loop(else_b, loop_label.as_deref()) =>
+            {
+                Some(fr.as_ref().clone())
+            }
+            [Stmt::If(c, exit_b, None), rest @ ..]
+                if !rest.is_empty()
+                    && stmts_definitely_exit_loop(exit_b, loop_label.as_deref()) =>
+            {
+                invert_comparison_for_exit(c)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(cond) = guard_expr else { return };
+    let Some((iv, max_step)) = extract_smi_loop_guard(&cond, &assigned_in_loop, smi_bounds) else {
+        return;
+    };
+    let iv_starts_nonneg = nonneg_i31.contains(&iv)
+        || find_prior_const_init(stmts, idx, &iv).is_some_and(|c| c <= 0x7fff_ffff);
+    if !iv_starts_nonneg {
+        return;
+    }
+    let Some(body_mut) = extract_iter0_then_body_mut(&mut stmts[idx]) else {
+        return;
+    };
+    if max_step_writes_per_iter(body_mut, &iv, max_step) != Some(1) {
+        return;
+    }
+    let mut updated = false;
+    rewrite_iv_steps_in_body(body_mut, &iv, max_step, &mut updated);
+}
+
+fn smi_ize_in_block(
+    stmts: &mut [Stmt],
+    smi_bounds: &mut HashSet<String>,
+    nonneg_i31: &mut HashSet<String>,
+) {
+    for i in 0..stmts.len() {
+        let pre_bounds = smi_bounds.clone();
+        let pre_nonneg = nonneg_i31.clone();
+        match &mut stmts[i] {
+            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                let mut rhs_w = HashSet::new();
+                collect_written_idents_expr(rhs, &mut rhs_w);
+                for w in rhs_w {
+                    smi_bounds.remove(&w);
+                    nonneg_i31.remove(&w);
+                }
+                if let Expr::Ident(id) = lhs.as_ref() {
+                    let is_bound = is_known_smi_bound_expr(rhs, smi_bounds);
+                    let is_nn = is_known_nonneg_i31_expr(rhs, nonneg_i31);
+                    let id = id.clone();
+                    smi_bounds.remove(&id);
+                    nonneg_i31.remove(&id);
+                    if is_bound {
+                        smi_bounds.insert(id.clone());
+                    }
+                    if is_nn {
+                        nonneg_i31.insert(id);
+                    }
+                } else {
+                    let mut lhs_w = HashSet::new();
+                    collect_written_idents_expr(lhs, &mut lhs_w);
+                    for w in lhs_w {
+                        smi_bounds.remove(&w);
+                        nonneg_i31.remove(&w);
+                    }
+                }
+            }
+            Stmt::Let(n, init) => {
+                let is_bound = init
+                    .as_ref()
+                    .is_some_and(|e| is_known_smi_bound_expr(e, smi_bounds));
+                let is_nn = init
+                    .as_ref()
+                    .is_some_and(|e| is_known_nonneg_i31_expr(e, nonneg_i31));
+                smi_bounds.remove(n);
+                nonneg_i31.remove(n);
+                if is_bound {
+                    smi_bounds.insert(n.clone());
+                }
+                if is_nn {
+                    nonneg_i31.insert(n.clone());
+                }
+            }
+            Stmt::Const(n, e) => {
+                let is_bound = is_known_smi_bound_expr(e, smi_bounds);
+                let is_nn = is_known_nonneg_i31_expr(e, nonneg_i31);
+                smi_bounds.remove(n);
+                nonneg_i31.remove(n);
+                if is_bound {
+                    smi_bounds.insert(n.clone());
+                }
+                if is_nn {
+                    nonneg_i31.insert(n.clone());
+                }
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    let is_bound = init
+                        .as_ref()
+                        .is_some_and(|e| is_known_smi_bound_expr(e, smi_bounds));
+                    let is_nn = init
+                        .as_ref()
+                        .is_some_and(|e| is_known_nonneg_i31_expr(e, nonneg_i31));
+                    smi_bounds.remove(n);
+                    nonneg_i31.remove(n);
+                    if is_bound {
+                        smi_bounds.insert(n.clone());
+                    }
+                    if is_nn {
+                        nonneg_i31.insert(n.clone());
+                    }
+                }
+            }
+            Stmt::If(c, a, b) => {
+                let mut w = HashSet::new();
+                collect_written_idents_expr(c, &mut w);
+                for k in &w {
+                    smi_bounds.remove(k);
+                    nonneg_i31.remove(k);
+                }
+                let mut a_b = smi_bounds.clone();
+                let mut a_n = nonneg_i31.clone();
+                smi_ize_in_block(a, &mut a_b, &mut a_n);
+                collect_written_idents_stmts(a, &mut w, true);
+                if let Some(b) = b {
+                    let mut b_b = smi_bounds.clone();
+                    let mut b_n = nonneg_i31.clone();
+                    smi_ize_in_block(b, &mut b_b, &mut b_n);
+                    collect_written_idents_stmts(b, &mut w, true);
+                }
+                for k in w {
+                    smi_bounds.remove(&k);
+                    nonneg_i31.remove(&k);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                let mut w = HashSet::new();
+                collect_written_idents_expr(d, &mut w);
+                for k in &w {
+                    smi_bounds.remove(k);
+                    nonneg_i31.remove(k);
+                }
+                for c in cases {
+                    let mut c_b = smi_bounds.clone();
+                    let mut c_n = nonneg_i31.clone();
+                    smi_ize_in_block(&mut c.body, &mut c_b, &mut c_n);
+                    collect_written_idents_stmts(&c.body, &mut w, true);
+                }
+                for k in w {
+                    smi_bounds.remove(&k);
+                    nonneg_i31.remove(&k);
+                }
+            }
+            Stmt::Block(b) => smi_ize_in_block(b, smi_bounds, nonneg_i31),
+            Stmt::Labeled(_, inner) => match inner.as_mut() {
+                Stmt::Block(b) => {
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(b, &mut w, false);
+                    let mut b_b = smi_bounds.clone();
+                    let mut b_n = nonneg_i31.clone();
+                    smi_ize_in_block(b, &mut b_b, &mut b_n);
+                    for k in w {
+                        smi_bounds.remove(&k);
+                        nonneg_i31.remove(&k);
+                    }
+                }
+                Stmt::LoopForever(_, b) => {
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(b, &mut w, true);
+                    for k in &w {
+                        smi_bounds.remove(k);
+                        nonneg_i31.remove(k);
+                    }
+                    let mut ib = smi_bounds.clone();
+                    let mut in_ = nonneg_i31.clone();
+                    smi_ize_in_block(b, &mut ib, &mut in_);
+                }
+                Stmt::While(c, b) => {
+                    let mut w = HashSet::new();
+                    collect_written_idents_expr(c, &mut w);
+                    collect_written_idents_stmts(b, &mut w, true);
+                    for k in &w {
+                        smi_bounds.remove(k);
+                        nonneg_i31.remove(k);
+                    }
+                    let mut ib = smi_bounds.clone();
+                    let mut in_ = nonneg_i31.clone();
+                    smi_ize_in_block(b, &mut ib, &mut in_);
+                }
+                other => {
+                    let mut b_b = smi_bounds.clone();
+                    let mut b_n = nonneg_i31.clone();
+                    smi_ize_in_block(std::slice::from_mut(other), &mut b_b, &mut b_n);
+                    let mut w = HashSet::new();
+                    collect_written_idents_stmts(std::slice::from_ref(other), &mut w, true);
+                    for k in w {
+                        smi_bounds.remove(&k);
+                        nonneg_i31.remove(&k);
+                    }
+                }
+            },
+            Stmt::LoopForever(_, b) => {
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(b, &mut w, true);
+                for k in &w {
+                    smi_bounds.remove(k);
+                    nonneg_i31.remove(k);
+                }
+                let mut ib = smi_bounds.clone();
+                let mut in_ = nonneg_i31.clone();
+                smi_ize_in_block(b, &mut ib, &mut in_);
+            }
+            Stmt::While(c, b) => {
+                let mut w = HashSet::new();
+                collect_written_idents_expr(c, &mut w);
+                collect_written_idents_stmts(b, &mut w, true);
+                for k in &w {
+                    smi_bounds.remove(k);
+                    nonneg_i31.remove(k);
+                }
+                let mut ib = smi_bounds.clone();
+                let mut in_ = nonneg_i31.clone();
+                smi_ize_in_block(b, &mut ib, &mut in_);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                let mut b_b = smi_bounds.clone();
+                let mut b_n = nonneg_i31.clone();
+                smi_ize_in_block(body, &mut b_b, &mut b_n);
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(body, &mut w, false);
+                for k in &w {
+                    smi_bounds.remove(k);
+                    nonneg_i31.remove(k);
+                }
+                let mut h_b = smi_bounds.clone();
+                let mut h_n = nonneg_i31.clone();
+                smi_ize_in_block(handler, &mut h_b, &mut h_n);
+                collect_written_idents_stmts(handler, &mut w, false);
+                for k in w {
+                    smi_bounds.remove(&k);
+                    nonneg_i31.remove(&k);
+                }
+            }
+            other => {
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(std::slice::from_ref(other), &mut w, true);
+                for k in w {
+                    smi_bounds.remove(&k);
+                    nonneg_i31.remove(&k);
+                }
+            }
+        }
+        if is_loop_stmt(&stmts[i]) {
+            try_smi_ize_loop(stmts, i, &pre_bounds, &pre_nonneg);
+        }
+    }
+}
+
+// =================================================================================================
+// 8. Wrapping-Int32 Loop-Carried Register Demotion (`x + z >>> 0` -> `x + z | 0`)
+// =================================================================================================
+
+/// Demotes `... >>> 0` to `... | 0` (or bare expression when already `Int32`) on declared locals
+/// whose EVERY read across the function transitively feeds bit-exact 32-bit consumers (`|`, `&`,
+/// `^`, `~`, `<<`, `>>`, `>>>`, `Math.imul`, `Math.clz32`, wrapping `+`/`-`, or read-only local
+/// array literals like SHA-256's `aK = [j, p, q, x, k, r, s, y]` whose element reads feed bit-exact
+/// 32-bit consumers).
+pub(super) fn demote_bitexact_u32_wraps(body: &mut [Stmt], params: &[String]) {
+    let param_set: HashSet<&str> = params.iter().map(String::as_str).collect();
+    let mut decl_counts: HashMap<String, usize> = HashMap::new();
+    let mut forbidden: HashSet<String> = HashSet::new();
+    let mut arr_only_assigned: HashSet<String> = HashSet::new();
+    let mut non_arr_assigned: HashSet<String> = HashSet::new();
+
+    fn scan_decls_expr(e: &Expr, forbidden: &mut HashSet<String>, in_closure: bool) {
+        match e {
+            Expr::Ident(id) if in_closure => {
+                forbidden.insert(id.clone());
+            }
+            Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                if let Expr::Ident(id) = l.as_ref() {
+                    if in_closure {
+                        forbidden.insert(id.clone());
+                    }
+                }
+                scan_decls_expr(l, forbidden, in_closure);
+                scan_decls_expr(r, forbidden, in_closure);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => scan_decls_expr(o, forbidden, in_closure),
+            Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+                scan_decls_expr(l, forbidden, in_closure);
+                scan_decls_expr(r, forbidden, in_closure);
+            }
+            Expr::Cond(c, t, f) => {
+                scan_decls_expr(c, forbidden, in_closure);
+                scan_decls_expr(t, forbidden, in_closure);
+                scan_decls_expr(f, forbidden, in_closure);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_decls_expr(c, forbidden, in_closure);
+                for a in args {
+                    scan_decls_expr(a, forbidden, in_closure);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    scan_decls_expr(x, forbidden, in_closure);
+                }
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_decls_expr(v, forbidden, in_closure);
+                }
+            }
+            Expr::Arrow(ps, ArrowBody::Expr(b)) => {
+                for p in ps {
+                    forbidden.insert(p.clone());
+                }
+                scan_decls_expr(b, forbidden, true);
+            }
+            Expr::Arrow(ps, ArrowBody::Block(s)) => {
+                for p in ps {
+                    forbidden.insert(p.clone());
+                }
+                for st in s {
+                    scan_decls_stmt_closure(st, forbidden);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_decls_stmt_closure(s: &Stmt, forbidden: &mut HashSet<String>) {
+        match s {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                scan_decls_expr(e, forbidden, true);
+            }
+            Stmt::Let(n, init) => {
+                forbidden.insert(n.clone());
+                if let Some(e) = init {
+                    scan_decls_expr(e, forbidden, true);
+                }
+            }
+            Stmt::Const(n, e) => {
+                forbidden.insert(n.clone());
+                scan_decls_expr(e, forbidden, true);
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    forbidden.insert(n.clone());
+                    if let Some(e) = init {
+                        scan_decls_expr(e, forbidden, true);
+                    }
+                }
+            }
+            Stmt::If(c, a, b) => {
+                scan_decls_expr(c, forbidden, true);
+                a.iter().for_each(|x| scan_decls_stmt_closure(x, forbidden));
+                if let Some(b) = b {
+                    b.iter().for_each(|x| scan_decls_stmt_closure(x, forbidden));
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                scan_decls_expr(d, forbidden, true);
+                for c in cases {
+                    c.tests
+                        .iter()
+                        .for_each(|t| scan_decls_expr(t, forbidden, true));
+                    c.body
+                        .iter()
+                        .for_each(|x| scan_decls_stmt_closure(x, forbidden));
+                }
+            }
+            Stmt::Labeled(_, inner) => scan_decls_stmt_closure(inner, forbidden),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                b.iter().for_each(|x| scan_decls_stmt_closure(x, forbidden));
+            }
+            Stmt::While(c, b) => {
+                scan_decls_expr(c, forbidden, true);
+                b.iter().for_each(|x| scan_decls_stmt_closure(x, forbidden));
+            }
+            Stmt::TryCatch {
+                body,
+                binding,
+                handler,
+            } => {
+                forbidden.insert(binding.clone());
+                body.iter()
+                    .for_each(|x| scan_decls_stmt_closure(x, forbidden));
+                handler
+                    .iter()
+                    .for_each(|x| scan_decls_stmt_closure(x, forbidden));
+            }
+            Stmt::FunctionDecl { name, params, body } => {
+                forbidden.insert(name.clone());
+                for p in params {
+                    forbidden.insert(p.clone());
+                }
+                body.iter()
+                    .for_each(|x| scan_decls_stmt_closure(x, forbidden));
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_decls_stmts(
+        stmts: &[Stmt],
+        decl_counts: &mut HashMap<String, usize>,
+        forbidden: &mut HashSet<String>,
+        arr_only: &mut HashSet<String>,
+        non_arr: &mut HashSet<String>,
+    ) {
+        fn record_assign(
+            name: &str,
+            rhs: &Expr,
+            arr_only: &mut HashSet<String>,
+            non_arr: &mut HashSet<String>,
+        ) {
+            if matches!(rhs, Expr::Array(_)) {
+                arr_only.insert(name.to_owned());
+            } else {
+                non_arr.insert(name.to_owned());
+            }
+        }
+        for s in stmts {
+            match s {
+                Stmt::Let(n, init) => {
+                    *decl_counts.entry(n.clone()).or_default() += 1;
+                    if let Some(e) = init {
+                        record_assign(n, e, arr_only, non_arr);
+                        scan_decls_expr(e, forbidden, false);
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    *decl_counts.entry(n.clone()).or_default() += 1;
+                    record_assign(n, e, arr_only, non_arr);
+                    scan_decls_expr(e, forbidden, false);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        *decl_counts.entry(n.clone()).or_default() += 1;
+                        if let Some(e) = init {
+                            record_assign(n, e, arr_only, non_arr);
+                            scan_decls_expr(e, forbidden, false);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(n) = lhs.as_ref() {
+                        record_assign(n, rhs, arr_only, non_arr);
+                    }
+                    scan_decls_expr(lhs, forbidden, false);
+                    scan_decls_expr(rhs, forbidden, false);
+                }
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            if let Expr::Ident(n) = lhs.as_ref() {
+                                record_assign(n, rhs, arr_only, non_arr);
+                            }
+                        }
+                        scan_decls_expr(item, forbidden, false);
+                    }
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    scan_decls_expr(e, forbidden, false);
+                }
+                Stmt::If(c, a, b) => {
+                    scan_decls_expr(c, forbidden, false);
+                    scan_decls_stmts(a, decl_counts, forbidden, arr_only, non_arr);
+                    if let Some(b) = b {
+                        scan_decls_stmts(b, decl_counts, forbidden, arr_only, non_arr);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_decls_expr(d, forbidden, false);
+                    for c in cases {
+                        c.tests
+                            .iter()
+                            .for_each(|t| scan_decls_expr(t, forbidden, false));
+                        scan_decls_stmts(&c.body, decl_counts, forbidden, arr_only, non_arr);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_decls_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        decl_counts,
+                        forbidden,
+                        arr_only,
+                        non_arr,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    scan_decls_stmts(b, decl_counts, forbidden, arr_only, non_arr);
+                }
+                Stmt::While(c, b) => {
+                    scan_decls_expr(c, forbidden, false);
+                    scan_decls_stmts(b, decl_counts, forbidden, arr_only, non_arr);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    forbidden.insert(binding.clone());
+                    scan_decls_stmts(body, decl_counts, forbidden, arr_only, non_arr);
+                    scan_decls_stmts(handler, decl_counts, forbidden, arr_only, non_arr);
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    forbidden.insert(name.clone());
+                    for p in params {
+                        forbidden.insert(p.clone());
+                    }
+                    body.iter()
+                        .for_each(|x| scan_decls_stmt_closure(x, forbidden));
+                }
+                Stmt::Raw(_) => {
+                    // Conservatively bail out if raw JS is present.
+                    decl_counts.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    scan_decls_stmts(
+        body,
+        &mut decl_counts,
+        &mut forbidden,
+        &mut arr_only_assigned,
+        &mut non_arr_assigned,
+    );
+    if decl_counts.is_empty() {
+        return;
+    }
+
+    let mut var_cands: HashSet<String> = HashSet::new();
+    let mut arr_cands: HashSet<String> = HashSet::new();
+    for (name, count) in decl_counts {
+        if count != 1 || param_set.contains(name.as_str()) || forbidden.contains(&name) {
+            continue;
+        }
+        if arr_only_assigned.contains(&name) && !non_arr_assigned.contains(&name) {
+            arr_cands.insert(name);
+        } else {
+            var_cands.insert(name);
+        }
+    }
+    if var_cands.is_empty() {
+        return;
+    }
+
+    fn is_safe_int_add_sub_operand(e: &Expr) -> bool {
+        match e {
+            Expr::Ident(_) | Expr::Member(_, _) | Expr::Index(_, _) => true,
+            Expr::Num(n) => {
+                n.is_finite()
+                    && n.fract() == 0.0
+                    && *n >= f64::from(i32::MIN)
+                    && *n <= f64::from(u32::MAX)
+            }
+            Expr::RawNum(s) => s
+                .parse::<i64>()
+                .ok()
+                .is_some_and(|v| v >= i64::from(i32::MIN) && v <= i64::from(u32::MAX)),
+            Expr::Unary(UnOp::BitNot | UnOp::Neg, inner) => is_safe_int_add_sub_operand(inner),
+            Expr::Binary(
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::UShr,
+                _,
+                _,
+            ) => true,
+            Expr::Binary(BinOp::Add | BinOp::Sub, l, r) => {
+                is_safe_int_add_sub_operand(l) && is_safe_int_add_sub_operand(r)
+            }
+            Expr::Call(callee, _) => matches!(
+                callee.as_ref(),
+                Expr::Member(obj, prop)
+                    if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                        && matches!(prop.as_str(), "imul" | "clz32")
+            ),
+            Expr::Cond(_, t, f) => is_safe_int_add_sub_operand(t) && is_safe_int_add_sub_operand(f),
+            _ => false,
+        }
+    }
+
+    fn prune_expr(
+        e: &Expr,
+        bit32_ctx: bool,
+        add_depth: u8,
+        val_discarded: bool,
+        var_cands: &mut HashSet<String>,
+        arr_cands: &mut HashSet<String>,
+        removed: &mut bool,
+    ) {
+        match e {
+            Expr::Ident(id) => {
+                if arr_cands.remove(id) {
+                    *removed = true;
+                }
+                if !bit32_ctx && var_cands.remove(id) {
+                    *removed = true;
+                }
+            }
+            Expr::Index(obj, idx) => {
+                prune_expr(idx, false, 0, false, var_cands, arr_cands, removed);
+                if let Expr::Ident(arr) = obj.as_ref() {
+                    if arr_cands.contains(arr) {
+                        if !bit32_ctx {
+                            arr_cands.remove(arr);
+                            *removed = true;
+                        }
+                        return;
+                    }
+                }
+                prune_expr(obj, false, 0, false, var_cands, arr_cands, removed);
+            }
+            Expr::Member(obj, prop) => {
+                if prop == "length" {
+                    if let Expr::Ident(arr) = obj.as_ref() {
+                        if arr_cands.contains(arr) {
+                            return;
+                        }
+                    }
+                }
+                prune_expr(obj, false, 0, false, var_cands, arr_cands, removed);
+            }
+            Expr::Binary(op, l, r) => match op {
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::UShr => {
+                    prune_expr(l, true, 0, false, var_cands, arr_cands, removed);
+                    prune_expr(r, true, 0, false, var_cands, arr_cands, removed);
+                }
+                BinOp::Add | BinOp::Sub
+                    if bit32_ctx
+                        && add_depth < 8
+                        && is_safe_int_add_sub_operand(l)
+                        && is_safe_int_add_sub_operand(r) =>
+                {
+                    prune_expr(l, true, add_depth + 1, false, var_cands, arr_cands, removed);
+                    prune_expr(r, true, add_depth + 1, false, var_cands, arr_cands, removed);
+                }
+                _ => {
+                    prune_expr(l, false, 0, false, var_cands, arr_cands, removed);
+                    prune_expr(r, false, 0, false, var_cands, arr_cands, removed);
+                }
+            },
+            Expr::Unary(op, inner) => match op {
+                UnOp::BitNot => prune_expr(inner, true, 0, false, var_cands, arr_cands, removed),
+                UnOp::Neg if bit32_ctx && add_depth < 8 && is_safe_int_add_sub_operand(inner) => {
+                    prune_expr(
+                        inner,
+                        true,
+                        add_depth + 1,
+                        false,
+                        var_cands,
+                        arr_cands,
+                        removed,
+                    );
+                }
+                _ => prune_expr(inner, false, 0, false, var_cands, arr_cands, removed),
+            },
+            Expr::Call(callee, args) => {
+                let is_bit32_math = matches!(
+                    callee.as_ref(),
+                    Expr::Member(obj, prop)
+                        if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                            && ((prop == "imul" && args.len() == 2)
+                                || (prop == "clz32" && args.len() == 1))
+                );
+                if is_bit32_math {
+                    for a in args {
+                        prune_expr(a, true, 0, false, var_cands, arr_cands, removed);
+                    }
+                } else {
+                    prune_expr(callee, false, 0, false, var_cands, arr_cands, removed);
+                    for a in args {
+                        prune_expr(a, false, 0, false, var_cands, arr_cands, removed);
+                    }
+                }
+            }
+            Expr::New(callee, args) => {
+                prune_expr(callee, false, 0, false, var_cands, arr_cands, removed);
+                for a in args {
+                    prune_expr(a, false, 0, false, var_cands, arr_cands, removed);
+                }
+            }
+            Expr::Cond(c, t, f) => {
+                prune_expr(c, false, 0, false, var_cands, arr_cands, removed);
+                prune_expr(
+                    t, bit32_ctx, add_depth, false, var_cands, arr_cands, removed,
+                );
+                prune_expr(
+                    f, bit32_ctx, add_depth, false, var_cands, arr_cands, removed,
+                );
+            }
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Ident(dst) = lhs.as_ref() {
+                    if !val_discarded && !bit32_ctx {
+                        if var_cands.remove(dst) {
+                            *removed = true;
+                        }
+                        if arr_cands.remove(dst) {
+                            *removed = true;
+                        }
+                    }
+                    if var_cands.contains(dst) {
+                        prune_expr(rhs, true, 0, false, var_cands, arr_cands, removed);
+                    } else if arr_cands.contains(dst) {
+                        if let Expr::Array(items) = rhs.as_ref() {
+                            for item in items {
+                                prune_expr(item, true, 0, false, var_cands, arr_cands, removed);
+                            }
+                        } else {
+                            arr_cands.remove(dst);
+                            *removed = true;
+                            prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                        }
+                    } else {
+                        prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                    }
+                } else {
+                    if let Expr::Index(obj, _) = lhs.as_ref() {
+                        if let Expr::Ident(arr) = obj.as_ref() {
+                            if arr_cands.remove(arr) {
+                                *removed = true;
+                            }
+                        }
+                    }
+                    prune_expr(lhs, false, 0, false, var_cands, arr_cands, removed);
+                    prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                }
+            }
+            Expr::CompoundAssign(_, lhs, rhs) => {
+                if let Expr::Ident(dst) = lhs.as_ref() {
+                    if var_cands.remove(dst) {
+                        *removed = true;
+                    }
+                    if arr_cands.remove(dst) {
+                        *removed = true;
+                    }
+                }
+                if let Expr::Index(obj, _) = lhs.as_ref() {
+                    if let Expr::Ident(arr) = obj.as_ref() {
+                        if arr_cands.remove(arr) {
+                            *removed = true;
+                        }
+                    }
+                }
+                prune_expr(lhs, false, 0, false, var_cands, arr_cands, removed);
+                prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+            }
+            Expr::Array(items) => {
+                for item in items {
+                    prune_expr(item, false, 0, false, var_cands, arr_cands, removed);
+                }
+            }
+            Expr::Seq(items) => {
+                let last_idx = items.len().saturating_sub(1);
+                for (idx, item) in items.iter().enumerate() {
+                    let is_last = idx == last_idx;
+                    let item_discarded = val_discarded || !is_last;
+                    let item_b32 = if is_last && !val_discarded {
+                        bit32_ctx
+                    } else {
+                        false
+                    };
+                    let item_depth = if is_last && !val_discarded {
+                        add_depth
+                    } else {
+                        0
+                    };
+                    prune_expr(
+                        item,
+                        item_b32,
+                        item_depth,
+                        item_discarded,
+                        var_cands,
+                        arr_cands,
+                        removed,
+                    );
+                }
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    prune_expr(v, false, 0, false, var_cands, arr_cands, removed);
+                }
+            }
+            Expr::Raw(_) if !var_cands.is_empty() || !arr_cands.is_empty() => {
+                var_cands.clear();
+                arr_cands.clear();
+                *removed = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn prune_stmts(
+        stmts: &[Stmt],
+        var_cands: &mut HashSet<String>,
+        arr_cands: &mut HashSet<String>,
+        removed: &mut bool,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::ExprStmt(e) => {
+                    prune_expr(e, false, 0, true, var_cands, arr_cands, removed);
+                }
+                Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    prune_expr(e, false, 0, false, var_cands, arr_cands, removed);
+                }
+                Stmt::Let(n, Some(rhs)) | Stmt::Const(n, rhs) => {
+                    if var_cands.contains(n) {
+                        prune_expr(rhs, true, 0, false, var_cands, arr_cands, removed);
+                    } else if arr_cands.contains(n) {
+                        if let Expr::Array(items) = rhs {
+                            for item in items {
+                                prune_expr(item, true, 0, false, var_cands, arr_cands, removed);
+                            }
+                        } else {
+                            arr_cands.remove(n);
+                            *removed = true;
+                            prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                        }
+                    } else {
+                        prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(rhs) = init {
+                            if var_cands.contains(n) {
+                                prune_expr(rhs, true, 0, false, var_cands, arr_cands, removed);
+                            } else if arr_cands.contains(n) {
+                                if let Expr::Array(items) = rhs {
+                                    for item in items {
+                                        prune_expr(
+                                            item, true, 0, false, var_cands, arr_cands, removed,
+                                        );
+                                    }
+                                } else {
+                                    arr_cands.remove(n);
+                                    *removed = true;
+                                    prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                                }
+                            } else {
+                                prune_expr(rhs, false, 0, false, var_cands, arr_cands, removed);
+                            }
+                        }
+                    }
+                }
+                Stmt::If(c, a, b) => {
+                    prune_expr(c, false, 0, false, var_cands, arr_cands, removed);
+                    prune_stmts(a, var_cands, arr_cands, removed);
+                    if let Some(b) = b {
+                        prune_stmts(b, var_cands, arr_cands, removed);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    prune_expr(d, false, 0, false, var_cands, arr_cands, removed);
+                    for c in cases {
+                        for t in &c.tests {
+                            prune_expr(t, false, 0, false, var_cands, arr_cands, removed);
+                        }
+                        prune_stmts(&c.body, var_cands, arr_cands, removed);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    prune_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        var_cands,
+                        arr_cands,
+                        removed,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    prune_stmts(b, var_cands, arr_cands, removed);
+                }
+                Stmt::While(c, b) => {
+                    prune_expr(c, false, 0, false, var_cands, arr_cands, removed);
+                    prune_stmts(b, var_cands, arr_cands, removed);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    prune_stmts(body, var_cands, arr_cands, removed);
+                    prune_stmts(handler, var_cands, arr_cands, removed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    loop {
+        let mut removed = false;
+        prune_stmts(body, &mut var_cands, &mut arr_cands, &mut removed);
+        if !removed || var_cands.is_empty() {
+            break;
+        }
+    }
+    if var_cands.is_empty() {
+        return;
+    }
+
+    fn demote_rhs(expr: &mut Expr) {
+        match expr {
+            Expr::Binary(BinOp::UShr, l, r) if exact_i32(r) == Some(0) => {
+                if super::post_opt::is_already_i32_expr(l) {
+                    *expr = (**l).clone();
+                } else if !matches!(l.as_ref(), Expr::Binary(BinOp::UShr, _, _)) {
+                    *expr = Expr::Binary(BinOp::BitOr, l.clone(), Box::new(Expr::Num(0.0)));
+                }
+            }
+            Expr::Cond(_, t, f) => {
+                demote_rhs(t);
+                demote_rhs(f);
+            }
+            Expr::Seq(items) => {
+                if let Some(last) = items.last_mut() {
+                    demote_rhs(last);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts(stmts: &mut [Stmt], var_cands: &HashSet<String>, arr_cands: &HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(dst) = lhs.as_ref() {
+                        if var_cands.contains(dst) {
+                            demote_rhs(rhs);
+                        } else if arr_cands.contains(dst) {
+                            if let Expr::Array(items) = rhs.as_mut() {
+                                for it in items {
+                                    demote_rhs(it);
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            if let Expr::Ident(dst) = lhs.as_ref() {
+                                if var_cands.contains(dst) {
+                                    demote_rhs(rhs);
+                                } else if arr_cands.contains(dst) {
+                                    if let Expr::Array(arr_items) = rhs.as_mut() {
+                                        for it in arr_items {
+                                            demote_rhs(it);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::Let(n, Some(rhs)) | Stmt::Const(n, rhs) => {
+                    if var_cands.contains(n) {
+                        demote_rhs(rhs);
+                    } else if arr_cands.contains(n) {
+                        if let Expr::Array(items) = rhs {
+                            for it in items {
+                                demote_rhs(it);
+                            }
+                        }
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(rhs) = init {
+                            if var_cands.contains(n) {
+                                demote_rhs(rhs);
+                            } else if arr_cands.contains(n) {
+                                if let Expr::Array(items) = rhs {
+                                    for it in items {
+                                        demote_rhs(it);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::If(_, a, b) => {
+                    rewrite_stmts(a, var_cands, arr_cands);
+                    if let Some(b) = b {
+                        rewrite_stmts(b, var_cands, arr_cands);
+                    }
+                }
+                Stmt::Switch(_, cases) => {
+                    for c in cases {
+                        rewrite_stmts(&mut c.body, var_cands, arr_cands);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts(std::slice::from_mut(inner.as_mut()), var_cands, arr_cands);
+                }
+                Stmt::LoopForever(_, b) | Stmt::While(_, b) | Stmt::Block(b) => {
+                    rewrite_stmts(b, var_cands, arr_cands);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts(body, var_cands, arr_cands);
+                    rewrite_stmts(handler, var_cands, arr_cands);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    rewrite_stmts(body, &var_cands, &arr_cands);
+}
+
+// =================================================================================================
 // Shared AST Helpers
 // =================================================================================================
 
@@ -4430,28 +5950,6 @@ fn stmts_have_non_panic_call(stmts: &[Stmt]) -> bool {
         }
         _ => false,
     })
-}
-
-fn stmt_has_panic_call(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::ExprStmt(Expr::Call(callee, _)) | Stmt::Throw(Expr::Call(callee, _)) => {
-            matches!(callee.as_ref(), Expr::Ident(n) if n.starts_with("core$panicking$"))
-        }
-        Stmt::If(_, a, b) => {
-            a.iter().any(stmt_has_panic_call)
-                || b.as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_has_panic_call))
-        }
-        Stmt::Switch(_, cases) => cases.iter().any(|c| c.body.iter().any(stmt_has_panic_call)),
-        Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
-            b.iter().any(stmt_has_panic_call)
-        }
-        Stmt::Labeled(_, inner) => stmt_has_panic_call(inner),
-        Stmt::TryCatch { body, handler, .. } => {
-            body.iter().any(stmt_has_panic_call) || handler.iter().any(stmt_has_panic_call)
-        }
-        _ => false,
-    }
 }
 
 fn stmts_have_control_flow(stmts: &[Stmt]) -> bool {
@@ -5693,6 +7191,658 @@ mod tests {
         assert!(
             s.contains("$hb_0[$ho_0 + i].x ="),
             "expected LHS member base replaced with hoisted buf/off: {s}"
+        );
+    }
+
+    #[test]
+    fn hoists_single_use_gzip_sync_slice_props_and_smi_izes_step() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "gzip_sync".to_owned(),
+            params: vec!["a".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("k".to_owned(), None),
+                    ("g".to_owned(), None),
+                    ("f".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("k"), jsast::member(jsast::id("a"), "len")),
+                jsast::assign_stmt(jsast::id("g"), Expr::Num(0.0)),
+                jsast::assign_stmt(jsast::id("f"), Expr::Num(4294967295.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("g")),
+                        Box::new(jsast::id("k")),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("f"),
+                            Expr::Binary(
+                                BinOp::BitXor,
+                                Box::new(jsast::index(
+                                    jsast::id("matrix_fflate$tables$CRCT"),
+                                    Expr::Binary(
+                                        BinOp::UShr,
+                                        Box::new(Expr::Binary(
+                                            BinOp::BitXor,
+                                            Box::new(Expr::Binary(
+                                                BinOp::BitAnd,
+                                                Box::new(jsast::id("f")),
+                                                Box::new(Expr::Num(255.0)),
+                                            )),
+                                            Box::new(jsast::index(
+                                                jsast::member(jsast::id("a"), "buf"),
+                                                Expr::Binary(
+                                                    BinOp::Add,
+                                                    Box::new(jsast::member(jsast::id("a"), "off")),
+                                                    Box::new(jsast::id("g")),
+                                                ),
+                                            )),
+                                        )),
+                                        Box::new(Expr::Num(0.0)),
+                                    ),
+                                )),
+                                Box::new(Expr::Binary(
+                                    BinOp::UShr,
+                                    Box::new(jsast::id("f")),
+                                    Box::new(Expr::Num(8.0)),
+                                )),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("g"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("g")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                    ],
+                ),
+                Stmt::Return(Some(jsast::id("f"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let s = jsast::stmt_to_string(&decl);
+        assert!(
+            s.contains("$hb_0 = a.buf;") && s.contains("$ho_0 = a.off;"),
+            "expected single-use a.buf and a.off hoisted out of gzip_sync loop: {s}"
+        );
+        assert!(
+            s.contains("$hb_0[$ho_0 + g]"),
+            "expected hoisted buf/off inside nested CRCT index: {s}"
+        );
+        assert!(
+            s.contains("g = g + 1 | 0;") && !s.contains("g = g + 1 >>> 0;"),
+            "expected counted loop step Smi-ized via k = a.len: {s}"
+        );
+    }
+
+    #[test]
+    fn hoists_while_header_len_and_skips_mutated_or_aliased_slice() {
+        // Positive: `while (g < a.len)` with no prior deref hoists `.len`, `.buf`, `.off`.
+        let mut decl = Stmt::FunctionDecl {
+            name: "sum_bytes".to_owned(),
+            params: vec!["a".to_owned()],
+            body: vec![
+                jsast::lets(vec![("g".to_owned(), None), ("acc".to_owned(), None)]),
+                jsast::assign_stmt(jsast::id("g"), Expr::Num(0.0)),
+                jsast::assign_stmt(jsast::id("acc"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("g")),
+                        Box::new(jsast::member(jsast::id("a"), "len")),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("acc"),
+                            Expr::Binary(
+                                BinOp::BitOr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("acc")),
+                                    Box::new(jsast::index(
+                                        jsast::member(jsast::id("a"), "buf"),
+                                        Expr::Binary(
+                                            BinOp::Add,
+                                            Box::new(jsast::member(jsast::id("a"), "off")),
+                                            Box::new(jsast::id("g")),
+                                        ),
+                                    )),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("g"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("g")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                    ],
+                ),
+                Stmt::Return(Some(jsast::id("acc"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let s = jsast::stmt_to_string(&decl);
+        assert!(
+            s.contains("$hb_0 = a.buf;")
+                && s.contains("$ho_0 = a.off;")
+                && s.contains("$hl_0 = a.len;"),
+            "expected all three slice props hoisted unconditionally from while header: {s}"
+        );
+        assert!(
+            s.contains("while (g < $hl_0)"),
+            "expected while header condition to use hoisted $hl_0: {s}"
+        );
+
+        // Negative: aliased slice `b = a` mutating `b.off` inside loop must NOT hoist `a.off`.
+        let mut aliased = Stmt::FunctionDecl {
+            name: "mut_alias".to_owned(),
+            params: vec!["a".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("b".to_owned(), None),
+                    ("g".to_owned(), None),
+                    ("acc".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("b"), jsast::id("a")),
+                jsast::assign_stmt(jsast::id("g"), Expr::Num(0.0)),
+                jsast::assign_stmt(jsast::id("acc"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("g")),
+                        Box::new(Expr::Num(4.0)),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("acc"),
+                            Expr::Binary(
+                                BinOp::Add,
+                                Box::new(jsast::id("acc")),
+                                Box::new(jsast::index(
+                                    jsast::member(jsast::id("a"), "buf"),
+                                    jsast::member(jsast::id("a"), "off"),
+                                )),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::member(jsast::id("b"), "off"),
+                            Expr::Binary(
+                                BinOp::Add,
+                                Box::new(jsast::member(jsast::id("b"), "off")),
+                                Box::new(Expr::Num(1.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("g"),
+                            Expr::Binary(
+                                BinOp::Add,
+                                Box::new(jsast::id("g")),
+                                Box::new(Expr::Num(1.0)),
+                            ),
+                        ),
+                    ],
+                ),
+                Stmt::Return(Some(jsast::id("acc"))),
+            ],
+        };
+        run_speed_post_opts(&mut aliased);
+        let sa = jsast::stmt_to_string(&aliased);
+        assert!(
+            !sa.contains("$ho_0 = a.off;"),
+            "mutated alias b.off must prevent hoisting a.off: {sa}"
+        );
+    }
+
+    #[test]
+    fn smi_izes_counted_loop_steps_and_preserves_unbounded_or_double_step_loops() {
+        // Positive: `for (;;)` Range::next pattern with const bound 64.
+        let mut bounded = Stmt::FunctionDecl {
+            name: "bounded".to_owned(),
+            params: vec!["arr".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("i".to_owned(), None),
+                    ("next".to_owned(), None),
+                    ("acc".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("i"), Expr::Num(0.0)),
+                jsast::assign_stmt(jsast::id("acc"), Expr::Num(0.0)),
+                Stmt::LoopForever(
+                    None,
+                    vec![Stmt::If(
+                        Expr::Binary(
+                            BinOp::Lt,
+                            Box::new(jsast::id("i")),
+                            Box::new(Expr::Num(64.0)),
+                        ),
+                        vec![
+                            jsast::assign_stmt(
+                                jsast::id("next"),
+                                Expr::Binary(
+                                    BinOp::UShr,
+                                    Box::new(Expr::Binary(
+                                        BinOp::Add,
+                                        Box::new(jsast::id("i")),
+                                        Box::new(Expr::Num(1.0)),
+                                    )),
+                                    Box::new(Expr::Num(0.0)),
+                                ),
+                            ),
+                            jsast::assign_stmt(
+                                jsast::id("acc"),
+                                Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("acc")),
+                                    Box::new(jsast::index(jsast::id("arr"), jsast::id("i"))),
+                                ),
+                            ),
+                            jsast::assign_stmt(jsast::id("i"), jsast::id("next")),
+                        ],
+                        Some(vec![Stmt::Break(None)]),
+                    )],
+                ),
+                Stmt::Return(Some(jsast::id("acc"))),
+            ],
+        };
+        run_speed_post_opts(&mut bounded);
+        let sb = jsast::stmt_to_string(&bounded);
+        assert!(
+            sb.contains("next = i + 1 | 0;") && !sb.contains(">>> 0"),
+            "expected Range::next step Smi-ized to | 0: {sb}"
+        );
+
+        // Negative 1: arbitrary u32 parameter `n` could be >= 2^31.
+        let mut unbounded = Stmt::FunctionDecl {
+            name: "unbounded".to_owned(),
+            params: vec!["n".to_owned()],
+            body: vec![
+                jsast::lets(vec![("i".to_owned(), None)]),
+                jsast::assign_stmt(jsast::id("i"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("i")),
+                        Box::new(jsast::id("n")),
+                    ),
+                    vec![jsast::assign_stmt(
+                        jsast::id("i"),
+                        Expr::Binary(
+                            BinOp::UShr,
+                            Box::new(Expr::Binary(
+                                BinOp::Add,
+                                Box::new(jsast::id("i")),
+                                Box::new(Expr::Num(1.0)),
+                            )),
+                            Box::new(Expr::Num(0.0)),
+                        ),
+                    )],
+                ),
+                Stmt::Return(Some(jsast::id("i"))),
+            ],
+        };
+        run_speed_post_opts(&mut unbounded);
+        let su = jsast::stmt_to_string(&unbounded);
+        assert!(
+            su.contains("i = i + 1 >>> 0;"),
+            "unbounded u32 parameter loop must keep >>> 0: {su}"
+        );
+
+        // Negative 2: two increments per iteration could overflow 0x7fffffff.
+        let mut double_step = Stmt::FunctionDecl {
+            name: "double_step".to_owned(),
+            params: vec![],
+            body: vec![
+                jsast::lets(vec![("i".to_owned(), None)]),
+                jsast::assign_stmt(jsast::id("i"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("i")),
+                        Box::new(Expr::Num(2147483647.0)),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("i"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("i")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("i"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("i")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                    ],
+                ),
+                Stmt::Return(Some(jsast::id("i"))),
+            ],
+        };
+        run_speed_post_opts(&mut double_step);
+        let sd = jsast::stmt_to_string(&double_step);
+        assert_eq!(
+            sd.matches("i = i + 1 >>> 0;").count(),
+            2,
+            "double-increment loop must keep >>> 0: {sd}"
+        );
+    }
+
+    #[test]
+    fn demotes_compress256_registers_through_local_array_and_guards_escapes() {
+        // Models `noble-hashes::compress256`: 64-round loop writing `ad = x + z >>> 0; ac = z + am >>> 0;`
+        // and shifting `j,p,q,x,k,r,s,y`, then storing into `aK = [j,p,q,x,k,r,s,y]` and accumulating
+        // `a[b + A] = aL + az >>> 0`.
+        let mut decl = Stmt::FunctionDecl {
+            name: "compress256".to_owned(),
+            params: vec!["a".to_owned(), "b".to_owned(), "w".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("j".to_owned(), None),
+                    ("p".to_owned(), None),
+                    ("q".to_owned(), None),
+                    ("x".to_owned(), None),
+                    ("k".to_owned(), None),
+                    ("r".to_owned(), None),
+                    ("s".to_owned(), None),
+                    ("y".to_owned(), None),
+                    ("i".to_owned(), None),
+                    ("z".to_owned(), None),
+                    ("am".to_owned(), None),
+                    ("ad".to_owned(), None),
+                    ("ac".to_owned(), None),
+                    ("aK".to_owned(), None),
+                    ("A".to_owned(), None),
+                    ("aL".to_owned(), None),
+                    ("az".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("j"), jsast::index(jsast::id("a"), Expr::Num(0.0))),
+                jsast::assign_stmt(jsast::id("p"), jsast::index(jsast::id("a"), Expr::Num(1.0))),
+                jsast::assign_stmt(jsast::id("q"), jsast::index(jsast::id("a"), Expr::Num(2.0))),
+                jsast::assign_stmt(jsast::id("x"), jsast::index(jsast::id("a"), Expr::Num(3.0))),
+                jsast::assign_stmt(jsast::id("k"), jsast::index(jsast::id("a"), Expr::Num(4.0))),
+                jsast::assign_stmt(jsast::id("r"), jsast::index(jsast::id("a"), Expr::Num(5.0))),
+                jsast::assign_stmt(jsast::id("s"), jsast::index(jsast::id("a"), Expr::Num(6.0))),
+                jsast::assign_stmt(jsast::id("y"), jsast::index(jsast::id("a"), Expr::Num(7.0))),
+                jsast::assign_stmt(jsast::id("i"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("i")),
+                        Box::new(Expr::Num(64.0)),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("z"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("y")),
+                                    Box::new(Expr::Binary(
+                                        BinOp::BitXor,
+                                        Box::new(jsast::id("k")),
+                                        Box::new(jsast::index(jsast::id("w"), jsast::id("i"))),
+                                    )),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("am"),
+                            Expr::Binary(
+                                BinOp::BitXor,
+                                Box::new(Expr::Binary(
+                                    BinOp::BitAnd,
+                                    Box::new(jsast::id("j")),
+                                    Box::new(jsast::id("p")),
+                                )),
+                                Box::new(jsast::id("q")),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("ad"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("x")),
+                                    Box::new(jsast::id("z")),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("ac"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("z")),
+                                    Box::new(jsast::id("am")),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(jsast::id("y"), jsast::id("s")),
+                        jsast::assign_stmt(jsast::id("s"), jsast::id("r")),
+                        jsast::assign_stmt(jsast::id("r"), jsast::id("k")),
+                        jsast::assign_stmt(jsast::id("k"), jsast::id("ad")),
+                        jsast::assign_stmt(jsast::id("x"), jsast::id("q")),
+                        jsast::assign_stmt(jsast::id("q"), jsast::id("p")),
+                        jsast::assign_stmt(jsast::id("p"), jsast::id("j")),
+                        jsast::assign_stmt(jsast::id("j"), jsast::id("ac")),
+                        jsast::assign_stmt(
+                            jsast::id("i"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("i")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                    ],
+                ),
+                jsast::assign_stmt(
+                    jsast::id("aK"),
+                    Expr::Array(vec![
+                        jsast::id("j"),
+                        jsast::id("p"),
+                        jsast::id("q"),
+                        jsast::id("x"),
+                        jsast::id("k"),
+                        jsast::id("r"),
+                        jsast::id("s"),
+                        jsast::id("y"),
+                    ]),
+                ),
+                jsast::assign_stmt(jsast::id("A"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("A")),
+                        Box::new(Expr::Num(8.0)),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("aL"),
+                            jsast::index(jsast::id("aK"), jsast::id("A")),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("az"),
+                            jsast::index(
+                                jsast::id("a"),
+                                Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("b")),
+                                    Box::new(jsast::id("A")),
+                                ),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::index(
+                                jsast::id("a"),
+                                Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("b")),
+                                    Box::new(jsast::id("A")),
+                                ),
+                            ),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("aL")),
+                                    Box::new(jsast::id("az")),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("A"),
+                            Expr::Binary(
+                                BinOp::UShr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(jsast::id("A")),
+                                    Box::new(Expr::Num(1.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                    ],
+                ),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let s = jsast::stmt_to_string(&decl);
+        assert!(
+            s.contains("ad = x + z | 0;") && s.contains("ac = z + am | 0;"),
+            "expected SHA-256 loop-carried registers demoted to signed Int32 | 0: {s}"
+        );
+        assert!(
+            s.contains("a[b] = aL + az >>> 0;") && s.contains("a[b + 7] = aL + az >>> 0;"),
+            "expected final state store to preserve >>> 0 canonical unsigned write (with b + 0 folded to b): {s}"
+        );
+
+        // Negative: local read by `<`, array index, `===`, or returned must NOT be demoted.
+        let mut neg = Stmt::FunctionDecl {
+            name: "neg".to_owned(),
+            params: vec!["a".to_owned(), "b".to_owned(), "arr".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("v_cmp".to_owned(), None),
+                    ("v_idx".to_owned(), None),
+                    ("v_eq".to_owned(), None),
+                    ("v_ret".to_owned(), None),
+                ]),
+                jsast::assign_stmt(
+                    jsast::id("v_cmp"),
+                    Expr::Binary(
+                        BinOp::UShr,
+                        Box::new(Expr::Binary(
+                            BinOp::Add,
+                            Box::new(jsast::id("a")),
+                            Box::new(jsast::id("b")),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("v_idx"),
+                    Expr::Binary(
+                        BinOp::UShr,
+                        Box::new(Expr::Binary(
+                            BinOp::Add,
+                            Box::new(jsast::id("a")),
+                            Box::new(jsast::id("b")),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("v_eq"),
+                    Expr::Binary(
+                        BinOp::UShr,
+                        Box::new(Expr::Binary(
+                            BinOp::Add,
+                            Box::new(jsast::id("a")),
+                            Box::new(jsast::id("b")),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("v_ret"),
+                    Expr::Binary(
+                        BinOp::UShr,
+                        Box::new(Expr::Binary(
+                            BinOp::Add,
+                            Box::new(jsast::id("a")),
+                            Box::new(jsast::id("b")),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("v_cmp")),
+                        Box::new(Expr::Num(10.0)),
+                    ),
+                    vec![Stmt::Return(Some(jsast::index(
+                        jsast::id("arr"),
+                        jsast::id("v_idx"),
+                    )))],
+                    None,
+                ),
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::StrictEq,
+                        Box::new(jsast::id("v_eq")),
+                        Box::new(Expr::Num(4294967295.0)),
+                    ),
+                    vec![Stmt::Return(Some(Expr::Num(1.0)))],
+                    None,
+                ),
+                Stmt::Return(Some(jsast::id("v_ret"))),
+            ],
+        };
+        run_speed_post_opts(&mut neg);
+        let sn = jsast::stmt_to_string(&neg);
+        assert_eq!(
+            sn.matches("a + b >>> 0").count(),
+            4,
+            "all four non-bit32-consumed locals must preserve >>> 0: {sn}"
         );
     }
 }

@@ -10645,6 +10645,7 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
         all_non_adt_boxed: false,
         all_adts_boxed: false,
         smi_u32_fields: BTreeSet::new(),
+        packed_arr_vec_types: BTreeSet::new(),
     };
     let speed_opts = Opts {
         profile: Some(crate::opts::Profile::ReleaseSpeed),
@@ -10948,6 +10949,7 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
         all_non_adt_boxed: false,
         all_adts_boxed: false,
         smi_u32_fields: BTreeSet::new(),
+        packed_arr_vec_types: BTreeSet::new(),
     };
     let speed_opts = Opts {
         profile: Some(crate::opts::Profile::ReleaseSpeed),
@@ -11286,6 +11288,374 @@ fn smi_u32_struct_fields_store_and_compare_signed_i32_and_cast_back_to_u32() {
     assert!(
         js.contains("next_z >>> 0"),
         "expected `u32 as usize` to canonicalize signed Smi field back via `>>> 0`: {js}"
+    );
+}
+
+#[test]
+fn pow2_unsigned_div_rem_shifts_and_masks_while_signed_keeps_div_rem() {
+    let interns = world();
+    let e = RBlockId(0);
+
+    // 1. Unsigned u32 div/rem by power-of-2 constants (both single-use inline and multi-use
+    //    materialized constant `32`, plus `/ 2`, `/ 1`, `% 1`, and non-pow2 `/ 3`).
+    let mut b = FuncBuilder::new(item(600), signature(vec![U32, U8], U32));
+    let x = b.param(U32, NO_ORIGIN);
+    let byte_v = b.param(U8, NO_ORIGIN);
+    let c32 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 32, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let d32 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Div,
+            l: x,
+            r: c32,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let r32 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Rem,
+            l: x,
+            r: c32,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let c2 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 2, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let d2 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Div,
+            l: x,
+            r: c2,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let c1 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let d1 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Div,
+            l: d2,
+            r: c1,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let r1 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Rem,
+            l: x,
+            r: c1,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let c4_u8 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 4, bytes: 1 }),
+        U8,
+        NO_ORIGIN,
+    );
+    let b_div4 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Div,
+            l: byte_v,
+            r: c4_u8,
+            ty: U8,
+        },
+        U8,
+        NO_ORIGIN,
+    );
+    let b_u32 = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::IntToInt,
+            v: b_div4,
+            from: U8,
+            to: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    // Combine via XOR of nonneg_i31 operands (should NOT need trailing `>>> 0`!).
+    let t1 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitXor,
+            l: d32,
+            r: r32,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let t2 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitXor,
+            l: t1,
+            r: d1,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let t3 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitXor,
+            l: t2,
+            r: r1,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let out = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitXor,
+            l: t3,
+            r: b_u32,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f_u = b.finish();
+    let opts = Opts {
+        optimizer: rcgjs_object::opts::OptimizerMode::On,
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        ..Opts::default()
+    };
+    let fuse_u = crate::lower::fuse::plan(&f_u, None, &interns.types, &interns, &opts);
+    let struct_u =
+        crate::lower::structure::structure(&f_u, &fuse_u, &interns.types, false).unwrap();
+    let sum = summary(&[]);
+    let body_u = body_of(BodyKind::Function, f_u.sig.clone());
+    let js_name_u = JsName::new("unsigned_pow2".to_owned());
+    let items = super::host::ItemIndex::new();
+    let vtables = super::unsize::VtableIndex::new();
+    let input_u = LowerInput {
+        name: &js_name_u,
+        summary: &sum,
+        body: &body_u,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: &items,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &vtables,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
+        nested_clone: crate::lower::NestedClone::default(),
+    };
+    let js_u = jsast::stmt_to_string(
+        &super::function::lower(&input_u, &f_u, &fuse_u, struct_u.region)
+            .unwrap()
+            .decl,
+    );
+    assert!(
+        js_u.contains(">>> 5")
+            && js_u.contains("& 31")
+            && js_u.contains(">>> 1")
+            && js_u.contains(">>> 2"),
+        "expected pow2 unsigned div/rem lowered to shifts and masks:\n{js_u}"
+    );
+    assert!(
+        !js_u.contains("/ 32")
+            && !js_u.contains("% 32")
+            && !js_u.contains("/ 2")
+            && !js_u.contains(">>> 0"),
+        "expected zero float div/rem and zero redundant >>> 0:\n{js_u}"
+    );
+
+    // 2. Signed `i32` division/remainder by power of 2 MUST keep `/` and `%` (truncates toward 0).
+    let mut bs = FuncBuilder::new(item(601), signature(vec![I32], I32));
+    let sx = bs.param(I32, NO_ORIGIN);
+    let sc2 = bs.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 2, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    let sd2 = bs.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Div,
+            l: sx,
+            r: sc2,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    let sr2 = bs.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Rem,
+            l: sx,
+            r: sc2,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    let sout = bs.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: sd2,
+            r: sr2,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    bs.terminate(e, RTerm::Return(Some(sout)));
+    let f_s = bs.finish();
+    let fuse_s = crate::lower::fuse::plan(&f_s, None, &interns.types, &interns, &opts);
+    let struct_s =
+        crate::lower::structure::structure(&f_s, &fuse_s, &interns.types, false).unwrap();
+    let body_s = body_of(BodyKind::Function, f_s.sig.clone());
+    let js_name_s = JsName::new("signed_pow2".to_owned());
+    let input_s = LowerInput {
+        name: &js_name_s,
+        summary: &sum,
+        body: &body_s,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: &items,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &vtables,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
+        nested_clone: crate::lower::NestedClone::default(),
+    };
+    let js_s = jsast::stmt_to_string(
+        &super::function::lower(&input_s, &f_s, &fuse_s, struct_s.region)
+            .unwrap()
+            .decl,
+    );
+    assert!(
+        js_s.contains("/ 2")
+            && js_s.contains("% 2")
+            && !js_s.contains(">>> 1")
+            && !js_s.contains(">> 1"),
+        "signed i32 div/rem by power of 2 must NOT become shift/mask:\n{js_s}"
+    );
+}
+
+#[test]
+fn licm_does_not_hoist_var_reassigned_before_continue_with_trailing_throw() {
+    use rcgjs_object::jsast::Stmt;
+    use std::collections::HashSet;
+
+    // Regression for `core$fmt$write`: a branch containing `{ w = next; continue; }` followed by
+    // a trailing unreachable `throw` must NOT be treated as `stmts_definitely_diverge`!
+    let mut body = vec![
+        Stmt::Lets(vec![
+            ("w".to_owned(), None),
+            ("e".to_owned(), None),
+            ("d".to_owned(), None),
+        ]),
+        jsast::assign_stmt(jsast::id("w"), jsast::member(jsast::id("b"), "template")),
+        Stmt::LoopForever(
+            None,
+            vec![
+                jsast::assign_stmt(
+                    jsast::id("e"),
+                    jsast::index(
+                        jsast::member(jsast::id("w"), "buf"),
+                        jsast::member(jsast::id("w"), "off"),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("d"),
+                    jsast::object_of(vec![
+                        ("buf", jsast::member(jsast::id("w"), "buf")),
+                        (
+                            "off",
+                            jsast::binary(
+                                jsast::BinOp::Add,
+                                jsast::member(jsast::id("w"), "off"),
+                                jsast::num(1),
+                            ),
+                        ),
+                    ]),
+                ),
+                Stmt::If(
+                    jsast::binary(jsast::BinOp::StrictEq, jsast::id("e"), jsast::num(0)),
+                    vec![Stmt::Return(Some(jsast::num(0)))],
+                    Some(vec![
+                        Stmt::Labeled(
+                            "a".to_owned(),
+                            Box::new(Stmt::Block(vec![
+                                jsast::assign_stmt(jsast::id("w"), jsast::id("d")),
+                                Stmt::Continue(None),
+                            ])),
+                        ),
+                        Stmt::Throw(jsast::call(jsast::id("$ur_1"), vec![])),
+                    ]),
+                ),
+            ],
+        ),
+    ];
+    let mut local_names: HashSet<String> = ["b", "w", "e", "d"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut extra_decls = Vec::new();
+    let imm = HashSet::new();
+    super::loop_opt::hoist_loop_invariant_props(
+        &mut body,
+        &mut local_names,
+        &mut extra_decls,
+        &imm,
+    );
+    let printed = jsast::stmt_to_string(&Stmt::Block(body));
+    assert!(
+        extra_decls.is_empty() && !printed.contains("= w.buf;") && !printed.contains("= w.off;"),
+        "must not hoist w.buf/w.off when w is reassigned before continue:\n{printed}"
     );
 }
 

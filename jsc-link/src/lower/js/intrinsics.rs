@@ -123,6 +123,17 @@ pub fn lower(
         } else {
             None
         };
+        let unwrapped_copy_slots = if name == "copy_nonoverlapping" && arguments.len() == 3 {
+            let s0 = unwrap_safe_slot(&arguments[0]);
+            let s1 = unwrap_safe_slot(&arguments[1]);
+            if s0.is_some() || s1.is_some() {
+                Some((s0, s1))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some((buf, off)) = unwrapped_slot {
             let rest = arguments.split_off(1);
             if rest.iter().all(jsast::is_droppable)
@@ -146,6 +157,56 @@ pub fn lower(
                 rebuilt.extend(cap);
                 intrinsic.captured = Some(rebuilt);
             }
+        } else if let Some((s0, s1)) = unwrapped_copy_slots {
+            let mut flat = Vec::with_capacity(5);
+            let s0_unwrapped = if let Some((b, o)) = s0 {
+                flat.push(b);
+                flat.push(o);
+                true
+            } else {
+                flat.push(arguments[0].clone());
+                false
+            };
+            let s1_unwrapped = if let Some((b, o)) = s1 {
+                flat.push(b);
+                flat.push(o);
+                true
+            } else {
+                flat.push(arguments[1].clone());
+                false
+            };
+            flat.push(arguments[2].clone());
+            let mut cap = if flat.iter().all(jsast::is_droppable) {
+                flat
+            } else {
+                let (setup, captured) =
+                    OperandEvaluation::Materialize.capture(flat, |value| cx.temp(value));
+                intrinsic.prelude.borrow_mut().extend(setup);
+                captured
+            };
+            let mut idx = 0;
+            let a0 = if s0_unwrapped {
+                let b = cap[idx].clone();
+                let o = cap[idx + 1].clone();
+                idx += 2;
+                ptr::slot(b, o)
+            } else {
+                let v = cap[idx].clone();
+                idx += 1;
+                v
+            };
+            let a1 = if s1_unwrapped {
+                let b = cap[idx].clone();
+                let o = cap[idx + 1].clone();
+                idx += 2;
+                ptr::slot(b, o)
+            } else {
+                let v = cap[idx].clone();
+                idx += 1;
+                v
+            };
+            let a2 = cap.remove(idx);
+            intrinsic.captured = Some(vec![a0, a1, a2]);
         } else {
             let (setup, arguments) =
                 OperandEvaluation::Materialize.capture(arguments, |value| cx.temp(value));
@@ -1643,6 +1704,13 @@ impl Intrinsic<'_, '_> {
             ));
         }
         let (dst, src) = (self.arg(target)?, self.arg(source)?);
+        if !volatile
+            && !overlapping
+            && !count_is_one
+            && self.can_inline_ta_copy_nonoverlapping(source, target, pointee)
+        {
+            return self.inline_ta_copy_nonoverlapping(dst, src);
+        }
         Ok(Outcome::Done(self.cx.ptr_copy(
             pointee,
             dst,
@@ -1651,6 +1719,194 @@ impl Intrinsic<'_, '_> {
             overlapping,
             count_is_one,
         )))
+    }
+
+    /// Whether a non-overlapping, non-volatile `copy_nonoverlapping` on numeric scalar `pointee`
+    /// can emit an inline Tier-A same-type `TypedArray` fast path (avoiding `{ buf, off }` slot
+    /// allocations and `$rt_copy_nonoverlapping` dispatch on small copies).
+    fn can_inline_ta_copy_nonoverlapping(
+        &self,
+        source: usize,
+        target: usize,
+        pointee: TypeId,
+    ) -> bool {
+        let cx = self.cx;
+        let table = cx.table;
+        let heap = cx.heap();
+        if !(heap.typed_heap_enabled
+            && !heap.non_rc_raw_alloc_reachable
+            && !cx.byte_views.raw_byte_derefs
+            && cx.byte_views.elide_scale_scalar)
+        {
+            return false;
+        }
+        if table.is_zst(pointee)
+            || table.needs_clone(pointee)
+            || !value::is_slot_pointee(table, pointee)
+        {
+            return false;
+        }
+        if table
+            .get(pointee)
+            .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+            .is_none()
+        {
+            return false;
+        }
+        let (Ok(src_ty), Ok(dst_ty)) = (self.arg_ty(source), self.arg_ty(target)) else {
+            return false;
+        };
+        table.pointer_form(src_ty) == Some(rcgjs_object::jir::types::PointerForm::Slot)
+            && table.pointer_form(dst_ty) == Some(rcgjs_object::jir::types::PointerForm::Slot)
+    }
+
+    fn inline_ta_copy_nonoverlapping(&self, dst: Expr, src: Expr) -> Res<Outcome> {
+        let const_count = self.constant_u32(2);
+        if const_count == Some(0) {
+            return Ok(Outcome::Done(Vec::new()));
+        }
+        let count = self.arg(2)?;
+        let cx = self.cx;
+        let is_zero = |e: &Expr| {
+            matches!(e, Expr::Num(n) if *n == 0.0) || matches!(e, Expr::RawNum(s) if s == "0")
+        };
+        let is_atom = |e: &Expr| {
+            matches!(
+                e,
+                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::Bool(_)
+            )
+        };
+        let mut body = Vec::new();
+        let extract_slot = |expr: Expr, body: &mut Vec<Stmt>| -> (Expr, Expr, Expr) {
+            if let Some((b_raw, o_raw)) = unwrap_safe_slot(&expr) {
+                let b = if matches!(b_raw, Expr::Ident(_)) {
+                    b_raw
+                } else {
+                    let (bind, id) = cx.temp(b_raw);
+                    body.push(bind);
+                    id
+                };
+                let o = if is_atom(&o_raw) {
+                    o_raw
+                } else {
+                    let (bind, id) = cx.temp(o_raw);
+                    body.push(bind);
+                    id
+                };
+                let fallback = ptr::slot(b.clone(), o.clone());
+                (b, o, fallback)
+            } else {
+                let slot = if matches!(expr, Expr::Ident(_)) {
+                    expr
+                } else {
+                    let (bind, id) = cx.temp(expr);
+                    body.push(bind);
+                    id
+                };
+                let (b_bind, b) = cx.temp(jsast::member(slot.clone(), "buf"));
+                let (o_bind, o) = cx.temp(jsast::member(slot.clone(), "off"));
+                body.push(b_bind);
+                body.push(o_bind);
+                (b, o, slot)
+            }
+        };
+
+        let (db, doff, dst_fallback) = extract_slot(dst, &mut body);
+        let (sb, soff, src_fallback) = extract_slot(src, &mut body);
+        let n = if is_atom(&count) {
+            count
+        } else {
+            self.temp(count)
+        };
+
+        let build_loop = || -> Vec<Stmt> {
+            let (bind_i, idx) = cx.temp(jsast::num(0));
+            let d_idx = if is_zero(&doff) {
+                idx.clone()
+            } else {
+                jsast::binary(BinOp::Add, doff.clone(), idx.clone())
+            };
+            let s_idx = if is_zero(&soff) {
+                idx.clone()
+            } else {
+                jsast::binary(BinOp::Add, soff.clone(), idx.clone())
+            };
+            vec![
+                bind_i,
+                jsast::while_(
+                    jsast::binary(BinOp::Lt, idx.clone(), n.clone()),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::index(db.clone(), d_idx),
+                            jsast::index(sb.clone(), s_idx),
+                        ),
+                        jsast::expr_stmt(jsast::compound_assign(BinOp::Add, idx, jsast::num(1))),
+                    ],
+                ),
+            ]
+        };
+
+        let build_bulk_set = || -> Stmt {
+            let end = if is_zero(&soff) {
+                n.clone()
+            } else {
+                jsast::binary(BinOp::Add, soff.clone(), n.clone())
+            };
+            let sub = jsast::method_call(sb.clone(), "subarray", vec![soff.clone(), end]);
+            let src_view = if is_zero(&soff) {
+                jsast::cond(
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        n.clone(),
+                        jsast::member(sb.clone(), "length"),
+                    ),
+                    sb.clone(),
+                    sub,
+                )
+            } else {
+                sub
+            };
+            jsast::expr_stmt(jsast::method_call(
+                db.clone(),
+                "set",
+                vec![src_view, doff.clone()],
+            ))
+        };
+
+        let is_view = |buf: Expr| jsast::method_call(jsast::id("ArrayBuffer"), "isView", vec![buf]);
+        let same_ta = jsast::binary(
+            BinOp::And,
+            jsast::binary(BinOp::And, is_view(db.clone()), is_view(sb.clone())),
+            jsast::binary(
+                BinOp::StrictEq,
+                jsast::member(db.clone(), "constructor"),
+                jsast::member(sb.clone(), "constructor"),
+            ),
+        );
+
+        let fast_branch = match const_count {
+            Some(c) if c <= 32 => build_loop(),
+            Some(_) => vec![build_bulk_set()],
+            None => vec![jsast::if_else(
+                jsast::binary(BinOp::Le, n.clone(), jsast::num(32)),
+                build_loop(),
+                vec![build_bulk_set()],
+            )],
+        };
+        let fallback_branch = vec![jsast::expr_stmt(jsast::rt_call(
+            "copy_nonoverlapping",
+            vec![dst_fallback, src_fallback, n.clone()],
+        ))];
+        body.push(jsast::if_else(same_ta, fast_branch, fallback_branch));
+
+        if const_count.is_some() {
+            Ok(Outcome::Done(body))
+        } else {
+            Ok(Outcome::Done(vec![jsast::if_(
+                jsast::binary(BinOp::Gt, n, jsast::num(0)),
+                body,
+            )]))
+        }
     }
 
     /// `write_bytes` (`ptr.rs::write_bytes`).
@@ -1673,13 +1929,9 @@ impl Intrinsic<'_, '_> {
             };
             vec![dst, value, count]
         } else {
-            let Some(zero) = value::zero_value_for_heap(
-                table,
-                self.cx.interns,
-                peeled,
-                self.cx.heap().native_string_enabled,
-                self.cx.heap().native_vec_enabled,
-            ) else {
+            let Some(zero) =
+                value::zero_value_for_heap_plan(table, self.cx.interns, peeled, self.cx.heap())
+            else {
                 return vec![jsast::expr_stmt(self.cx.zombie(
                     "`write_bytes` is not supported by rustc_codegen_js for this pointee: a byte \
                      pattern names a value only for a one byte pointee, and zero for a scalar one"
@@ -1989,6 +2241,49 @@ impl Intrinsic<'_, '_> {
     }
 }
 
+/// Extracts `(buf, off)` from a plain `{ buf, off }` slot literal (or a zero-offset guard
+/// `c === 0 ? { buf, off: num } : { buf, off: ... }` whose `then` arm is already a numeric slot
+/// literal, safe to evaluate even when `count === 0`).
+fn unwrap_safe_slot(expr: &Expr) -> Option<(Expr, Expr)> {
+    let fields = match expr {
+        Expr::Object(fields) => fields,
+        Expr::Cond(cond, then_expr, else_expr)
+            if matches!(
+                cond.as_ref(),
+                Expr::Binary(BinOp::StrictEq, _, zero) if **zero == jsast::num(0)
+            ) =>
+        {
+            let Expr::Object(then_fields) = then_expr.as_ref() else {
+                return None;
+            };
+            if then_fields.len() != 2
+                || !then_fields
+                    .iter()
+                    .any(|(k, v)| k == "off" && matches!(v, Expr::Num(_) | Expr::RawNum(_)))
+            {
+                return None;
+            }
+            match else_expr.as_ref() {
+                Expr::Object(else_fields) => else_fields,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if fields.len() != 2 {
+        return None;
+    }
+    let buf = fields
+        .iter()
+        .find(|(k, _)| k == "buf")
+        .map(|(_, v)| v.clone())?;
+    let off = fields
+        .iter()
+        .find(|(k, _)| k == "off")
+        .map(|(_, v)| v.clone())?;
+    Some((buf, off))
+}
+
 /// Whether a type has no values at all, as far as this schema can tell.
 fn is_uninhabited(cx: &JsCx<'_>, ty: TypeId) -> bool {
     match value::kind(cx.table, cx.table.peeled(ty)) {
@@ -2072,5 +2367,330 @@ impl Int {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rcgjs_object::item::{Availability, ItemSummary, JsName, SemanticKey};
+    use rcgjs_object::jir::interns::Interns;
+    use rcgjs_object::jir::origin::OriginId;
+    use rcgjs_object::jir::repr::{
+        Carrier, Func, Op, OpKind, RBlock, RBlockId, RTerm, ValueDef, ValueId,
+    };
+    use rcgjs_object::jir::semantic::{
+        AbiSignature, Body, BodyKind, BodySemantic, ConstTree, DefinitionId, ItemId, Signature,
+    };
+    use rcgjs_object::jir::types::{
+        IntFacts, IntRepr, JsFacts, LayoutFacts, PointerForm, TypeDescriptor, TypeId, TypeKind,
+        TypeMeta,
+    };
+    use rcgjs_object::jir::ItemClass;
+    use rcgjs_object::jsast;
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+
+    use crate::analysis::byte_views::ByteViewPlan;
+    use crate::analysis::heap::HeapPlan;
+    use crate::lower::js::{host, unsize};
+    use crate::lower::{LowerInput, NestedClone};
+    use crate::opts::{Opts, Profile};
+
+    fn mk_desc(id: u128, kind: TypeKind, size: u64) -> TypeDescriptor {
+        let tid = TypeId(id);
+        let int = match kind {
+            TypeKind::Integer { signed, bits } => Some(IntFacts {
+                signed,
+                bits,
+                repr: IntRepr::Number,
+            }),
+            _ => None,
+        };
+        TypeDescriptor {
+            id: tid,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: Some(size),
+                align: Some(size.max(1)),
+                sized: true,
+                zst: size == 0,
+                ..LayoutFacts::default()
+            },
+            js: JsFacts {
+                int,
+                is_indirect: false,
+                needs_clone: false,
+                peeled: tid,
+                transparent: None,
+                crosses_transparent_union: false,
+                enum_repr: None,
+                is_primitive_enum: false,
+                unsized_tail: None,
+                byte_element: false,
+                pointer_form: None,
+                fields: Vec::new(),
+            },
+            meta: TypeMeta::default(),
+        }
+    }
+
+    #[test]
+    fn tier_a_inline_copy_nonoverlapping_handles_dynamic_and_const_counts() {
+        let mut interns = Interns::new();
+        let copy_name = interns.intern_str("copy_nonoverlapping");
+        let unit = TypeId(1);
+        let u8_ty = TypeId(2);
+        let usize_ty = TypeId(3);
+        let ptr_const_u8 = TypeId(4);
+        let ptr_mut_u8 = TypeId(5);
+        interns
+            .types
+            .insert(mk_desc(1, TypeKind::Tuple(Vec::new()), 0));
+        interns.types.insert(mk_desc(
+            2,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            1,
+        ));
+        interns.types.insert(mk_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+        ));
+        let mut pc = mk_desc(
+            4,
+            TypeKind::RawPointer {
+                pointee: u8_ty,
+                mutable: false,
+            },
+            4,
+        );
+        pc.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(pc);
+        let mut pm = mk_desc(
+            5,
+            TypeKind::RawPointer {
+                pointee: u8_ty,
+                mutable: true,
+            },
+            4,
+        );
+        pm.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(pm);
+
+        let heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: false,
+            native_vec_enabled: true,
+            raw_alloc_reachable: false,
+            non_rc_raw_alloc_reachable: false,
+            any_boxed: false,
+            boxed_defs: BTreeSet::new(),
+            boxed_non_adt_keys: BTreeSet::new(),
+            all_non_adt_boxed: false,
+            all_adts_boxed: false,
+            smi_u32_fields: BTreeSet::new(),
+            packed_arr_vec_types: BTreeSet::new(),
+        };
+
+        let lower = |func: &Func| -> String {
+            let body = Body {
+                item: func.item,
+                kind: BodyKind::Function,
+                semantic: BodySemantic::Ordinary,
+                signature: func.sig.clone(),
+                locals: Vec::new(),
+                blocks: Vec::new(),
+            };
+            let summary = ItemSummary {
+                key: SemanticKey {
+                    link_name: "copy_test".to_owned(),
+                    item: None,
+                },
+                body_hash: None,
+                semantic_hash: None,
+                availability: Availability::Available,
+                deps: Vec::new(),
+                abi: None,
+                physical: None,
+                kind: ItemKind::Fn,
+                linkage: Linkage::internal(),
+                order: None,
+                dts: false,
+                fallback: BlobRef {
+                    offset: 0,
+                    clen: 0,
+                    ulen: 0,
+                },
+                body: None,
+                origin: None,
+                estimated_bytes: 0,
+                class: ItemClass::default(),
+            };
+            let js_name = JsName::new("copy_test".to_owned());
+            let opts = Opts {
+                profile: Some(Profile::ReleaseSpeed),
+                ..Opts::default()
+            };
+            let items = host::ItemIndex::new();
+            let vtables = unsize::VtableIndex::new();
+            let input = LowerInput {
+                name: &js_name,
+                summary: &summary,
+                body: &body,
+                origins: None,
+                interns: &interns,
+                table: &interns.types,
+                opts: &opts,
+                items: &items,
+                drop_glue: host::EMPTY_DROP_GLUE,
+                vtables: &vtables,
+                spills: &[],
+                abi: None,
+                physical: None,
+                call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+                bigints: None,
+                byte_views: ByteViewPlan {
+                    raw_byte_derefs: false,
+                    elide_scale_scalar: true,
+                },
+                heap: Some(&heap),
+                nested_clone: NestedClone::default(),
+            };
+            jsast::stmt_to_string(&crate::lower::lower_func(&input, func).expect("lower").decl)
+        };
+
+        // 1. Dynamic count: guarded by `> 0`, inline `<= 32` loop, `.set(.subarray())` for `> 32`,
+        //    fallback to `__rt.copy_nonoverlapping` for non-TypedArray.
+        let f_dyn = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 10,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ptr_const_u8, ptr_mut_u8, usize_ty],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ptr_const_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ptr_mut_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                ops: vec![Op {
+                    result: None,
+                    origin: OriginId(0),
+                    kind: OpKind::Intrinsic {
+                        name: copy_name,
+                        types: vec![u8_ty],
+                        fallback: None,
+                        args: vec![ValueId(0), ValueId(1), ValueId(2)],
+                        track_caller: None,
+                    },
+                }],
+                term: RTerm::Return(None),
+            }],
+        };
+        let js_dyn = lower(&f_dyn);
+        assert!(js_dyn.contains("ArrayBuffer.isView("), "{js_dyn}");
+        assert!(js_dyn.contains("<= 32"), "{js_dyn}");
+        assert!(js_dyn.contains(".subarray("), "{js_dyn}");
+        assert!(js_dyn.contains("__rt.copy_nonoverlapping("), "{js_dyn}");
+
+        // 2. Const count 16: inline loop only, no `.subarray(`.
+        let f_16 = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 11,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ptr_const_u8, ptr_mut_u8],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ptr_const_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ptr_mut_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1)],
+                ops: vec![
+                    Op {
+                        result: Some(ValueId(2)),
+                        origin: OriginId(0),
+                        kind: OpKind::Const(ConstTree::Scalar { bits: 16, bytes: 4 }),
+                    },
+                    Op {
+                        result: None,
+                        origin: OriginId(0),
+                        kind: OpKind::Intrinsic {
+                            name: copy_name,
+                            types: vec![u8_ty],
+                            fallback: None,
+                            args: vec![ValueId(0), ValueId(1), ValueId(2)],
+                            track_caller: None,
+                        },
+                    },
+                ],
+                term: RTerm::Return(None),
+            }],
+        };
+        let js_16 = lower(&f_16);
+        assert!(js_16.contains("ArrayBuffer.isView("), "{js_16}");
+        assert!(js_16.contains("while ("), "{js_16}");
+        assert!(!js_16.contains(".subarray("), "{js_16}");
+
+        // 3. Const count 0: complete no-op.
+        let mut f_0 = f_16;
+        f_0.blocks[0].ops[0].kind = OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 });
+        let js_0 = lower(&f_0);
+        assert!(!js_0.contains("copy_nonoverlapping"), "{js_0}");
+        assert!(!js_0.contains("ArrayBuffer.isView"), "{js_0}");
     }
 }

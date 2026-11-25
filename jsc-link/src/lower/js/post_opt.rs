@@ -47,6 +47,11 @@ pub(super) fn run_speed_post_opts_with_mode(
         fold_constants_and_switches(body, &uninit_locals);
     }
 
+    // 1c. Fold IEEE-754 `Math.max` / `Math.min` labeled-block idioms (`d3-hierarchy`).
+    if !local_names.contains("Math") {
+        fold_ieee_max_min(body);
+    }
+
     // 2. Collapse nested `if (a) { if (b) { ... } }` and fold guarded `f2i` i32 clamps (`earcut`).
     loop_opt::fold_guarded_f2i(body);
 
@@ -78,6 +83,11 @@ pub(super) fn run_speed_post_opts_with_mode(
     if allow_duplicating {
         loop_opt::version_checked_loops(body);
     }
+
+    // 6b. Smi-ize counted loop induction steps (`i = i + 1 >>> 0` -> `i = i + 1 | 0`) and demote
+    //     bit-exact 32-bit loop-carried registers (`x + z >>> 0` -> `x + z | 0`, `compress256`).
+    loop_opt::smi_ize_counted_loop_steps(body);
+    loop_opt::demote_bitexact_u32_wraps(body, params);
 
     // 7. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE.
     if !local_names.contains("Reflect") {
@@ -263,7 +273,7 @@ fn is_bool_expr(expr: &Expr) -> bool {
     }
 }
 
-fn is_already_i32_expr(expr: &Expr) -> bool {
+pub(super) fn is_already_i32_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Unary(UnOp::BitNot, _) => true,
         Expr::Binary(
@@ -276,7 +286,105 @@ fn is_already_i32_expr(expr: &Expr) -> bool {
             Expr::Member(obj, prop)
                 if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math") && prop == "imul"
         ),
+        Expr::Call(callee, args) if args.len() == 1 => matches!(
+            callee.as_ref(),
+            Expr::Member(obj, prop)
+                if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math") && prop == "clz32"
+        ),
         _ => false,
+    }
+}
+
+/// Returns `true` iff `expr` is provably an exact integer in `[0, 0x7fff_ffff]` (never `-0.0`,
+/// `NaN`, or negative), where signed `Int32` and unsigned `Uint32` are identical.
+pub(super) fn is_proven_nonneg_i31(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => {
+            n.is_finite()
+                && n.fract() == 0.0
+                && !(*n == 0.0 && n.is_sign_negative())
+                && *n >= 0.0
+                && *n <= 2147483647.0
+        }
+        Expr::RawNum(s) => s.parse::<u32>().ok().is_some_and(|v| v <= 0x7fff_ffff),
+        Expr::Binary(BinOp::BitAnd, l, r) => is_proven_nonneg_i31(l) || is_proven_nonneg_i31(r),
+        Expr::Binary(BinOp::UShr, _, r) => exact_u32(r).is_some_and(|k| (k & 31) >= 1),
+        Expr::Binary(BinOp::BitOr | BinOp::BitXor, l, r) => {
+            is_proven_nonneg_i31(l) && is_proven_nonneg_i31(r)
+        }
+        Expr::Cond(_, t, e) => is_proven_nonneg_i31(t) && is_proven_nonneg_i31(e),
+        Expr::Call(callee, args) if args.len() == 1 => matches!(
+            callee.as_ref(),
+            Expr::Member(obj, prop)
+                if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math") && prop == "clz32"
+        ),
+        _ => false,
+    }
+}
+
+fn is_proven_u32_int(expr: &Expr) -> bool {
+    is_proven_nonneg_i31(expr)
+        || exact_u32(expr).is_some()
+        || matches!(expr, Expr::Binary(BinOp::UShr, _, _))
+}
+
+fn is_pos_zero(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => *n == 0.0 && !n.is_sign_negative(),
+        Expr::RawNum(s) => s == "0",
+        _ => false,
+    }
+}
+
+/// Returns `true` iff `expr` is guaranteed to evaluate to an exact integer (never a string, bool,
+/// `-0.0`, or object), so `0 + expr` and `expr + 0` are strictly equal to `expr`.
+fn is_guaranteed_int_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => {
+            n.is_finite()
+                && n.fract() == 0.0
+                && !(*n == 0.0 && n.is_sign_negative())
+                && *n >= -2147483648.0
+                && *n <= 4294967295.0
+        }
+        Expr::RawNum(s) => s.parse::<i64>().is_ok(),
+        Expr::Unary(UnOp::BitNot, _) => true,
+        Expr::Binary(
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::UShr,
+            _,
+            _,
+        ) => true,
+        Expr::Call(callee, args) => matches!(
+            callee.as_ref(),
+            Expr::Member(obj, prop)
+                if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                    && ((prop == "imul" && args.len() == 2) || (prop == "clz32" && args.len() == 1))
+        ),
+        Expr::Cond(_, t, e) => is_guaranteed_int_expr(t) && is_guaranteed_int_expr(e),
+        _ => false,
+    }
+}
+
+/// Returns `true` iff `expr` inside `arr[0 + expr]` / `arr[expr + 0]` is a numeric index expression
+/// (rejecting string/bool/object/call expressions where `0 + expr` would coerce differently).
+fn is_numeric_index_subexpr(expr: &Expr) -> bool {
+    if is_guaranteed_int_expr(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Ident(_) | Expr::Member(_, _) => true,
+        Expr::Unary(UnOp::Neg, inner) => is_numeric_index_subexpr(inner),
+        Expr::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, l, r) => {
+            is_numeric_index_subexpr(l) && is_numeric_index_subexpr(r)
+        }
+        _ => false,
+    }
+}
+
+fn strip_zero_ushr(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Binary(BinOp::UShr, l, r) if exact_i32(r) == Some(0) => (**l).clone(),
+        other => other.clone(),
     }
 }
 
@@ -352,8 +460,18 @@ fn fold_expr(expr: &mut Expr) -> bool {
                 None
             }
         }
-        // `[c0, c1, ...][k]` where every element is a pure literal -> `c_k`
+        // `[c0, c1, ...][k]` where every element is a pure literal -> `c_k`, and
+        // `arr[0 + idx]` / `arr[idx + 0]` -> `arr[idx]` for numeric index subexpressions.
         Expr::Index(arr, idx) => {
+            if let Expr::Binary(BinOp::Add, il, ir) = idx.as_ref() {
+                if is_pos_zero(il) && is_numeric_index_subexpr(ir) {
+                    **idx = (**ir).clone();
+                    changed = true;
+                } else if is_pos_zero(ir) && is_numeric_index_subexpr(il) {
+                    **idx = (**il).clone();
+                    changed = true;
+                }
+            }
             if let (Expr::Array(items), Some(k)) = (arr.as_ref(), exact_u32(idx)) {
                 let k = k as usize;
                 if k < items.len() && items.iter().all(|it| SimpleLit::from_expr(it).is_some()) {
@@ -474,6 +592,8 @@ fn fold_expr(expr: &mut Expr) -> bool {
                         None
                     }
                 }
+                _ if is_pos_zero(l) && is_guaranteed_int_expr(r) => Some((**r).clone()),
+                _ if is_pos_zero(r) && is_guaranteed_int_expr(l) => Some((**l).clone()),
                 _ => None,
             },
             BinOp::Sub => match (exact_i32(l), exact_i32(r)) {
@@ -491,6 +611,26 @@ fn fold_expr(expr: &mut Expr) -> bool {
                 (Some(a), Some(b)) => Some(num_expr_i32(a | b)),
                 (None, Some(0)) if is_already_i32_expr(l) => Some((**l).clone()),
                 (Some(0), None) if is_already_i32_expr(r) => Some((**r).clone()),
+                (None, Some(0)) => match l.as_ref() {
+                    Expr::Binary(BinOp::UShr, inner, zero) if exact_i32(zero) == Some(0) => {
+                        Some(if is_already_i32_expr(inner) {
+                            (**inner).clone()
+                        } else {
+                            Expr::Binary(BinOp::BitOr, inner.clone(), Box::new(Expr::Num(0.0)))
+                        })
+                    }
+                    _ => None,
+                },
+                (Some(0), None) => match r.as_ref() {
+                    Expr::Binary(BinOp::UShr, inner, zero) if exact_i32(zero) == Some(0) => {
+                        Some(if is_already_i32_expr(inner) {
+                            (**inner).clone()
+                        } else {
+                            Expr::Binary(BinOp::BitOr, inner.clone(), Box::new(Expr::Num(0.0)))
+                        })
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             BinOp::BitAnd => match (to_i32_bits(l), to_i32_bits(r)) {
@@ -551,15 +691,50 @@ fn fold_expr(expr: &mut Expr) -> bool {
             },
             BinOp::UShr => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(Expr::Num(((a as u32).wrapping_shr(b as u32)) as f64)),
-                _ if exact_i32(r) == Some(0)
-                    && matches!(l.as_ref(), Expr::Binary(BinOp::UShr, _, _)) =>
-                {
-                    Some(l.as_ref().clone())
+                _ if exact_i32(r) == Some(0) => {
+                    if matches!(l.as_ref(), Expr::Binary(BinOp::UShr, _, _))
+                        || is_proven_nonneg_i31(l)
+                    {
+                        Some(l.as_ref().clone())
+                    } else if let Expr::Binary(BinOp::BitOr, inner, zero) = l.as_ref() {
+                        if exact_i32(zero) == Some(0) {
+                            Some(Expr::Binary(
+                                BinOp::UShr,
+                                inner.clone(),
+                                Box::new(Expr::Num(0.0)),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else if let Expr::Binary(BinOp::Div, dl, dr) = l.as_ref() {
+                        match (exact_u32(dl), exact_u32(dr)) {
+                            (Some(a), Some(b)) if b > 0 => Some(Expr::Num((a / b) as f64)),
+                            (_, Some(c))
+                                if c >= 2 && c.is_power_of_two() && is_proven_u32_int(dl) =>
+                            {
+                                Some(Expr::Binary(
+                                    BinOp::UShr,
+                                    Box::new(strip_zero_ushr(dl)),
+                                    Box::new(Expr::Num(f64::from(c.trailing_zeros()))),
+                                ))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             },
             BinOp::Rem => match (exact_u32(l), exact_u32(r)) {
                 (Some(a), Some(b)) if b > 0 => Some(Expr::Num((a % b) as f64)),
+                (_, Some(c)) if c >= 2 && c.is_power_of_two() && is_proven_u32_int(l) => {
+                    Some(Expr::Binary(
+                        BinOp::BitAnd,
+                        Box::new(strip_zero_ushr(l)),
+                        Box::new(Expr::Num(f64::from(c - 1))),
+                    ))
+                }
                 _ => None,
             },
             BinOp::Lt => match (exact_u32(l), exact_u32(r)) {
@@ -1920,15 +2095,53 @@ fn expr_clobbers_divrem(expr: &Expr, operands: &HashSet<String>) -> bool {
     }
 }
 
-pub(super) fn stmts_definitely_diverge(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::Throw(_) => true,
-        Stmt::ExprStmt(Expr::Call(callee, _)) => matches!(
-            callee.as_ref(),
-            Expr::Ident(name) if name.starts_with("core$panicking$")
-        ),
+fn stmt_may_exit_non_throw(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) => true,
+        Stmt::If(_, a, b) => {
+            a.iter().any(stmt_may_exit_non_throw)
+                || b.as_ref()
+                    .is_some_and(|b| b.iter().any(stmt_may_exit_non_throw))
+        }
+        Stmt::Switch(_, cases) => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_may_exit_non_throw)),
+        Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+            b.iter().any(stmt_may_exit_non_throw)
+        }
+        Stmt::Labeled(_, inner) => stmt_may_exit_non_throw(inner),
+        Stmt::TryCatch { body, handler, .. } => {
+            body.iter().any(stmt_may_exit_non_throw) || handler.iter().any(stmt_may_exit_non_throw)
+        }
         _ => false,
-    })
+    }
+}
+
+pub(super) fn stmts_definitely_diverge(stmts: &[Stmt]) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Throw(_) => return true,
+            Stmt::ExprStmt(Expr::Call(callee, _))
+                if matches!(
+                    callee.as_ref(),
+                    Expr::Ident(name) if name.starts_with("core$panicking$")
+                ) =>
+            {
+                return true;
+            }
+            Stmt::If(_, a, Some(b))
+                if stmts_definitely_diverge(a) && stmts_definitely_diverge(b) =>
+            {
+                return true;
+            }
+            _ => {
+                if stmt_may_exit_non_throw(s) {
+                    return false;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn stmt_clobbers_divrem(stmt: &Stmt, operands: &HashSet<String>) -> bool {
@@ -2693,6 +2906,554 @@ fn fast_path_f64_sign_bit_stmts(
     changed
 }
 
+/// Folds IEEE-754 `Math.max` / `Math.min` labeled-block idioms (both the general 2-variable form
+/// and the 1-variable + constant form emitted by `js_max` / `js_min` after `fast_path_f64_sign_bit`)
+/// into `dst = Math.max(a, b)` / `dst = Math.min(a, b)`, preserving exact `NaN` and `-0.0`/`+0.0`
+/// semantics.
+fn fold_ieee_max_min(body: &mut Vec<Stmt>) {
+    let mut read_counts: HashMap<String, usize> = HashMap::new();
+    for stmt in body.iter() {
+        tally_ident_reads_stmt(stmt, &mut read_counts);
+    }
+    fold_ieee_max_min_stmts(body, &read_counts);
+}
+
+fn is_nan_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => n.is_nan(),
+        Expr::Ident(id) | Expr::RawNum(id) => id == "NaN",
+        _ => false,
+    }
+}
+
+/// Matches `x !== x` (`Some((x, true))`) or `x === x` (`Some((x, false))`), with optional `!`.
+fn match_nan_test_expr(expr: &Expr) -> Option<(String, bool)> {
+    match expr {
+        Expr::Unary(UnOp::Not, inner) => {
+            let (v, is_nan) = match_nan_test_expr(inner)?;
+            Some((v, !is_nan))
+        }
+        Expr::Binary(op @ (BinOp::StrictNe | BinOp::StrictEq), l, r) => {
+            if let (Expr::Ident(a), Expr::Ident(b)) = (l.as_ref(), r.as_ref()) {
+                if a == b {
+                    return Some((a.clone(), *op == BinOp::StrictNe));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Matches `x < 0 || x === 0 && 1 / x < 0` (the inline non-NaN `is_sign_negative` emitted by
+/// `fast_path_f64_sign_bit`), returning `(var_name, true_means_negative)`.
+fn match_is_sign_negative_expr(expr: &Expr) -> Option<(String, bool)> {
+    if let Expr::Unary(UnOp::Not, inner) = expr {
+        let (v, b) = match_is_sign_negative_expr(inner)?;
+        return Some((v, !b));
+    }
+    let Expr::Binary(BinOp::Or, l, r) = expr else {
+        return None;
+    };
+    let is_zero = |e: &Expr| exact_f64_lit(e).is_some_and(|v| v == 0.0);
+    let is_one = |e: &Expr| exact_f64_lit(e) == Some(1.0);
+    let var = match l.as_ref() {
+        Expr::Binary(BinOp::Lt, a, b) if is_zero(b) => match a.as_ref() {
+            Expr::Ident(id) => id.clone(),
+            _ => return None,
+        },
+        Expr::Binary(BinOp::Gt, a, b) if is_zero(a) => match b.as_ref() {
+            Expr::Ident(id) => id.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let Expr::Binary(BinOp::And, eq_part, inv_part) = r.as_ref() else {
+        return None;
+    };
+    let eq_ok = matches!(
+        eq_part.as_ref(),
+        Expr::Binary(BinOp::StrictEq, a, b)
+            if (matches!(a.as_ref(), Expr::Ident(id) if id == &var) && is_zero(b))
+                || (is_zero(a) && matches!(b.as_ref(), Expr::Ident(id) if id == &var))
+    );
+    if !eq_ok {
+        return None;
+    }
+    let is_one_div_var = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Binary(BinOp::Div, num, den)
+                if is_one(num) && matches!(den.as_ref(), Expr::Ident(id) if id == &var)
+        )
+    };
+    let inv_ok = matches!(
+        inv_part.as_ref(),
+        Expr::Binary(BinOp::Lt, a, b) if is_one_div_var(a) && is_zero(b)
+    ) || matches!(
+        inv_part.as_ref(),
+        Expr::Binary(BinOp::Gt, a, b) if is_zero(a) && is_one_div_var(b)
+    );
+    inv_ok.then_some((var, true))
+}
+
+fn match_assign_and_break<'a>(stmts: &'a [Stmt], dst: &str, label: &str) -> Option<&'a Expr> {
+    let [Stmt::ExprStmt(Expr::Assign(lhs, rhs)), Stmt::Break(Some(brk))] = stmts else {
+        return None;
+    };
+    if matches!(lhs.as_ref(), Expr::Ident(id) if id == dst) && brk == label {
+        Some(rhs.as_ref())
+    } else {
+        None
+    }
+}
+
+/// Checks if `cond` tests `!is_nan(var)` given an optional preceding `tmp = var !== var` / `var === var`.
+fn match_non_nan_guard_cond(
+    cond: &Expr,
+    prev_nan_tmp: Option<(&str, &str, bool)>,
+) -> Option<String> {
+    if let Some((tmp, var, tmp_is_nan)) = prev_nan_tmp {
+        if tmp_is_nan {
+            if matches!(cond, Expr::Unary(UnOp::Not, inner) if matches!(inner.as_ref(), Expr::Ident(id) if id == tmp))
+            {
+                return Some(var.to_owned());
+            }
+        } else if matches!(cond, Expr::Ident(id) if id == tmp) {
+            return Some(var.to_owned());
+        }
+    }
+    if let Some((var, is_nan)) = match_nan_test_expr(cond) {
+        if !is_nan {
+            return Some(var);
+        }
+    }
+    None
+}
+
+/// Given `ord_cond` and branch results `(then_val, else_val)` for unequal non-NaN operands `(a, b)`,
+/// returns `Some(true)` for `Math.max`, `Some(false)` for `Math.min`, or `None`.
+fn classify_strict_order_branch(
+    ord_cond: &Expr,
+    then_val: &Expr,
+    else_val: &Expr,
+    a: &Expr,
+    b: &Expr,
+) -> Option<bool> {
+    let Expr::Binary(op, l, r) = ord_cond else {
+        return None;
+    };
+    // Determine which of (a, b) is strictly larger when `ord_cond` is true (knowing a !== b).
+    let then_picks_larger = match (
+        op,
+        l.as_ref() == a && r.as_ref() == b,
+        l.as_ref() == b && r.as_ref() == a,
+    ) {
+        (BinOp::Gt | BinOp::Ge, true, _) => then_val == a && else_val == b,
+        (BinOp::Lt | BinOp::Le, _, true) => then_val == a && else_val == b,
+        (BinOp::Lt | BinOp::Le, true, _) => then_val == b && else_val == a,
+        (BinOp::Gt | BinOp::Ge, _, true) => then_val == b && else_val == a,
+        _ => return None,
+    };
+    if then_picks_larger {
+        return Some(true);
+    }
+    let then_picks_smaller = match (
+        op,
+        l.as_ref() == a && r.as_ref() == b,
+        l.as_ref() == b && r.as_ref() == a,
+    ) {
+        (BinOp::Lt | BinOp::Le, true, _) => then_val == a && else_val == b,
+        (BinOp::Gt | BinOp::Ge, _, true) => then_val == a && else_val == b,
+        (BinOp::Gt | BinOp::Ge, true, _) => then_val == b && else_val == a,
+        (BinOp::Lt | BinOp::Le, _, true) => then_val == b && else_val == a,
+        _ => return None,
+    };
+    then_picks_smaller.then_some(false)
+}
+
+/// Verifies `eq_body` (entered when `a === b` and both are non-NaN) matches `Math.max(a, b)`
+/// (`is_max == true`) or `Math.min(a, b)` (`is_max == false`) bit-identically on `-0.0` / `+0.0`.
+#[allow(clippy::too_many_arguments)]
+fn verify_eq_branch(
+    eq_body: &[Stmt],
+    dst: &str,
+    label: &str,
+    a: &Expr,
+    b: &Expr,
+    const_b: Option<f64>,
+    is_max: bool,
+    read_counts: &HashMap<String, usize>,
+) -> bool {
+    // Case 1: Sign-bit check inside `a === b`.
+    let sign_branch: Option<(String, bool, &Expr, &Expr)> = match eq_body {
+        [Stmt::ExprStmt(Expr::Assign(dd_lhs, dd_rhs)), Stmt::If(cond, t, Some(e))] => {
+            let Expr::Ident(dd_name) = dd_lhs.as_ref() else {
+                return false;
+            };
+            if read_counts.get(dd_name).copied().unwrap_or(0) != 1
+                || dd_name == dst
+                || matches!(a, Expr::Ident(id) if id == dd_name)
+                || matches!(b, Expr::Ident(id) if id == dd_name)
+            {
+                return false;
+            }
+            let Some((sign_var, rhs_true_neg)) = match_is_sign_negative_expr(dd_rhs) else {
+                return false;
+            };
+            let cond_true_neg = if matches!(cond, Expr::Ident(id) if id == dd_name) {
+                rhs_true_neg
+            } else if matches!(cond, Expr::Unary(UnOp::Not, inner) if matches!(inner.as_ref(), Expr::Ident(id) if id == dd_name))
+            {
+                !rhs_true_neg
+            } else {
+                return false;
+            };
+            let (Some(w1), Some(w2)) = (
+                match_assign_and_break(t, dst, label),
+                match_assign_and_break(e, dst, label),
+            ) else {
+                return false;
+            };
+            Some((sign_var, cond_true_neg, w1, w2))
+        }
+        [Stmt::If(cond, t, Some(e))] => {
+            let Some((sign_var, cond_true_neg)) = match_is_sign_negative_expr(cond) else {
+                return false;
+            };
+            let (Some(w1), Some(w2)) = (
+                match_assign_and_break(t, dst, label),
+                match_assign_and_break(e, dst, label),
+            ) else {
+                return false;
+            };
+            Some((sign_var, cond_true_neg, w1, w2))
+        }
+        _ => None,
+    };
+
+    if let Some((sign_var, cond_true_neg, w1, w2)) = sign_branch {
+        let z = Expr::Ident(sign_var);
+        let other = if &z == a {
+            b
+        } else if &z == b {
+            a
+        } else {
+            return false;
+        };
+        let (on_neg, on_nonneg) = if cond_true_neg { (w1, w2) } else { (w2, w1) };
+        return if is_max {
+            on_neg == other && on_nonneg == &z
+        } else {
+            on_neg == &z && on_nonneg == other
+        };
+    }
+
+    // Case 2: Direct constant-folded assignment `[dst = w; break label]`, valid ONLY when `b` is
+    // a finite non-NaN literal (`const_b = Some(c)`).
+    if let (Some(c), Some(w)) = (const_b, match_assign_and_break(eq_body, dst, label)) {
+        if c != 0.0 {
+            return w == a || w == b;
+        }
+        // `c == 0.0`: verify exact `-0.0` vs `+0.0` tie-breaking.
+        if c.is_sign_positive() {
+            // `+0.0`: Math.max(a, +0) -> +0 (`b`), Math.min(a, +0) -> a (preserves -0).
+            return if is_max { w == b } else { w == a };
+        } else {
+            // `-0.0`: Math.max(a, -0) -> a (preserves +0), Math.min(a, -0) -> -0 (`b`).
+            return if is_max { w == a } else { w == b };
+        }
+    }
+
+    false
+}
+
+/// Matches the inner compare-and-break body after both operands are proven non-NaN.
+/// Returns `Some((b_expr, is_max))` where `a` is the already-checked variable `a_var`.
+fn match_max_min_compare_body(
+    inner: &[Stmt],
+    a_var: &str,
+    known_b_var: Option<&str>,
+    dst: &str,
+    label: &str,
+    read_counts: &HashMap<String, usize>,
+) -> Option<(Expr, bool)> {
+    let [Stmt::If(cmp_cond, cmp_then, Some(cmp_else))] = inner else {
+        return None;
+    };
+    let a = Expr::Ident(a_var.to_owned());
+
+    // Subcase A: `if (a === b) { ... } else if (a > b) { ... } else { ... }`
+    if let Expr::Binary(BinOp::StrictEq, eq_l, eq_r) = cmp_cond {
+        let b_expr = if eq_l.as_ref() == &a {
+            eq_r.as_ref()
+        } else if eq_r.as_ref() == &a {
+            eq_l.as_ref()
+        } else {
+            return None;
+        };
+        let const_b = match known_b_var {
+            Some(bv) => {
+                if !matches!(b_expr, Expr::Ident(id) if id == bv) {
+                    return None;
+                }
+                None
+            }
+            None => {
+                let c = exact_f64_lit(b_expr)?;
+                if !c.is_finite() {
+                    return None;
+                }
+                Some(c)
+            }
+        };
+        let [Stmt::If(ord_cond, ord_then, Some(ord_else))] = cmp_else.as_slice() else {
+            return None;
+        };
+        let v1 = match_assign_and_break(ord_then, dst, label)?;
+        let v2 = match_assign_and_break(ord_else, dst, label)?;
+        let is_max = classify_strict_order_branch(ord_cond, v1, v2, &a, b_expr)?;
+        if verify_eq_branch(
+            cmp_then,
+            dst,
+            label,
+            &a,
+            b_expr,
+            const_b,
+            is_max,
+            read_counts,
+        ) {
+            return Some((b_expr.clone(), is_max));
+        }
+        return None;
+    }
+
+    // Subcase B (1-var + constant only): direct `if (a > c) { dst = a; break } else { dst = c; break }`
+    // with no separate `===` branch.
+    if known_b_var.is_none() {
+        let Expr::Binary(op, ol, or) = cmp_cond else {
+            return None;
+        };
+        let (b_expr, a_on_left) = if ol.as_ref() == &a {
+            (or.as_ref(), true)
+        } else if or.as_ref() == &a {
+            (ol.as_ref(), false)
+        } else {
+            return None;
+        };
+        let c = exact_f64_lit(b_expr)?;
+        if !c.is_finite() {
+            return None;
+        }
+        let v1 = match_assign_and_break(cmp_then, dst, label)?;
+        let v2 = match_assign_and_break(cmp_else, dst, label)?;
+        let is_max = classify_strict_order_branch(cmp_cond, v1, v2, &a, b_expr)?;
+        if c != 0.0 {
+            return Some((b_expr.clone(), is_max));
+        }
+        // Check exact tie-breaking at `a === 0` (`+0.0` vs `-0.0`):
+        let eq_takes_then = matches!(op, BinOp::Ge | BinOp::Le);
+        let eq_result = if eq_takes_then { v1 } else { v2 };
+        let _ = a_on_left;
+        let ok = if c.is_sign_positive() {
+            if is_max {
+                eq_result == b_expr
+            } else {
+                eq_result == &a
+            }
+        } else if is_max {
+            eq_result == &a
+        } else {
+            eq_result == b_expr
+        };
+        if ok {
+            return Some((b_expr.clone(), is_max));
+        }
+    }
+
+    None
+}
+
+/// Attempts to match an IEEE-754 `Math.max` / `Math.min` idiom starting at `stmts[idx]`.
+/// Returns `(start_idx, end_excl, replacement_stmt)` on match.
+fn match_ieee_max_min_at(
+    stmts: &[Stmt],
+    idx: usize,
+    read_counts: &HashMap<String, usize>,
+) -> Option<(usize, usize, Stmt)> {
+    // Check optional preceding `c_ = k !== k;` (or `c_ = k === k;`).
+    let (label_idx, prev_nan_tmp, consume_prev) =
+        if let Some(Stmt::ExprStmt(Expr::Assign(lhs, rhs))) = stmts.get(idx) {
+            if let (Expr::Ident(tmp), Some((var, is_nan))) =
+                (lhs.as_ref(), match_nan_test_expr(rhs))
+            {
+                if tmp != &var && matches!(stmts.get(idx + 1), Some(Stmt::Labeled(..))) {
+                    let single_read = read_counts.get(tmp).copied().unwrap_or(0) == 1;
+                    (idx + 1, Some((tmp.as_str(), var, is_nan)), single_read)
+                } else {
+                    (idx, None, false)
+                }
+            } else {
+                (idx, None, false)
+            }
+        } else {
+            (idx, None, false)
+        };
+
+    let Stmt::Labeled(label, inner_box) = stmts.get(label_idx)? else {
+        return None;
+    };
+    let Stmt::Block(block) = inner_box.as_ref() else {
+        return None;
+    };
+    let [Stmt::If(outer_cond, outer_then, None), Stmt::ExprStmt(Expr::Assign(dst_lhs, nan_rhs))] =
+        block.as_slice()
+    else {
+        return None;
+    };
+    let Expr::Ident(dst) = dst_lhs.as_ref() else {
+        return None;
+    };
+    if !is_nan_expr(nan_rhs) {
+        return None;
+    }
+    // If keeping the preceding `c_ = k !== k;` (because `c_` is read later), `dst` must not be `c_`.
+    if !consume_prev {
+        if let Some((tmp, _, _)) = &prev_nan_tmp {
+            if dst == *tmp {
+                return None;
+            }
+        }
+    }
+
+    let prev_ref = prev_nan_tmp
+        .as_ref()
+        .map(|(tmp, var, is_nan)| (*tmp, var.as_str(), *is_nan));
+
+    // Either `outer_cond` checks `!is_nan(a)` alone, or collapsed `!is_nan(a) && !is_nan(b)`.
+    let matched: Option<(String, Expr, bool)> = if let Some(a_var) =
+        match_non_nan_guard_cond(outer_cond, prev_ref)
+    {
+        // Try 2-variable nested NaN check first:
+        match outer_then.as_slice() {
+            [Stmt::ExprStmt(Expr::Assign(da_lhs, da_rhs)), Stmt::If(b_cond, b_then, None)] => {
+                if let (Expr::Ident(da_name), Some((b_var, da_is_nan))) =
+                    (da_lhs.as_ref(), match_nan_test_expr(da_rhs))
+                {
+                    if read_counts.get(da_name).copied().unwrap_or(0) == 1
+                        && da_name != dst
+                        && da_name != &a_var
+                        && da_name != &b_var
+                        && match_non_nan_guard_cond(
+                            b_cond,
+                            Some((da_name.as_str(), b_var.as_str(), da_is_nan)),
+                        )
+                        .as_deref()
+                            == Some(b_var.as_str())
+                    {
+                        match_max_min_compare_body(
+                            b_then,
+                            &a_var,
+                            Some(&b_var),
+                            dst,
+                            label,
+                            read_counts,
+                        )
+                        .map(|(b_expr, is_max)| (a_var.clone(), b_expr, is_max))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            [Stmt::If(b_cond, b_then, None)] => {
+                if let Some(b_var) = match_non_nan_guard_cond(b_cond, None) {
+                    match_max_min_compare_body(
+                        b_then,
+                        &a_var,
+                        Some(&b_var),
+                        dst,
+                        label,
+                        read_counts,
+                    )
+                    .map(|(b_expr, is_max)| (a_var.clone(), b_expr, is_max))
+                } else {
+                    // Could be 1-variable + constant (no second NaN check).
+                    match_max_min_compare_body(outer_then, &a_var, None, dst, label, read_counts)
+                        .map(|(b_expr, is_max)| (a_var.clone(), b_expr, is_max))
+                }
+            }
+            _ => match_max_min_compare_body(outer_then, &a_var, None, dst, label, read_counts)
+                .map(|(b_expr, is_max)| (a_var.clone(), b_expr, is_max)),
+        }
+    } else if let Expr::Binary(BinOp::And, c1, c2) = outer_cond {
+        if let (Some(a_var), Some(b_var)) = (
+            match_non_nan_guard_cond(c1, prev_ref),
+            match_non_nan_guard_cond(c2, None),
+        ) {
+            match_max_min_compare_body(outer_then, &a_var, Some(&b_var), dst, label, read_counts)
+                .map(|(b_expr, is_max)| (a_var, b_expr, is_max))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let (a_var, b_expr, is_max) = matched?;
+    let method = if is_max { "max" } else { "min" };
+    let repl = jsast::assign_stmt(
+        jsast::id(dst.clone()),
+        jsast::method_call(jsast::id("Math"), method, vec![jsast::id(a_var), b_expr]),
+    );
+    let start = if consume_prev { idx } else { label_idx };
+    Some((start, label_idx + 1, repl))
+}
+
+fn fold_ieee_max_min_stmts(stmts: &mut Vec<Stmt>, read_counts: &HashMap<String, usize>) {
+    // Recurse into nested structures first.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::If(_, t, e) => {
+                fold_ieee_max_min_stmts(t, read_counts);
+                if let Some(el) = e {
+                    fold_ieee_max_min_stmts(el, read_counts);
+                }
+            }
+            Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                fold_ieee_max_min_stmts(b, read_counts);
+            }
+            Stmt::Labeled(_, inner) => {
+                if let Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) = inner.as_mut()
+                {
+                    fold_ieee_max_min_stmts(b, read_counts);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    fold_ieee_max_min_stmts(&mut c.body, read_counts);
+                }
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                fold_ieee_max_min_stmts(body, read_counts);
+                fold_ieee_max_min_stmts(handler, read_counts);
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0usize;
+    while i < stmts.len() {
+        if let Some((start, end, repl)) = match_ieee_max_min_at(stmts, i, read_counts) {
+            stmts.splice(start..end, std::iter::once(repl));
+            i = start + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Straight-line CSE for repeated pure `s.charCodeAt(idx)` loads dominated by an unconditional
 /// first evaluation (e.g. `65 <= a.charCodeAt(A) && a.charCodeAt(A) <= 90` followed by
 /// `97 <= a.charCodeAt(A)` in `marked`).
@@ -3369,6 +4130,536 @@ mod tests {
         assert!(
             printed.contains("x & 15"),
             "expected nested bitmask folded to `x & 15`: {printed}"
+        );
+    }
+
+    #[test]
+    fn folds_proven_nonneg_ushr_zero_and_safe_zero_add() {
+        let ushr0 = |e: Expr| Expr::Binary(BinOp::UShr, Box::new(e), Box::new(Expr::Num(0.0)));
+        let mut decl = Stmt::FunctionDecl {
+            name: "alg".to_owned(),
+            params: vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "arr".to_owned(),
+                "i".to_owned(),
+                "s".to_owned(),
+            ],
+            body: vec![
+                jsast::lets(vec![
+                    ("m1".to_owned(), None),
+                    ("m_neg".to_owned(), None),
+                    ("sh".to_owned(), None),
+                    ("xr".to_owned(), None),
+                    ("xr_neg".to_owned(), None),
+                    ("idx".to_owned(), None),
+                    ("z_int".to_owned(), None),
+                    ("z_str".to_owned(), None),
+                ]),
+                // `(a & 255) >>> 0` -> `a & 255`
+                jsast::assign_stmt(
+                    jsast::id("m1"),
+                    ushr0(Expr::Binary(
+                        BinOp::BitAnd,
+                        Box::new(jsast::id("a")),
+                        Box::new(Expr::Num(255.0)),
+                    )),
+                ),
+                // `(a & 0x80000000) >>> 0` MUST keep `>>> 0` (bit 31 set!)
+                jsast::assign_stmt(
+                    jsast::id("m_neg"),
+                    ushr0(Expr::Binary(
+                        BinOp::BitAnd,
+                        Box::new(jsast::id("a")),
+                        Box::new(Expr::Num(2147483648.0)),
+                    )),
+                ),
+                // `(a >>> 5) >>> 0` -> `a >>> 5`
+                jsast::assign_stmt(
+                    jsast::id("sh"),
+                    ushr0(Expr::Binary(
+                        BinOp::UShr,
+                        Box::new(jsast::id("a")),
+                        Box::new(Expr::Num(5.0)),
+                    )),
+                ),
+                // `((a & 255) ^ (b >>> 24)) >>> 0` -> `(a & 255) ^ (b >>> 24)`
+                jsast::assign_stmt(
+                    jsast::id("xr"),
+                    ushr0(Expr::Binary(
+                        BinOp::BitXor,
+                        Box::new(Expr::Binary(
+                            BinOp::BitAnd,
+                            Box::new(jsast::id("a")),
+                            Box::new(Expr::Num(255.0)),
+                        )),
+                        Box::new(Expr::Binary(
+                            BinOp::UShr,
+                            Box::new(jsast::id("b")),
+                            Box::new(Expr::Num(24.0)),
+                        )),
+                    )),
+                ),
+                // `((a & 255) ^ (b >>> 0)) >>> 0` MUST keep `>>> 0` (b >>> 0 can have bit 31 set!)
+                jsast::assign_stmt(
+                    jsast::id("xr_neg"),
+                    ushr0(Expr::Binary(
+                        BinOp::BitXor,
+                        Box::new(Expr::Binary(
+                            BinOp::BitAnd,
+                            Box::new(jsast::id("a")),
+                            Box::new(Expr::Num(255.0)),
+                        )),
+                        Box::new(ushr0(jsast::id("b"))),
+                    )),
+                ),
+                // `arr[0 + i]` -> `arr[i]`
+                jsast::assign_stmt(
+                    jsast::id("idx"),
+                    jsast::index(
+                        jsast::id("arr"),
+                        Expr::Binary(
+                            BinOp::Add,
+                            Box::new(Expr::Num(0.0)),
+                            Box::new(jsast::id("i")),
+                        ),
+                    ),
+                ),
+                // `0 + (a & 31)` -> `a & 31`
+                jsast::assign_stmt(
+                    jsast::id("z_int"),
+                    Expr::Binary(
+                        BinOp::Add,
+                        Box::new(Expr::Num(0.0)),
+                        Box::new(Expr::Binary(
+                            BinOp::BitAnd,
+                            Box::new(jsast::id("a")),
+                            Box::new(Expr::Num(31.0)),
+                        )),
+                    ),
+                ),
+                // `0 + s` MUST NOT fold (could be string concatenation!)
+                jsast::assign_stmt(
+                    jsast::id("z_str"),
+                    Expr::Binary(
+                        BinOp::Add,
+                        Box::new(Expr::Num(0.0)),
+                        Box::new(jsast::id("s")),
+                    ),
+                ),
+                Stmt::Return(Some(Expr::Array(vec![
+                    jsast::id("m1"),
+                    jsast::id("m_neg"),
+                    jsast::id("sh"),
+                    jsast::id("xr"),
+                    jsast::id("xr_neg"),
+                    jsast::id("idx"),
+                    jsast::id("z_int"),
+                    jsast::id("z_str"),
+                ]))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains("m1 = a & 255;"),
+            "expected (a & 255) >>> 0 folded: {printed}"
+        );
+        assert!(
+            printed.contains("m_neg = (a & 2147483648) >>> 0;"),
+            "expected (a & 0x80000000) >>> 0 preserved: {printed}"
+        );
+        assert!(
+            printed.contains("sh = a >>> 5;"),
+            "expected (a >>> 5) >>> 0 folded: {printed}"
+        );
+        assert!(
+            printed.contains("xr = a & 255 ^ b >>> 24;"),
+            "expected proven-nonneg xor >>> 0 folded: {printed}"
+        );
+        assert!(
+            printed.contains("xr_neg = (a & 255 ^ b >>> 0) >>> 0;"),
+            "expected possibly-negative xor >>> 0 preserved: {printed}"
+        );
+        assert!(
+            printed.contains("idx = arr[i];"),
+            "expected arr[0 + i] folded to arr[i]: {printed}"
+        );
+        assert!(
+            printed.contains("z_int = a & 31;"),
+            "expected 0 + (a & 31) folded: {printed}"
+        );
+        assert!(
+            printed.contains("z_str = 0 + s;"),
+            "0 + arbitrary ident must NOT fold: {printed}"
+        );
+    }
+
+    #[test]
+    fn folds_ieee_max_min_two_var_and_const_idioms_and_rejects_unsound_neg_zero() {
+        let sign_neg = |v: &str| {
+            Expr::Binary(
+                BinOp::Or,
+                Box::new(Expr::Binary(
+                    BinOp::Lt,
+                    Box::new(jsast::id(v)),
+                    Box::new(Expr::Num(0.0)),
+                )),
+                Box::new(Expr::Binary(
+                    BinOp::And,
+                    Box::new(Expr::Binary(
+                        BinOp::StrictEq,
+                        Box::new(jsast::id(v)),
+                        Box::new(Expr::Num(0.0)),
+                    )),
+                    Box::new(Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(Expr::Binary(
+                            BinOp::Div,
+                            Box::new(Expr::Num(1.0)),
+                            Box::new(jsast::id(v)),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    )),
+                )),
+            )
+        };
+        let assign_brk = |dst: &str, val: Expr, lbl: &str| {
+            vec![
+                jsast::assign_stmt(jsast::id(dst), val),
+                Stmt::Break(Some(lbl.to_owned())),
+            ]
+        };
+
+        // 1. Exact 2-variable `Math.max(k, r)` + 2-variable `Math.min(k, r)` + 1-var const `1` + `+0.0`.
+        let mut decl = Stmt::FunctionDecl {
+            name: "minmax".to_owned(),
+            params: vec!["k".to_owned(), "r".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("c_".to_owned(), None),
+                    ("da".to_owned(), None),
+                    ("dd".to_owned(), None),
+                    ("j".to_owned(), None),
+                    ("c2".to_owned(), None),
+                    ("da2".to_owned(), None),
+                    ("dd2".to_owned(), None),
+                    ("m".to_owned(), None),
+                    ("dh".to_owned(), None),
+                    ("y1".to_owned(), None),
+                    ("d0".to_owned(), None),
+                    ("y0max".to_owned(), None),
+                    ("d0m".to_owned(), None),
+                    ("y0min".to_owned(), None),
+                ]),
+                // Math.max(k, r)
+                jsast::assign_stmt(
+                    jsast::id("c_"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("k")),
+                        Box::new(jsast::id("k")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "c".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("c_"))),
+                            vec![
+                                jsast::assign_stmt(
+                                    jsast::id("da"),
+                                    Expr::Binary(
+                                        BinOp::StrictNe,
+                                        Box::new(jsast::id("r")),
+                                        Box::new(jsast::id("r")),
+                                    ),
+                                ),
+                                Stmt::If(
+                                    Expr::Unary(UnOp::Not, Box::new(jsast::id("da"))),
+                                    vec![Stmt::If(
+                                        Expr::Binary(
+                                            BinOp::StrictEq,
+                                            Box::new(jsast::id("k")),
+                                            Box::new(jsast::id("r")),
+                                        ),
+                                        vec![
+                                            jsast::assign_stmt(jsast::id("dd"), sign_neg("k")),
+                                            Stmt::If(
+                                                jsast::id("dd"),
+                                                assign_brk("j", jsast::id("r"), "c"),
+                                                Some(assign_brk("j", jsast::id("k"), "c")),
+                                            ),
+                                        ],
+                                        Some(vec![Stmt::If(
+                                            Expr::Binary(
+                                                BinOp::Gt,
+                                                Box::new(jsast::id("k")),
+                                                Box::new(jsast::id("r")),
+                                            ),
+                                            assign_brk("j", jsast::id("k"), "c"),
+                                            Some(assign_brk("j", jsast::id("r"), "c")),
+                                        )]),
+                                    )],
+                                    None,
+                                ),
+                            ],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("j"), jsast::id("NaN")),
+                    ])),
+                ),
+                // Math.min(k, r)
+                jsast::assign_stmt(
+                    jsast::id("c2"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("k")),
+                        Box::new(jsast::id("k")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "c2l".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("c2"))),
+                            vec![
+                                jsast::assign_stmt(
+                                    jsast::id("da2"),
+                                    Expr::Binary(
+                                        BinOp::StrictNe,
+                                        Box::new(jsast::id("r")),
+                                        Box::new(jsast::id("r")),
+                                    ),
+                                ),
+                                Stmt::If(
+                                    Expr::Unary(UnOp::Not, Box::new(jsast::id("da2"))),
+                                    vec![Stmt::If(
+                                        Expr::Binary(
+                                            BinOp::StrictEq,
+                                            Box::new(jsast::id("k")),
+                                            Box::new(jsast::id("r")),
+                                        ),
+                                        vec![
+                                            jsast::assign_stmt(jsast::id("dd2"), sign_neg("k")),
+                                            Stmt::If(
+                                                jsast::id("dd2"),
+                                                assign_brk("m", jsast::id("k"), "c2l"),
+                                                Some(assign_brk("m", jsast::id("r"), "c2l")),
+                                            ),
+                                        ],
+                                        Some(vec![Stmt::If(
+                                            Expr::Binary(
+                                                BinOp::Lt,
+                                                Box::new(jsast::id("k")),
+                                                Box::new(jsast::id("r")),
+                                            ),
+                                            assign_brk("m", jsast::id("k"), "c2l"),
+                                            Some(assign_brk("m", jsast::id("r"), "c2l")),
+                                        )]),
+                                    )],
+                                    None,
+                                ),
+                            ],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("m"), jsast::id("NaN")),
+                    ])),
+                ),
+                // Constant-1 variant: `Math.max(j, 1)`
+                jsast::assign_stmt(
+                    jsast::id("dh"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("j")),
+                        Box::new(jsast::id("j")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "f".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("dh"))),
+                            vec![Stmt::If(
+                                Expr::Binary(
+                                    BinOp::StrictEq,
+                                    Box::new(jsast::id("j")),
+                                    Box::new(Expr::Num(1.0)),
+                                ),
+                                assign_brk("y1", jsast::id("j"), "f"),
+                                Some(vec![Stmt::If(
+                                    Expr::Binary(
+                                        BinOp::Gt,
+                                        Box::new(jsast::id("j")),
+                                        Box::new(Expr::Num(1.0)),
+                                    ),
+                                    assign_brk("y1", jsast::id("j"), "f"),
+                                    Some(assign_brk("y1", Expr::Num(1.0), "f")),
+                                )]),
+                            )],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("y1"), jsast::id("NaN")),
+                    ])),
+                ),
+                // Constant +0.0 MAX (picks `+0.0` on `j === 0`) -> valid `Math.max(j, 0)`
+                jsast::assign_stmt(
+                    jsast::id("d0"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("j")),
+                        Box::new(jsast::id("j")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "f0".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("d0"))),
+                            vec![Stmt::If(
+                                Expr::Binary(
+                                    BinOp::StrictEq,
+                                    Box::new(jsast::id("j")),
+                                    Box::new(Expr::Num(0.0)),
+                                ),
+                                assign_brk("y0max", Expr::Num(0.0), "f0"),
+                                Some(vec![Stmt::If(
+                                    Expr::Binary(
+                                        BinOp::Gt,
+                                        Box::new(jsast::id("j")),
+                                        Box::new(Expr::Num(0.0)),
+                                    ),
+                                    assign_brk("y0max", jsast::id("j"), "f0"),
+                                    Some(assign_brk("y0max", Expr::Num(0.0), "f0")),
+                                )]),
+                            )],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("y0max"), jsast::id("NaN")),
+                    ])),
+                ),
+                // Constant +0.0 MIN (picks `j` on `j === 0`, preserving `-0.0`) -> valid `Math.min(j, 0)`
+                jsast::assign_stmt(
+                    jsast::id("d0m"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("j")),
+                        Box::new(jsast::id("j")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "f0m".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("d0m"))),
+                            vec![Stmt::If(
+                                Expr::Binary(
+                                    BinOp::StrictEq,
+                                    Box::new(jsast::id("j")),
+                                    Box::new(Expr::Num(0.0)),
+                                ),
+                                assign_brk("y0min", jsast::id("j"), "f0m"),
+                                Some(vec![Stmt::If(
+                                    Expr::Binary(
+                                        BinOp::Lt,
+                                        Box::new(jsast::id("j")),
+                                        Box::new(Expr::Num(0.0)),
+                                    ),
+                                    assign_brk("y0min", jsast::id("j"), "f0m"),
+                                    Some(assign_brk("y0min", Expr::Num(0.0), "f0m")),
+                                )]),
+                            )],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("y0min"), jsast::id("NaN")),
+                    ])),
+                ),
+                Stmt::Return(Some(Expr::Array(vec![
+                    jsast::id("j"),
+                    jsast::id("m"),
+                    jsast::id("y1"),
+                    jsast::id("y0max"),
+                    jsast::id("y0min"),
+                ]))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains("j = Math.max(k, r);"),
+            "expected 2-var Math.max folded: {printed}"
+        );
+        assert!(
+            printed.contains("m = Math.min(k, r);"),
+            "expected 2-var Math.min folded: {printed}"
+        );
+        assert!(
+            printed.contains("y1 = Math.max(j, 1);"),
+            "expected const-1 Math.max folded: {printed}"
+        );
+        assert!(
+            printed.contains("y0max = Math.max(j, 0);"),
+            "expected const-+0 Math.max folded: {printed}"
+        );
+        assert!(
+            printed.contains("y0min = Math.min(j, 0);"),
+            "expected const-+0 Math.min folded: {printed}"
+        );
+        assert!(
+            !printed.contains("NaN") && !printed.contains("break "),
+            "all five labeled NaN blocks should collapse cleanly: {printed}"
+        );
+
+        // 2. Negative `-0.0` soundness: MAX against `+0.0` that returns `j` on `j === 0` (which
+        //    would return `-0.0` instead of `+0.0`) MUST NOT fold to `Math.max(j, 0)`.
+        let mut bad_neg0 = Stmt::FunctionDecl {
+            name: "bad_zero".to_owned(),
+            params: vec!["j".to_owned()],
+            body: vec![
+                jsast::lets(vec![("dh".to_owned(), None), ("y".to_owned(), None)]),
+                jsast::assign_stmt(
+                    jsast::id("dh"),
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(jsast::id("j")),
+                        Box::new(jsast::id("j")),
+                    ),
+                ),
+                Stmt::Labeled(
+                    "f".to_owned(),
+                    Box::new(Stmt::Block(vec![
+                        Stmt::If(
+                            Expr::Unary(UnOp::Not, Box::new(jsast::id("dh"))),
+                            vec![Stmt::If(
+                                Expr::Binary(
+                                    BinOp::StrictEq,
+                                    Box::new(jsast::id("j")),
+                                    Box::new(Expr::Num(0.0)),
+                                ),
+                                assign_brk("y", jsast::id("j"), "f"),
+                                Some(vec![Stmt::If(
+                                    Expr::Binary(
+                                        BinOp::Gt,
+                                        Box::new(jsast::id("j")),
+                                        Box::new(Expr::Num(0.0)),
+                                    ),
+                                    assign_brk("y", jsast::id("j"), "f"),
+                                    Some(assign_brk("y", Expr::Num(0.0), "f")),
+                                )]),
+                            )],
+                            None,
+                        ),
+                        jsast::assign_stmt(jsast::id("y"), jsast::id("NaN")),
+                    ])),
+                ),
+                Stmt::Return(Some(jsast::id("y"))),
+            ],
+        };
+        run_speed_post_opts(&mut bad_neg0);
+        let sb = jsast::stmt_to_string(&bad_neg0);
+        assert!(
+            !sb.contains("Math.max") && sb.contains("NaN"),
+            "wrong -0.0 tie-break on MAX against +0.0 must NOT fold to Math.max: {sb}"
         );
     }
 }

@@ -2582,7 +2582,24 @@ fn product_node(table: &TypeTable, ty: TypeId, depth: usize) -> Option<ProductNo
     if let Some(pointer) = descriptor.js.pointer_form {
         let components = match pointer {
             PointerForm::Thin | PointerForm::Str => vec![LaneComponent::Value],
-            PointerForm::Slot => vec![LaneComponent::Buffer, LaneComponent::Offset],
+            PointerForm::Slot => {
+                // Only Rust references (`&T` / `&mut T`) to non-ZST pointees are guaranteed to be
+                // plain `{ buf, off }` slot records. Raw pointers (`*const T` / `*mut T` and
+                // transparent wrappers like `NonNull<T>`, `Unique<T>`, `core::fmt::Arguments.args`)
+                // and ZST references can carry bare integer addresses (null, dangling alignment,
+                // or provenance-free tagged integers) or scaled byte-view records (`sc`/`w`/`es`).
+                // Splitting them into `(p.buf, p.off)` and rebuilding `{ buf, off }` turns bare
+                // integers into `{ buf: undefined, off: undefined }` and strips extra metadata.
+                let is_non_zst_ref = matches!(
+                    table.get(table.peeled(ty)).map(|d| &d.kind),
+                    Some(TypeKind::Reference { pointee, .. }) if !table.is_zst(*pointee)
+                );
+                if is_non_zst_ref {
+                    vec![LaneComponent::Buffer, LaneComponent::Offset]
+                } else {
+                    vec![LaneComponent::Value]
+                }
+            }
             PointerForm::FatSlice => vec![
                 LaneComponent::Buffer,
                 LaneComponent::Offset,
@@ -6625,5 +6642,180 @@ mod tests {
             !plan.flat.contains_key(&item(22)),
             "mutably-borrowed recursive by-value parameter must not flatten"
         );
+    }
+
+    #[test]
+    fn product_node_keeps_raw_slot_pointers_and_zst_refs_as_single_value() {
+        let mut interns = interns();
+        let u8_ty = TypeId(500);
+        let raw_ptr_ty = TypeId(501);
+        let non_null_ty = TypeId(502);
+        let ref_u8_ty = TypeId(503);
+        let ref_unit_ty = TypeId(504);
+        let args_ty = TypeId(505);
+
+        let mut u8_desc = descriptor(
+            u8_ty,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+        );
+        u8_desc.layout.size = Some(1);
+        interns.types.insert(u8_desc);
+
+        let mut raw_desc = descriptor(
+            raw_ptr_ty,
+            TypeKind::RawPointer {
+                pointee: u8_ty,
+                mutable: false,
+            },
+        );
+        raw_desc.layout.size = Some(4);
+        raw_desc.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(raw_desc);
+
+        let mut push_str = |s: &str| {
+            let id = StrId(interns.strings.len() as u32);
+            interns.strings.push(s.to_owned());
+            id
+        };
+        let ptr_name = push_str("pointer");
+        let nn_v = push_str("NonNull");
+        let tpl_name = push_str("template");
+        let args_name = push_str("args");
+        let args_v = push_str("Arguments");
+
+        let nn_fields = vec![FieldDescriptor {
+            key: FieldKey::Transparent,
+            ty: raw_ptr_ty,
+            offset: 0,
+        }];
+        let mut nn_desc = descriptor(
+            non_null_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 502,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![crate::jir::types::VariantDescriptor {
+                    name: nn_v,
+                    fields: nn_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+        );
+        nn_desc.layout.size = Some(4);
+        nn_desc.js.transparent = Some(crate::jir::types::TransparentField {
+            ty: raw_ptr_ty,
+            field: 0,
+        });
+        nn_desc.js.pointer_form = Some(PointerForm::Slot);
+        nn_desc.js.fields = nn_fields;
+        interns.types.insert(nn_desc);
+
+        let mut ref_u8_desc = descriptor(
+            ref_u8_ty,
+            TypeKind::Reference {
+                pointee: u8_ty,
+                mutable: false,
+            },
+        );
+        ref_u8_desc.layout.size = Some(4);
+        ref_u8_desc.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(ref_u8_desc);
+
+        let mut ref_unit_desc = descriptor(
+            ref_unit_ty,
+            TypeKind::Reference {
+                pointee: UNIT,
+                mutable: false,
+            },
+        );
+        ref_unit_desc.layout.size = Some(4);
+        ref_unit_desc.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(ref_unit_desc);
+
+        let args_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(tpl_name),
+                ty: non_null_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(args_name),
+                ty: raw_ptr_ty,
+                offset: 4,
+            },
+        ];
+        let mut args_desc = descriptor(
+            args_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 505,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![crate::jir::types::VariantDescriptor {
+                    name: args_v,
+                    fields: args_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+        );
+        args_desc.layout.size = Some(8);
+        args_desc.js.is_indirect = true;
+        args_desc.js.needs_clone = true;
+        args_desc.js.fields = args_fields;
+        interns.types.insert(args_desc);
+
+        assert_eq!(
+            product_node(&interns.types, raw_ptr_ty, 0),
+            Some(ProductNode::Leaf {
+                ty: raw_ptr_ty,
+                components: vec![LaneComponent::Value],
+            }),
+            "raw PointerForm::Slot must stay a single Value lane (can hold bare int / tagged addr)"
+        );
+        assert_eq!(
+            product_node(&interns.types, non_null_ty, 0),
+            Some(ProductNode::Leaf {
+                ty: non_null_ty,
+                components: vec![LaneComponent::Value],
+            }),
+            "transparent NonNull<T> over RawPointer must stay a single Value lane"
+        );
+        assert_eq!(
+            product_node(&interns.types, ref_unit_ty, 0),
+            Some(ProductNode::Leaf {
+                ty: ref_unit_ty,
+                components: vec![LaneComponent::Value],
+            }),
+            "ZST reference &() with PointerForm::Slot must stay a single Value lane"
+        );
+        assert_eq!(
+            product_node(&interns.types, ref_u8_ty, 0),
+            Some(ProductNode::Leaf {
+                ty: ref_u8_ty,
+                components: vec![LaneComponent::Buffer, LaneComponent::Offset],
+            }),
+            "non-ZST &u8 reference with PointerForm::Slot still splits into (Buffer, Offset)"
+        );
+        assert!(
+            recursive_shape(&interns.types, args_ty).is_none(),
+            "struct of raw slot pointers (core::fmt::Arguments) must not recursively split into buf/off"
+        );
+        let _ = ptr_name;
     }
 }

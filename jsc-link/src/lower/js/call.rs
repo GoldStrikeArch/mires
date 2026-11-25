@@ -272,9 +272,15 @@ impl JsCx<'_> {
         // Mires v4 Phase 3 universal flat `Vec<T, Global>` hooks (`ReleaseSpeed` + `Default`
         // allocator + `!byte_views` + `!non_rc_raw_alloc_reachable`).
         if let CallSemantic::Standard(operation) = semantic {
-            if operation.is_native_vec() && self.heap().native_vec_enabled {
-                if let Some(lowered) = self.lower_native_vec_call(op, *operation, args)? {
-                    return Ok(lowered);
+            if self.heap().native_vec_enabled {
+                if operation.is_native_vec() {
+                    if let Some(lowered) = self.lower_native_vec_call(op, *operation, args)? {
+                        return Ok(lowered);
+                    }
+                } else if *operation == StandardOperation::VecResize {
+                    if let Some(lowered) = self.lower_native_vec_resize(args)? {
+                        return Ok(lowered);
+                    }
                 }
             }
         }
@@ -1150,14 +1156,7 @@ impl JsCx<'_> {
                         let buf = jsast::new(jsast::id("Array"), vec![cap]);
                         return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
                     }
-                    let shell_expr = uninit_shell(
-                        table,
-                        self.interns,
-                        elem,
-                        0,
-                        heap.native_string_enabled,
-                        heap.native_vec_enabled,
-                    );
+                    let shell_expr = uninit_shell(table, self.interns, elem, 0, heap);
                     if const_u128(*cap_v) == Some(1) {
                         if let Some(shell) = shell_expr {
                             let slot = if tracked {
@@ -1184,7 +1183,10 @@ impl JsCx<'_> {
                     return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
                 }
                 let zeroed = self.expr_of(*zeroed_v)?;
-                let mk = self.zero_factory(elem);
+                let mk = match value::zero_value_for_heap_plan(table, self.interns, elem, heap) {
+                    Some(v) => jsast::arrow(Vec::new(), v),
+                    None => jsast::null(),
+                };
                 let mut call_args = vec![cap, zeroed, mk];
                 if tracked {
                     call_args.push(Expr::Bool(true));
@@ -1718,6 +1720,93 @@ impl JsCx<'_> {
         }
     }
 
+    /// Lowers `Vec::resize(&mut self, new_len, value)` on numeric `TypedArray`-backed
+    /// `Vec<T, Global>` directly to reserve + native `TypedArray.prototype.fill` (C++ `memset`).
+    fn lower_native_vec_resize(&self, args: &[ValueId]) -> Res<Option<Lowered>> {
+        const TA_SUFFIXES: [&str; 8] = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "f64"];
+        let [v_v, new_len_v, val_v] = args else {
+            return Ok(None);
+        };
+        let table = self.table;
+        let arg_ty = self.ty_of(*v_v)?;
+        let Some(vec_ty) = value::pointee_of(table, arg_ty) else {
+            return Ok(None);
+        };
+        let Some(elem_ty) = crate::analysis::heap::global_vec_elem_ty(table, vec_ty) else {
+            return Ok(None);
+        };
+        let Some(elem_desc) = table.get(elem_ty) else {
+            return Ok(None);
+        };
+        if elem_desc.layout.zst {
+            return Ok(None);
+        }
+        let Some(k) = crate::analysis::heap::native_vec_ta_kind(table, elem_ty) else {
+            return Ok(None);
+        };
+        let elem_size = elem_desc.layout.size.unwrap_or(1).max(1);
+        let min_cap: u64 = if elem_size == 1 {
+            8
+        } else if elem_size <= 1024 {
+            4
+        } else {
+            1
+        };
+        let max_elems: u64 = 2_147_483_647u64 / elem_size;
+        let suffix = TA_SUFFIXES[k as usize];
+
+        let mut setup = Vec::new();
+        let bind_atom = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
+            if matches!(
+                expr,
+                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::Bool(_)
+            ) {
+                expr
+            } else {
+                let (bind, id) = self.temp(expr);
+                setup.push(bind);
+                id
+            }
+        };
+        let v = bind_atom(self.expr_of(*v_v)?, &mut setup);
+        let nl = bind_atom(self.expr_of(*new_len_v)?, &mut setup);
+        let val = bind_atom(self.expr_of(*val_v)?, &mut setup);
+
+        let (b_ol, ol) = self.temp(jsast::member(v.clone(), "len"));
+        setup.push(b_ol);
+        let grow_body = vec![
+            jsast::if_(
+                jsast::binary(
+                    jsast::BinOp::Gt,
+                    nl.clone(),
+                    jsast::member(jsast::member(v.clone(), "buf"), "length"),
+                ),
+                vec![jsast::expr_stmt(jsast::rt_call(
+                    format!("nv_reserve_{suffix}"),
+                    vec![
+                        v.clone(),
+                        ol.clone(),
+                        jsast::binary(jsast::BinOp::Sub, nl.clone(), ol.clone()),
+                        jsast::num(min_cap as f64),
+                        Expr::Bool(false),
+                        jsast::num(max_elems as f64),
+                    ],
+                ))],
+            ),
+            jsast::expr_stmt(jsast::method_call(
+                jsast::member(v.clone(), "buf"),
+                "fill",
+                vec![val, ol.clone(), nl.clone()],
+            )),
+        ];
+        setup.push(jsast::if_(
+            jsast::binary(jsast::BinOp::Gt, nl.clone(), ol),
+            grow_body,
+        ));
+        setup.push(jsast::assign_stmt(jsast::member(v, "len"), nl));
+        Ok(Some(Lowered::Done(setup)))
+    }
+
     /// Lowers Mires v4 Phase 3 universal flat `Vec<T, Global>` hooks
     /// (`StandardOperation::is_native_vec`) directly at call sites when
     /// `self.heap().native_vec_enabled` holds.
@@ -1738,6 +1827,7 @@ impl JsCx<'_> {
             "Float32Array",
             "Float64Array",
         ];
+        const TA_SUFFIXES: [&str; 8] = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "f64"];
 
         let table = self.table;
         let heap = self.heap();
@@ -1754,6 +1844,18 @@ impl JsCx<'_> {
 
         let bind_if_needed = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
             if matches!(expr, Expr::Ident(_)) {
+                expr
+            } else {
+                let (bind, id) = self.temp(expr);
+                setup.push(bind);
+                id
+            }
+        };
+        let bind_atom = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
+            if matches!(
+                expr,
+                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::Bool(_)
+            ) {
                 expr
             } else {
                 let (bind, id) = self.temp(expr);
@@ -1805,6 +1907,7 @@ impl JsCx<'_> {
         } else {
             crate::analysis::heap::native_vec_ta_kind(table, elem_ty)
         };
+        let packed_arr = !is_zst && ta_kind.is_none() && heap.is_packed_arr_vec(table, vec_ty);
         let min_cap: u64 = if elem_size == 1 {
             8
         } else if elem_size <= 1024 {
@@ -1824,7 +1927,7 @@ impl JsCx<'_> {
 
         match operation {
             StandardOperation::NativeVecNew => {
-                let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                let Some(empty) = value::empty_native_vec_expr_for_heap(table, vec_ty, heap) else {
                     return Ok(None);
                 };
                 Ok(Some(Lowered::value(empty)))
@@ -1846,7 +1949,9 @@ impl JsCx<'_> {
                 }
                 if let Some(c) = const_u128(*cap_v) {
                     if c == 0 {
-                        let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                        let Some(empty) =
+                            value::empty_native_vec_expr_for_heap(table, vec_ty, heap)
+                        else {
                             return Ok(None);
                         };
                         return Ok(Some(Lowered::value(empty)));
@@ -1864,6 +1969,12 @@ impl JsCx<'_> {
                                 ("len", jsast::num(0)),
                             ]))));
                         }
+                        if packed_arr {
+                            return Ok(Some(Lowered::value(jsast::object_of(vec![
+                                ("buf", jsast::array(Vec::new())),
+                                ("len", jsast::num(0)),
+                            ]))));
+                        }
                         return Ok(Some(Lowered::value(jsast::object_of(vec![
                             (
                                 "buf",
@@ -1876,9 +1987,26 @@ impl JsCx<'_> {
                 let cap = self.expr_of(*cap_v)?;
                 if let Some(k) = ta_kind {
                     Ok(Some(Lowered::value(jsast::rt_call(
-                        "nv_with_cap_ta",
-                        vec![cap, jsast::num(f64::from(k)), jsast::num(max_elems as f64)],
+                        format!("nv_with_cap_{}", TA_SUFFIXES[k as usize]),
+                        vec![cap, jsast::num(max_elems as f64)],
                     ))))
+                } else if packed_arr {
+                    let mut setup = Vec::new();
+                    let cap = bind_atom(cap, &mut setup);
+                    setup.push(jsast::if_(
+                        jsast::binary(jsast::BinOp::Gt, cap, jsast::num(max_elems as f64)),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "js_abort",
+                            vec![jsast::string("capacity overflow")],
+                        ))],
+                    ));
+                    Ok(Some(Lowered::Value(
+                        setup,
+                        jsast::object_of(vec![
+                            ("buf", jsast::array(Vec::new())),
+                            ("len", jsast::num(0)),
+                        ]),
+                    )))
                 } else {
                     Ok(Some(Lowered::value(jsast::rt_call(
                         "nv_with_cap_arr",
@@ -1900,7 +2028,9 @@ impl JsCx<'_> {
                 if let Some(k) = ta_kind {
                     if let Some(c) = const_u128(*n_v) {
                         if c == 0 {
-                            let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                            let Some(empty) =
+                                value::empty_native_vec_expr_for_heap(table, vec_ty, heap)
+                            else {
                                 return Ok(None);
                             };
                             return Ok(Some(Lowered::value(empty)));
@@ -1920,28 +2050,45 @@ impl JsCx<'_> {
                     }
                     let n = self.expr_of(*n_v)?;
                     return Ok(Some(Lowered::value(jsast::rt_call(
-                        "nv_zeroed_ta",
-                        vec![n, jsast::num(f64::from(k)), jsast::num(max_elems as f64)],
+                        format!("nv_zeroed_{}", TA_SUFFIXES[k as usize]),
+                        vec![n, jsast::num(max_elems as f64)],
                     ))));
                 }
-                let Some(zero) = value::zero_value_for_heap(
-                    table,
-                    self.interns,
-                    elem_ty,
-                    heap.native_string_enabled,
-                    heap.native_vec_enabled,
-                ) else {
+                let Some(zero) =
+                    value::zero_value_for_heap_plan(table, self.interns, elem_ty, heap)
+                else {
                     return Ok(None);
                 };
                 let n = self.expr_of(*n_v)?;
                 if !table.is_indirect(peeled_elem) {
+                    if packed_arr {
+                        Ok(Some(Lowered::value(jsast::rt_call(
+                            "nv_zeroed_arr_p",
+                            vec![n, jsast::num(max_elems as f64), zero],
+                        ))))
+                    } else {
+                        Ok(Some(Lowered::value(jsast::rt_call(
+                            "nv_zeroed_arr",
+                            vec![
+                                n,
+                                jsast::num(align as f64),
+                                jsast::num(max_elems as f64),
+                                zero,
+                            ],
+                        ))))
+                    }
+                } else if packed_arr {
+                    let helper = if tracked {
+                        "nv_zeroed_arr_fn_tracked_p"
+                    } else {
+                        "nv_zeroed_arr_fn_p"
+                    };
                     Ok(Some(Lowered::value(jsast::rt_call(
-                        "nv_zeroed_arr",
+                        helper,
                         vec![
                             n,
-                            jsast::num(align as f64),
                             jsast::num(max_elems as f64),
-                            zero,
+                            jsast::arrow(Vec::new(), zero),
                         ],
                     ))))
                 } else {
@@ -1992,7 +2139,8 @@ impl JsCx<'_> {
                     if !jsast::is_droppable(&arr_e) {
                         setup.push(jsast::expr_stmt(arr_e));
                     }
-                    let Some(empty) = value::empty_native_vec_expr(table, vec_ty) else {
+                    let Some(empty) = value::empty_native_vec_expr_for_heap(table, vec_ty, heap)
+                    else {
                         return Ok(None);
                     };
                     return Ok(Some(Lowered::Value(setup, empty)));
@@ -2148,32 +2296,62 @@ impl JsCx<'_> {
                     ));
                     return Ok(Some(Lowered::Done(setup)));
                 }
-                if let Some(k) = ta_kind {
-                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
-                        "nv_reserve_ta",
+                if packed_arr {
+                    let mut setup = Vec::new();
+                    if !jsast::is_droppable(&v) {
+                        setup.push(jsast::expr_stmt(v));
+                    }
+                    setup.push(jsast::if_(
+                        jsast::binary(
+                            jsast::BinOp::Gt,
+                            jsast::binary(jsast::BinOp::Add, used, add),
+                            jsast::num(max_elems as f64),
+                        ),
+                        vec![jsast::expr_stmt(jsast::rt_call(
+                            "js_abort",
+                            vec![jsast::string("capacity overflow")],
+                        ))],
+                    ));
+                    return Ok(Some(Lowered::Done(setup)));
+                }
+                let mut setup = Vec::new();
+                let v = bind_if_needed(v, &mut setup);
+                let used = bind_atom(used, &mut setup);
+                let add = bind_atom(add, &mut setup);
+                let call = if let Some(k) = ta_kind {
+                    jsast::rt_call(
+                        format!("nv_reserve_{}", TA_SUFFIXES[k as usize]),
                         vec![
-                            v,
-                            used,
-                            add,
+                            v.clone(),
+                            used.clone(),
+                            add.clone(),
                             jsast::num(min_cap as f64),
                             Expr::Bool(exact),
-                            jsast::num(f64::from(k)),
                             jsast::num(max_elems as f64),
                         ],
-                    ))])))
+                    )
                 } else {
-                    Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                    jsast::rt_call(
                         "nv_reserve_arr",
                         vec![
-                            v,
-                            used,
-                            add,
+                            v.clone(),
+                            used.clone(),
+                            add.clone(),
                             jsast::num(min_cap as f64),
                             Expr::Bool(exact),
                             jsast::num(max_elems as f64),
                         ],
-                    ))])))
-                }
+                    )
+                };
+                setup.push(jsast::if_(
+                    jsast::binary(
+                        jsast::BinOp::Gt,
+                        jsast::binary(jsast::BinOp::Add, used, add),
+                        jsast::member(jsast::member(v, "buf"), "length"),
+                    ),
+                    vec![jsast::expr_stmt(call)],
+                ));
+                Ok(Some(Lowered::Done(setup)))
             }
             StandardOperation::NativeVecTryReserve
             | StandardOperation::NativeVecTryReserveExact => {
@@ -2184,7 +2362,12 @@ impl JsCx<'_> {
                 let v = self.expr_of(*v_v)?;
                 let used = self.expr_of(*used_v)?;
                 let add = self.expr_of(*add_v)?;
-                if is_zst {
+                if is_zst || packed_arr {
+                    let limit = if is_zst {
+                        4_294_967_295.0
+                    } else {
+                        max_elems as f64
+                    };
                     let mut setup = Vec::new();
                     if !jsast::is_droppable(&v) {
                         setup.push(jsast::expr_stmt(v));
@@ -2194,7 +2377,7 @@ impl JsCx<'_> {
                         jsast::binary(
                             jsast::BinOp::Le,
                             jsast::binary(jsast::BinOp::Add, used, add),
-                            jsast::num(4_294_967_295.0),
+                            jsast::num(limit),
                         ),
                     )));
                 }
@@ -2233,7 +2416,7 @@ impl JsCx<'_> {
                 let v = self.expr_of(*v_v)?;
                 let target = self.expr_of(*target_v)?;
                 let mut setup = Vec::new();
-                if is_zst {
+                if is_zst || packed_arr {
                     if !jsast::is_droppable(&v) {
                         setup.push(jsast::expr_stmt(v));
                     }
@@ -2262,13 +2445,14 @@ impl JsCx<'_> {
                     return Ok(None);
                 };
                 let v = self.expr_of(*v_v)?;
-                if is_zst {
+                if is_zst || packed_arr {
+                    let limit = if is_zst {
+                        4_294_967_295.0
+                    } else {
+                        max_elems as f64
+                    };
                     return Ok(Some(Lowered::Done(vec![jsast::if_(
-                        jsast::binary(
-                            jsast::BinOp::StrictEq,
-                            jsast::member(v, "len"),
-                            jsast::num(4_294_967_295.0),
-                        ),
+                        jsast::binary(jsast::BinOp::Ge, jsast::member(v, "len"), jsast::num(limit)),
                         vec![jsast::expr_stmt(jsast::rt_call(
                             "js_abort",
                             vec![jsast::string("capacity overflow")],
@@ -2277,13 +2461,8 @@ impl JsCx<'_> {
                 }
                 if let Some(k) = ta_kind {
                     Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
-                        "nv_grow_one_ta",
-                        vec![
-                            v,
-                            jsast::num(min_cap as f64),
-                            jsast::num(f64::from(k)),
-                            jsast::num(max_elems as f64),
-                        ],
+                        format!("nv_grow_{}", TA_SUFFIXES[k as usize]),
+                        vec![v, jsast::num(min_cap as f64), jsast::num(max_elems as f64)],
                     ))])))
                 } else {
                     Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
@@ -2331,6 +2510,55 @@ impl JsCx<'_> {
                         Ok(Some(Lowered::Done(setup)))
                     };
                 }
+                if packed_arr {
+                    if !is_mut && !tracked {
+                        let (bb, b) = self.temp(jsast::member(v.clone(), "buf"));
+                        setup.push(bb);
+                        setup.push(jsast::expr_stmt(jsast::method_call(
+                            b.clone(),
+                            "push",
+                            vec![val_expr],
+                        )));
+                        setup.push(jsast::assign_stmt(
+                            jsast::member(v, "len"),
+                            jsast::member(b, "length"),
+                        ));
+                        return Ok(Some(Lowered::Done(setup)));
+                    }
+                    let val = bind_if_needed(val_expr, &mut setup);
+                    let (bb, b) = self.temp(jsast::member(v.clone(), "buf"));
+                    setup.push(bb);
+                    let (bl, l) = self.temp(jsast::member(b.clone(), "length"));
+                    setup.push(bl);
+                    setup.push(jsast::expr_stmt(jsast::method_call(
+                        b.clone(),
+                        "push",
+                        vec![val.clone()],
+                    )));
+                    setup.push(jsast::assign_stmt(
+                        jsast::member(v, "len"),
+                        jsast::binary(jsast::BinOp::Add, l.clone(), jsast::num(1)),
+                    ));
+                    if tracked {
+                        setup.push(jsast::expr_stmt(jsast::rt_call(
+                            "nv_box_track_slot",
+                            vec![b.clone(), l.clone(), val.clone()],
+                        )));
+                    }
+                    if !is_mut {
+                        return Ok(Some(Lowered::Done(setup)));
+                    }
+                    let Some(res) = op.result else {
+                        return Ok(None);
+                    };
+                    let ret_ty = self.ty_of(res)?;
+                    let ret_expr = match table.pointer_form(ret_ty) {
+                        Some(PointerForm::Thin) => val,
+                        Some(PointerForm::Slot) => ptr::slot(b, l),
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(Lowered::Value(setup, ret_expr)));
+                }
                 let val = if is_mut || tracked {
                     bind_if_needed(val_expr, &mut setup)
                 } else {
@@ -2346,11 +2574,10 @@ impl JsCx<'_> {
                             jsast::member(jsast::member(v.clone(), "buf"), "length"),
                         ),
                         vec![jsast::expr_stmt(jsast::rt_call(
-                            "nv_grow_one_ta",
+                            format!("nv_grow_{}", TA_SUFFIXES[k as usize]),
                             vec![
                                 v.clone(),
                                 jsast::num(min_cap as f64),
-                                jsast::num(f64::from(k)),
                                 jsast::num(max_elems as f64),
                             ],
                         ))],
@@ -2389,11 +2616,7 @@ impl JsCx<'_> {
                 }
                 setup.push(jsast::assign_stmt(
                     jsast::member(v.clone(), "len"),
-                    jsast::binary(
-                        jsast::BinOp::UShr,
-                        jsast::binary(jsast::BinOp::Add, l.clone(), jsast::num(1)),
-                        jsast::num(0),
-                    ),
+                    jsast::binary(jsast::BinOp::Add, l.clone(), jsast::num(1)),
                 ));
                 if !is_mut {
                     return Ok(Some(Lowered::Done(setup)));
@@ -2449,33 +2672,45 @@ impl JsCx<'_> {
                 let (_, res_id) = self.temp(jsast::undefined());
 
                 let mut some_body = Vec::new();
-                let (bl, l) = self.temp(jsast::binary(
-                    jsast::BinOp::UShr,
-                    jsast::binary(
-                        jsast::BinOp::Sub,
-                        jsast::member(v.clone(), "len"),
-                        jsast::num(1),
-                    ),
-                    jsast::num(0),
-                ));
-                some_body.push(bl);
-                some_body.push(jsast::assign_stmt(
-                    jsast::member(v.clone(), "len"),
-                    l.clone(),
-                ));
-                let elem_expr = if is_zst {
-                    jsast::undefined()
-                } else {
-                    let (be, e) =
-                        self.temp(jsast::index(jsast::member(v.clone(), "buf"), l.clone()));
+                let elem_expr = if packed_arr {
+                    let (bb, b) = self.temp(jsast::member(v.clone(), "buf"));
+                    some_body.push(bb);
+                    let (be, e) = self.temp(jsast::method_call(b.clone(), "pop", Vec::new()));
                     some_body.push(be);
-                    if ta_kind.is_none() && elem_desc.layout.needs_drop {
-                        some_body.push(jsast::assign_stmt(
-                            jsast::index(jsast::member(v.clone(), "buf"), l),
-                            jsast::undefined(),
-                        ));
-                    }
+                    some_body.push(jsast::assign_stmt(
+                        jsast::member(v.clone(), "len"),
+                        jsast::member(b, "length"),
+                    ));
                     e
+                } else {
+                    let (bl, l) = self.temp(jsast::binary(
+                        jsast::BinOp::UShr,
+                        jsast::binary(
+                            jsast::BinOp::Sub,
+                            jsast::member(v.clone(), "len"),
+                            jsast::num(1),
+                        ),
+                        jsast::num(0),
+                    ));
+                    some_body.push(bl);
+                    some_body.push(jsast::assign_stmt(
+                        jsast::member(v.clone(), "len"),
+                        l.clone(),
+                    ));
+                    if is_zst {
+                        jsast::undefined()
+                    } else {
+                        let (be, e) =
+                            self.temp(jsast::index(jsast::member(v.clone(), "buf"), l.clone()));
+                        some_body.push(be);
+                        if ta_kind.is_none() && elem_desc.layout.needs_drop {
+                            some_body.push(jsast::assign_stmt(
+                                jsast::index(jsast::member(v.clone(), "buf"), l),
+                                jsast::undefined(),
+                            ));
+                        }
+                        e
+                    }
                 };
                 let some_fields = match value::key_name(self.interns, some_key) {
                     Some(k) => vec![(k, elem_expr)],
@@ -2535,6 +2770,12 @@ impl JsCx<'_> {
                     ));
                     setup.push(bo);
                     out
+                } else if packed_arr {
+                    jsast::cond(
+                        jsast::binary(jsast::BinOp::StrictEq, l.clone(), jsast::num(0)),
+                        jsast::rt_call("_nv_ea", vec![jsast::num(align as f64)]),
+                        jsast::member(v, "buf"),
+                    )
                 } else {
                     let (_, b_id) = self.temp(jsast::undefined());
                     setup.push(jsast::if_else(
@@ -2987,8 +3228,7 @@ fn uninit_shell(
     interns: &rcgjs_object::jir::interns::Interns,
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
-    native_string: bool,
-    native_vec: bool,
+    heap: &crate::analysis::heap::HeapPlan,
 ) -> Option<Expr> {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     if depth > 4 {
@@ -2999,7 +3239,7 @@ fn uninit_shell(
     if desc.layout.zst {
         return Some(jsast::undefined());
     }
-    if native_string
+    if heap.native_string_enabled
         && desc.meta.candidate == rcgjs_object::jir::types::RepresentationCandidate::String
     {
         return Some(jsast::object_of(vec![
@@ -3007,8 +3247,8 @@ fn uninit_shell(
             ("cap", jsast::num(0)),
         ]));
     }
-    if native_vec && crate::analysis::heap::is_direct_global_vec_ty(table, peeled) {
-        if let Some(empty) = value::empty_native_vec_expr(table, peeled) {
+    if heap.native_vec_enabled && crate::analysis::heap::is_direct_global_vec_ty(table, peeled) {
+        if let Some(empty) = value::empty_native_vec_expr_for_heap(table, peeled, heap) {
             return Some(empty);
         }
     }
@@ -3051,16 +3291,7 @@ fn uninit_shell(
                 Some(jsast::array(
                     elems
                         .iter()
-                        .map(|e| {
-                            uninit_field_shell(
-                                table,
-                                interns,
-                                *e,
-                                depth + 1,
-                                native_string,
-                                native_vec,
-                            )
-                        })
+                        .map(|e| uninit_field_shell(table, interns, *e, depth + 1, heap))
                         .collect(),
                 ))
             } else {
@@ -3081,14 +3312,7 @@ fn uninit_shell(
                 let key = value::key_name(interns, field.key)?;
                 entries.push((
                     key,
-                    uninit_field_shell(
-                        table,
-                        interns,
-                        field.ty,
-                        depth + 1,
-                        native_string,
-                        native_vec,
-                    ),
+                    uninit_field_shell(table, interns, field.ty, depth + 1, heap),
                 ));
             }
             Some(jsast::object(entries))
@@ -3106,8 +3330,7 @@ fn uninit_field_shell(
     interns: &rcgjs_object::jir::interns::Interns,
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
-    native_string: bool,
-    native_vec: bool,
+    heap: &crate::analysis::heap::HeapPlan,
 ) -> Expr {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     let peeled = table.peeled(ty);
@@ -3119,8 +3342,588 @@ fn uninit_field_shell(
                 form: NominalForm::Struct,
                 ..
             },
-        ) => uninit_shell(table, interns, peeled, depth, native_string, native_vec)
-            .unwrap_or_else(jsast::undefined),
+        ) => uninit_shell(table, interns, peeled, depth, heap).unwrap_or_else(jsast::undefined),
         _ => jsast::undefined(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rcgjs_object::item::{Availability, ItemSummary, JsName, SemanticKey};
+    use rcgjs_object::jir::interns::Interns;
+    use rcgjs_object::jir::origin::OriginId;
+    use rcgjs_object::jir::repr::{
+        Carrier, Func, Op, OpKind, RBlock, RBlockId, RTerm, ValueDef, ValueId,
+    };
+    use rcgjs_object::jir::semantic::{
+        AbiSignature, Body, BodyKind, BodySemantic, CallSemantic, Callee, ConstTree, DefinitionId,
+        ItemId, Signature, StandardOperation,
+    };
+    use rcgjs_object::jir::types::{
+        AllocatorIdentity, EnumRepr, FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts,
+        LayoutFacts, NominalForm, PointerForm, RepresentationCandidate, TypeDescriptor, TypeId,
+        TypeKind, TypeMeta, VariantDescriptor,
+    };
+    use rcgjs_object::jir::ItemClass;
+    use rcgjs_object::jsast;
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+
+    use crate::analysis::byte_views::ByteViewPlan;
+    use crate::analysis::heap::HeapPlan;
+    use crate::lower::js::{host, unsize};
+    use crate::lower::{LowerInput, NestedClone};
+    use crate::opts::{Opts, Profile};
+
+    fn mk_desc(id: u128, kind: TypeKind, size: u64, is_indirect: bool) -> TypeDescriptor {
+        let tid = TypeId(id);
+        let int = match kind {
+            TypeKind::Integer { signed, bits } => Some(IntFacts {
+                signed,
+                bits,
+                repr: if bits > 32 {
+                    IntRepr::BigInt
+                } else {
+                    IntRepr::Number
+                },
+            }),
+            _ => None,
+        };
+        TypeDescriptor {
+            id: tid,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: Some(size),
+                align: Some(size.max(1)),
+                sized: true,
+                zst: size == 0,
+                ..LayoutFacts::default()
+            },
+            js: JsFacts {
+                int,
+                is_indirect,
+                needs_clone: is_indirect,
+                peeled: tid,
+                transparent: None,
+                crosses_transparent_union: false,
+                enum_repr: None,
+                is_primitive_enum: false,
+                unsized_tail: None,
+                byte_element: false,
+                pointer_form: None,
+                fields: Vec::new(),
+            },
+            meta: TypeMeta::default(),
+        }
+    }
+
+    fn lower_func(interns: &Interns, func: &Func, heap: &HeapPlan) -> String {
+        let body = Body {
+            item: func.item,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: func.sig.clone(),
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: "test_fn".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let js_name = JsName::new("test_fn".to_owned());
+        let opts = Opts {
+            profile: Some(Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let items = host::ItemIndex::new();
+        let vtables = unsize::VtableIndex::new();
+        let input = LowerInput {
+            name: &js_name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns,
+            table: &interns.types,
+            opts: &opts,
+            items: &items,
+            drop_glue: host::EMPTY_DROP_GLUE,
+            vtables: &vtables,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: ByteViewPlan {
+                raw_byte_derefs: false,
+                elide_scale_scalar: true,
+            },
+            heap: Some(heap),
+            nested_clone: NestedClone::default(),
+        };
+        jsast::stmt_to_string(&crate::lower::lower_func(&input, func).expect("lower").decl)
+    }
+
+    #[test]
+    fn phase1b_lowers_packed_vec_monomorphic_ta_and_fast_vec_resize() {
+        let mut interns = Interns::new();
+        let sym = interns.intern_str("std_hook");
+        let resize_sym = interns.intern_str("alloc$vec$Vec$resize$h1");
+        let len_key = interns.intern_str("len");
+        let x_key = interns.intern_str("x");
+        let none_name = interns.intern_str("None");
+        let some_name = interns.intern_str("Some");
+        let f0_name = interns.intern_str("_0");
+
+        let unit = TypeId(1);
+        let u8_ty = TypeId(2);
+        let usize_ty = TypeId(3);
+        let obj_ty = TypeId(4);
+        interns
+            .types
+            .insert(mk_desc(1, TypeKind::Tuple(Vec::new()), 0, false));
+        interns.types.insert(mk_desc(
+            2,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            1,
+            false,
+        ));
+        interns.types.insert(mk_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            false,
+        ));
+        interns.types.insert(mk_desc(
+            4,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 5,
+                    local_hash: 1,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: x_key,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(x_key),
+                        ty: usize_ty,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            8,
+            true,
+        ));
+
+        let mk_vec = |interns: &mut Interns, vid: u128, rid: u128, elem: TypeId| {
+            let mut vd = mk_desc(
+                vid,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 2,
+                        local_hash: 1,
+                    },
+                    form: NominalForm::Struct,
+                    args: vec![elem],
+                    variants: vec![VariantDescriptor {
+                        name: len_key,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(len_key),
+                            ty: usize_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                12,
+                true,
+            );
+            vd.meta.candidate = RepresentationCandidate::Vec;
+            vd.meta.allocator = AllocatorIdentity::Global;
+            interns.types.insert(vd);
+            let mut rd = mk_desc(
+                rid,
+                TypeKind::Reference {
+                    pointee: TypeId(vid),
+                    mutable: true,
+                },
+                4,
+                false,
+            );
+            rd.js.pointer_form = Some(PointerForm::Thin);
+            interns.types.insert(rd);
+            (TypeId(vid), TypeId(rid))
+        };
+
+        let (vec_u8, ref_vec_u8) = mk_vec(&mut interns, 10, 11, u8_ty);
+        let (vec_obj, ref_vec_obj) = mk_vec(&mut interns, 12, 13, obj_ty);
+
+        let opt_obj = TypeId(14);
+        let mut opt_desc = mk_desc(
+            14,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 7,
+                },
+                form: NominalForm::Enum,
+                args: vec![obj_ty],
+                variants: vec![
+                    VariantDescriptor {
+                        name: none_name,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: some_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f0_name),
+                            ty: obj_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            8,
+            false,
+        );
+        opt_desc.js.enum_repr = Some(EnumRepr::NullNiche {
+            none_variant: 0,
+            some_variant: 1,
+        });
+        interns.types.insert(opt_desc);
+
+        let mut heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: false,
+            native_vec_enabled: true,
+            raw_alloc_reachable: false,
+            non_rc_raw_alloc_reachable: false,
+            any_boxed: false,
+            boxed_defs: BTreeSet::new(),
+            boxed_non_adt_keys: BTreeSet::new(),
+            all_non_adt_boxed: false,
+            all_adts_boxed: false,
+            smi_u32_fields: BTreeSet::new(),
+            packed_arr_vec_types: BTreeSet::from([vec_obj]),
+        };
+
+        let std_call = |res, op, args, name| Op {
+            result: res,
+            origin: OriginId(0),
+            kind: OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 2,
+                            local_hash: 99,
+                        },
+                        instantiation: 1,
+                    },
+                    link_name: name,
+                },
+                function: None,
+                args,
+                track_caller: None,
+                semantic: CallSemantic::Standard(op),
+                host: None,
+            },
+        };
+
+        // 1. Vec<u8>: with_capacity(n), zeroed(n), push(b), resize(n, b)
+        let f_u8 = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 1,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ref_vec_u8, usize_ty, u8_ty],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ref_vec_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: vec_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: vec_u8,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                ops: vec![
+                    std_call(
+                        Some(ValueId(3)),
+                        StandardOperation::NativeVecWithCapacity,
+                        vec![ValueId(1)],
+                        sym,
+                    ),
+                    std_call(
+                        Some(ValueId(4)),
+                        StandardOperation::NativeVecFromElemZeroed,
+                        vec![ValueId(1)],
+                        sym,
+                    ),
+                    std_call(
+                        None,
+                        StandardOperation::NativeVecPush,
+                        vec![ValueId(0), ValueId(2)],
+                        sym,
+                    ),
+                    std_call(
+                        None,
+                        StandardOperation::VecResize,
+                        vec![ValueId(0), ValueId(1), ValueId(2)],
+                        resize_sym,
+                    ),
+                ],
+                term: RTerm::Return(None),
+            }],
+        };
+        let js_u8 = lower_func(&interns, &f_u8, &heap);
+        assert!(js_u8.contains("__rt.nv_with_cap_u8("), "{js_u8}");
+        assert!(js_u8.contains("__rt.nv_zeroed_u8("), "{js_u8}");
+        assert!(js_u8.contains("__rt.nv_grow_u8("), "{js_u8}");
+        assert!(js_u8.contains("__rt.nv_reserve_u8("), "{js_u8}");
+        assert!(js_u8.contains(".buf.fill("), "{js_u8}");
+        assert!(!js_u8.contains("nv_grow_one_ta"), "{js_u8}");
+        assert!(!js_u8.contains("nv_with_cap_ta"), "{js_u8}");
+        assert!(!js_u8.contains("nv_zeroed_ta"), "{js_u8}");
+        assert!(!js_u8.contains("alloc$vec$Vec$resize$h1"), "{js_u8}");
+
+        // 2. Packed Vec<Obj>: new, with_capacity(16), push, pop, reserve, shrink_to
+        let f_obj = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 2,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ref_vec_obj, obj_ty, usize_ty],
+                result: opt_obj,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ref_vec_obj,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: obj_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: vec_obj,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: vec_obj,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: opt_obj,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                ops: vec![
+                    Op {
+                        result: Some(ValueId(3)),
+                        origin: OriginId(0),
+                        kind: OpKind::Const(ConstTree::Scalar { bits: 16, bytes: 4 }),
+                    },
+                    std_call(
+                        Some(ValueId(4)),
+                        StandardOperation::NativeVecNew,
+                        vec![],
+                        sym,
+                    ),
+                    std_call(
+                        Some(ValueId(5)),
+                        StandardOperation::NativeVecWithCapacity,
+                        vec![ValueId(3)],
+                        sym,
+                    ),
+                    std_call(
+                        None,
+                        StandardOperation::NativeVecReserve,
+                        vec![ValueId(0), ValueId(2), ValueId(3)],
+                        sym,
+                    ),
+                    std_call(
+                        None,
+                        StandardOperation::NativeVecShrinkTo,
+                        vec![ValueId(0), ValueId(2)],
+                        sym,
+                    ),
+                    std_call(
+                        None,
+                        StandardOperation::NativeVecPush,
+                        vec![ValueId(0), ValueId(1)],
+                        sym,
+                    ),
+                    std_call(
+                        Some(ValueId(6)),
+                        StandardOperation::NativeVecPop,
+                        vec![ValueId(0)],
+                        sym,
+                    ),
+                ],
+                term: RTerm::Return(Some(ValueId(6))),
+            }],
+        };
+        let js_packed = lower_func(&interns, &f_obj, &heap);
+        assert!(js_packed.contains("buf: []"), "{js_packed}");
+        assert!(js_packed.contains(".push("), "{js_packed}");
+        assert!(js_packed.contains(".pop()"), "{js_packed}");
+        assert!(!js_packed.contains("new Array("), "{js_packed}");
+        assert!(!js_packed.contains("nv_grow_one_arr"), "{js_packed}");
+        assert!(!js_packed.contains("nv_reserve_arr"), "{js_packed}");
+        assert!(!js_packed.contains("nv_shrink_arr"), "{js_packed}");
+        assert!(!js_packed.contains("_nv_ea"), "{js_packed}");
+
+        // 3. Non-TA VecResize (Vec<Obj>) must NOT be intercepted as TypedArray fill
+        heap.packed_arr_vec_types.clear();
+        let f_obj_resize = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 3,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ref_vec_obj, usize_ty, obj_ty],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ref_vec_obj,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: usize_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: obj_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                ops: vec![std_call(
+                    None,
+                    StandardOperation::VecResize,
+                    vec![ValueId(0), ValueId(1), ValueId(2)],
+                    resize_sym,
+                )],
+                term: RTerm::Return(None),
+            }],
+        };
+        let js_obj_resize = lower_func(&interns, &f_obj_resize, &heap);
+        assert!(
+            js_obj_resize.contains("alloc$vec$Vec$resize$h1("),
+            "{js_obj_resize}"
+        );
     }
 }

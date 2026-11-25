@@ -252,7 +252,7 @@ pub(super) fn int32_only_values(
         }
     }
     if set.is_empty() {
-        return set;
+        return nonneg_i31_elidable_values(func, table, interns, carried_pairs);
     }
 
     // Values returned, thrown, or switched on escape to non-bit-rep-only consumers.
@@ -376,7 +376,142 @@ pub(super) fn int32_only_values(
             break;
         }
     }
+    set.extend(nonneg_i31_elidable_values(
+        func,
+        table,
+        interns,
+        carried_pairs,
+    ));
     set
+}
+
+/// Unsigned 32-bit (`u32`/`usize`) SSA values provably in `[0, 0x7fff_ffff]` (bit 31 cleared),
+/// where signed `Int32` and unsigned `Uint32` representations are bit-identical for EVERY consumer,
+/// restricted to ops whose `int32_only` lowering omits `>>> 0` without emitting `| 0`
+/// (`BitAnd`/`BitOr`/`BitXor`, lossless `u32`/`usize` casts, `Copy`/`Move`).
+fn nonneg_i31_elidable_values(
+    func: &Func,
+    table: &TypeTable,
+    interns: &rcgjs_object::jir::interns::Interns,
+    carried_pairs: &BTreeMap<ValueId, CarriedPair>,
+) -> BTreeSet<ValueId> {
+    let is_u32_num = |ty: TypeId| {
+        table.int_repr(ty) == IntRepr::Number && table.int_info(ty) == Some((false, 32))
+    };
+    let mut const_u32: BTreeMap<ValueId, u32> = BTreeMap::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            let Some(result) = op.result else { continue };
+            if let OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar { bits, .. }) =
+                &op.kind
+            {
+                let ty = func.values[result.0 as usize].ty;
+                if table.int_repr(ty) == IntRepr::Number {
+                    if let Some((false, width)) = table.int_info(ty) {
+                        let v = if width < 32 {
+                            (*bits as u32) & ((1u32 << width) - 1)
+                        } else {
+                            *bits as u32
+                        };
+                        const_u32.insert(result, v);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut nonneg_i31: BTreeSet<ValueId> = BTreeSet::new();
+    for (&v, &c) in &const_u32 {
+        if c <= 0x7fff_ffff {
+            nonneg_i31.insert(v);
+        }
+    }
+
+    loop {
+        let mut grew = false;
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(result) = op.result else { continue };
+                if nonneg_i31.contains(&result) || carried_pairs.contains_key(&result) {
+                    continue;
+                }
+                let result_ty = func.values[result.0 as usize].ty;
+                if !is_u32_num(result_ty) {
+                    continue;
+                }
+                let is_i31 = match &op.kind {
+                    OpKind::Copy(src) | OpKind::Move(src) => nonneg_i31.contains(src),
+                    OpKind::Cast {
+                        kind: CastKind::IntToInt,
+                        v: src,
+                        from,
+                        ..
+                    } => {
+                        value::is_bool(table, *from)
+                            || (table.int_repr(*from) == IntRepr::Number
+                                && table.int_info(*from).is_some_and(|(s, b)| !s && b < 32))
+                            || (is_u32_num(*from) && nonneg_i31.contains(src))
+                    }
+                    OpKind::Binary { op: bin, l, r, ty } if is_u32_num(*ty) => match bin {
+                        BinaryOp::BitAnd => nonneg_i31.contains(l) || nonneg_i31.contains(r),
+                        BinaryOp::BitOr | BinaryOp::BitXor => {
+                            nonneg_i31.contains(l) && nonneg_i31.contains(r)
+                        }
+                        BinaryOp::Shr | BinaryOp::ShrUnchecked => {
+                            const_u32.get(r).is_some_and(|&k| (k & 31) >= 1)
+                        }
+                        BinaryOp::Div => const_u32.get(r).is_some_and(|&c| c >= 2),
+                        BinaryOp::Rem => const_u32
+                            .get(r)
+                            .is_some_and(|&c| (1..=0x8000_0000).contains(&c)),
+                        _ => false,
+                    },
+                    OpKind::Intrinsic { name, .. } => interns.str(*name).is_some_and(|iname| {
+                        matches!(
+                            iname,
+                            "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" | "ctpop"
+                        )
+                    }),
+                    _ => false,
+                };
+                if is_i31 {
+                    grew |= nonneg_i31.insert(result);
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut elidable = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            let Some(result) = op.result else { continue };
+            if !nonneg_i31.contains(&result) {
+                continue;
+            }
+            let omit_wrap_ok = match &op.kind {
+                OpKind::Binary {
+                    op: BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor,
+                    ..
+                }
+                | OpKind::Copy(_)
+                | OpKind::Move(_) => true,
+                OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: src,
+                    from,
+                    ..
+                } => is_u32_num(*from) && nonneg_i31.contains(src),
+                _ => false,
+            };
+            if omit_wrap_ok {
+                elidable.insert(result);
+            }
+        }
+    }
+    elidable
 }
 
 /// Unsigned 32-bit (`u32`) SSA values produced by reading a `smi_u32_fields` struct field (or
@@ -1161,8 +1296,40 @@ impl<'a> JsCx<'a> {
                 };
                 mask(product)
             }
-            BinaryOp::Div => mask(jsast::binary(JsBinOp::Div, lhs, rhs)),
-            BinaryOp::Rem => mask(jsast::binary(JsBinOp::Rem, lhs, rhs)),
+            BinaryOp::Div => {
+                if repr == IntRepr::Number && !signed && bits <= 32 {
+                    if let Some(c) = self.const_u32_expr(&rhs, bits) {
+                        if c == 1 {
+                            return Ok(lhs);
+                        }
+                        if c >= 2 && c.is_power_of_two() {
+                            return Ok(jsast::binary(
+                                JsBinOp::UShr,
+                                strip32(lhs),
+                                jsast::num(f64::from(c.trailing_zeros())),
+                            ));
+                        }
+                    }
+                }
+                mask(jsast::binary(JsBinOp::Div, lhs, rhs))
+            }
+            BinaryOp::Rem => {
+                if repr == IntRepr::Number && !signed && bits <= 32 {
+                    if let Some(c) = self.const_u32_expr(&rhs, bits) {
+                        if c == 1 && !super::loop_opt::expr_has_side_effect(&lhs) {
+                            return Ok(jsast::num(0.0));
+                        }
+                        if c >= 2 && c.is_power_of_two() {
+                            return Ok(jsast::binary(
+                                JsBinOp::BitAnd,
+                                strip32(lhs),
+                                jsast::num(f64::from(c - 1)),
+                            ));
+                        }
+                    }
+                }
+                mask(jsast::binary(JsBinOp::Rem, lhs, rhs))
+            }
             BinaryOp::BitAnd => mask(jsast::binary(JsBinOp::BitAnd, strip32(lhs), strip32(rhs))),
             BinaryOp::BitOr => mask(jsast::binary(JsBinOp::BitOr, strip32(lhs), strip32(rhs))),
             BinaryOp::BitXor => mask(jsast::binary(JsBinOp::BitXor, strip32(lhs), strip32(rhs))),
@@ -1189,6 +1356,73 @@ impl<'a> JsCx<'a> {
                 ))
             }
         })
+    }
+
+    /// Resolves an exact unsigned `<= 32`-bit constant from an already-lowered RHS expression,
+    /// checking both inline numeric literals and materialized single-constant JIR `OpKind::Const`
+    /// locals in `self.plan.names`.
+    fn const_u32_expr(&self, expr: &Expr, bits: u32) -> Option<u32> {
+        let unwrapped = match expr {
+            Expr::Binary(JsBinOp::UShr | JsBinOp::BitOr, l, r)
+                if matches!(r.as_ref(), Expr::Num(n) if *n == 0.0)
+                    || matches!(r.as_ref(), Expr::RawNum(s) if s == "0") =>
+            {
+                l.as_ref()
+            }
+            other => other,
+        };
+        let mask_bits = |v: u128| -> u32 {
+            if bits < 32 {
+                (v as u32) & ((1u32 << bits) - 1)
+            } else {
+                v as u32
+            }
+        };
+        match unwrapped {
+            Expr::Num(n)
+                if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX) =>
+            {
+                Some(mask_bits(*n as u128))
+            }
+            Expr::RawNum(s) => s.parse::<u32>().ok().map(|v| mask_bits(u128::from(v))),
+            Expr::Ident(name) => {
+                if self.formal_param_names.borrow().contains(name) {
+                    return None;
+                }
+                let mut found: Option<u32> = None;
+                for (&vid, mapped) in &self.plan.names {
+                    if mapped != name {
+                        continue;
+                    }
+                    let mut cur = vid;
+                    let mut val = None;
+                    for _ in 0..4 {
+                        let def = self.def_of(cur)?;
+                        match &def.kind {
+                            OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar {
+                                bits: raw,
+                                ..
+                            }) => {
+                                val = Some(mask_bits(*raw));
+                                break;
+                            }
+                            OpKind::Copy(src) | OpKind::Move(src) => cur = *src,
+                            _ => return None,
+                        }
+                    }
+                    let c = val?;
+                    if let Some(prev) = found {
+                        if prev != c {
+                            return None;
+                        }
+                    } else {
+                        found = Some(c);
+                    }
+                }
+                found
+            }
+            _ => None,
+        }
     }
 
     /// `op v` (`rvalue.rs::codegen_unop`).

@@ -34,11 +34,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::item::{JsName, LinkItem};
+use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
 use crate::jir::repr::{Carrier, Func, Op, OpKind, Proj, Root, ValueId};
-use crate::jir::semantic::{CallSemantic, Callee, ConstTree, ItemId, StandardOperation};
+use crate::jir::semantic::{
+    BodySemantic, CallSemantic, Callee, ConstTree, ItemId, StandardOperation,
+};
 use crate::jir::types::{RepresentationCandidate, TypeId, TypeKind, TypeTable};
-use crate::jsast::{self, BinOp, Expr};
+use crate::jsast::{self, BinOp, Expr, Stmt};
 
 /// The operations the kernel consumes or elides at a call site.
 pub(crate) fn is_format_machinery(operation: StandardOperation) -> bool {
@@ -392,13 +396,13 @@ impl<'a> View<'a> {
         else {
             return None;
         };
-        let (root, mut path) = match self.def(reference).map(|op| &op.kind)? {
-            OpKind::BorrowView {
+        let (root, mut path) = match self.def(reference).map(|op| &op.kind) {
+            Some(OpKind::BorrowView {
                 root,
                 path,
                 mutable: false,
-            } => (*root, path.clone()),
-            _ => return None,
+            }) => (*root, path.clone()),
+            _ => (Root::Value(reference), vec![Proj::Deref]),
         };
         let mut ty = pointee;
         loop {
@@ -638,6 +642,16 @@ pub(crate) fn analyze(
     interns: &Interns,
     resolve: &dyn Fn(&ItemId) -> Option<StandardOperation>,
 ) -> Analysis {
+    analyze_with(func, table, interns, resolve, false)
+}
+
+fn analyze_with(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    resolve: &dyn Fn(&ItemId) -> Option<StandardOperation>,
+    allow_partial: bool,
+) -> Analysis {
     let view = View::new(func, table, interns);
     let uses = use_counts(func);
     let used_once = |v: ValueId| uses.get(&v).copied().unwrap_or(0) == 1;
@@ -648,12 +662,21 @@ pub(crate) fn analyze(
         for (i, op) in block.ops.iter().enumerate() {
             let OpKind::Call {
                 callee: Callee::Direct { item, .. },
+                semantic,
                 ..
             } = &op.kind
             else {
                 continue;
             };
-            if let Some(operation) = resolve(item).filter(|op| is_format_machinery(*op)) {
+            let op_id = resolve(item)
+                .filter(|op| is_format_machinery(*op))
+                .or(match semantic {
+                    CallSemantic::Standard(StandardOperation::StringFmtWriteFmt) => {
+                        Some(StandardOperation::StringFmtWriteFmt)
+                    }
+                    _ => None,
+                });
+            if let Some(operation) = op_id {
                 machinery.insert((b, i), (operation, *item));
             }
         }
@@ -700,8 +723,8 @@ pub(crate) fn analyze(
         sites.push(site);
     }
 
-    // The decline-whole-item rule, plus which machinery items the committed rewrite may stop
-    // referencing: those every identified call to which is proven.
+    // The decline-whole-item rule (required for B1 carrier planning), plus which machinery items
+    // the committed rewrite may stop referencing: those every identified call to which is proven.
     let mut call_counts: BTreeMap<ItemId, (u32, u32)> = BTreeMap::new();
     let mut declined = false;
     for (position, (operation, item)) in &machinery {
@@ -709,7 +732,7 @@ pub(crate) fn analyze(
         entry.0 += 1;
         if proven.contains(position) {
             entry.1 += 1;
-        } else if declines_item(*operation) {
+        } else if !allow_partial && declines_item(*operation) {
             declined = true;
         }
     }
@@ -726,6 +749,89 @@ pub(crate) fn analyze(
         .map(|(item, _)| *item)
         .collect();
     Analysis { sites, elidable }
+}
+
+/// Marks all proven `format!`/`write!` sites directly for universal `NativeString`
+/// (`heap.native_string_enabled`), independent of B1 `CandidateKind::String` regions.
+///
+/// Under universal `NativeString` (`js-str=bytes` + `{ s, cap }`), every `String` stays
+/// `Carrier::Baseline` universally and every `&str` is already a UTF-8 byte string. Proven sites
+/// mark only their use-once `Arguments::new`, `Argument::new_*`, and spine renames with
+/// `Carrier::HostString`, leaving any unrelated unproven format calls in the same function
+/// untouched. Each rewritten function is carrier-verified before installation.
+///
+/// Returns the names of every modified function.
+pub(crate) fn commit_universal_native_string_sites(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    live: &BTreeSet<JsName>,
+    skip: &BTreeSet<JsName>,
+    items: &crate::lower::js::host::ItemIndex,
+) -> BTreeSet<JsName> {
+    let resolve = |item: &ItemId| items.get(item).and_then(|entry| entry.standard);
+    let mut touched = BTreeSet::new();
+    for (name, entry) in funcs.iter_mut() {
+        if !live.contains(name) || skip.contains(name) {
+            continue;
+        }
+        let Ok(func) = entry else {
+            continue;
+        };
+        let Some(link_item) = table.get(name) else {
+            continue;
+        };
+        if !matches!(
+            link_item.jir.body.as_ref().map(|body| body.semantic),
+            Some(BodySemantic::Ordinary)
+        ) {
+            continue;
+        }
+        let Some(interns) = link_item.jir.interns() else {
+            continue;
+        };
+        let analysis = analyze_with(func, &interns.types, interns, &resolve, true);
+        if analysis.sites.is_empty() {
+            continue;
+        }
+        let mut candidate = func.clone();
+        let mut applied_any = false;
+        for site in &analysis.sites {
+            if candidate.values[site.args_value.0 as usize].carrier != Carrier::Baseline {
+                continue;
+            }
+            // Pre-check that `write_fmt`'s return type is the canonical `Result<(), fmt::Error>`
+            // so `intercept` can never decline later in Phase C.
+            if let SiteKind::WriteFmt {
+                result: Some(res), ..
+            } = site.kind
+            {
+                let res_ty = candidate.values[res.0 as usize].ty;
+                if super::fmt::write_ok_expr(&interns.types, interns, res_ty).is_err() {
+                    continue;
+                }
+            }
+            candidate.values[site.args_value.0 as usize].carrier = Carrier::HostString;
+            for arg in &site.args {
+                candidate.values[arg.value.0 as usize].carrier = Carrier::HostString;
+            }
+            for (rename, renamed) in &site.renames {
+                candidate.values[rename.0 as usize].carrier =
+                    candidate.values[renamed.0 as usize].carrier;
+            }
+            applied_any = true;
+        }
+        if !applied_any {
+            continue;
+        }
+        if candidate
+            .verify_carriers(&interns.types, crate::opt::observed_carriers(&candidate))
+            .is_ok()
+        {
+            *func = candidate;
+            touched.insert(name.clone());
+        }
+    }
+    touched
 }
 
 /// Every value's use count: op operands plus terminator/edge arguments.
@@ -894,14 +1000,15 @@ fn prove_site(
     }
     // The write_fmt receiver must be the exact `&mut String` the builder contract expects.
     if let SiteKind::WriteFmt { receiver, .. } = kind {
+        let recv_ty = view.table.peeled(view.ty(receiver)?);
         let TypeKind::Reference {
             pointee,
             mutable: true,
-        } = *view.kind_of(view.ty(receiver)?)?
+        } = *view.kind_of(recv_ty)?
         else {
             return None;
         };
-        let descriptor = view.table.get(pointee)?;
+        let descriptor = view.table.get(view.table.peeled(pointee))?;
         if descriptor.meta.candidate != RepresentationCandidate::String {
             return None;
         }
@@ -986,7 +1093,7 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
                     "marked new_argument placeholder spec unsupported",
                 ));
             }
-            let text = format_text(
+            let (stmts, text) = format_text(
                 cx,
                 root,
                 &path,
@@ -995,7 +1102,11 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
                 spec,
                 cx.func.values[result.0 as usize].carrier,
             )?;
-            Ok(Some(Lowered::value(text)))
+            if stmts.is_empty() {
+                Ok(Some(Lowered::value(text)))
+            } else {
+                Ok(Some(Lowered::Value(stmts, text)))
+            }
         }
         StandardOperation::FormatArgsNew => {
             let Some(result) = op.result.filter(|result| marked(*result)) else {
@@ -1028,9 +1139,10 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             if pieces.len() != texts.len() + 1 {
                 return Err(kernel_decline("marked format template arity"));
             }
-            Ok(Some(Lowered::value(super::fmt::concat_format_pieces(
-                &pieces, &texts,
-            ))))
+            let byte_strings = cx.heap().native_string_enabled || crate::lower::bstr::enabled();
+            Ok(Some(Lowered::value(
+                super::fmt::concat_format_pieces_with_bytes(&pieces, &texts, byte_strings),
+            )))
         }
         StandardOperation::FormatArgsToString => {
             let [arguments] = args.as_slice() else {
@@ -1081,9 +1193,23 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             let recv = cx.read_place(&walk.place);
             if cx.heap().native_string_enabled {
                 let text = cx.expr_of(*arguments)?;
-                return Ok(Some(Lowered::Done(vec![jsast::expr_stmt(
-                    jsast::compound_assign(BinOp::Add, jsast::member(recv, "s"), text),
-                )])));
+                let stmts = vec![jsast::expr_stmt(jsast::compound_assign(
+                    BinOp::Add,
+                    jsast::member(recv, "s"),
+                    text,
+                ))];
+                return match op.result {
+                    None => Ok(Some(Lowered::Done(stmts))),
+                    Some(result) => {
+                        let ok = super::fmt::write_ok_expr(cx.table, cx.interns, cx.ty_of(result)?)
+                            .map_err(|_| {
+                                kernel_decline(
+                                    "marked write_fmt result is not Result<(), fmt::Error>",
+                                )
+                            })?;
+                        Ok(Some(Lowered::Value(stmts, ok)))
+                    }
+                };
             }
             // The receiver is a committed StringBuilder behind `&mut` (the plan's gate). The
             // append is `String::push_str`'s: the formatted text (well formed piece by piece, see
@@ -1216,10 +1342,12 @@ fn format_text(
     format: ArgFormat,
     spec: PlaceholderSpec,
     mark: Carrier,
-) -> Res<Expr> {
+) -> Res<(Vec<Stmt>, Expr)> {
     let walk = cx.walk_place(&root, path)?;
     let loaded = cx.read_place(&walk.place);
-    Ok(match (format, kind) {
+    let byte_strings = cx.heap().native_string_enabled || crate::lower::bstr::enabled();
+    let mut setup = Vec::new();
+    let expr = match (format, kind) {
         (ArgFormat::Display, DisplayKind::Integer { .. }) => {
             if spec.is_default() {
                 jsast::call(jsast::id("String"), vec![loaded])
@@ -1267,10 +1395,32 @@ fn format_text(
         (ArgFormat::Display, DisplayKind::Bool) => {
             jsast::cond(loaded, jsast::string("true"), jsast::string("false"))
         }
-        (ArgFormat::Display, DisplayKind::Char) => crate::lower::bstr::char_text(loaded),
-        // The planner accounts the members a site reaches (`representation`): the set is a sink.
+        (ArgFormat::Display, DisplayKind::Char) => {
+            if byte_strings {
+                let ch = if matches!(loaded, Expr::Ident(_) | Expr::Num(_)) {
+                    loaded
+                } else {
+                    let (bind, id) = cx.temp(loaded);
+                    setup.push(bind);
+                    id
+                };
+                jsast::cond(
+                    jsast::binary(BinOp::Lt, ch.clone(), jsast::num(128)),
+                    jsast::method_call(jsast::id("String"), "fromCharCode", vec![ch.clone()]),
+                    jsast::rt_call("bstr_char", vec![ch]),
+                )
+            } else {
+                jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded])
+            }
+        }
+        // Under `js-str=bytes` / universal `NativeString`, every `&str` is already a well-formed
+        // UTF-8 byte string; in UTF-16 mode wrap in `__rt.native_str_wf` to normalize lone surrogates.
         (ArgFormat::Display, DisplayKind::Str) => {
-            super::string::well_formed(loaded, &mut BTreeSet::new())
+            if byte_strings {
+                loaded
+            } else {
+                super::string::well_formed(loaded, &mut BTreeSet::new())
+            }
         }
         (ArgFormat::Display, DisplayKind::F64) => match spec.precision {
             Some(prec) => jsast::rt_call(
@@ -1300,7 +1450,8 @@ fn format_text(
             _ => loaded,
         },
         _ => return Err(kernel_decline("unsupported format/kind combination")),
-    })
+    };
+    Ok((setup, expr))
 }
 
 #[cfg(test)]

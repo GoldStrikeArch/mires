@@ -215,6 +215,7 @@ struct ConstUsage {
 struct HoistCollector {
     allow_bigint: bool,
     bstr_strings: bool,
+    speed_profile: bool,
     counts: BTreeMap<String, (Expr, ConstUsage)>,
     unreachable_throws: usize,
 }
@@ -322,7 +323,8 @@ impl HoistCollector {
                 return;
             }
             if let Expr::Index(obj, idx) = expr {
-                if is_scalar_array_lit(obj, 4, self.allow_bigint) {
+                let min_inline_arr = if self.speed_profile { 2 } else { 4 };
+                if is_scalar_array_lit(obj, min_inline_arr, self.allow_bigint) {
                     let key = format!("arr:{obj}");
                     self.record(key, obj, in_loop);
                     self.visit_expr(idx, in_loop, false);
@@ -908,16 +910,36 @@ fn find_read_only_nested_array_init(
     }
 }
 
-fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> Option<Expr> {
+fn find_read_only_table_init(
+    body: &[Stmt],
+    local: &str,
+    allow_bigint: bool,
+    min_len: usize,
+) -> Option<Expr> {
     struct Check<'a> {
         local: &'a str,
         allow_bigint: bool,
+        min_len: usize,
         decl_count: usize,
         found_init: Option<Expr>,
         reads: usize,
         bad: bool,
     }
     impl Check<'_> {
+        fn check_init_rhs(&mut self, rhs: &Expr) {
+            if !is_scalar_array_lit(rhs, self.min_len, self.allow_bigint) {
+                self.bad = true;
+                return;
+            }
+            if let Some(prev) = &self.found_init {
+                if prev != rhs {
+                    self.bad = true;
+                }
+                return;
+            }
+            self.found_init = Some(rhs.clone());
+        }
+
         fn stmt(&mut self, s: &Stmt) {
             if self.bad {
                 return;
@@ -925,17 +947,18 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
             match s {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
                 {
-                    if !is_scalar_array_lit(rhs, 8, self.allow_bigint) {
-                        self.bad = true;
-                        return;
-                    }
-                    if let Some(prev) = &self.found_init {
-                        if prev != rhs.as_ref() {
-                            self.bad = true;
+                    self.check_init_rhs(rhs);
+                }
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) {
+                                self.check_init_rhs(rhs);
+                                continue;
+                            }
                         }
-                        return;
+                        self.expr(item, false);
                     }
-                    self.found_init = Some((**rhs).clone());
                 }
                 Stmt::ExprStmt(e) | Stmt::Throw(e) => self.expr(e, false),
                 Stmt::Let(n, init) => {
@@ -946,13 +969,11 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
                             return;
                         }
                         if let Some(rhs) = init {
-                            if self.found_init.is_some()
-                                || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
-                            {
+                            if self.found_init.is_some() {
                                 self.bad = true;
                                 return;
                             }
-                            self.found_init = Some(rhs.clone());
+                            self.check_init_rhs(rhs);
                         }
                         return;
                     }
@@ -969,13 +990,11 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
                                 return;
                             }
                             if let Some(rhs) = init {
-                                if self.found_init.is_some()
-                                    || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
-                                {
+                                if self.found_init.is_some() {
                                     self.bad = true;
                                     return;
                                 }
-                                self.found_init = Some(rhs.clone());
+                                self.check_init_rhs(rhs);
                             }
                             continue;
                         }
@@ -1064,7 +1083,17 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
                     self.expr(obj, false);
                     self.expr(idx, false);
                 }
-                Expr::Member(obj, _) => self.expr(obj, false),
+                Expr::Member(obj, prop) => {
+                    if !is_lhs && prop == "length" {
+                        if let Expr::Ident(name) = obj.as_ref() {
+                            if name == self.local {
+                                self.reads += 1;
+                                return;
+                            }
+                        }
+                    }
+                    self.expr(obj, false);
+                }
                 Expr::Call(c, args) | Expr::New(c, args) => {
                     self.expr(c, false);
                     args.iter().for_each(|a| self.expr(a, false));
@@ -1106,6 +1135,7 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
     let mut check = Check {
         local,
         allow_bigint,
+        min_len,
         decl_count: 0,
         found_init: None,
         reads: 0,
@@ -1698,13 +1728,13 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
     }
 }
 
-fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) {
+fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>, min_len: usize) {
     let mut out = Vec::with_capacity(stmts.len());
     for mut s in std::mem::take(stmts) {
         match &mut s {
             Stmt::ExprStmt(Expr::Assign(lhs, rhs))
                 if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
-                    && (is_scalar_array_lit(rhs, 8, true)
+                    && (is_scalar_array_lit(rhs, min_len, true)
                         || is_nested_scalar_array_lit(rhs, 8, true)
                         || is_pure_const_slice_lit(rhs, true).is_some()) =>
             {
@@ -1716,7 +1746,7 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
                         item,
                         Expr::Assign(lhs, rhs)
                             if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
-                                && (is_scalar_array_lit(rhs, 8, true)
+                                && (is_scalar_array_lit(rhs, min_len, true)
                                     || is_nested_scalar_array_lit(rhs, 8, true)
                                     || is_pure_const_slice_lit(rhs, true).is_some())
                     )
@@ -1737,19 +1767,19 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
                 }
             }
             Stmt::If(_, a, b) => {
-                strip_hoisted_table_stmts(a, hoisted);
+                strip_hoisted_table_stmts(a, hoisted, min_len);
                 if let Some(b) = b {
-                    strip_hoisted_table_stmts(b, hoisted);
+                    strip_hoisted_table_stmts(b, hoisted, min_len);
                 }
             }
             Stmt::Switch(_, cases) => {
                 for c in cases {
-                    strip_hoisted_table_stmts(&mut c.body, hoisted);
+                    strip_hoisted_table_stmts(&mut c.body, hoisted, min_len);
                 }
             }
             Stmt::Labeled(_, inner) => {
                 let mut v = vec![std::mem::replace(inner.as_mut(), Stmt::Block(Vec::new()))];
-                strip_hoisted_table_stmts(&mut v, hoisted);
+                strip_hoisted_table_stmts(&mut v, hoisted, min_len);
                 **inner = if v.len() == 1 {
                     v.pop().unwrap()
                 } else {
@@ -1757,11 +1787,11 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
                 };
             }
             Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
-                strip_hoisted_table_stmts(b, hoisted);
+                strip_hoisted_table_stmts(b, hoisted, min_len);
             }
             Stmt::TryCatch { body, handler, .. } => {
-                strip_hoisted_table_stmts(body, hoisted);
-                strip_hoisted_table_stmts(handler, hoisted);
+                strip_hoisted_table_stmts(body, hoisted, min_len);
+                strip_hoisted_table_stmts(handler, hoisted, min_len);
             }
             _ => {}
         }
@@ -1862,6 +1892,7 @@ fn replace_ident_in_expr(expr: &mut Expr, from: &str, to: &str) {
 struct HoistRewriter<'a> {
     allow_bigint: bool,
     bstr_strings: bool,
+    speed_profile: bool,
     const_map: &'a BTreeMap<String, JsName>,
     unreachable_fn: Option<&'a JsName>,
     changed: bool,
@@ -1953,7 +1984,8 @@ impl HoistRewriter<'_> {
                 }
             }
             if let Expr::Index(obj, idx) = expr {
-                if is_scalar_array_lit(obj, 4, self.allow_bigint) {
+                let min_inline_arr = if self.speed_profile { 2 } else { 4 };
+                if is_scalar_array_lit(obj, min_inline_arr, self.allow_bigint) {
                     let key = format!("arr:{obj}");
                     if let Some(hoisted) = self.const_map.get(&key) {
                         **obj = Expr::Ident(hoisted.as_str().to_owned());
@@ -2135,33 +2167,53 @@ fn exact_int_lit(expr: &Expr) -> Option<i64> {
     }
 }
 
-fn typed_int_array_ctor(elems: &[Expr]) -> Option<&'static str> {
-    if elems.len() < 8 {
+fn exact_f64_lit(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Num(n) if n.is_finite() => Some(*n),
+        Expr::Unary(UnOp::Neg, inner) => exact_f64_lit(inner).map(|v| -v),
+        Expr::Unary(UnOp::Pos, inner) => exact_f64_lit(inner),
+        Expr::RawNum(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+fn typed_num_array_ctor(elems: &[Expr], min_len: usize) -> Option<&'static str> {
+    if elems.len() < min_len {
         return None;
     }
     let mut min_v = i64::MAX;
     let mut max_v = i64::MIN;
+    let mut all_int = true;
     for e in elems {
-        let v = exact_int_lit(e)?;
-        min_v = min_v.min(v);
-        max_v = max_v.max(v);
+        if let Some(v) = exact_int_lit(e) {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        } else {
+            all_int = false;
+            break;
+        }
     }
-    if min_v >= 0 && max_v <= 255 {
-        Some("Uint8Array")
-    } else if min_v >= 0 && max_v <= 65535 {
-        Some("Uint16Array")
-    } else if min_v >= i64::from(i32::MIN) && max_v <= i64::from(i32::MAX) {
-        Some("Int32Array")
-    } else if min_v >= 0 && max_v <= i64::from(u32::MAX) {
-        Some("Uint32Array")
+    if all_int {
+        if min_v >= 0 && max_v <= 255 {
+            return Some("Uint8Array");
+        } else if min_v >= 0 && max_v <= 65535 {
+            return Some("Uint16Array");
+        } else if min_v >= i64::from(i32::MIN) && max_v <= i64::from(i32::MAX) {
+            return Some("Int32Array");
+        } else if min_v >= 0 && max_v <= i64::from(u32::MAX) {
+            return Some("Uint32Array");
+        }
+    }
+    if elems.iter().all(|e| exact_f64_lit(e).is_some()) {
+        Some("Float64Array")
     } else {
         None
     }
 }
 
-fn wrap_typed_int_array(expr: Expr) -> Expr {
+fn wrap_typed_num_array(expr: Expr, min_len: usize) -> Expr {
     if let Expr::Array(ref elems) = expr {
-        if let Some(ctor) = typed_int_array_ctor(elems) {
+        if let Some(ctor) = typed_num_array_ctor(elems, min_len) {
             return Expr::New(Box::new(Expr::Ident(ctor.to_owned())), vec![expr]);
         }
     }
@@ -2348,7 +2400,7 @@ fn upgrade_readonly_static_int_arrays(
             _ => None,
         };
         let Some(elems) = arr_opt else { continue };
-        if typed_int_array_ctor(elems).is_some()
+        if typed_num_array_ctor(elems, 4).is_some()
             && !exclusions.raw_tokens.contains(item_name.as_str())
         {
             cands.insert(item_name.as_str().to_owned());
@@ -2394,7 +2446,7 @@ fn upgrade_readonly_static_int_arrays(
         let decl = std::mem::replace(&mut item.decl, Stmt::Comment(String::new()));
         let upgraded = match decl {
             Stmt::Let(n, Some(arr)) | Stmt::Const(n, arr) => {
-                Stmt::Const(n, wrap_typed_int_array(arr))
+                Stmt::Const(n, wrap_typed_num_array(arr, 4))
             }
             other => other,
         };
@@ -2422,6 +2474,9 @@ fn run_with_opts(
     let speed_profile = opts.profile == Some(crate::opts::Profile::ReleaseSpeed);
 
     // Pass 1: Hoist single-assignment read-only scalar lookup tables at any nesting depth.
+    // Under `ReleaseSpeed`, also hoist small constant numeric/scalar array literals (`len >= 2`,
+    // e.g. 4-word ASCII bitmasks inside loops) into module-scope TypedArrays.
+    let table_min_len = if speed_profile { 2 } else { 8 };
     for (item_name, res, _, _) in lowered.iter_mut() {
         let Ok(lowered_item) = res else { continue };
         let Stmt::FunctionDecl { params, body, .. } = &mut lowered_item.decl else {
@@ -2433,7 +2488,9 @@ fn run_with_opts(
 
         let mut candidates: Vec<(String, Expr, bool)> = Vec::new();
         for local in &declared_locals {
-            if let Some(arr_expr) = find_read_only_table_init(body, local, allow_bigint) {
+            if let Some(arr_expr) =
+                find_read_only_table_init(body, local, allow_bigint, table_min_len)
+            {
                 candidates.push((local.clone(), arr_expr, true));
             } else if let Some(nested_expr) =
                 find_read_only_nested_array_init(body, local, allow_bigint)
@@ -2451,7 +2508,7 @@ fn run_with_opts(
             let mut replacements: Vec<(String, JsName)> = Vec::new();
             for (local, arr_expr, is_read_only_table) in candidates {
                 let arr_expr = if speed_profile && is_read_only_table {
-                    wrap_typed_int_array(arr_expr)
+                    wrap_typed_num_array(arr_expr, table_min_len)
                 } else {
                     arr_expr
                 };
@@ -2477,7 +2534,7 @@ fn run_with_opts(
                 replacements.push((local, hc_name));
             }
 
-            strip_hoisted_table_stmts(body, &hoisted_set);
+            strip_hoisted_table_stmts(body, &hoisted_set, table_min_len);
             for (local, hc_name) in replacements {
                 replace_ident_in_stmts(body, &local, hc_name.as_str());
             }
@@ -2499,6 +2556,7 @@ fn run_with_opts(
     let mut collector = HoistCollector {
         allow_bigint,
         bstr_strings,
+        speed_profile,
         counts: BTreeMap::new(),
         unreachable_throws: 0,
     };
@@ -2519,7 +2577,7 @@ fn run_with_opts(
                 Expr::Array(elems) => elems.len(),
                 _ => 0,
             };
-            usage.in_loop || usage.count >= 2 || len >= 8
+            usage.in_loop || usage.count >= 2 || len >= 8 || (speed_profile && len >= 4)
         } else {
             key.starts_with("fn:")
         };
@@ -2527,7 +2585,7 @@ fn run_with_opts(
             continue;
         }
         let init_expr = if speed_profile && key.starts_with("arr:") {
-            wrap_typed_int_array(expr.clone())
+            wrap_typed_num_array(expr.clone(), 2)
         } else {
             expr.clone()
         };
@@ -2600,6 +2658,7 @@ fn run_with_opts(
             let mut rewriter = HoistRewriter {
                 allow_bigint,
                 bstr_strings,
+                speed_profile,
                 const_map: &const_map,
                 unreachable_fn: unreachable_fn.as_ref(),
                 changed: false,
@@ -6153,6 +6212,143 @@ mod tests {
         assert!(
             mut_js.starts_with("let MUT_T = ["),
             "mutated static array must stay plain let Array: {mut_js}"
+        );
+    }
+
+    #[test]
+    fn speed_profile_hoists_small_loop_const_arrays_and_skips_mutable_or_escaping() {
+        // Exact `minisearch::text::tokenize` 4-word ASCII bitmask allocated inside a loop, plus
+        // a 4-element Float64 lookup table, alongside a mutable `[0, 0, 0, 0]` and an escaping
+        // `[1, 2, 3, 4]` that MUST NOT be hoisted.
+        let mask_vals: Vec<Expr> = [9216.0, 2348873711.0, 3087007745.0, 671088640.0]
+            .into_iter()
+            .map(Expr::Num)
+            .collect();
+        let float_vals: Vec<Expr> = [
+            Expr::Num(0.5),
+            Expr::Num(1.5),
+            Expr::Unary(UnOp::Neg, Box::new(Expr::Num(2.5))),
+            Expr::Num(3.5),
+        ]
+        .into_iter()
+        .collect();
+        let zero4: Vec<Expr> = vec![Expr::Num(0.0); 4];
+        let esc4: Vec<Expr> = [1.0, 2.0, 3.0, 4.0].into_iter().map(Expr::Num).collect();
+
+        let fn_tokenize = jsast::function(
+            "tokenize",
+            vec!["j".to_owned(), "n".to_owned()],
+            vec![
+                Stmt::Lets(vec![
+                    ("ar".to_owned(), None),
+                    ("fl".to_owned(), None),
+                    ("mut_a".to_owned(), None),
+                    ("esc_a".to_owned(), None),
+                    ("i".to_owned(), Some(Expr::Num(0.0))),
+                    ("acc".to_owned(), Some(Expr::Num(0.0))),
+                ]),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(Expr::Ident("i".to_owned())),
+                        Box::new(Expr::Ident("n".to_owned())),
+                    ),
+                    vec![
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("ar".to_owned())),
+                            Box::new(Expr::Array(mask_vals)),
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("fl".to_owned())),
+                            Box::new(Expr::Array(float_vals)),
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("mut_a".to_owned())),
+                            Box::new(Expr::Array(zero4)),
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Index(
+                                Box::new(Expr::Ident("mut_a".to_owned())),
+                                Box::new(Expr::Num(0.0)),
+                            )),
+                            Box::new(Expr::Num(1.0)),
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("esc_a".to_owned())),
+                            Box::new(Expr::Array(esc4)),
+                        )),
+                        Stmt::ExprStmt(Expr::Call(
+                            Box::new(Expr::Ident("sink".to_owned())),
+                            vec![Expr::Ident("esc_a".to_owned())],
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("acc".to_owned())),
+                            Box::new(Expr::Binary(
+                                BinOp::Add,
+                                Box::new(Expr::Index(
+                                    Box::new(Expr::Ident("ar".to_owned())),
+                                    Box::new(Expr::Ident("j".to_owned())),
+                                )),
+                                Box::new(Expr::Binary(
+                                    BinOp::Add,
+                                    Box::new(Expr::Index(
+                                        Box::new(Expr::Ident("fl".to_owned())),
+                                        Box::new(Expr::Ident("j".to_owned())),
+                                    )),
+                                    Box::new(Expr::Index(
+                                        Box::new(Expr::Ident("mut_a".to_owned())),
+                                        Box::new(Expr::Ident("j".to_owned())),
+                                    )),
+                                )),
+                            )),
+                        )),
+                        Stmt::ExprStmt(Expr::Assign(
+                            Box::new(Expr::Ident("i".to_owned())),
+                            Box::new(Expr::Binary(
+                                BinOp::Add,
+                                Box::new(Expr::Ident("i".to_owned())),
+                                Box::new(Expr::Num(1.0)),
+                            )),
+                        )),
+                    ],
+                ),
+                Stmt::Return(Some(Expr::Ident("acc".to_owned()))),
+            ],
+        );
+
+        let speed_opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let (table, lowered, _, _, added) = test_run(speed_opts, vec![("tokenize", fn_tokenize)]);
+        assert!(added, "expected hoisted const items");
+        let fn_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+
+        let all_consts: String = table
+            .values()
+            .map(|it| it.js.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_consts.contains("new Uint32Array([9216, 2348873711, 3087007745, 671088640])"),
+            "expected 4-element u32 mask hoisted as Uint32Array:\n{all_consts}"
+        );
+        assert!(
+            all_consts.contains("new Float64Array([0.5, 1.5, -2.5, 3.5])"),
+            "expected 4-element float table hoisted as Float64Array:\n{all_consts}"
+        );
+        assert!(
+            !fn_js.contains("9216") && !fn_js.contains("2348873711") && !fn_js.contains("-2.5"),
+            "hoisted array literals must be stripped from loop body:\n{fn_js}"
+        );
+        assert!(
+            fn_js.contains("mut_a = [0, 0, 0, 0];"),
+            "mutated [0, 0, 0, 0] must NOT be hoisted:\n{fn_js}"
+        );
+        assert!(
+            fn_js.contains("esc_a = [1, 2, 3, 4];"),
+            "escaping [1, 2, 3, 4] passed to call must NOT be hoisted:\n{fn_js}"
         );
     }
 }

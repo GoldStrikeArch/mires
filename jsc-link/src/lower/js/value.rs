@@ -1088,7 +1088,7 @@ pub fn is_slot(table: &TypeTable, pointer_ty: TypeId) -> bool {
 /// (`alloc_support.rs::zero_value`, over the type table instead of a scratch allocation).
 #[cfg(test)]
 pub fn zero_value(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<Expr> {
-    zero_value_at(table, interns, ty, 0, false, false)
+    zero_value_at(table, interns, ty, 0, false, false, None)
 }
 
 /// Empty universal flat `Vec<T, Global>` literal matching `NativeVecNew` (`{ buf, len }`).
@@ -1120,6 +1120,23 @@ pub fn empty_native_vec_expr(table: &TypeTable, vec_ty: TypeId) -> Option<Expr> 
     ]))
 }
 
+/// Empty universal flat `Vec<T, Global>` literal honoring [`crate::analysis::heap::HeapPlan::packed_arr_vec_types`]:
+/// returns a fresh mutable `{ buf: [], len: 0 }` for dense `PACKED_ELEMENTS` array vectors
+/// instead of the shared frozen `_nv_ea` sentinel.
+pub fn empty_native_vec_expr_for_heap(
+    table: &TypeTable,
+    vec_ty: TypeId,
+    heap: &crate::analysis::heap::HeapPlan,
+) -> Option<Expr> {
+    if heap.is_packed_arr_vec(table, vec_ty) {
+        return Some(jsast::object_of(vec![
+            ("buf", jsast::array(Vec::new())),
+            ("len", jsast::num(0)),
+        ]));
+    }
+    empty_native_vec_expr(table, vec_ty)
+}
+
 pub fn zero_value_for_heap(
     table: &TypeTable,
     interns: &Interns,
@@ -1127,7 +1144,24 @@ pub fn zero_value_for_heap(
     native_string: bool,
     native_vec: bool,
 ) -> Option<Expr> {
-    zero_value_at(table, interns, ty, 0, native_string, native_vec)
+    zero_value_at(table, interns, ty, 0, native_string, native_vec, None)
+}
+
+pub fn zero_value_for_heap_plan(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    heap: &crate::analysis::heap::HeapPlan,
+) -> Option<Expr> {
+    zero_value_at(
+        table,
+        interns,
+        ty,
+        0,
+        heap.native_string_enabled,
+        heap.native_vec_enabled,
+        Some(heap),
+    )
 }
 
 fn zero_value_at(
@@ -1137,6 +1171,7 @@ fn zero_value_at(
     depth: u32,
     native_string: bool,
     native_vec: bool,
+    heap: Option<&crate::analysis::heap::HeapPlan>,
 ) -> Option<Expr> {
     if depth > 16 {
         return None;
@@ -1155,7 +1190,11 @@ fn zero_value_at(
         ]));
     }
     if native_vec && crate::analysis::heap::is_direct_global_vec_ty(table, ty) {
-        if let Some(empty) = empty_native_vec_expr(table, ty) {
+        let empty = match heap {
+            Some(h) => empty_native_vec_expr_for_heap(table, ty, h),
+            None => empty_native_vec_expr(table, ty),
+        };
+        if let Some(empty) = empty {
             return Some(empty);
         }
     }
@@ -1167,6 +1206,7 @@ fn zero_value_at(
             depth + 1,
             native_string,
             native_vec,
+            heap,
         ) {
             return Some(value);
         }
@@ -1190,9 +1230,15 @@ fn zero_value_at(
         TypeKind::Integer { .. } => int_literal(table, ty, 0),
         // A zeroed pointer is the null address, which is the number zero.
         TypeKind::RawPointer { .. } | TypeKind::FnPtr { .. } => Some(jsast::num(0)),
-        TypeKind::Pattern(base) => {
-            zero_value_at(table, interns, *base, depth + 1, native_string, native_vec)
-        }
+        TypeKind::Pattern(base) => zero_value_at(
+            table,
+            interns,
+            *base,
+            depth + 1,
+            native_string,
+            native_vec,
+            heap,
+        ),
         TypeKind::Adt {
             form: NominalForm::Struct,
             variants,
@@ -1211,6 +1257,7 @@ fn zero_value_at(
                         depth + 1,
                         native_string,
                         native_vec,
+                        heap,
                     )?,
                 ));
             }
@@ -1236,6 +1283,7 @@ fn zero_value_at(
                         depth + 1,
                         native_string,
                         native_vec,
+                        heap,
                     )?,
                 ));
             }
@@ -1252,6 +1300,7 @@ fn zero_value_at(
                         depth + 1,
                         native_string,
                         native_vec,
+                        heap,
                     )
                 })
                 .collect::<Option<Vec<_>>>()?,
@@ -1264,6 +1313,7 @@ fn zero_value_at(
                 depth + 1,
                 native_string,
                 native_vec,
+                heap,
             )?;
             Some(jsast::array((0..*length).map(|_| zero.clone()).collect()))
         }

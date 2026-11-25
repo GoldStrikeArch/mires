@@ -80,7 +80,7 @@ const BUDGET_FLOOR: u64 = 384;
 /// TurboFan (inline small hot helpers without creating giant functions that bail out of JIT).
 const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 320;
 const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 384;
-const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 640;
+const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 1_024;
 const SPEED_INLINE_HINT_FOOTPRINT: u64 = 448;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
 const SPEED_CALLER_CAP: u64 = 32_768;
@@ -483,67 +483,64 @@ pub(crate) fn run_with_profile_and_retargets(
                 && callee_bytes <= 560
                 && after <= bytes.saturating_add(360);
             // Under speed-first mode, never let earlier cold callees starve tiny leaf helpers
-            // called inside loops (e.g., `Word::add` inside SHA-512's 80-round compression loop).
-            // Restrict to call-free leaves `<= 192` B and still charge `growth` so non-loop
-            // callers (like top-level dispatchers) cannot consume freed budget and bloat.
-            let callee_is_leaf = callee_func.blocks.iter().all(|b| {
-                let cold_diverging = matches!(b.term, RTerm::Unreachable);
-                (cold_diverging
-                    || b.ops.iter().all(|op| {
-                        !matches!(op.kind, OpKind::Call { .. })
-                            || matches!(
-                            op.kind,
-                            OpKind::Call {
-                                semantic: CallSemantic::Standard(
-                                    crate::jir::semantic::StandardOperation::StringAsStr
-                                        | crate::jir::semantic::StandardOperation::NativeStrAsStr
-                                        | crate::jir::semantic::StandardOperation::NativeStrNew
-                                        | crate::jir::semantic::StandardOperation::NativeStrFromStr
-                                        | crate::jir::semantic::StandardOperation::NativeStrLen
-                                        | crate::jir::semantic::StandardOperation::NativeStrPushStr
-                                ),
-                                ..
-                            }
-                        )
-                    }))
-                    && !matches!(b.term, RTerm::Invoke { .. })
-            });
+            // called inside loops (e.g., `Word::add` inside SHA-512's 80-round compression loop,
+            // `Range::into_iter`, `Ord::min`, `Vec::len`, `Vec::index`, `compare$closure_1`).
+            let callee_is_leaf = callee_is_inline_leaf(&callee_func);
+            let callee_total_ops: usize = callee_func.blocks.iter().map(|b| b.ops.len()).sum();
+            let speed_tiny_exempt = speed
+                && (trivial_leaf
+                    || (callee_is_leaf
+                        && (callee_bytes <= 120
+                            || (callee_func.blocks.len() <= 2
+                                && callee_total_ops <= 8
+                                && callee_bytes <= 256))));
             let speed_hot_loop = speed
                 && looping.contains(&(site.block as u32))
                 && callee_is_leaf
-                && callee_bytes <= 640;
-            let speed_tiny_leaf = speed
-                && callee_is_leaf
-                && (callee_bytes <= 180
-                    || ((callee_func.sig.abi.inline_hint
-                        || callee_func.sig.abi.inline_always
-                        || site.has_track_caller)
-                        && callee_bytes <= 384));
-            let speed_budget_free = speed_hot_loop || speed_tiny_leaf;
-            let size_limit = if speed_budget_free {
-                limit
-                    .max(entry_bytes.saturating_add(8_192))
-                    .max(SPEED_CALLER_CAP)
-            } else if is_sole && net <= 0 {
-                limit.max(if speed { SPEED_CALLER_CAP } else { 16_384 })
-            } else if speed && is_sole && callee_bytes <= 512 {
-                limit.max(SPEED_CALLER_CAP)
-            } else {
-                limit
-            };
+                && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT;
+            let speed_tiny_leaf = speed_tiny_exempt
+                || (speed
+                    && callee_is_leaf
+                    && (callee_bytes <= 180
+                        || ((callee_func.sig.abi.inline_hint
+                            || callee_func.sig.abi.inline_always
+                            || site.has_track_caller)
+                            && callee_bytes <= 384)));
+            let speed_sole_loop = speed
+                && is_sole
+                && looping.contains(&(site.block as u32))
+                && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT;
+            let speed_budget_free = speed_hot_loop || speed_tiny_leaf || speed_sole_loop;
             // Inlining a `#[track_caller]` callee substitutes a `{filename,line,col}` literal
-            // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller or
-            // loop-virtualizable helper (e.g. `Option::get_or_insert_with` at an `Invoke` site)
-            // may add ~20-40 B of temporary `try/catch` scaffolding before downstream cleanup.
+            // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller,
+            // loop-virtualizable, or tiny leaf helper into a large caller may add temporary
+            // local-renaming / `try/catch` scaffolding before downstream cleanup.
             // Account for that pre-cleanup slack under `ReleaseSpeed`.
             let effective_callee_bytes = if speed
                 && (site.has_track_caller
                     || is_sole
+                    || speed_tiny_leaf
                     || matches!(criterion, Criterion::LoopVirtualizable))
             {
                 callee_bytes.saturating_add(96)
             } else {
                 callee_bytes
+            };
+            let size_limit = if speed_tiny_exempt {
+                limit
+                    .max(entry_bytes.saturating_add(8_192))
+                    .max(SPEED_CALLER_CAP)
+                    .max(bytes.saturating_add(effective_callee_bytes))
+            } else if speed_budget_free {
+                limit
+                    .max(entry_bytes.saturating_add(8_192))
+                    .max(SPEED_CALLER_CAP)
+            } else if is_sole && net <= 0 {
+                limit.max(if speed { SPEED_CALLER_CAP } else { 16_384 })
+            } else if speed && is_sole && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
+                limit.max(SPEED_CALLER_CAP)
+            } else {
+                limit
             };
             if after > size_limit
                 || after > bytes.saturating_add(effective_callee_bytes)
@@ -923,7 +920,7 @@ fn prepare_callee_for_site<'a>(
             }
         }
         if let Some(site_fact) = site_track_caller {
-            rewrite_forwarded_track_caller(&mut callee_func, site_fact, items);
+            rewrite_forwarded_track_caller(&mut callee_func, site_fact, items, &imported.interns);
             if !unused_caller_location(&callee_func) {
                 bind_caller_location_param(&mut callee_func, site_fact, &imported.interns, origin)?;
             }
@@ -980,14 +977,86 @@ fn clean_candidate(
         .map_err(|_| "inline.cleanup-invalid")
 }
 
-/// Whether `func` is a trivial single-block pure scalar wrapper (`<= 3` pure ops, no calls,
-/// no invokes, no aggregates, no asserts) whose inlining reduces to inline JS operators.
+/// Whether a `StandardOperation` is lowered inline at the call site without emitting a JS call.
+fn is_inline_lowered_std_op(op: crate::jir::semantic::StandardOperation) -> bool {
+    use crate::jir::semantic::StandardOperation as Std;
+    op.is_native_vec()
+        || op.is_native_string()
+        || op.is_fast_str_op()
+        || op.is_str()
+        || matches!(
+            op,
+            Std::StringAsStr | Std::VecAsSlice | Std::VecAsMutSlice | Std::VecLen | Std::VecIsEmpty
+        )
+}
+
+/// Whether a `StandardOperation` is both lowered inline at the call site and provably non-throwing.
+fn is_pure_inline_lowered_std_op(op: crate::jir::semantic::StandardOperation) -> bool {
+    use crate::jir::semantic::StandardOperation as Std;
+    op.is_fast_str_op()
+        || matches!(
+            op,
+            Std::StringAsStr
+                | Std::NativeStrAsStr
+                | Std::NativeStrNew
+                | Std::NativeStrFromStr
+                | Std::NativeStrLen
+                | Std::NativeStrCapacity
+                | Std::NativeStrClear
+                | Std::NativeVecNew
+                | Std::NativeVecCapacity
+                | Std::NativeVecAsPtr
+                | Std::NativeVecAsMutPtr
+                | Std::NativeVecAsSlice
+                | Std::NativeVecAsMutSlice
+                | Std::VecAsSlice
+                | Std::VecAsMutSlice
+                | Std::VecLen
+                | Std::VecIsEmpty
+                | Std::StrLen
+                | Std::StrIsCharBoundary
+                | Std::StrEq
+                | Std::StrCmp
+                | Std::StrPartialCmp
+                | Std::StrIsAscii
+                | Std::SliceIsAscii
+        )
+}
+
+/// Whether `callee_func` is a leaf body (no non-cold JS calls outside inline-lowered std ops, and
+/// no non-noop `Invoke` terminators).
+fn callee_is_inline_leaf(callee_func: &Func) -> bool {
+    callee_func.blocks.iter().all(|b| {
+        let cold_diverging = matches!(b.term, RTerm::Unreachable);
+        let ops_leaf = cold_diverging
+            || b.ops.iter().all(|op| {
+                !matches!(op.kind, OpKind::Call { .. })
+                    || matches!(
+                        op.kind,
+                        OpKind::Call {
+                            semantic: CallSemantic::Standard(std_op),
+                            ..
+                        } if is_inline_lowered_std_op(std_op)
+                    )
+            });
+        let term_leaf = match &b.term {
+            RTerm::Invoke {
+                unwind: (ub, _), ..
+            } => is_noop_rethrow_block(callee_func, *ub),
+            _ => true,
+        };
+        ops_leaf && term_leaf
+    })
+}
+
+/// Whether `func` is a trivial single-block pure scalar/field wrapper (`<= 4` pure ops, no calls,
+/// no invokes, no aggregates, no asserts) whose inlining reduces to inline JS operators or field reads.
 fn trivial_pure_leaf(func: &Func) -> bool {
     if func.blocks.len() != 1 || func.has_invoke() {
         return false;
     }
     let block = &func.blocks[0];
-    if block.ops.len() > 3 || !matches!(block.term, RTerm::Return(_)) {
+    if block.ops.len() > 4 || !matches!(block.term, RTerm::Return(_)) {
         return false;
     }
     block.ops.iter().all(|op| {
@@ -999,11 +1068,17 @@ fn trivial_pure_leaf(func: &Func) -> bool {
                 | OpKind::Binary { .. }
                 | OpKind::Unary { .. }
                 | OpKind::Cast { .. }
+                | OpKind::Deref(_)
+                | OpKind::Field { .. }
+                | OpKind::Drop {
+                    glue: DropGlue::None,
+                    ..
+                }
         )
     })
 }
 
-/// Returns the number of fields if `ty` is `&Location` (`file: &str, line: u32, col: u32, ZST...`).
+/// Returns the number of fields if `ty` is `&Location` (`file: &str | NonNull<str>, line: u32, col: u32, ZST...`).
 fn location_param_fields(table: &TypeTable, ty: TypeId) -> Option<usize> {
     let TypeKind::Reference { pointee, .. } = table.get(table.peeled(ty))?.kind else {
         return None;
@@ -1022,13 +1097,7 @@ fn location_param_fields(table: &TypeTable, ty: TypeId) -> Option<usize> {
     if variant.fields.len() < 3 {
         return None;
     }
-    let TypeKind::Reference {
-        pointee: file_pointee,
-        ..
-    } = table.get(table.peeled(variant.fields[0].ty))?.kind
-    else {
-        return None;
-    };
+    let file_pointee = crate::lower::js::value::pointee_of(table, variant.fields[0].ty)?;
     if !matches!(table.get(table.peeled(file_pointee))?.kind, TypeKind::Str) {
         return None;
     }
@@ -1126,15 +1195,18 @@ fn qualifies(
     }
     let callee_bytes = sizes.get(callee).copied().unwrap_or(u64::MAX);
     if speed {
+        // Check loop sites BEFORE `#[inline]` hints so hot-loop helpers (e.g. `Ord::min`,
+        // `Vec::len`, `Vec::index`, `Range::into_iter`, `compare$closure_1`) receive the wider
+        // `LoopVirtualizable` budget and slack instead of being shadowed by `InlineHint`.
+        if looping.contains(&(site.block as u32)) && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
+            return Some(Criterion::LoopVirtualizable);
+        }
         if let Some(Ok(callee_func)) = funcs.get(callee) {
             if (callee_func.sig.abi.inline_always && callee_bytes <= SPEED_INLINE_ALWAYS_FOOTPRINT)
                 || (callee_func.sig.abi.inline_hint && callee_bytes <= SPEED_INLINE_HINT_FOOTPRINT)
             {
                 return Some(Criterion::InlineHint);
             }
-        }
-        if looping.contains(&(site.block as u32)) && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
-            return Some(Criterion::LoopVirtualizable);
         }
     }
     let loop_shape = || -> bool {
@@ -1254,6 +1326,10 @@ fn callee_invoke_safe(callee: &Func, interns: &Interns) -> bool {
                     ..
                 } => true,
                 OpKind::Drop { .. } | OpKind::Host { .. } => cold_diverging,
+                OpKind::Call {
+                    semantic: CallSemantic::Standard(std_op),
+                    ..
+                } if is_pure_inline_lowered_std_op(*std_op) => true,
                 OpKind::Call { .. } => {
                     if cold_diverging {
                         true
@@ -1377,19 +1453,29 @@ fn collect_sites(
                     false
                 }
                 CallSemantic::Standard(std_op) if allow_std_post_repr => {
-                    !matches!(
-                        std_op,
-                        crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
-                            | crate::jir::semantic::StandardOperation::FormatArgumentNewLowerHex
-                            | crate::jir::semantic::StandardOperation::FormatArgumentNewUpperHex
-                            | crate::jir::semantic::StandardOperation::FormatArgsNew
-                            | crate::jir::semantic::StandardOperation::FormatArgsToString
-                            | crate::jir::semantic::StandardOperation::F64FromStr
-                            | crate::jir::semantic::StandardOperation::F32FromStr
-                            | crate::jir::semantic::StandardOperation::SliceSort
-                            | crate::jir::semantic::StandardOperation::SliceSortCmp
-                    ) && !(crate::lower::bstr::enabled()
-                        && matches!(std_op, crate::jir::semantic::StandardOperation::StringAsStr))
+                    !crate::lower::semantic_ops::fmt_kernel::is_format_machinery(*std_op)
+                        && !matches!(
+                            std_op,
+                            crate::jir::semantic::StandardOperation::F64FromStr
+                                | crate::jir::semantic::StandardOperation::F32FromStr
+                                | crate::jir::semantic::StandardOperation::SliceSort
+                                | crate::jir::semantic::StandardOperation::SliceSortCmp
+                        )
+                        && !(crate::lower::bstr::enabled()
+                            && matches!(
+                                std_op,
+                                crate::jir::semantic::StandardOperation::StringAsStr
+                                    | crate::jir::semantic::StandardOperation::StrToLowercase
+                                    | crate::jir::semantic::StandardOperation::StrToUppercase
+                            ))
+                        && !(speed
+                            && *std_op == crate::jir::semantic::StandardOperation::VecResize
+                            && args.first().is_some_and(|&recv| {
+                                is_ta_vec_resize_receiver(
+                                    &caller_metadata.interns.types,
+                                    func.values[recv.0 as usize].ty,
+                                )
+                            }))
                 }
                 _ => false,
             };
@@ -1501,6 +1587,20 @@ fn collect_sites(
                             || op.is_native_string()
                             || op.is_native_vec()
                             || op.is_fast_str_op()
+                            || (crate::lower::bstr::enabled()
+                                && matches!(
+                                    op,
+                                    crate::jir::semantic::StandardOperation::StrToLowercase
+                                        | crate::jir::semantic::StandardOperation::StrToUppercase
+                                ))
+                            || (speed
+                                && op == crate::jir::semantic::StandardOperation::VecResize
+                                && callee_func.sig.arguments.first().is_some_and(|&arg_ty| {
+                                    is_ta_vec_resize_receiver(
+                                        &callee_metadata.interns.types,
+                                        arg_ty,
+                                    )
+                                }))
                     })
             {
                 stats.decline("inline.semantic-boundary");
@@ -1604,9 +1704,30 @@ fn strip_unused_last_param(callee: &mut Func) {
     }
 }
 
+/// Whether `recv_ty` (`&mut Vec<T, Global>`) is a `TypedArray`-eligible numeric/scalar vector
+/// whose `Vec::resize` is intercepted directly by `call.rs` (Phase 1B `TypedArray.fill`).
+fn is_ta_vec_resize_receiver(table: &TypeTable, recv_ty: TypeId) -> bool {
+    let Some(vec_ty) = crate::lower::js::value::pointee_of(table, recv_ty) else {
+        return false;
+    };
+    let Some(elem_ty) = crate::analysis::heap::global_vec_elem_ty(table, vec_ty) else {
+        return false;
+    };
+    crate::analysis::heap::native_vec_ta_kind(table, elem_ty).is_some()
+        || matches!(
+            table.get(table.peeled(elem_ty)).map(|d| &d.kind),
+            Some(TypeKind::Bool | TypeKind::Char)
+        )
+}
+
 /// Rewrites implicit `#[track_caller]` forwarding ops in `callee` to the call-site
 /// `SourceFactId`.
-fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, items: &ItemIndex) {
+fn rewrite_forwarded_track_caller(
+    callee: &mut Func,
+    site_fact: SourceFactId,
+    items: &ItemIndex,
+    interns: &Interns,
+) {
     for block in &mut callee.blocks {
         for op in &mut block.ops {
             match &mut op.kind {
@@ -1618,6 +1739,13 @@ fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, it
                     if items.get(item).is_some_and(|entry| entry.caller_location) {
                         *tc = Some(site_fact);
                     }
+                }
+                OpKind::Intrinsic {
+                    name,
+                    track_caller: tc @ None,
+                    ..
+                } if interns.str(*name) == Some("caller_location") => {
+                    *tc = Some(site_fact);
                 }
                 OpKind::Assert {
                     track_caller: tc @ None,
@@ -1794,8 +1922,16 @@ fn body_decline(
                 }
                 // The original item owes the linker its compile-time required-by diagnostic.
                 OpKind::Zombie(_) => Some("inline.zombie"),
-                OpKind::Intrinsic { name, .. } if interns.str(*name) == Some("caller_location") => {
-                    Some("inline.track-caller-unavailable")
+                OpKind::Intrinsic {
+                    name,
+                    track_caller: inner_tc,
+                    ..
+                } if interns.str(*name) == Some("caller_location") => {
+                    let ok = speed
+                        && (inner_tc.is_some()
+                            || (callee.sig.abi.caller_location
+                                && (site_track_caller.is_some() || caller_caller_location)));
+                    (!ok).then_some("inline.track-caller-unavailable")
                 }
                 // Host and template lowering may own item-local bindings and observable ordering.
                 _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns, speed) => {
@@ -5254,5 +5390,1031 @@ mod tests {
             f_deps.iter().any(|d| d == panic_dep),
             "panic lang dep should be imported into caller summary: {f_deps:?}"
         );
+    }
+
+    #[test]
+    fn speed_tiny_leaves_inline_past_caller_cap_and_measurement_noise() {
+        use crate::jir::semantic::StandardOperation;
+        use crate::jir::types::{
+            FieldDescriptor, FieldKey, NominalForm, PointerForm, VariantDescriptor,
+        };
+
+        let mut prog = Prog::new();
+        let vec_ty = TypeId(20);
+        let ref_vec_ty = TypeId(21);
+        let vec_name = prog.strid("Vec");
+        let f_len = prog.strid("len");
+        let js_base = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        let vec_fields = vec![FieldDescriptor {
+            key: FieldKey::Name(f_len),
+            ty: I32,
+            offset: 0,
+        }];
+        prog.interns.intern_type(TypeDescriptor {
+            id: vec_ty,
+            name: Some(vec_name),
+            kind: TypeKind::Adt {
+                def: item(80).definition,
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: vec_name,
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: vec_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                fields: vec_fields,
+                ..js_base(vec_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: ref_vec_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: vec_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..js_base(ref_vec_ty)
+            },
+        });
+
+        // 1) Identity helper (`Range::into_iter`: `function(a){return a}`, 23 B, `#[inline]`).
+        let id_str = prog.strid("into_iter");
+        let mut id_sig = sig(1);
+        id_sig.abi.inline_hint = true;
+        let mut id_b = FuncBuilder::new(item(2), id_sig);
+        let p = id_b.param(I32, O);
+        id_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(p)));
+        let into_iter = id_b.finish();
+
+        // 2) `Ord::min`-shaped 3-block leaf (`b < a ? b : a`, 35 B, `#[inline]`).
+        let min_str = prog.strid("ord_min");
+        let mut min_sig = sig(2);
+        min_sig.abi.inline_hint = true;
+        let mut min_b = FuncBuilder::new(item(3), min_sig);
+        let a = min_b.param(I32, O);
+        let b = min_b.param(I32, O);
+        let cmp = min_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Lt,
+                l: b,
+                r: a,
+                ty: I32,
+            },
+            I32,
+            O,
+        );
+        let then_bb = min_b.block();
+        let else_bb = min_b.block();
+        min_b.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: cmp,
+                scrut_ty: I32,
+                cases: vec![(1, then_bb, Vec::new())],
+                default: (else_bb, Vec::new()),
+            },
+        );
+        min_b.terminate(then_bb, RTerm::Return(Some(b)));
+        min_b.terminate(else_bb, RTerm::Return(Some(a)));
+        let ord_min = min_b.finish();
+
+        // 3) `Vec::len` (`CallSemantic::Standard(VecLen)`, `Deref` + `Field`, 27 B, `#[inline]`).
+        let len_str = prog.strid("vec_len");
+        let mut len_sig = Signature {
+            arguments: vec![ref_vec_ty],
+            result: I32,
+            abi: AbiSignature {
+                parameters: 1,
+                inline_hint: true,
+                ..AbiSignature::default()
+            },
+        };
+        len_sig.abi.inline_hint = true;
+        let mut len_b = FuncBuilder::new(item(4), len_sig);
+        let vref = len_b.param(ref_vec_ty, O);
+        let vval = len_b.op(FuncBuilder::ENTRY, OpKind::Deref(vref), vec_ty, O);
+        let vlen = len_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: vval,
+                variant: None,
+                field: 0,
+            },
+            I32,
+            O,
+        );
+        len_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(vlen)));
+        let vec_len = len_b.finish();
+
+        // Caller calls all three helpers.
+        let caller_sig = Signature {
+            arguments: vec![ref_vec_ty, I32],
+            result: I32,
+            abi: AbiSignature {
+                parameters: 2,
+                ..AbiSignature::default()
+            },
+        };
+        let mut f_b = FuncBuilder::new(item(1), caller_sig);
+        let pv = f_b.param(ref_vec_ty, O);
+        let px = f_b.param(I32, O);
+        let c1 = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: id_str,
+                },
+                function: None,
+                args: vec![px],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        let c2 = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(4),
+                    link_name: len_str,
+                },
+                function: None,
+                args: vec![pv],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::VecLen),
+                host: None,
+            },
+            I32,
+            O,
+        );
+        let c3 = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(3),
+                    link_name: min_str,
+                },
+                function: None,
+                args: vec![c1, c2],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(c3)));
+        let caller = f_b.finish();
+
+        prog.add("into_iter", into_iter);
+        prog.add("ord_min", ord_min);
+        prog.add("vec_len", vec_len);
+        prog.add("caller", caller);
+
+        let f_name = JsName::new("caller".to_owned());
+        let id_name = JsName::new("into_iter".to_owned());
+        let min_name = JsName::new("ord_min".to_owned());
+        let len_name = JsName::new("vec_len".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    metadata_dummy_refs(funcs[name].as_ref().unwrap(), interns),
+                )
+            })
+            .collect();
+        // Huge caller already past `SPEED_CALLER_CAP` (40_000 B), and each splice adds +45 B of
+        // local-renaming noise (exceeding raw 23..35 B callee sizes, within the +96 B slack).
+        let sizes = BTreeMap::from([
+            (f_name.clone(), 40_000),
+            (id_name.clone(), 23),
+            (min_name.clone(), 35),
+            (len_name.clone(), 27),
+        ]);
+        let stats = run_with_profile(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|name, func, _| {
+                if name != &f_name {
+                    return Some((sizes[name], BTreeSet::new()));
+                }
+                let mut remaining = 0u64;
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if let OpKind::Call {
+                        callee: Callee::Direct { link_name, .. },
+                        ..
+                    } = &op.kind
+                    {
+                        remaining += 1;
+                        if let Some(s) = interns.str(*link_name) {
+                            refs.insert(JsName::new(s.to_owned()));
+                        }
+                    }
+                }
+                let inlined = 3u64.saturating_sub(remaining);
+                Some((40_000 + inlined * 45, refs))
+            },
+            &|_, _| false,
+            &|_| true,
+            50_000,
+            &sizes,
+            true,
+            Some(crate::opts::Profile::ReleaseSpeed),
+        );
+        assert_eq!(
+            stats.applied, 3,
+            "all 3 tiny leaves should inline past cap/noise (declined={:?})",
+            stats.declined
+        );
+        assert_eq!(stats.witnesses_failed, 0);
+        assert_eq!(prog.calls_in("caller"), 0);
+    }
+
+    #[test]
+    fn speed_vec_index_nonnull_location_inlines_while_ta_vec_resize_stays_outline() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable, SourceFact};
+        use crate::jir::semantic::StandardOperation;
+        use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+        use crate::jir::types::{
+            AllocatorIdentity, FieldDescriptor, FieldKey, NominalForm, PointerForm,
+            RepresentationCandidate, VariantDescriptor,
+        };
+        use rcgjs_object::item::{ItemKind, Linkage};
+        use rcgjs_object::object::BlobRef;
+        use std::borrow::Cow;
+
+        let mut prog = Prog::new();
+        let str_ty = TypeId(30);
+        let raw_str_ty = TypeId(31);
+        let u32_ty = TypeId(32);
+        let loc_ty = TypeId(33);
+        let ref_loc_ty = TypeId(34);
+        let u8_ty = TypeId(35);
+        let vec_u8_ty = TypeId(36);
+        let ref_vec_u8_ty = TypeId(37);
+        let mut_vec_u8_ty = TypeId(38);
+        let unit_ty = TypeId(39);
+
+        let js_base = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        prog.interns.intern_type(TypeDescriptor {
+            id: str_ty,
+            name: None,
+            kind: TypeKind::Str,
+            layout: LayoutFacts {
+                sized: false,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_base(str_ty),
+        });
+        // Real `core::panic::Location` stores `file: NonNull<str>` (peels to `RawPointer { pointee: Str }`).
+        prog.interns.intern_type(TypeDescriptor {
+            id: raw_str_ty,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: str_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(8),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::FatSlice),
+                ..js_base(raw_str_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                ..js_base(u32_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: u8_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(1),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 8,
+                    repr: IntRepr::Number,
+                }),
+                byte_element: true,
+                ..js_base(u8_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: unit_ty,
+            name: None,
+            kind: TypeKind::Tuple(Vec::new()),
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(0),
+                align: Some(1),
+                zst: true,
+                one_zst: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_base(unit_ty),
+        });
+        let loc_name = prog.strid("Location");
+        let f_file = prog.strid("file");
+        let f_line = prog.strid("line");
+        let f_col = prog.strid("col");
+        let loc_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(f_file),
+                ty: raw_str_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(f_line),
+                ty: u32_ty,
+                offset: 8,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(f_col),
+                ty: u32_ty,
+                offset: 12,
+            },
+        ];
+        prog.interns.intern_type(TypeDescriptor {
+            id: loc_ty,
+            name: Some(loc_name),
+            kind: TypeKind::Adt {
+                def: item(91).definition,
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: loc_name,
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: loc_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(16),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                fields: loc_fields,
+                ..js_base(loc_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: ref_loc_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: loc_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..js_base(ref_loc_ty)
+            },
+        });
+        let vec_name = prog.strid("Vec");
+        prog.interns.intern_type(TypeDescriptor {
+            id: vec_u8_ty,
+            name: Some(vec_name),
+            kind: TypeKind::Adt {
+                def: item(92).definition,
+                form: NominalForm::Struct,
+                args: vec![u8_ty],
+                variants: vec![VariantDescriptor {
+                    name: vec_name,
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: Vec::new(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(12),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta {
+                candidate: RepresentationCandidate::Vec,
+                allocator: AllocatorIdentity::Global,
+                ..TypeMeta::default()
+            },
+            js: JsFacts {
+                is_indirect: true,
+                ..js_base(vec_u8_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: ref_vec_u8_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: vec_u8_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..js_base(ref_vec_u8_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: mut_vec_u8_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: vec_u8_ty,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..js_base(mut_vec_u8_ty)
+            },
+        });
+
+        let file_s = prog.strid("enclose.rs");
+        let site_fact = prog.interns.intern_source_fact(SourceFact {
+            file: file_s,
+            line: 42,
+            col: 3,
+        });
+        let vec_index_s = prog.strid("vec_index");
+        let vec_resize_s = prog.strid("vec_resize");
+        let native_as_slice_s = prog.strid("rcgjs_vec_as_slice");
+
+        // `Vec::index` (`#[track_caller]`, uses `&Location` with `NonNull<str>` and calls `NativeVecAsSlice`).
+        let idx_sig = Signature {
+            arguments: vec![ref_vec_u8_ty, u32_ty],
+            result: u32_ty,
+            abi: AbiSignature {
+                parameters: 3,
+                caller_location: true,
+                inline_hint: true,
+                ..AbiSignature::default()
+            },
+        };
+        let mut idx_b = FuncBuilder::new(item(2), idx_sig);
+        let p_vec = idx_b.param(ref_vec_u8_ty, O);
+        let p_i = idx_b.param(u32_ty, O);
+        let p_loc = idx_b.param(ref_loc_ty, O);
+        let _slice = idx_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(9),
+                    link_name: native_as_slice_s,
+                },
+                function: None,
+                args: vec![p_vec],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::NativeVecAsSlice),
+                host: None,
+            },
+            u32_ty,
+            O,
+        );
+        let loc_v = idx_b.op(FuncBuilder::ENTRY, OpKind::Deref(p_loc), loc_ty, O);
+        let line_v = idx_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: loc_v,
+                variant: None,
+                field: 1,
+            },
+            u32_ty,
+            O,
+        );
+        let out_v = idx_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: p_i,
+                r: line_v,
+                ty: u32_ty,
+            },
+            u32_ty,
+            O,
+        );
+        idx_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out_v)));
+        let vec_index = idx_b.finish();
+
+        // `Vec::resize` on `Vec<u8, Global>` (must NOT inline under speed so Phase 1B `call.rs` intercepts it).
+        let resize_sig = Signature {
+            arguments: vec![mut_vec_u8_ty, u32_ty, u8_ty],
+            result: unit_ty,
+            abi: AbiSignature {
+                parameters: 3,
+                inline_hint: true,
+                ..AbiSignature::default()
+            },
+        };
+        let mut res_b = FuncBuilder::new(item(3), resize_sig);
+        let _rv = res_b.param(mut_vec_u8_ty, O);
+        let _rn = res_b.param(u32_ty, O);
+        let _rx = res_b.param(u8_ty, O);
+        res_b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let vec_resize = res_b.finish();
+
+        let caller_sig = Signature {
+            arguments: vec![ref_vec_u8_ty, mut_vec_u8_ty, u32_ty, u8_ty],
+            result: u32_ty,
+            abi: AbiSignature {
+                parameters: 4,
+                ..AbiSignature::default()
+            },
+        };
+        let mut f_b = FuncBuilder::new(item(1), caller_sig);
+        let pv = f_b.param(ref_vec_u8_ty, O);
+        let pmv = f_b.param(mut_vec_u8_ty, O);
+        let pi = f_b.param(u32_ty, O);
+        let px = f_b.param(u8_ty, O);
+        f_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(3),
+                    link_name: vec_resize_s,
+                },
+                function: None,
+                args: vec![pmv, pi, px],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::VecResize),
+                host: None,
+            },
+            O,
+        );
+        let got = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: vec_index_s,
+                },
+                function: None,
+                args: vec![pv, pi],
+                track_caller: Some(site_fact),
+                semantic: CallSemantic::Standard(StandardOperation::VecIndex),
+                host: None,
+            },
+            u32_ty,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(got)));
+        let caller = f_b.finish();
+
+        prog.add("vec_index", vec_index);
+        prog.add("vec_resize", vec_resize);
+        prog.add("caller", caller);
+
+        let mut items = ItemIndex::new();
+        items.insert(
+            item(9),
+            crate::lower::js::host::ItemEntry {
+                name: "rcgjs_vec_as_slice".to_owned(),
+                params: 1,
+                abi_known: true,
+                result: Some(u32_ty),
+                arguments: vec![ref_vec_u8_ty],
+                caller_location: false,
+                caller_location_def: None,
+                is_core: false,
+                used_params: BTreeSet::new(),
+                standard: Some(StandardOperation::NativeVecAsSlice),
+                keyed_purity: None,
+                keyed_read_params: None,
+                keyed_may_unwind: None,
+                keyed_row_capture: None,
+                keyed_proxy_safe_params: None,
+            },
+        );
+        let make_origins = |fact| OriginTable {
+            origins: vec![Origin {
+                source: Some(fact),
+                local_name: None,
+                kind: OriginKind::Statement,
+                inline_stack: Vec::new(),
+            }],
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: Vec::new(),
+            item_path: StrId(0),
+            root: None,
+        };
+        let make_summary = || ItemSummary {
+            key: SemanticKey {
+                link_name: "f".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::empty(),
+        };
+
+        let f_name = JsName::new("caller".to_owned());
+        let idx_name = JsName::new("vec_index".to_owned());
+        let res_name = JsName::new("vec_resize".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = BTreeMap::from([
+            (
+                f_name.clone(),
+                Metadata {
+                    universe: interns,
+                    interns: Cow::Borrowed(interns),
+                    origins: Some(Cow::Owned(make_origins(site_fact))),
+                    header: None,
+                    summary: Some(Cow::Owned(make_summary())),
+                },
+            ),
+            (
+                idx_name.clone(),
+                Metadata {
+                    universe: interns,
+                    interns: Cow::Borrowed(interns),
+                    origins: Some(Cow::Owned(make_origins(site_fact))),
+                    header: None,
+                    summary: Some(Cow::Owned(make_summary())),
+                },
+            ),
+            (
+                res_name.clone(),
+                Metadata {
+                    universe: interns,
+                    interns: Cow::Borrowed(interns),
+                    origins: Some(Cow::Owned(make_origins(site_fact))),
+                    header: None,
+                    summary: Some(Cow::Owned(make_summary())),
+                },
+            ),
+        ]);
+        let sizes = BTreeMap::from([
+            (f_name.clone(), 400),
+            (idx_name.clone(), 90),
+            (res_name.clone(), 50),
+        ]);
+        let stats = run_with_profile(
+            funcs,
+            &mut metadata,
+            &graph,
+            &items,
+            &|name, func, _| {
+                if name != &f_name {
+                    return Some((sizes[name], BTreeSet::new()));
+                }
+                let has_idx = func.blocks.iter().flat_map(|b| &b.ops).any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            callee: Callee::Direct { item: id, .. },
+                            ..
+                        } if *id == item(2)
+                    )
+                });
+                let bytes = if has_idx { 400 } else { 440 };
+                Some((bytes, BTreeSet::new()))
+            },
+            &|_, _| false,
+            &|_| true,
+            10_000,
+            &sizes,
+            true,
+            Some(crate::opts::Profile::ReleaseSpeed),
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "Vec::index with NonNull<str> Location should inline, Vec::resize must stay outline (declined={:?})",
+            stats.declined
+        );
+        // 1 semantic-boundary decline for `rcgjs_vec_as_slice` inside `vec_index`, plus 1 for
+        // TA-eligible `Vec::resize` inside `caller`.
+        assert_eq!(
+            stats
+                .declined
+                .get("inline.semantic-boundary")
+                .copied()
+                .unwrap_or(0),
+            2,
+            "NativeVecAsSlice and TA-eligible Vec::resize should both be declined at semantic boundary"
+        );
+        let remaining_callees: Vec<ItemId> = prog
+            .func("caller")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    ..
+                } => Some(*item),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            remaining_callees.contains(&item(3))
+                && remaining_callees.contains(&item(9))
+                && !remaining_callees.contains(&item(2)),
+            "expected Vec::resize (3) + inlined NativeVecAsSlice (9), without Vec::index (2): {remaining_callees:?}"
+        );
+    }
+
+    #[test]
+    fn speed_sole_caller_loop_closure_above_640b_inlines_both_sites() {
+        let mut prog = Prog::new();
+        let helper_str = prog.strid("external_op");
+        let closure_str = prog.strid("analyse_closure_0");
+
+        // Callee closure: non-leaf (calls `external_op`), priced at 750 B (> 640 B, <= 1024 B).
+        let mut c_b = FuncBuilder::new(item(2), sig(1));
+        let cx = c_b.param(I32, O);
+        let cres = c_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(99),
+                    link_name: helper_str,
+                },
+                function: None,
+                args: vec![cx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        c_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(cres)));
+        let closure = c_b.finish();
+
+        // Caller calls `analyse_closure_0` twice: once inside a loop block, once after the loop.
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let x0 = f_b.param(I32, O);
+        let loop_bb = f_b.block();
+        let exit_bb = f_b.block();
+        let lp = f_b.block_param(loop_bb, I32, O);
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Goto(loop_bb, vec![x0]));
+        let in_loop = f_b.op(
+            loop_bb,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: closure_str,
+                },
+                function: None,
+                args: vec![lp],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(
+            loop_bb,
+            RTerm::Switch {
+                scrut: in_loop,
+                scrut_ty: I32,
+                cases: vec![(0, exit_bb, vec![in_loop])],
+                default: (loop_bb, vec![in_loop]),
+            },
+        );
+        let ep = f_b.block_param(exit_bb, I32, O);
+        let after_loop = f_b.op(
+            exit_bb,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: closure_str,
+                },
+                function: None,
+                args: vec![ep],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(exit_bb, RTerm::Return(Some(after_loop)));
+        let caller = f_b.finish();
+
+        prog.add("analyse_closure_0", closure);
+        prog.add("analyse", caller);
+
+        let f_name = JsName::new("analyse".to_owned());
+        let c_name = JsName::new("analyse_closure_0".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    metadata_dummy_refs(funcs[name].as_ref().unwrap(), interns),
+                )
+            })
+            .collect();
+        let sizes = BTreeMap::from([(f_name.clone(), 1_200), (c_name.clone(), 750)]);
+        let stats = run_with_profile(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|name, func, _| {
+                if name != &f_name {
+                    return Some((750, BTreeSet::new()));
+                }
+                let remaining = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.ops)
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                callee: Callee::Direct { item: id, .. },
+                                ..
+                            } if *id == item(2)
+                        )
+                    })
+                    .count() as u64;
+                let mut refs = BTreeSet::new();
+                if remaining > 0 {
+                    refs.insert(c_name.clone());
+                }
+                let inlined = 2u64.saturating_sub(remaining);
+                Some((1_200 + inlined * 700, refs))
+            },
+            &|callee, caller| callee == &c_name && caller == &f_name,
+            &|_| true,
+            50_000,
+            &sizes,
+            true,
+            Some(crate::opts::Profile::ReleaseSpeed),
+        );
+        assert_eq!(
+            stats.applied, 2,
+            "both loop and post-loop sites of 750B sole-caller closure should inline (declined={:?})",
+            stats.declined
+        );
+        let remaining_closure_calls = prog
+            .func("analyse")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        callee: Callee::Direct { item: id, .. },
+                        ..
+                    } if *id == item(2)
+                )
+            })
+            .count();
+        assert_eq!(remaining_closure_calls, 0);
     }
 }

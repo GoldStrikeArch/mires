@@ -31,8 +31,9 @@ use std::sync::Arc;
 
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::semantic::{
-    CallSemantic, Callee, CastKind, ConstTree, DropGlue, GlobalReference, HostPayload, ItemId,
-    Operand, OperandKind, Place, Projection, Rvalue, StatementKind, Terminator, TypeId,
+    BlockId, Body, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, DropGlue,
+    GlobalReference, HostPayload, ItemId, LocalId, Operand, OperandKind, Place, Projection, Rvalue,
+    StatementKind, Terminator, TypeId, Unwind,
 };
 use rcgjs_object::jir::types::{
     EnumRepr, FieldKey, NominalAbi, NominalForm, PinnedBoundary, PointerForm,
@@ -42,11 +43,17 @@ use rcgjs_object::object::ItemKind;
 
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
-use crate::opts::{OptimizerMode, Opts, Profile};
+use crate::opts::{OptimizerMode, OptimizerPass, Opts, Profile};
 
 /// Whether `callee` is a pure representation-opaque sysroot runtime helper (memory/pointer/alloc/
-/// NativeVec primitive) that never inspects `.TAG` or struct field names and never exposes values
-/// across the JS host boundary.
+/// string/byte/NativeVec primitive) that never inspects `.TAG` or struct field names and never
+/// exposes Rust values across the JS host boundary.
+///
+/// Deliberately excluded:
+/// - `host_*`, `host_try`, `host_spawn`, `host_future_*`: host/JS boundary or `.TAG` inspection.
+/// - `bstr_boundary`, `bstr_ref`, `bstr_ref_in`, `bstr_str_in`, `bstr_utf8_bytes`: JS boundary
+///   membranes (`bstr_ref` reads `t.TAG`).
+/// - `map_*`: handled separately via `rcgjs.map.*` marker logic.
 pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Interns) -> bool {
     let Callee::Runtime {
         member,
@@ -61,15 +68,44 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "dealloc"
             | "realloc"
             | "alloc_zeroed"
+            | "alloc_error"
+            | "panic"
+            | "abort"
+            | "abort_error"
+            | "js_abort"
+            | "unreachable"
+            | "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+            | "bcmp"
+            | "strlen"
             | "copy"
             | "copy_nonoverlapping"
+            | "write_bytes"
+            | "compare_bytes"
             | "overwrite"
             | "_put"
+            | "_put_plain"
+            | "_put_tracked"
             | "box"
             | "prefix"
             | "unproject"
             | "erase"
             | "unref"
+            | "unscale"
+            | "unscale_scalar"
+            | "unscale_uninit"
+            | "scale"
+            | "scale_scalar"
+            | "byte_sign"
+            | "read_byte"
+            | "write_byte"
+            | "read_byte_at"
+            | "write_byte_at"
+            | "retype"
+            | "retype_rc"
+            | "ptr_is_null"
             | "offset"
             | "offset_from"
             | "ptr_eq"
@@ -81,6 +117,7 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "addr"
             | "slice_from_parts"
             | "sfp"
+            | "chunk_slice"
             | "thin"
             | "tail_raw"
             | "tail_ref"
@@ -91,6 +128,112 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "write_array"
             | "unwindow"
             | "unwindow_slice"
+            | "byte_slice_ref"
+            | "str_bytes"
+            | "str_bytes_mut"
+            | "detach_str_memo"
+            | "bytes_str"
+            | "str_len"
+            | "str_to_lowercase"
+            | "str_to_uppercase"
+            | "bytes_is_ascii"
+            | "nstr_with_cap"
+            | "nstr_reserve"
+            | "nstr_into_vec"
+            | "nstr_into_nvec"
+            | "nstr_ascii_lower"
+            | "nstr_ascii_upper"
+            | "nstr_repeat"
+            | "bstr_in"
+            | "bstr_out"
+            | "bstr_bytes"
+            | "bstr_bytes_mut"
+            | "bstr_of"
+            | "bstr_get"
+            | "bstr_get_from"
+            | "bstr_get_to"
+            | "bstr_sub"
+            | "bstr_sub_from"
+            | "bstr_sub_to"
+            | "bstr_cmp"
+            | "bstr_cmp_range"
+            | "bstr_eq_arr"
+            | "bstr_cmp_ptr"
+            | "ptr_cmp_bstr"
+            | "bstr_copy_to"
+            | "bstr_char"
+            | "bstr_find_char"
+            | "bstr_rfind_char"
+            | "bstr_find_str"
+            | "bstr_rfind_str"
+            | "bstr_trim"
+            | "bstr_trim_start"
+            | "bstr_trim_end"
+            | "bstr_push"
+            | "bstr_pop"
+            | "bstr_truncate"
+            | "bstr_host_sb"
+            | "bstr_block"
+            | "bstr_sb_block"
+            | "bstr_block_typed"
+            | "bstr_sb_block_typed"
+            | "bstr_sb_check"
+            | "bstr_to_lowercase"
+            | "bstr_to_uppercase"
+            | "native_str_wf"
+            | "native_str_utf16_index"
+            | "native_str_byte_index"
+            | "native_str_is_char_boundary"
+            | "native_str_push"
+            | "native_str_pop"
+            | "native_str_truncate"
+            | "_sb_check"
+            | "sb_new"
+            | "sb_push"
+            | "sb_push_char"
+            | "sb_take"
+            | "convert_host_sb"
+            | "convert_str_block"
+            | "convert_sb_block"
+            | "convert_nv_block"
+            | "convert_nv_typed"
+            | "convert_block_nv"
+            | "convert_block_sv"
+            | "convert_sv_nv"
+            | "f2i"
+            | "f2i_big"
+            | "i2f32_big"
+            | "fmod"
+            | "fmodf"
+            | "native_f64_to_string"
+            | "native_f32_to_string"
+            | "fmt_float_fixed"
+            | "fmt_int_hex"
+            | "fmt_int_dec"
+            | "rcgjs_fmt_float_parts"
+            | "parse_f64"
+            | "parse_f32"
+            | "rc_alloc_slice"
+            | "arc_alloc_slice"
+            | "typed_alloc"
+            | "typed_alloc_arr"
+            | "typed_realloc"
+            | "typed_dealloc"
+            | "typed_dealloc_raw"
+            | "t_alloc_arr"
+            | "t_alloc_z"
+            | "t_realloc_ta"
+            | "t_realloc_ta_checked"
+            | "t_realloc_arr"
+            | "t_realloc_arr_checked"
+            | "t_dealloc_maybe"
+            | "t_box_new_tracked"
+            | "box_new"
+            | "native_vec_new"
+            | "native_vec_set_capacity"
+            | "native_vec_set_len"
+            | "tv_new"
+            | "typed_vec_push"
             | "nv_push_arr"
             | "nv_push_ta"
             | "nv_pop_arr"
@@ -129,14 +272,43 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "nv_swap_remove"
             | "nv_idx"
             | "nv_range"
-            | "convert_sv_nv"
+            | "nv_grow_u8"
+            | "nv_grow_i8"
+            | "nv_grow_u16"
+            | "nv_grow_i16"
+            | "nv_grow_u32"
+            | "nv_grow_i32"
+            | "nv_grow_f32"
+            | "nv_grow_f64"
+            | "nv_with_cap_u8"
+            | "nv_with_cap_i8"
+            | "nv_with_cap_u16"
+            | "nv_with_cap_i16"
+            | "nv_with_cap_u32"
+            | "nv_with_cap_i32"
+            | "nv_with_cap_f32"
+            | "nv_with_cap_f64"
+            | "nv_zeroed_u8"
+            | "nv_zeroed_i8"
+            | "nv_zeroed_u16"
+            | "nv_zeroed_i16"
+            | "nv_zeroed_u32"
+            | "nv_zeroed_i32"
+            | "nv_zeroed_f32"
+            | "nv_zeroed_f64"
+            | "nv_reserve_u8"
+            | "nv_reserve_i8"
+            | "nv_reserve_u16"
+            | "nv_reserve_i16"
+            | "nv_reserve_u32"
+            | "nv_reserve_i32"
+            | "nv_reserve_f32"
+            | "nv_reserve_f64"
+            | "nv_zeroed_arr_p"
+            | "nv_zeroed_arr_fn_p"
+            | "nv_zeroed_arr_fn_tracked_p"
+            | "nv_resize_zero_ta"
             | "slice_sort"
-            | "typed_alloc"
-            | "typed_realloc"
-            | "typed_dealloc"
-            | "typed_dealloc_raw"
-            | "box_new"
-            | "typed_vec_push"
     )
 }
 
@@ -209,9 +381,27 @@ pub fn specialize_table(
     let offered_set: BTreeSet<&JsName> = offered.iter().collect();
     let items_by_id: BTreeMap<ItemId, JsName> = table
         .values()
-        .filter_map(|item| Some((item.jir.summary.as_ref()?.key.item?, item.name.clone())))
+        .filter_map(|item| {
+            let id = item
+                .jir
+                .summary
+                .as_ref()
+                .and_then(|s| s.key.item)
+                .or_else(|| item.jir.body.as_ref().map(|b| b.item))?;
+            Some((id, item.name.clone()))
+        })
         .collect();
     let global_types = build_global_type_map(table);
+    let drop_glue_by_ty: BTreeMap<TypeId, JsName> = table
+        .values()
+        .filter_map(|item| {
+            let body = item.jir.body.as_ref()?;
+            let BodySemantic::DropGlue(ty) = body.semantic else {
+                return None;
+            };
+            Some((peel_global(ty, &global_types), item.name.clone()))
+        })
+        .collect();
 
     let mut excluded_enums: BTreeSet<TypeId> = extra_excluded.clone();
     let mut host_boundary_types: BTreeSet<TypeId> = BTreeSet::new();
@@ -328,8 +518,17 @@ pub fn specialize_table(
             );
         }
 
-        // 3. Scan calls, drops, and constant trees for boundary/static/non-offered edges.
+        // 3. Scan reachable MIR blocks for calls, drops, and constant trees crossing boundaries,
+        // non-offered items, or non-offered statics. Dead `FalseEdge`/`FalseUnwind` and folded
+        // `RuntimeCheck` branches (for offered items when `AstDce` applies) are skipped so
+        // unreachable v1-folded calls/drops do not spuriously poison internal enums.
+        let item_is_offered = offered_set.contains(&item.name);
+        let reachable_blocks =
+            reachable_mir_blocks(body, item_is_offered && opts.applies(OptimizerPass::AstDce));
         for block in &body.blocks {
+            if !reachable_blocks.contains(&block.id) {
+                continue;
+            }
             for stmt in &block.statements {
                 match &stmt.kind {
                     StatementKind::Assign {
@@ -665,6 +864,52 @@ pub fn specialize_table(
                         );
                     }
 
+                    // Closure-taking and async-driver `rcgjs.host.*` markers wrap an internal
+                    // JIR closure environment or coroutine future in an opaque JS thunk/state;
+                    // the JS host never inspects closure upvars or coroutine saved locals.
+                    // Only the host-visible arguments, return type, and JS-called closure/poller
+                    // parameters & return types cross the boundary.
+                    if item_is_offered {
+                        if let Some(HostPayload::Marker { section, .. }) = &call.host {
+                            if let Some(marker) = interns
+                                .str(*section)
+                                .and_then(|s| s.strip_prefix("rcgjs.host."))
+                            {
+                                if handle_opaque_host_marker(
+                                    marker,
+                                    call,
+                                    interns,
+                                    table,
+                                    &offered_set,
+                                    &items_by_id,
+                                    &drop_glue_by_ty,
+                                    &global_types,
+                                    opts,
+                                    &mut excluded_enums,
+                                    &mut host_boundary_types,
+                                    &mut visited_excl,
+                                    &mut visited_host,
+                                ) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    let is_internal_foreign = match &call.callee {
+                        Callee::Foreign { symbol, .. } => interns.str(*symbol).is_some_and(|sym| {
+                            let js_name = JsName::new(sym.to_owned());
+                            table.get(&js_name).is_some_and(|target| {
+                                target.kind == ItemKind::Alloc
+                                    || (target.kind == ItemKind::Fn
+                                        && offered_set.contains(&js_name)
+                                        && !target.linkage.exported
+                                        && target.dts.is_none())
+                            })
+                        }),
+                        _ => false,
+                    };
+
                     let is_host_boundary = call.host.is_some()
                         || matches!(
                             call.semantic,
@@ -672,7 +917,8 @@ pub fn specialize_table(
                                 | CallSemantic::ViewAbi
                                 | CallSemantic::RawJavaScript
                         )
-                        || (matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. })
+                        || (matches!(call.callee, Callee::Foreign { .. }) && !is_internal_foreign)
+                        || (matches!(call.callee, Callee::Runtime { .. })
                             && !is_representation_opaque_runtime(&call.callee, interns));
 
                     let is_non_offered_direct = match &call.callee {
@@ -683,9 +929,10 @@ pub fn specialize_table(
                             let target_name = items_by_id.get(tid).cloned().or_else(|| {
                                 interns.str(*link_name).map(|s| JsName::new(s.to_owned()))
                             });
-                            !target_name
-                                .as_ref()
-                                .is_some_and(|n| offered_set.contains(n))
+                            !target_name.as_ref().is_some_and(|n| {
+                                offered_set.contains(n)
+                                    || table.get(n).is_some_and(|t| t.kind == ItemKind::Alloc)
+                            })
                         }
                         _ => false,
                     };
@@ -1513,6 +1760,347 @@ fn walk_type_id_global(
     walk_type_id(ty, &empty, global, out, visited);
 }
 
+fn is_offered_internal_static(
+    target: &GlobalReference,
+    interns: &Interns,
+    table: &BTreeMap<JsName, LinkItem>,
+    offered_set: &BTreeSet<&JsName>,
+) -> bool {
+    let GlobalReference::Static { link_name, .. } = target else {
+        return false;
+    };
+    let Some(name_str) = interns.str(*link_name) else {
+        return false;
+    };
+    let name = JsName::new(name_str.to_owned());
+    offered_set.contains(&name)
+        && table
+            .get(&name)
+            .is_some_and(|item| !item.linkage.exported && item.dts.is_none())
+}
+
+fn reachable_mir_blocks(body: &Body, fold_runtime_checks: bool) -> BTreeSet<BlockId> {
+    let mut visited = BTreeSet::new();
+    let Some(entry) = body.blocks.first().map(|b| b.id) else {
+        return visited;
+    };
+    let by_id: BTreeMap<BlockId, usize> = body
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    let mut work = vec![entry];
+    while let Some(bid) = work.pop() {
+        if !visited.insert(bid) {
+            continue;
+        }
+        let Some(&idx) = by_id.get(&bid) else {
+            continue;
+        };
+        let block = &body.blocks[idx];
+        let mut const_locals: BTreeMap<LocalId, u128> = BTreeMap::new();
+        if fold_runtime_checks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    StatementKind::Assign { destination, value } => {
+                        if destination.projection.contains(&Projection::Deref) {
+                            const_locals.clear();
+                        } else if destination.projection.is_empty() {
+                            match value {
+                                Rvalue::Use(op) => match &op.kind {
+                                    OperandKind::RuntimeCheck(v) => {
+                                        const_locals.insert(destination.local, u128::from(*v));
+                                    }
+                                    OperandKind::Constant(
+                                        rcgjs_object::jir::semantic::Constant::Scalar {
+                                            bits, ..
+                                        },
+                                    ) => {
+                                        const_locals.insert(destination.local, *bits);
+                                    }
+                                    _ => {
+                                        const_locals.remove(&destination.local);
+                                    }
+                                },
+                                Rvalue::Reference { place, .. }
+                                | Rvalue::RawPointer { place, .. }
+                                | Rvalue::Reborrow { place, .. } => {
+                                    const_locals.remove(&destination.local);
+                                    const_locals.remove(&place.local);
+                                }
+                                _ => {
+                                    const_locals.remove(&destination.local);
+                                }
+                            }
+                        } else {
+                            const_locals.remove(&destination.local);
+                        }
+                    }
+                    StatementKind::CopyNonOverlapping { .. } => {
+                        const_locals.clear();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let push_unwind = |u: Unwind, work: &mut Vec<BlockId>| {
+            if let Unwind::Cleanup(b) = u {
+                work.push(b);
+            }
+        };
+        match &block.terminator {
+            Terminator::Goto(b)
+            | Terminator::FalseEdge { real: b, .. }
+            | Terminator::FalseUnwind { real: b, .. } => {
+                work.push(*b);
+            }
+            Terminator::Switch {
+                discriminant,
+                targets,
+                otherwise,
+            } => {
+                let folded = if fold_runtime_checks {
+                    match &discriminant.kind {
+                        OperandKind::RuntimeCheck(v) => Some(u128::from(*v)),
+                        OperandKind::Constant(rcgjs_object::jir::semantic::Constant::Scalar {
+                            bits,
+                            ..
+                        }) => Some(*bits),
+                        OperandKind::Copy(p) | OperandKind::Move(p) if p.projection.is_empty() => {
+                            const_locals.get(&p.local).copied()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(val) = folded {
+                    let target = targets
+                        .iter()
+                        .find_map(|&(bits, b)| (bits == val).then_some(b))
+                        .unwrap_or(*otherwise);
+                    work.push(target);
+                } else {
+                    work.push(*otherwise);
+                    for &(_, b) in targets {
+                        work.push(b);
+                    }
+                }
+            }
+            Terminator::Call(call) => {
+                if let Some(t) = call.target {
+                    work.push(t);
+                }
+                push_unwind(call.unwind, &mut work);
+            }
+            Terminator::Drop {
+                target,
+                unwind,
+                async_drop,
+                ..
+            } => {
+                work.push(*target);
+                push_unwind(*unwind, &mut work);
+                if let Some(b) = async_drop {
+                    work.push(*b);
+                }
+            }
+            Terminator::Assert {
+                condition,
+                expected,
+                target,
+                unwind,
+                ..
+            } => {
+                work.push(*target);
+                let proven_ok = fold_runtime_checks
+                    && match &condition.kind {
+                        OperandKind::RuntimeCheck(v) => *v == *expected,
+                        OperandKind::Copy(p) | OperandKind::Move(p) if p.projection.is_empty() => {
+                            const_locals
+                                .get(&p.local)
+                                .is_some_and(|&bits| (bits != 0) == *expected)
+                        }
+                        _ => false,
+                    };
+                if !proven_ok {
+                    push_unwind(*unwind, &mut work);
+                }
+            }
+            Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::UnwindResume
+            | Terminator::UnwindTerminate(_) => {}
+        }
+    }
+    visited
+}
+
+/// Handles closure-taking and async-driver `rcgjs.host.*` markers whose JS host wrappers store
+/// a Rust closure environment or coroutine future opaquely without inspecting its captured fields
+/// or saved locals. Returns `true` when the call was soundly handled (so the caller skips the
+/// conservative whole-argument `walk_both`), or `false` to fall back to the conservative walk.
+#[allow(clippy::too_many_arguments)]
+fn handle_opaque_host_marker(
+    marker: &str,
+    call: &rcgjs_object::jir::semantic::Call,
+    interns: &Interns,
+    table: &BTreeMap<JsName, LinkItem>,
+    offered_set: &BTreeSet<&JsName>,
+    items_by_id: &BTreeMap<ItemId, JsName>,
+    drop_glue_by_ty: &BTreeMap<TypeId, JsName>,
+    global_types: &BTreeMap<TypeId, TypeDescriptor>,
+    opts: &Opts,
+    excluded_enums: &mut BTreeSet<TypeId>,
+    host_boundary_types: &mut BTreeSet<TypeId>,
+    visited_excl: &mut BTreeSet<TypeId>,
+    visited_host: &mut BTreeSet<TypeId>,
+) -> bool {
+    let mut walk_both = |ty: TypeId, ty_interns: &Interns| {
+        walk_type_id(ty, ty_interns, global_types, excluded_enums, visited_excl);
+        walk_type_id(
+            ty,
+            ty_interns,
+            global_types,
+            host_boundary_types,
+            visited_host,
+        );
+    };
+
+    // 1. Closure-taking markers (`host.rs:245-284`): JS receives `(...$a) => body(env, ...$a)`
+    //    (plus `() => drop_glue(env)` for `try`). `env` never crosses into JS.
+    let closure_idx = match marker {
+        "callback0" | "callback1" | "callback2" | "callback3" | "callback4" | "promise"
+        | "localwaker" | "microtask" | "task" | "try"
+            if call.arguments.len() == 1 =>
+        {
+            Some(0usize)
+        }
+        "settled" if call.arguments.len() == 2 => Some(1usize),
+        _ => None,
+    };
+    if let Some(c_idx) = closure_idx {
+        let closure_peeled = peel_global(call.arguments[c_idx].ty, global_types);
+        let Some(closure_desc) = global_types.get(&closure_peeled) else {
+            return false;
+        };
+        let TypeKind::Closure { def, .. } = closure_desc.kind else {
+            return false;
+        };
+        let closure_item_id = ItemId {
+            definition: def,
+            instantiation: closure_peeled.0,
+        };
+        let Some(closure_name) = items_by_id.get(&closure_item_id) else {
+            return false;
+        };
+        if !offered_set.contains(closure_name) {
+            return false;
+        }
+        let Some(closure_item) = table.get(closure_name) else {
+            return false;
+        };
+        let (Some(c_body), Some(c_interns)) =
+            (closure_item.jir.body.as_ref(), closure_item.jir.interns())
+        else {
+            return false;
+        };
+        if marker == "try" && closure_desc.layout.needs_drop {
+            let Some(glue_name) = drop_glue_by_ty.get(&closure_peeled) else {
+                return false;
+            };
+            if !offered_set.contains(glue_name) {
+                return false;
+            }
+        }
+
+        // Walk all non-closure arguments (e.g. `settled`'s `args[0]`), the call result (e.g.
+        // `try`'s `Result<T, JsValue>`), and the JS-visible parameters/result of the closure body
+        // (skipping `arguments[0]`, the captured environment).
+        for (i, arg) in call.arguments.iter().enumerate() {
+            if i != c_idx {
+                walk_both(arg.ty, interns);
+            }
+        }
+        walk_both(call.destination.ty, interns);
+        for &inp in c_body.signature.arguments.iter().skip(1) {
+            walk_both(inp, c_interns);
+        }
+        walk_both(c_body.signature.result, c_interns);
+        return true;
+    }
+
+    // 2. Async-driver markers (`host.rs:672-765`): JS stores `state.future` opaquely and only
+    //    passes `state` to the offered `poll_once`/`poll_result` helper and offered `drop_glue`.
+    //    `host_future_*` inspects `Poll::Ready` and `Result::Ok`/`Err` on `poll_result`'s return
+    //    value, which we explicitly walk via `h_body.signature.result`.
+    let (is_promise, expected_args) = match marker {
+        "futurepromise" | "futurenativepromise" => (true, 1usize),
+        "spawn" => (false, 1usize),
+        "spawnowner" | "spawnowner.v2" => (false, 2usize),
+        _ => return false,
+    };
+    if !opts.applies(OptimizerPass::FuturePoller) || call.arguments.len() != expected_args {
+        return false;
+    }
+    let Some(host) = &call.host else {
+        return false;
+    };
+    let helper_key = if is_promise {
+        "poll_result"
+    } else {
+        "poll_once"
+    };
+    let Some(helper_ref) = host.helper(interns, helper_key) else {
+        return false;
+    };
+    let helper_name = items_by_id.get(&helper_ref.item).cloned().or_else(|| {
+        interns
+            .str(helper_ref.link_name)
+            .map(|s| JsName::new(s.to_owned()))
+    });
+    let Some(helper_name) = helper_name else {
+        return false;
+    };
+    if !offered_set.contains(&helper_name) {
+        return false;
+    }
+    let Some(helper_item) = table.get(&helper_name) else {
+        return false;
+    };
+    let (Some(h_body), Some(h_interns)) =
+        (helper_item.jir.body.as_ref(), helper_item.jir.interns())
+    else {
+        return false;
+    };
+    let future_peeled = peel_global(call.arguments[0].ty, global_types);
+    let Some(future_desc) = global_types.get(&future_peeled) else {
+        return false;
+    };
+    if future_desc.layout.needs_drop {
+        let Some(glue_name) = drop_glue_by_ty.get(&future_peeled) else {
+            return false;
+        };
+        if !offered_set.contains(glue_name) {
+            return false;
+        }
+    }
+
+    // Walk `call.destination.ty`, any non-future args (`owner`), and the poll helper's non-future
+    // inputs (`Waker`/`Context`) and return type (`Poll<Result<JsValue, JsValue>>` or `bool`),
+    // while keeping `future` (`args[0]`, `h_body.signature.arguments[0]`) opaque.
+    for arg in call.arguments.iter().skip(1) {
+        walk_both(arg.ty, interns);
+    }
+    walk_both(call.destination.ty, interns);
+    for &inp in h_body.signature.arguments.iter().skip(1) {
+        walk_both(inp, h_interns);
+    }
+    walk_both(h_body.signature.result, h_interns);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_operand_consts(
     op: &Operand,
@@ -1527,10 +2115,12 @@ fn scan_operand_consts(
     if let OperandKind::Constant(constant) = &op.kind {
         match constant {
             rcgjs_object::jir::semantic::Constant::Pointer {
-                target: GlobalReference::Static { .. },
+                target: target @ GlobalReference::Static { .. },
                 ..
             } => {
-                walk_type_id(op.ty, interns, global, excluded, visited);
+                if !is_offered_internal_static(target, interns, table, offered_set) {
+                    walk_type_id(op.ty, interns, global, excluded, visited);
+                }
             }
             rcgjs_object::jir::semantic::Constant::Pointer {
                 target: GlobalReference::Function { link_name, .. },
@@ -1580,12 +2170,14 @@ fn scan_const_tree(
     }
     match tree {
         ConstTree::Global {
-            target: GlobalReference::Static { .. },
+            target: target @ GlobalReference::Static { .. },
             ..
         }
-        | ConstTree::StaticField { .. }
-        | ConstTree::StaticSlice { .. } => {
-            walk_type_id(ty, interns, global, excluded, visited);
+        | ConstTree::StaticField { target, .. }
+        | ConstTree::StaticSlice { target, .. } => {
+            if !is_offered_internal_static(target, interns, table, offered_set) {
+                walk_type_id(ty, interns, global, excluded, visited);
+            }
         }
         ConstTree::Global {
             target: GlobalReference::Function { link_name, .. },
@@ -2250,6 +2842,771 @@ mod tests {
         assert_eq!(
             updated.enum_repr(t_exported_opt),
             Some(EnumRepr::Tag { fieldless: false })
+        );
+    }
+
+    fn payload_enum_desc(
+        id: TypeId,
+        def_hash: u64,
+        v0_name: StrId,
+        v0_ty: TypeId,
+        v1_name: StrId,
+        v1_ty: TypeId,
+        f0_name: StrId,
+    ) -> TypeDescriptor {
+        let mut js = base_facts(id);
+        js.is_indirect = true;
+        js.needs_clone = true;
+        js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        TypeDescriptor {
+            id,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: def_hash,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: v0_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f0_name),
+                            ty: v0_ty,
+                            offset: 4,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: v1_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f0_name),
+                            ty: v1_ty,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(NominalDiscriminant { bits: 1, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                size: Some(8),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js,
+        }
+    }
+
+    fn js_value_desc(id: TypeId) -> TypeDescriptor {
+        TypeDescriptor {
+            id,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 900,
+                },
+                args: Vec::new(),
+                form: NominalForm::Opaque,
+                variants: Vec::new(),
+                niche: None,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta {
+                boundary: PinnedBoundary::Host,
+                ..Default::default()
+            },
+            js: base_facts(id),
+        }
+    }
+
+    fn custom_item(
+        name: &str,
+        item_id: ItemId,
+        semantic: BodySemantic,
+        interns: Arc<Interns>,
+        arguments: Vec<TypeId>,
+        result: TypeId,
+        blocks: Vec<BasicBlock>,
+    ) -> LinkItem {
+        let mut jir = LinkJir::default();
+        jir.body = Some(Body {
+            item: item_id,
+            kind: BodyKind::Function,
+            semantic,
+            signature: Signature {
+                arguments,
+                result,
+                abi: AbiSignature::default(),
+            },
+            locals: Vec::new(),
+            blocks,
+        });
+        jir.use_shared_interns(interns);
+        LinkItem {
+            name: JsName::new(name.to_owned()),
+            kind: ItemKind::Fn,
+            js: String::new(),
+            refs: BTreeSet::new(),
+            zombies: Vec::new(),
+            linkage: Linkage::internal(),
+            debug_path: name.to_owned(),
+            crate_name: "test".to_owned(),
+            order: None,
+            map: ItemMap::default(),
+            dts: None,
+            optimization: Default::default(),
+            late_ir: Default::default(),
+            baseline_shadow: Default::default(),
+            jir,
+        }
+    }
+
+    fn dummy_place(ty: TypeId) -> Place {
+        Place {
+            local: LocalId(0),
+            projection: Vec::new(),
+            ty,
+        }
+    }
+
+    fn dummy_operand(ty: TypeId) -> Operand {
+        Operand {
+            ty,
+            kind: OperandKind::Copy(dummy_place(ty)),
+        }
+    }
+
+    #[test]
+    fn opaque_runtime_allowlist_covers_audited_helpers_and_rejects_boundary_helpers() {
+        let mut interns = Interns::default();
+        for sym in [
+            "write_bytes",
+            "compare_bytes",
+            "t_alloc_arr",
+            "t_alloc_z",
+            "t_realloc_arr",
+            "t_realloc_arr_checked",
+            "t_realloc_ta",
+            "t_realloc_ta_checked",
+            "t_dealloc_maybe",
+            "t_box_new_tracked",
+            "_put_plain",
+            "_put_tracked",
+            "rc_alloc_slice",
+            "arc_alloc_slice",
+            "typed_alloc_arr",
+            "nstr_into_vec",
+            "nstr_ascii_lower",
+            "bstr_in",
+            "bstr_out",
+            "bstr_bytes",
+            "bstr_of",
+            "bstr_sub",
+            "bstr_sub_from",
+            "bstr_sub_to",
+            "bstr_cmp",
+            "bstr_cmp_range",
+            "bstr_char",
+            "bstr_find_char",
+            "bstr_rfind_char",
+            "bstr_find_str",
+            "bstr_rfind_str",
+            "bstr_trim",
+            "bstr_trim_start",
+            "bstr_trim_end",
+            "bstr_push",
+            "bstr_pop",
+            "bstr_truncate",
+            "js_abort",
+            "abort_error",
+            "panic",
+            "unreachable",
+            "nv_grow_u8",
+            "nv_grow_i8",
+            "nv_grow_u16",
+            "nv_grow_i16",
+            "nv_grow_u32",
+            "nv_grow_i32",
+            "nv_grow_f32",
+            "nv_grow_f64",
+            "nv_with_cap_u8",
+            "nv_with_cap_i8",
+            "nv_with_cap_u16",
+            "nv_with_cap_i16",
+            "nv_with_cap_u32",
+            "nv_with_cap_i32",
+            "nv_with_cap_f32",
+            "nv_with_cap_f64",
+            "nv_zeroed_u8",
+            "nv_zeroed_i8",
+            "nv_zeroed_u16",
+            "nv_zeroed_i16",
+            "nv_zeroed_u32",
+            "nv_zeroed_i32",
+            "nv_zeroed_f32",
+            "nv_zeroed_f64",
+            "nv_resize_zero_ta",
+        ] {
+            let id = interns.intern_str(sym);
+            assert!(
+                is_representation_opaque_runtime(
+                    &Callee::Runtime {
+                        member: id,
+                        sysroot: true,
+                    },
+                    &interns,
+                ),
+                "sysroot helper `{sym}` must be representation-opaque"
+            );
+            assert!(
+                !is_representation_opaque_runtime(
+                    &Callee::Runtime {
+                        member: id,
+                        sysroot: false,
+                    },
+                    &interns,
+                ),
+                "non-sysroot helper `{sym}` must never be treated as opaque"
+            );
+        }
+        for boundary in [
+            "host_try",
+            "host_spawn",
+            "host_future_promise",
+            "host_str_to_lowercase",
+            "bstr_boundary",
+            "bstr_ref",
+            "bstr_ref_in",
+            "bstr_str_in",
+            "bstr_utf8_bytes",
+            "map_new",
+            "map_get",
+            "map_set",
+        ] {
+            let id = interns.intern_str(boundary);
+            assert!(
+                !is_representation_opaque_runtime(
+                    &Callee::Runtime {
+                        member: id,
+                        sysroot: true,
+                    },
+                    &interns,
+                ),
+                "boundary helper `{boundary}` must NOT be in is_representation_opaque_runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_runtime_host_try_async_foreign_and_dead_branch_specialize_internal_enums() {
+        use rcgjs_object::jir::semantic::{Call, DirectItemRef};
+
+        let mut interns = Interns::default();
+        let s_none = interns.intern_str("None");
+        let s_some = interns.intern_str("Some");
+        let s_leaf = interns.intern_str("Leaf");
+        let s_edge = interns.intern_str("Edge");
+        let s_ok = interns.intern_str("Ok");
+        let s_err = interns.intern_str("Err");
+        let s_pending = interns.intern_str("Pending");
+        let s_ready = interns.intern_str("Ready");
+        let s_f0 = interns.intern_str("_0");
+        let s_empty = interns.intern_str("");
+        let s_t_alloc_arr = interns.intern_str("t_alloc_arr");
+        let s_write_bytes = interns.intern_str("write_bytes");
+        let s_nv_grow_u8 = interns.intern_str("nv_grow_u8");
+        let s_bstr_boundary = interns.intern_str("bstr_boundary");
+        let s_host_try = interns.intern_str("rcgjs.host.try");
+        let s_host_fp = interns.intern_str("rcgjs.host.futurepromise");
+        let s_poll_result_key = interns.intern_str("poll_result");
+        let s_poll_result_name = interns.intern_str("poll_result_fn");
+        let s_panic_sym = interns.intern_str("rust_begin_unwind");
+        let s_ext_sym = interns.intern_str("external_c_fn");
+        let s_v1_name = interns.intern_str("v1_only_fn");
+
+        let t_unit = TypeId(1);
+        let t_u32 = TypeId(2);
+        let t_js = TypeId(3);
+        let t_entry = TypeId(4);
+        let t_opt_u32 = TypeId(5);
+        let t_try_res = TypeId(6);
+        let t_poll_res = TypeId(7);
+        let t_boundary_enum = TypeId(8);
+        let t_foreign_enum = TypeId(9);
+        let t_closure = TypeId(10);
+        let t_coro = TypeId(11);
+        let t_ref_coro = TypeId(12);
+
+        let closure_def = DefinitionId {
+            crate_id: 1,
+            local_hash: 500,
+        };
+        let closure_item_id = ItemId {
+            definition: closure_def,
+            instantiation: t_closure.0,
+        };
+        let poll_item_id = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 501,
+            },
+            instantiation: 0,
+        };
+        let v1_item_id = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 502,
+            },
+            instantiation: 0,
+        };
+
+        let mut closure_desc = TypeDescriptor {
+            id: t_closure,
+            name: None,
+            kind: TypeKind::Closure {
+                def: closure_def,
+                upvars: vec![t_entry, t_opt_u32],
+                fn_pointer_shim: None,
+            },
+            layout: LayoutFacts {
+                size: Some(16),
+                align: Some(4),
+                sized: true,
+                needs_drop: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_closure),
+        };
+        closure_desc.js.is_indirect = true;
+
+        let mut coro_desc = TypeDescriptor {
+            id: t_coro,
+            name: None,
+            kind: TypeKind::Coroutine {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 503,
+                },
+                upvars: vec![t_opt_u32],
+                saved_locals: vec![(0, t_entry)],
+                states: vec![vec![], vec![0]],
+                variants: vec![
+                    VariantDescriptor {
+                        name: s_empty,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: s_empty,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: t_entry,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(NominalDiscriminant { bits: 1, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+            },
+            layout: LayoutFacts {
+                size: Some(16),
+                align: Some(4),
+                sized: true,
+                needs_drop: false,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_coro),
+        };
+        coro_desc.js.is_indirect = true;
+
+        for desc in [
+            unit_desc(t_unit),
+            u32_desc(t_u32),
+            js_value_desc(t_js),
+            payload_enum_desc(t_entry, 200, s_leaf, t_u32, s_edge, t_u32, s_f0),
+            option_desc(t_opt_u32, t_u32, s_none, s_some, s_f0),
+            payload_enum_desc(t_try_res, 201, s_ok, t_u32, s_err, t_js, s_f0),
+            option_desc(t_poll_res, t_try_res, s_pending, s_ready, s_f0),
+            payload_enum_desc(t_boundary_enum, 202, s_leaf, t_u32, s_edge, t_u32, s_f0),
+            payload_enum_desc(t_foreign_enum, 203, s_leaf, t_u32, s_edge, t_u32, s_f0),
+            closure_desc,
+            coro_desc,
+            ref_desc(t_ref_coro, t_coro, PointerForm::Thin),
+        ] {
+            interns.types.insert(desc);
+        }
+        let shared = Arc::new(interns);
+
+        let mk_call = |id: u32,
+                       callee: Callee,
+                       semantic: CallSemantic,
+                       host: Option<HostPayload>,
+                       arguments: Vec<Operand>,
+                       dest_ty: TypeId,
+                       next: BlockId| BasicBlock {
+            id: BlockId(id),
+            cleanup: false,
+            statements: Vec::new(),
+            terminator: Terminator::Call(Call {
+                function: dummy_operand(t_unit),
+                callee,
+                semantic,
+                arguments,
+                destination: dummy_place(dest_ty),
+                target: Some(next),
+                unwind: Unwind::Continue,
+                track_caller: None,
+                host,
+            }),
+        };
+
+        // Main offered function exercises:
+        // bb0: RuntimeCheck(false) switch -> dead bb1 (calls non-offered v1_only_fn(Entry)), live bb2
+        // bb2: opaque sysroot Runtime `t_alloc_arr(Entry)`
+        // bb3: opaque sysroot Runtime `write_bytes(Option<u32>)`
+        // bb4: opaque sysroot Runtime `nv_grow_u8(Entry)`
+        // bb5: `rcgjs.host.try(closure_capturing_Entry_and_Option)` -> Result<u32, JsValue>
+        // bb6: `rcgjs.host.futurepromise(coro_saving_Entry)` with `poll_result` -> JsValue
+        // bb7: internal offered `Callee::Foreign(rust_begin_unwind)` with `Option<u32>`
+        // bb8: non-opaque sysroot `bstr_boundary(BoundaryEnum)` -> MUST protect BoundaryEnum
+        // bb9: unresolved `Callee::Foreign(external_c_fn)` with `ForeignEnum` -> MUST protect ForeignEnum
+        // bb10: Return
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Switch {
+                    discriminant: Operand {
+                        ty: t_u32,
+                        kind: OperandKind::RuntimeCheck(false),
+                    },
+                    targets: vec![(1, BlockId(1))],
+                    otherwise: BlockId(2),
+                },
+            },
+            mk_call(
+                1,
+                Callee::Direct {
+                    item: v1_item_id,
+                    link_name: s_v1_name,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_entry)],
+                t_unit,
+                BlockId(10),
+            ),
+            mk_call(
+                2,
+                Callee::Runtime {
+                    member: s_t_alloc_arr,
+                    sysroot: true,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_entry)],
+                t_entry,
+                BlockId(3),
+            ),
+            mk_call(
+                3,
+                Callee::Runtime {
+                    member: s_write_bytes,
+                    sysroot: true,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_opt_u32)],
+                t_unit,
+                BlockId(4),
+            ),
+            mk_call(
+                4,
+                Callee::Runtime {
+                    member: s_nv_grow_u8,
+                    sysroot: true,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_entry)],
+                t_unit,
+                BlockId(5),
+            ),
+            mk_call(
+                5,
+                Callee::Direct {
+                    item: closure_item_id,
+                    link_name: s_host_try,
+                },
+                CallSemantic::Host,
+                Some(HostPayload::Marker {
+                    section: s_host_try,
+                    def: DefinitionId {
+                        crate_id: 2,
+                        local_hash: 1,
+                    },
+                    template: None,
+                    helpers: Vec::new(),
+                }),
+                vec![dummy_operand(t_closure)],
+                t_try_res,
+                BlockId(6),
+            ),
+            mk_call(
+                6,
+                Callee::Direct {
+                    item: poll_item_id,
+                    link_name: s_host_fp,
+                },
+                CallSemantic::Host,
+                Some(HostPayload::Marker {
+                    section: s_host_fp,
+                    def: DefinitionId {
+                        crate_id: 2,
+                        local_hash: 2,
+                    },
+                    template: None,
+                    helpers: vec![(
+                        s_poll_result_key,
+                        DirectItemRef {
+                            item: poll_item_id,
+                            link_name: s_poll_result_name,
+                        },
+                    )],
+                }),
+                vec![dummy_operand(t_coro)],
+                t_js,
+                BlockId(7),
+            ),
+            mk_call(
+                7,
+                Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 99,
+                    },
+                    symbol: s_panic_sym,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_opt_u32)],
+                t_unit,
+                BlockId(8),
+            ),
+            mk_call(
+                8,
+                Callee::Runtime {
+                    member: s_bstr_boundary,
+                    sysroot: true,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_boundary_enum)],
+                t_unit,
+                BlockId(9),
+            ),
+            mk_call(
+                9,
+                Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 100,
+                    },
+                    symbol: s_ext_sym,
+                },
+                CallSemantic::Ordinary,
+                None,
+                vec![dummy_operand(t_foreign_enum)],
+                t_unit,
+                BlockId(10),
+            ),
+            BasicBlock {
+                id: BlockId(10),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Return,
+            },
+        ];
+
+        let ret_block = vec![BasicBlock {
+            id: BlockId(0),
+            cleanup: false,
+            statements: Vec::new(),
+            terminator: Terminator::Return,
+        }];
+
+        let f_main = JsName::new("main_fn".to_owned());
+        let f_closure = JsName::new("closure_body".to_owned());
+        let f_closure_drop = JsName::new("closure_drop".to_owned());
+        let f_poll = JsName::new("poll_result_fn".to_owned());
+        let f_panic = JsName::new("rust_begin_unwind".to_owned());
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            f_main.clone(),
+            custom_item(
+                "main_fn",
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 1,
+                        local_hash: 1,
+                    },
+                    instantiation: 0,
+                },
+                BodySemantic::Ordinary,
+                shared.clone(),
+                Vec::new(),
+                t_unit,
+                blocks,
+            ),
+        );
+        table.insert(
+            f_closure.clone(),
+            custom_item(
+                "closure_body",
+                closure_item_id,
+                BodySemantic::Ordinary,
+                shared.clone(),
+                vec![t_closure],
+                t_u32,
+                ret_block.clone(),
+            ),
+        );
+        table.insert(
+            f_closure_drop.clone(),
+            custom_item(
+                "closure_drop",
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 1,
+                        local_hash: 504,
+                    },
+                    instantiation: 0,
+                },
+                BodySemantic::DropGlue(t_closure),
+                shared.clone(),
+                vec![t_closure],
+                t_unit,
+                ret_block.clone(),
+            ),
+        );
+        table.insert(
+            f_poll.clone(),
+            custom_item(
+                "poll_result_fn",
+                poll_item_id,
+                BodySemantic::Ordinary,
+                shared.clone(),
+                vec![t_ref_coro, t_js],
+                t_poll_res,
+                ret_block.clone(),
+            ),
+        );
+        table.insert(
+            f_panic.clone(),
+            custom_item(
+                "rust_begin_unwind",
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 1,
+                        local_hash: 505,
+                    },
+                    instantiation: 0,
+                },
+                BodySemantic::Ordinary,
+                shared,
+                vec![t_opt_u32],
+                t_unit,
+                ret_block,
+            ),
+        );
+
+        let reachable = vec![
+            f_main.clone(),
+            f_closure.clone(),
+            f_closure_drop.clone(),
+            f_poll.clone(),
+            f_panic.clone(),
+        ];
+        let opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let mut table_unspec = table.clone();
+        let plan = specialize_table(&mut table, &reachable, &reachable, &BTreeSet::new(), &opts);
+
+        assert_eq!(
+            plan.decisions.get(&t_entry),
+            Some(&EnumRepr::IntTag { fieldless: false }),
+            "internal payload enum behind opaque runtime/host_try/futurepromise/dead-branch must get IntTag"
+        );
+        assert_eq!(
+            plan.decisions.get(&t_opt_u32),
+            Some(&EnumRepr::NullNiche {
+                none_variant: 0,
+                some_variant: 1
+            }),
+            "internal Option<u32> must get NullNiche"
+        );
+        assert!(
+            !plan.decisions.contains_key(&t_try_res),
+            "Result<u32, JsValue> returned by host_try must keep EnumRepr::Tag"
+        );
+        assert!(
+            !plan.decisions.contains_key(&t_poll_res),
+            "Poll<Result<u32, JsValue>> returned by poll_result must keep EnumRepr::Tag"
+        );
+        assert!(
+            !plan.decisions.contains_key(&t_boundary_enum),
+            "enum crossing bstr_boundary must keep EnumRepr::Tag"
+        );
+        assert!(
+            !plan.decisions.contains_key(&t_foreign_enum),
+            "enum crossing unresolved Callee::Foreign must keep EnumRepr::Tag"
+        );
+
+        // Negative check: if the closure body is NOT offered (v1 fallback), `rcgjs.host.try`
+        // must conservatively exclude the closure's captured enums (`Entry` and `Option<u32>`).
+        let offered_without_closure = vec![f_main, f_closure_drop, f_poll, f_panic];
+        let fallback_plan = specialize_table(
+            &mut table_unspec,
+            &reachable,
+            &offered_without_closure,
+            &BTreeSet::new(),
+            &opts,
+        );
+        assert!(
+            !fallback_plan.decisions.contains_key(&t_entry),
+            "non-offered closure body in host_try must conservatively protect captured Entry"
+        );
+        assert!(
+            !fallback_plan.decisions.contains_key(&t_opt_u32),
+            "non-offered closure body in host_try must conservatively protect captured Option<u32>"
         );
     }
 }

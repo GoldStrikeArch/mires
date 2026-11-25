@@ -1013,7 +1013,7 @@ globalThis.__rt.copy = (dst, src, count, clone, plain) => {
           return;
         }
       } else if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
-        if (count <= 8) {
+        if (count <= 32) {
           for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
         } else {
           db.set(soff === 0 && count === sb.length ? sb : sb.subarray(soff, soff + count), doff);
@@ -1166,7 +1166,7 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
     if (db !== undefined && sb !== undefined && doff >= 0 && soff >= 0
         && doff + count <= db.length && soff + count <= sb.length) {
       if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
-        if (count <= 8) {
+        if (count <= 32) {
           for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
         } else {
           db.set(soff === 0 && count === sb.length ? sb : sb.subarray(soff, soff + count), doff);
@@ -7716,24 +7716,46 @@ globalThis.__rt.nv_zeroed_ta = (n, k, maxElems) => {
 globalThis.__rt.nv_zeroed_arr = (n, align, maxElems, val) => {
   if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
   if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  const b = new Array(n);
-  for (let i = 0; i < n; i++) b[i] = val;
+  const b = [];
+  for (let i = 0; i < n; i++) b.push(val);
   return { buf: b, len: n };
 };
 globalThis.__rt.nv_zeroed_arr_fn = (n, align, maxElems, mk) => {
   if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
   if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  const b = new Array(n);
-  for (let i = 0; i < n; i++) b[i] = mk();
+  const b = [];
+  for (let i = 0; i < n; i++) b.push(mk());
   return { buf: b, len: n };
 };
 globalThis.__rt.nv_zeroed_arr_fn_tracked = (n, align, maxElems, mk) => {
   if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
   if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  const b = new Array(n);
+  const b = [];
   for (let i = 0; i < n; i++) {
     const e = mk();
-    b[i] = e;
+    b.push(e);
+    if (e !== null && typeof e === "object") globalThis.__rt._boxes.set(e, { buf: b, off: i });
+  }
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_zeroed_arr_p = (n, maxElems, val) => {
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = [];
+  for (let i = 0; i < n; i++) b.push(val);
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_zeroed_arr_fn_p = (n, maxElems, mk) => {
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = [];
+  for (let i = 0; i < n; i++) b.push(mk());
+  return { buf: b, len: n };
+};
+globalThis.__rt.nv_zeroed_arr_fn_tracked_p = (n, maxElems, mk) => {
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  const b = [];
+  for (let i = 0; i < n; i++) {
+    const e = mk();
+    b.push(e);
     if (e !== null && typeof e === "object") globalThis.__rt._boxes.set(e, { buf: b, off: i });
   }
   return { buf: b, len: n };
@@ -7895,4 +7917,314 @@ globalThis.__rt.nstr_into_nvec = (s) => {
   const buf = new Uint8Array(cap);
   for (let i = 0; i < len; i++) buf[i] = str.charCodeAt(i);
   return { buf: buf, len: len };
+};
+
+// Mires v5 Phase 1B monomorphic per-TypedArray-kind constructors & grow/reserve helpers
+// (each is a top-level `__rt.<name>` assignment so `minimal-shim.mjs` tree-shakes unused kinds).
+globalThis.__rt.nv_with_cap_u8 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(0), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint8Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_i8 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(1), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int8Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_u16 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(2), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint16Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_i16 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(3), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int16Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_u32 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(4), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint32Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_i32 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(5), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int32Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_f32 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(6), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Float32Array(cap), len: 0 };
+};
+globalThis.__rt.nv_with_cap_f64 = (cap, maxElems) => {
+  if (cap === 0) return { buf: globalThis.__rt._nv_et(7), len: 0 };
+  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Float64Array(cap), len: 0 };
+};
+
+globalThis.__rt.nv_zeroed_u8 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(0), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint8Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_i8 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(1), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int8Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_u16 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(2), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint16Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_i16 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(3), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int16Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_u32 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(4), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Uint32Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_i32 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(5), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Int32Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_f32 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(6), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Float32Array(n), len: n };
+};
+globalThis.__rt.nv_zeroed_f64 = (n, maxElems) => {
+  if (n === 0) return { buf: globalThis.__rt._nv_et(7), len: 0 };
+  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  return { buf: new Float64Array(n), len: n };
+};
+
+globalThis.__rt.nv_grow_u8 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Uint8Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_i8 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Int8Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_u16 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Uint16Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_i16 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Int16Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_u32 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Uint32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_i32 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Int32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_f32 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Float32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_grow_f64 = (v, minCap, maxElems) => {
+  const old = v.buf.length;
+  const req = old + 1;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = old * 2;
+  if (next < req) next = req;
+  if (next < minCap) next = minCap;
+  if (next > maxElems) next = maxElems;
+  const nb = new Float64Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+
+globalThis.__rt.nv_reserve_u8 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Uint8Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_i8 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Int8Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_u16 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Uint16Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_i16 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Int16Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_u32 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Uint32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_i32 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Int32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_f32 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Float32Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
+};
+globalThis.__rt.nv_reserve_f64 = (v, used, add, minCap, exact, maxElems) => {
+  const old = v.buf.length;
+  const req = used + add;
+  if (req <= old) return;
+  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+  let next = req;
+  if (!exact) {
+    const doubled = old * 2;
+    if (doubled > next) next = doubled;
+    if (minCap > next) next = minCap;
+    if (next > maxElems) next = maxElems;
+  }
+  const nb = new Float64Array(next);
+  if (old > 0) nb.set(v.buf);
+  v.buf = nb;
 };

@@ -24,10 +24,13 @@ use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
 use crate::jir::interp::{self, Hooks, Trap, Value};
-use crate::jir::repr::{Dominators, Func, FuncBuilder, Op, OpKind, RBlockId, RTerm, ValueId};
+use crate::jir::repr::{
+    CellId, Dominators, Func, FuncBuilder, Op, OpKind, RBlockId, RTerm, Root, ValueId,
+};
 use crate::jir::semantic::{
-    AbiSignature, BinaryOp, BodyKind, BodySemantic, CallSemantic, Callee, ConstTree, DefinitionId,
-    DirectItemRef, DropGlue, HostPayload, ItemId, Signature, TypeId, VtableEntry,
+    AbiSignature, BinaryOp, BodyKind, BodySemantic, CallSemantic, Callee, CastKind, ConstTree,
+    DefinitionId, DirectItemRef, DropGlue, HostPayload, ItemId, Signature, TypeId, UnaryOp,
+    VtableEntry,
 };
 use crate::jir::types::{IteratorIdentity, TypeKind};
 use crate::jir::{OriginId, TypeTable};
@@ -763,17 +766,64 @@ pub(crate) fn check_invoke_pruning(
     Ok(())
 }
 
+const WITNESS_MAX_NOOP_UNWIND_BLOCKS: usize = 64;
+
+fn witness_escaped_cells(func: &Func) -> BTreeSet<CellId> {
+    let mut escaped = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::Drop {
+                    root: Root::Cell(cell),
+                    glue: DropGlue::Direct { .. } | DropGlue::Dynamic,
+                    ..
+                } => {
+                    escaped.insert(*cell);
+                }
+                _ => {}
+            }
+        }
+    }
+    escaped
+}
+
+fn witness_is_bool_or_int(ty: TypeId, types: &TypeTable) -> bool {
+    matches!(
+        types.get(types.peeled(ty)).map(|d| &d.kind),
+        Some(TypeKind::Bool | TypeKind::Integer { .. })
+    )
+}
+
 fn verify_noop_unwind_chain(
     func: &Func,
     interns: &Interns,
     start: RBlockId,
     pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
 ) -> Result<(), String> {
-    let mut cur = start;
-    let mut visited = BTreeSet::new();
-    for _ in 0..8 {
-        if !visited.insert(cur) {
-            return Err(format!("noop unwind chain cycles at bb{}", cur.0));
+    let mut escaped_cells: Option<BTreeSet<CellId>> = None;
+    let mut color: BTreeMap<RBlockId, u8> = BTreeMap::new();
+    let mut stack: Vec<(RBlockId, bool)> = vec![(start, false)];
+
+    while let Some((cur, exiting)) = stack.pop() {
+        if exiting {
+            color.insert(cur, 2);
+            continue;
+        }
+        match color.get(&cur).copied() {
+            Some(2) => continue,
+            Some(1) => return Err(format!("noop unwind DAG cycles at bb{}", cur.0)),
+            _ => {}
+        }
+        if color.len() >= WITNESS_MAX_NOOP_UNWIND_BLOCKS {
+            return Err("noop unwind DAG exceeds 64-block bound".to_owned());
         }
         let block = func
             .blocks
@@ -781,7 +831,56 @@ fn verify_noop_unwind_chain(
             .ok_or_else(|| format!("missing unwind block bb{}", cur.0))?;
         for op in &block.ops {
             match &op.kind {
-                OpKind::Copy(_) | OpKind::Move(_) => {}
+                OpKind::Copy(_)
+                | OpKind::Move(_)
+                | OpKind::Const(_)
+                | OpKind::Field { .. }
+                | OpKind::CellLoad(_)
+                | OpKind::BorrowView { .. }
+                | OpKind::RawView { .. }
+                | OpKind::Discriminant(_) => {}
+                OpKind::CellStore { cell, .. } => {
+                    let escaped = escaped_cells.get_or_insert_with(|| witness_escaped_cells(func));
+                    if escaped.contains(cell) {
+                        return Err(format!(
+                            "cell store to escaped cell c{} in unwind block bb{}",
+                            cell.0, cur.0
+                        ));
+                    }
+                }
+                OpKind::Unary {
+                    op: UnaryOp::Not | UnaryOp::Neg,
+                    ty,
+                    ..
+                } => {
+                    if !witness_is_bool_or_int(*ty, &interns.types) {
+                        return Err(format!(
+                            "unary op on non-bool/int type t{} in unwind block bb{}",
+                            ty.0, cur.0
+                        ));
+                    }
+                }
+                OpKind::Binary {
+                    op:
+                        BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor,
+                    ty,
+                    ..
+                } => {
+                    if !witness_is_bool_or_int(*ty, &interns.types) {
+                        return Err(format!(
+                            "binary op on non-bool/int type t{} in unwind block bb{}",
+                            ty.0, cur.0
+                        ));
+                    }
+                }
+                OpKind::Cast {
+                    kind: CastKind::IntToInt | CastKind::Subtype,
+                    ..
+                } => {}
                 OpKind::Drop { glue, .. } => match glue {
                     DropGlue::None => {}
                     DropGlue::Direct { link_name, .. } => {
@@ -805,14 +904,52 @@ fn verify_noop_unwind_chain(
                     }
                     verify_empty_return_callee(interns, *link_name, pre_funcs)?;
                 }
+                OpKind::Call {
+                    callee: Callee::Nop,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                    function: None,
+                    ..
+                } => {
+                    if let Some(res) = op.result {
+                        if value_is_used_anywhere(func, res) {
+                            return Err(format!("unwind nop call result v{} is used", res.0));
+                        }
+                    }
+                }
                 other => {
                     return Err(format!("non-noop op {other:?} in unwind block bb{}", cur.0));
                 }
             }
         }
+        color.insert(cur, 1);
+        stack.push((cur, true));
         match &block.term {
-            RTerm::Throw(None) => return Ok(()),
-            RTerm::Goto(next, _) => cur = *next,
+            RTerm::Throw(None) => {}
+            RTerm::Goto(next, _) => {
+                if color.get(next).copied() == Some(1) {
+                    return Err(format!("noop unwind DAG cycles at bb{}", next.0));
+                }
+                if !color.contains_key(next) {
+                    stack.push((*next, false));
+                }
+            }
+            RTerm::Switch { cases, default, .. } => {
+                if color.get(&default.0).copied() == Some(1) {
+                    return Err(format!("noop unwind DAG cycles at bb{}", default.0 .0));
+                }
+                if !color.contains_key(&default.0) {
+                    stack.push((default.0, false));
+                }
+                for &(_, target, _) in cases {
+                    if color.get(&target).copied() == Some(1) {
+                        return Err(format!("noop unwind DAG cycles at bb{}", target.0));
+                    }
+                    if !color.contains_key(&target) {
+                        stack.push((target, false));
+                    }
+                }
+            }
             other => {
                 return Err(format!(
                     "unwind block bb{} ends in non-noop terminator {other:?}",
@@ -821,7 +958,11 @@ fn verify_noop_unwind_chain(
             }
         }
     }
-    Err("noop unwind chain exceeds 8-block bound".to_owned())
+    if color.is_empty() {
+        Err("noop unwind DAG is empty".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 fn value_is_used_anywhere(func: &Func, val: ValueId) -> bool {
@@ -1683,6 +1824,42 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "convert_nv_typed"
             | "bstr_block_typed"
             | "bstr_sb_block_typed"
+            | "nv_grow_u8"
+            | "nv_grow_i8"
+            | "nv_grow_u16"
+            | "nv_grow_i16"
+            | "nv_grow_u32"
+            | "nv_grow_i32"
+            | "nv_grow_f32"
+            | "nv_grow_f64"
+            | "nv_with_cap_u8"
+            | "nv_with_cap_i8"
+            | "nv_with_cap_u16"
+            | "nv_with_cap_i16"
+            | "nv_with_cap_u32"
+            | "nv_with_cap_i32"
+            | "nv_with_cap_f32"
+            | "nv_with_cap_f64"
+            | "nv_zeroed_u8"
+            | "nv_zeroed_i8"
+            | "nv_zeroed_u16"
+            | "nv_zeroed_i16"
+            | "nv_zeroed_u32"
+            | "nv_zeroed_i32"
+            | "nv_zeroed_f32"
+            | "nv_zeroed_f64"
+            | "nv_reserve_u8"
+            | "nv_reserve_i8"
+            | "nv_reserve_u16"
+            | "nv_reserve_i16"
+            | "nv_reserve_u32"
+            | "nv_reserve_i32"
+            | "nv_reserve_f32"
+            | "nv_reserve_f64"
+            | "nv_zeroed_arr_p"
+            | "nv_zeroed_arr_fn_p"
+            | "nv_zeroed_arr_fn_tracked_p"
+            | "nv_resize_zero_ta"
     )
 }
 
@@ -1829,6 +2006,338 @@ mod tests {
             Witness::DropElided { count: 1 },
         ] {
             witness.check(&func, &table).expect("the verifier accepts");
+        }
+    }
+
+    #[test]
+    fn invoke_pruning_witness_accepts_branching_dag_and_rejects_unsound_dags() {
+        let mut interns = Interns::new();
+        let bool_ty = TypeId(2);
+        let raw_i32_ty = TypeId(3);
+        interns.intern_type(table().get(I32).unwrap().clone());
+        interns.intern_type(TypeDescriptor {
+            id: bool_ty,
+            name: None,
+            kind: TypeKind::Bool,
+            layout: LayoutFacts {
+                size: Some(1),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: bool_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        interns.intern_type(TypeDescriptor {
+            id: raw_i32_ty,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: I32,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: raw_i32_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let sig = Signature {
+            abi: AbiSignature::default(),
+            arguments: Vec::new(),
+            result: I32,
+        };
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 0,
+                local_hash: 7,
+            },
+            instantiation: 0,
+        };
+        let host = HostPayload::Marker {
+            section: interns.intern_str("rcgjs.host.invoke"),
+            def: item.definition,
+            template: None,
+            helpers: Vec::new(),
+        };
+
+        // 1. Valid branching DAG with diamond merge -> Throw(None).
+        let mut b = FuncBuilder::new(item, sig.clone());
+        let flag_cell = b.cell(bool_ty, false, OriginId(0));
+        let zero = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            I32,
+            OriginId(0),
+        );
+        let t_bool = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 1 }),
+            bool_ty,
+            OriginId(0),
+        );
+        b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::CellAlloc(flag_cell),
+            OriginId(0),
+        );
+        b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: host.clone(),
+                args: Vec::new(),
+            },
+            OriginId(0),
+        );
+        let normal = b.block();
+        let u_head = b.block();
+        let u_a = b.block();
+        let u_b = b.block();
+        let u_tail = b.block();
+        b.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Invoke {
+                normal: (normal, Vec::new()),
+                unwind: (u_head, Vec::new()),
+            },
+        );
+        b.terminate(normal, RTerm::Return(Some(zero)));
+        let loaded = b.op(u_head, OpKind::CellLoad(flag_cell), bool_ty, OriginId(0));
+        b.effect(
+            u_head,
+            OpKind::CellStore {
+                cell: flag_cell,
+                v: t_bool,
+            },
+            OriginId(0),
+        );
+        let eq = b.op(
+            u_head,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: loaded,
+                r: t_bool,
+                ty: bool_ty,
+            },
+            bool_ty,
+            OriginId(0),
+        );
+        b.terminate(
+            u_head,
+            RTerm::Switch {
+                scrut: eq,
+                scrut_ty: bool_ty,
+                cases: vec![(1, u_a, Vec::new())],
+                default: (u_b, Vec::new()),
+            },
+        );
+        b.effect(
+            u_a,
+            OpKind::Drop {
+                root: Root::Value(zero),
+                path: Vec::new(),
+                glue: DropGlue::None,
+            },
+            OriginId(0),
+        );
+        b.terminate(u_a, RTerm::Goto(u_tail, Vec::new()));
+        b.terminate(u_b, RTerm::Goto(u_tail, Vec::new()));
+        b.terminate(u_tail, RTerm::Throw(None));
+        let valid_func = b.finish();
+
+        let site = [InvokePrunedSite {
+            block: FuncBuilder::ENTRY,
+            reason: InvokePruneReason::NoopUnwindChain,
+        }];
+        let empty_table = BTreeMap::new();
+        let empty_funcs = BTreeMap::new();
+        let empty_live = BTreeSet::new();
+        check_invoke_pruning(
+            &valid_func,
+            &interns,
+            &site,
+            &empty_table,
+            &empty_funcs,
+            &empty_live,
+        )
+        .expect("witness must accept sound branching cleanup DAG");
+
+        // 2. Cycle in cleanup DAG must be rejected.
+        let mut cyc = valid_func.clone();
+        cyc.blocks[u_a.0 as usize].term = RTerm::Goto(u_head, Vec::new());
+        let err = check_invoke_pruning(
+            &cyc,
+            &interns,
+            &site,
+            &empty_table,
+            &empty_funcs,
+            &empty_live,
+        )
+        .expect_err("witness must reject cycle in cleanup DAG");
+        assert!(err.contains("cycle"), "unexpected error: {err}");
+
+        // 3. CellStore to an escaped cell (via RawView) must be rejected.
+        let mut esc = FuncBuilder::new(item, sig.clone());
+        let esc_cell = esc.cell(I32, true, OriginId(0));
+        let val = esc.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 7, bytes: 4 }),
+            I32,
+            OriginId(0),
+        );
+        esc.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(esc_cell), OriginId(0));
+        let _raw = esc.op(
+            FuncBuilder::ENTRY,
+            OpKind::RawView {
+                root: Root::Cell(esc_cell),
+                path: Vec::new(),
+                mutable: true,
+            },
+            raw_i32_ty,
+            OriginId(0),
+        );
+        esc.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: host.clone(),
+                args: Vec::new(),
+            },
+            OriginId(0),
+        );
+        let en = esc.block();
+        let eu = esc.block();
+        esc.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Invoke {
+                normal: (en, Vec::new()),
+                unwind: (eu, Vec::new()),
+            },
+        );
+        esc.terminate(en, RTerm::Return(Some(val)));
+        esc.effect(
+            eu,
+            OpKind::CellStore {
+                cell: esc_cell,
+                v: val,
+            },
+            OriginId(0),
+        );
+        esc.terminate(eu, RTerm::Throw(None));
+        let esc_func = esc.finish();
+        let err = check_invoke_pruning(
+            &esc_func,
+            &interns,
+            &site,
+            &empty_table,
+            &empty_funcs,
+            &empty_live,
+        )
+        .expect_err("witness must reject escaped cell store");
+        assert!(err.contains("escaped cell"), "unexpected error: {err}");
+
+        // 4. Exceeding 64-block bound (65 blocks) must be rejected.
+        let mut big = FuncBuilder::new(item, sig);
+        let z = big.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            I32,
+            OriginId(0),
+        );
+        big.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: host,
+                args: Vec::new(),
+            },
+            OriginId(0),
+        );
+        let bn = big.block();
+        let chain: Vec<RBlockId> = (0..65).map(|_| big.block()).collect();
+        big.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Invoke {
+                normal: (bn, Vec::new()),
+                unwind: (chain[0], Vec::new()),
+            },
+        );
+        big.terminate(bn, RTerm::Return(Some(z)));
+        for w in chain.windows(2) {
+            big.terminate(w[0], RTerm::Goto(w[1], Vec::new()));
+        }
+        big.terminate(chain[64], RTerm::Throw(None));
+        let big_func = big.finish();
+        let err = check_invoke_pruning(
+            &big_func,
+            &interns,
+            &site,
+            &empty_table,
+            &empty_funcs,
+            &empty_live,
+        )
+        .expect_err("witness must reject 65-block cleanup DAG");
+        assert!(err.contains("64-block"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn witness_sysroot_allowlist_covers_monomorphic_nv_helpers() {
+        for sym in [
+            "nv_grow_u8",
+            "nv_grow_i8",
+            "nv_grow_u16",
+            "nv_grow_i16",
+            "nv_grow_u32",
+            "nv_grow_i32",
+            "nv_grow_f32",
+            "nv_grow_f64",
+            "nv_with_cap_u8",
+            "nv_with_cap_i8",
+            "nv_with_cap_u16",
+            "nv_with_cap_i16",
+            "nv_with_cap_u32",
+            "nv_with_cap_i32",
+            "nv_with_cap_f32",
+            "nv_with_cap_f64",
+            "nv_zeroed_u8",
+            "nv_zeroed_i8",
+            "nv_zeroed_u16",
+            "nv_zeroed_i16",
+            "nv_zeroed_u32",
+            "nv_zeroed_i32",
+            "nv_zeroed_f32",
+            "nv_zeroed_f64",
+            "nv_resize_zero_ta",
+        ] {
+            assert!(
+                witness_sysroot_shim_is_non_throwing(sym),
+                "witness allowlist missing `{sym}`"
+            );
         }
     }
 }

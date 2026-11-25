@@ -851,21 +851,10 @@ impl Planner<'_> {
                 .filter(|component| component.iter().any(|node| carriers[*node].is_some()))
                 .collect();
             if components.is_empty() {
-                let commit = if self.cx.heap.native_string_enabled
-                    && self.fmt.values().any(|a| !a.sites.is_empty())
-                {
-                    let mut c = self
-                        .build_commit(problem, &vec![None; count], &ops, fault)
-                        .unwrap_or_default();
-                    c.measured = Some((baseline, baseline));
-                    c
-                } else {
-                    Commit {
-                        measured: Some((baseline, baseline)),
-                        ..Commit::default()
-                    }
-                };
-                accepted = Some(commit);
+                accepted = Some(Commit {
+                    measured: Some((baseline, baseline)),
+                    ..Commit::default()
+                });
                 break;
             }
 
@@ -3328,92 +3317,95 @@ impl Planner<'_> {
         // below (the inlined site spells its own reads). A site labeled baseline throughout
         // stays plain calls to the baseline machinery; a mixed labeling rolls the region back.
         let mut fmt_elide: BTreeSet<(usize, usize)> = BTreeSet::new();
-        if let Some(analysis) = self.fmt.get(name) {
-            use semantic_ops::fmt_kernel::{DisplayKind, SiteKind};
-            let native = |carrier: Option<Carrier>| {
-                matches!(carrier, Some(Carrier::HostString | Carrier::StringBuilder))
-            };
-            for site in &analysis.sites {
-                // A callee an unproven call still reaches kept its edges; its sites stay plain.
-                if !site
-                    .callees
-                    .iter()
-                    .all(|item| analysis.elidable.contains(item))
-                {
-                    continue;
-                }
-                let dest = match site.kind {
-                    SiteKind::ToString { result } => label(name, Site::Value(result), &[]),
-                    SiteKind::WriteFmt { receiver, .. } => {
-                        label(name, Site::Value(receiver), &[Step::Deref])
-                    }
+        // When universal `native_string_enabled` is active, proven format sites are committed by
+        // `fmt_kernel::commit_universal_native_string_sites` after post-repr inlining once the
+        // final `HeapPlan` is settled (so pre-post-O `Carrier::HostString` marks never block
+        // inlining of helpers containing `format!`/`write!`).
+        if !self.cx.heap.native_string_enabled {
+            if let Some(analysis) = self.fmt.get(name) {
+                use semantic_ops::fmt_kernel::{DisplayKind, SiteKind};
+                let native = |carrier: Option<Carrier>| {
+                    matches!(carrier, Some(Carrier::HostString | Carrier::StringBuilder))
                 };
-                let mut strings: Vec<(ValueId, Option<Carrier>)> = Vec::new();
-                for arg in &site.args {
-                    if arg.kind != DisplayKind::String {
+                for site in &analysis.sites {
+                    // A callee an unproven call still reaches kept its edges; its sites stay plain.
+                    if !site
+                        .callees
+                        .iter()
+                        .all(|item| analysis.elidable.contains(item))
+                    {
                         continue;
                     }
-                    let value_site = match arg.root {
-                        Root::Value(v) => Site::Value(v),
-                        Root::Cell(c) => Site::Cell(c),
+                    let dest = match site.kind {
+                        SiteKind::ToString { result } => label(name, Site::Value(result), &[]),
+                        SiteKind::WriteFmt { receiver, .. } => {
+                            label(name, Site::Value(receiver), &[Step::Deref])
+                        }
                     };
-                    let steps: Vec<Step> = arg.path.iter().map(|_| Step::Deref).collect();
-                    strings.push((arg.value, label(name, value_site, &steps)));
-                }
-                let native_str = self.cx.heap.native_string_enabled;
-                let all = native_str || (native(dest) && strings.iter().all(|(_, l)| native(*l)));
-                let any = native_str || native(dest) || strings.iter().any(|(_, l)| native(*l));
-                if !any {
-                    continue;
-                }
-                if !all {
-                    return Err((
-                        BTreeSet::new(),
-                        format!("`{}` format site solved to mixed carriers", name.as_str()),
-                    ));
-                }
-                if !native_str
-                    && matches!(site.kind, SiteKind::WriteFmt { .. })
-                    && dest != Some(Carrier::StringBuilder)
-                {
-                    return Err((
-                        BTreeSet::new(),
-                        format!("`{}` format receiver is not a StringBuilder", name.as_str()),
-                    ));
-                }
-                out.values[site.args_value.0 as usize].carrier = Carrier::HostString;
-                for arg in &site.args {
-                    if let Some(helper) = arg.required_helper() {
-                        members.insert(helper.to_owned());
+                    let mut strings: Vec<(ValueId, Option<Carrier>)> = Vec::new();
+                    for arg in &site.args {
+                        if arg.kind != DisplayKind::String {
+                            continue;
+                        }
+                        let value_site = match arg.root {
+                            Root::Value(v) => Site::Value(v),
+                            Root::Cell(c) => Site::Cell(c),
+                        };
+                        let steps: Vec<Step> = arg.path.iter().map(|_| Step::Deref).collect();
+                        strings.push((arg.value, label(name, value_site, &steps)));
                     }
-                    out.values[arg.value.0 as usize].carrier = match arg.kind {
-                        // The mark records the source's own committed carrier, so the emission
-                        // reads `.text` exactly when the source is a builder (or `.s` under
-                        // universal native `String`).
-                        DisplayKind::String => strings
-                            .iter()
-                            .find(|(value, _)| *value == arg.value)
-                            .and_then(|(_, label)| *label)
-                            .unwrap_or(Carrier::HostString),
-                        _ => Carrier::HostString,
-                    };
+                    let all = native(dest) && strings.iter().all(|(_, l)| native(*l));
+                    let any = native(dest) || strings.iter().any(|(_, l)| native(*l));
+                    if !any {
+                        continue;
+                    }
+                    if !all {
+                        return Err((
+                            BTreeSet::new(),
+                            format!("`{}` format site solved to mixed carriers", name.as_str()),
+                        ));
+                    }
+                    if matches!(site.kind, SiteKind::WriteFmt { .. })
+                        && dest != Some(Carrier::StringBuilder)
+                    {
+                        return Err((
+                            BTreeSet::new(),
+                            format!("`{}` format receiver is not a StringBuilder", name.as_str()),
+                        ));
+                    }
+                    out.values[site.args_value.0 as usize].carrier = Carrier::HostString;
+                    for arg in &site.args {
+                        if let Some(helper) = arg.required_helper() {
+                            members.insert(helper.to_owned());
+                        }
+                        out.values[arg.value.0 as usize].carrier = match arg.kind {
+                            // The mark records the source's own committed carrier, so the emission
+                            // reads `.text` exactly when the source is a builder.
+                            DisplayKind::String => strings
+                                .iter()
+                                .find(|(value, _)| *value == arg.value)
+                                .and_then(|(_, label)| *label)
+                                .unwrap_or(Carrier::HostString),
+                            _ => Carrier::HostString,
+                        };
+                    }
+                    // A rename on the spine reads a marked value and is its one consumer's operand:
+                    // it carries the same native text, or the carrier verifier sees a native value
+                    // moved into a baseline one.
+                    for (rename, renamed) in &site.renames {
+                        out.values[rename.0 as usize].carrier =
+                            out.values[renamed.0 as usize].carrier;
+                    }
+                    if matches!(site.kind, SiteKind::WriteFmt { .. })
+                        || dest == Some(Carrier::StringBuilder)
+                    {
+                        members.insert("str_len".to_owned());
+                    }
+                    fmt_elide.insert(site.consumer);
+                    fmt_elide.insert(site.new_call);
+                    fmt_elide.extend(site.display_calls.iter().copied());
+                    touched = true;
                 }
-                // A rename on the spine reads a marked value and is its one consumer's operand:
-                // it carries the same native text, or the carrier verifier sees a native value
-                // moved into a baseline one.
-                for (rename, renamed) in &site.renames {
-                    out.values[rename.0 as usize].carrier = out.values[renamed.0 as usize].carrier;
-                }
-                if !native_str
-                    && (matches!(site.kind, SiteKind::WriteFmt { .. })
-                        || dest == Some(Carrier::StringBuilder))
-                {
-                    members.insert("str_len".to_owned());
-                }
-                fmt_elide.insert(site.consumer);
-                fmt_elide.insert(site.new_call);
-                fmt_elide.extend(site.display_calls.iter().copied());
-                touched = true;
             }
         }
 

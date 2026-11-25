@@ -3425,3 +3425,804 @@ assert.equal(display_str('plain'), 'plain');
 "#,
     );
 }
+
+/// Universal `NativeString` (`heap.native_string_enabled = true`) call-site format kernel:
+/// commits proven `format!`/`write!` sites directly via `commit_universal_native_string_sites`
+/// without B1 string regions, handles integers, hex (`{:08x}`, `{:#08X}`), fixed floats (`{:.5}`),
+/// `bool`, `String` (both direct `&String` and struct `Proj::Field`), `&str`, ASCII & non-ASCII
+/// `char`, non-ASCII UTF-8 template literals, `EnumRepr::IntTag` `Result<(), fmt::Error>`, and
+/// partial per-site commits alongside unrelated unproven format calls.
+#[test]
+fn universal_native_string_fmt_kernel_lowers_all_kinds_and_int_tag_result() {
+    use crate::analysis::heap::HeapPlan;
+    use crate::item::{LinkItem, Linkage as ItemLinkage};
+    use crate::jir::origin::OriginId;
+    use crate::jir::repr::{FuncBuilder, OpKind, Proj, RTerm, Root, ValueId};
+    use crate::jir::semantic::{Body, BodyKind, CallSemantic, Callee, ConstTree, ItemId};
+    use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+    use crate::jir::types::EnumRepr;
+    use crate::lower::js::host::{ItemEntry, ItemIndex};
+    use crate::lower::{lower_func, LowerInput};
+    use crate::opts::Opts;
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+    use std::collections::BTreeMap;
+
+    const ORIGIN: OriginId = OriginId(0);
+    const ARG_LIST_FMT: TypeId = TypeId(70);
+    const ARG_LIST_FMT_REF: TypeId = TypeId(71);
+    const TEMPLATE_FMT: TypeId = TypeId(72);
+    const ARG_LIST_WR: TypeId = TypeId(73);
+    const ARG_LIST_WR_REF: TypeId = TypeId(74);
+    const TEMPLATE_WR: TypeId = TypeId(75);
+    const WRAPPER: TypeId = TypeId(76);
+    const WRAPPER_REF: TypeId = TypeId(77);
+    const FMT_RESULT_INT: TypeId = TypeId(78);
+
+    // Template 1 (`format!`):
+    // "café={:+05} hex={:08x} HEX={:#08X} f={:.5} s={} ds={} str={} ch={} b={} 🦀"
+    let mut tpl_fmt: Vec<u8> = Vec::new();
+    let push_lit = |buf: &mut Vec<u8>, s: &str| {
+        let bytes = s.as_bytes();
+        assert!(bytes.len() <= 0x7f);
+        buf.push(bytes.len() as u8);
+        buf.extend_from_slice(bytes);
+    };
+    let push_spec = |buf: &mut Vec<u8>, flags: u32, width: Option<u16>, prec: Option<u16>| {
+        let mut hdr = 0xc0u8 | 1;
+        if width.is_some() {
+            hdr |= 2;
+        }
+        if prec.is_some() {
+            hdr |= 4;
+        }
+        buf.push(hdr);
+        buf.extend_from_slice(&flags.to_le_bytes());
+        if let Some(w) = width {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        if let Some(p) = prec {
+            buf.extend_from_slice(&p.to_le_bytes());
+        }
+    };
+    const DEFAULT_FLAGS: u32 = (' ' as u32) | (3 << 29);
+    const SIGN_PLUS: u32 = 1 << 21;
+    const ALTERNATE: u32 = 1 << 23;
+    const ZERO_PAD: u32 = 1 << 24;
+    const WIDTH: u32 = 1 << 27;
+    const PRECISION: u32 = 1 << 28;
+
+    push_lit(&mut tpl_fmt, "café=");
+    push_spec(
+        &mut tpl_fmt,
+        DEFAULT_FLAGS | SIGN_PLUS | ZERO_PAD | WIDTH,
+        Some(5),
+        None,
+    );
+    push_lit(&mut tpl_fmt, " hex=");
+    push_spec(
+        &mut tpl_fmt,
+        DEFAULT_FLAGS | ZERO_PAD | WIDTH,
+        Some(8),
+        None,
+    );
+    push_lit(&mut tpl_fmt, " HEX=");
+    push_spec(
+        &mut tpl_fmt,
+        DEFAULT_FLAGS | ALTERNATE | ZERO_PAD | WIDTH,
+        Some(8),
+        None,
+    );
+    push_lit(&mut tpl_fmt, " f=");
+    push_spec(&mut tpl_fmt, DEFAULT_FLAGS | PRECISION, None, Some(5));
+    push_lit(&mut tpl_fmt, " s=");
+    tpl_fmt.push(0xc0);
+    push_lit(&mut tpl_fmt, " ds=");
+    tpl_fmt.push(0xc0);
+    push_lit(&mut tpl_fmt, " str=");
+    tpl_fmt.push(0xc0);
+    push_lit(&mut tpl_fmt, " ch=");
+    tpl_fmt.push(0xc0);
+    push_lit(&mut tpl_fmt, " b=");
+    tpl_fmt.push(0xc0);
+    push_lit(&mut tpl_fmt, " 🦀");
+    tpl_fmt.push(0);
+
+    // Template 2 (`write!` with IntTag Result): "λ={:.5}:{}\n"
+    let mut tpl_wr: Vec<u8> = Vec::new();
+    push_lit(&mut tpl_wr, "λ=");
+    push_spec(&mut tpl_wr, DEFAULT_FLAGS | PRECISION, None, Some(5));
+    push_lit(&mut tpl_wr, ":");
+    tpl_wr.push(0xc0);
+    push_lit(&mut tpl_wr, "\n");
+    tpl_wr.push(0);
+
+    let (mut type_table, mut interns) = table();
+    // Struct holding a `String` field to exercise `Proj::Field` on `DisplayKind::String`.
+    let wrap_fields = vec![field(&mut interns, "label", STRING)];
+    type_table.insert(strukt(&mut interns, WRAPPER, "Wrap", wrap_fields, 12));
+    type_table.insert(reference(WRAPPER_REF, WRAPPER, false));
+    // `Result<(), fmt::Error>` specialized to Phase 4 `EnumRepr::IntTag { fieldless: true }`.
+    let mut int_tag_res = type_table.get(FMT_RESULT).unwrap().clone();
+    int_tag_res.id = FMT_RESULT_INT;
+    int_tag_res.js.peeled = FMT_RESULT_INT;
+    int_tag_res.js.is_indirect = false;
+    int_tag_res.js.enum_repr = Some(EnumRepr::IntTag { fieldless: true });
+    type_table.insert(int_tag_res);
+
+    let mut mk_arr = |id: TypeId, ref_id: TypeId, elem: TypeId, len: usize| {
+        let mut arr = descriptor(
+            id,
+            TypeKind::Array {
+                element: elem,
+                length: len as u64,
+            },
+            (8 * len) as u64,
+        );
+        arr.js.is_indirect = true;
+        type_table.insert(arr);
+        type_table.insert(reference(ref_id, id, false));
+    };
+    mk_arr(ARG_LIST_FMT, ARG_LIST_FMT_REF, ARGUMENT, 9);
+    mk_arr(ARG_LIST_WR, ARG_LIST_WR_REF, ARGUMENT, 2);
+    let mut tpl1_desc = descriptor(
+        TEMPLATE_FMT,
+        TypeKind::Array {
+            element: U8,
+            length: tpl_fmt.len() as u64,
+        },
+        tpl_fmt.len() as u64,
+    );
+    tpl1_desc.js.is_indirect = true;
+    type_table.insert(tpl1_desc);
+    let mut tpl2_desc = descriptor(
+        TEMPLATE_WR,
+        TypeKind::Array {
+            element: U8,
+            length: tpl_wr.len() as u64,
+        },
+        tpl_wr.len() as u64,
+    );
+    tpl2_desc.js.is_indirect = true;
+    type_table.insert(tpl2_desc);
+
+    let mut items = ItemIndex::new();
+    let mut machinery = |n: u64, link: &str, params: usize, standard: StandardOperation| {
+        let id = ItemId {
+            definition: def_id(n),
+            instantiation: 0,
+        };
+        items.insert(
+            id,
+            ItemEntry {
+                name: link.to_owned(),
+                params,
+                abi_known: true,
+                result: None,
+                arguments: Vec::new(),
+                caller_location: false,
+                caller_location_def: None,
+                is_core: false,
+                used_params: BTreeSet::new(),
+                standard: Some(standard),
+                keyed_purity: None,
+                keyed_read_params: None,
+                keyed_may_unwind: None,
+                keyed_row_capture: None,
+                keyed_proxy_safe_params: None,
+            },
+        );
+        Callee::Direct {
+            item: id,
+            link_name: interns.intern_str(link),
+        }
+    };
+    let disp = machinery(
+        501,
+        "arg_display",
+        1,
+        StandardOperation::FormatArgumentNewDisplay,
+    );
+    let lhex = machinery(
+        502,
+        "arg_lhex",
+        1,
+        StandardOperation::FormatArgumentNewLowerHex,
+    );
+    let uhex = machinery(
+        503,
+        "arg_uhex",
+        1,
+        StandardOperation::FormatArgumentNewUpperHex,
+    );
+    let args_new = machinery(504, "args_new", 2, StandardOperation::FormatArgsNew);
+    let fmt_to_s = machinery(
+        505,
+        "fmt_to_string",
+        1,
+        StandardOperation::FormatArgsToString,
+    );
+    let wr_fmt = machinery(506, "write_fmt", 2, StandardOperation::StringFmtWriteFmt);
+    let unknown_arg = Callee::Direct {
+        item: ItemId {
+            definition: def_id(599),
+            instantiation: 0,
+        },
+        link_name: interns.intern_str("arg_debug"),
+    };
+    let mk_call = |callee: &Callee, args: Vec<ValueId>, semantic: CallSemantic| OpKind::Call {
+        callee: callee.clone(),
+        function: None,
+        args,
+        track_caller: None,
+        semantic,
+        host: None,
+    };
+
+    // Function 1: `fmt_all(i, hx, ux, f, wrap, s_ref, st, ch, b) -> String`
+    let fmt_item = ItemId {
+        definition: def_id(600),
+        instantiation: 0,
+    };
+    let mut b1 = FuncBuilder::new(
+        fmt_item,
+        sig(
+            vec![
+                I32,
+                U32,
+                U32,
+                F64,
+                WRAPPER_REF,
+                STRING_REF,
+                STR_REF,
+                CHAR,
+                BOOL,
+            ],
+            STRING,
+        ),
+    );
+    let e1 = FuncBuilder::ENTRY;
+    let p_i = b1.param(I32, ORIGIN);
+    let p_hx = b1.param(U32, ORIGIN);
+    let p_ux = b1.param(U32, ORIGIN);
+    let p_f = b1.param(F64, ORIGIN);
+    let p_wrap = b1.param(WRAPPER_REF, ORIGIN);
+    let p_sref = b1.param(STRING_REF, ORIGIN);
+    let p_st = b1.param(STR_REF, ORIGIN);
+    let p_ch = b1.param(CHAR, ORIGIN);
+    let p_b = b1.param(BOOL, ORIGIN);
+
+    let borrow_cell = |fb: &mut FuncBuilder, v: ValueId, ty: TypeId, ref_ty: TypeId| {
+        let cell = fb.cell(ty, true, ORIGIN);
+        fb.effect(e1, OpKind::CellAlloc(cell), ORIGIN);
+        fb.effect(e1, OpKind::CellStore { cell, v }, ORIGIN);
+        fb.op(
+            e1,
+            OpKind::BorrowView {
+                root: Root::Cell(cell),
+                path: vec![],
+                mutable: false,
+            },
+            ref_ty,
+            ORIGIN,
+        )
+    };
+    let r_i = borrow_cell(&mut b1, p_i, I32, I32_REF);
+    let r_hx = borrow_cell(&mut b1, p_hx, U32, U32_REF);
+    let r_ux = borrow_cell(&mut b1, p_ux, U32, U32_REF);
+    let r_f = borrow_cell(&mut b1, p_f, F64, F64_REF);
+    // `String` behind `Proj::Field` (`&(*wrap).label`).
+    let r_wrap_str = b1.op(
+        e1,
+        OpKind::BorrowView {
+            root: Root::Value(p_wrap),
+            path: vec![
+                Proj::Deref,
+                Proj::Field {
+                    field: 0,
+                    ty: STRING,
+                },
+            ],
+            mutable: false,
+        },
+        STRING_REF,
+        ORIGIN,
+    );
+    // Direct `&String` parameter without an intermediate `BorrowView`.
+    let r_direct_s = p_sref;
+    let r_st = borrow_cell(&mut b1, p_st, STR_REF, PIECES_REF);
+    let r_ch = borrow_cell(&mut b1, p_ch, CHAR, CHAR_REF);
+    let r_b = borrow_cell(&mut b1, p_b, BOOL, BOOL_REF);
+
+    let elems = vec![
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_i], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&lhex, vec![r_hx], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&uhex, vec![r_ux], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_f], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_wrap_str], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_direct_s], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_st], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_ch], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+        b1.op(
+            e1,
+            mk_call(&disp, vec![r_b], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ),
+    ];
+    let list1 = b1.op(
+        e1,
+        OpKind::Aggregate {
+            ty: ARG_LIST_FMT,
+            variant: 0,
+            active_field: None,
+            fields: elems,
+        },
+        ARG_LIST_FMT,
+        ORIGIN,
+    );
+    let list1_ref = b1.op(
+        e1,
+        OpKind::BorrowView {
+            root: Root::Value(list1),
+            path: vec![],
+            mutable: false,
+        },
+        ARG_LIST_FMT_REF,
+        ORIGIN,
+    );
+    let tpl1_v = b1.op(
+        e1,
+        OpKind::Const(ConstTree::Aggregate(
+            tpl_fmt
+                .iter()
+                .map(|&byte| ConstTree::Scalar {
+                    bits: u128::from(byte),
+                    bytes: 1,
+                })
+                .collect(),
+        )),
+        TEMPLATE_FMT,
+        ORIGIN,
+    );
+    let args1 = b1.op(
+        e1,
+        mk_call(&args_new, vec![tpl1_v, list1_ref], CallSemantic::Ordinary),
+        ARGUMENTS,
+        ORIGIN,
+    );
+    let out1 = b1.op(
+        e1,
+        mk_call(&fmt_to_s, vec![args1], CallSemantic::Ordinary),
+        STRING,
+        ORIGIN,
+    );
+    b1.terminate(e1, RTerm::Return(Some(out1)));
+    let func_fmt = b1.finish();
+
+    // Function 2: `write_int_tag(out: &mut String, x: f64, ch: char) -> Result<(), fmt::Error>`
+    // with `EnumRepr::IntTag { fieldless: true }` AND an unrelated unproven `Arguments::new`
+    // call in a dead/conditional branch to verify per-site universal commit!
+    let wr_item = ItemId {
+        definition: def_id(601),
+        instantiation: 0,
+    };
+    let mut b2 = FuncBuilder::new(
+        wr_item,
+        sig(vec![STRING_MUT, F64, CHAR, BOOL], FMT_RESULT_INT),
+    );
+    let e2 = FuncBuilder::ENTRY;
+    let w_out = b2.param(STRING_MUT, ORIGIN);
+    let w_f = b2.param(F64, ORIGIN);
+    let w_ch = b2.param(CHAR, ORIGIN);
+    let w_flag = b2.param(BOOL, ORIGIN);
+    let bb_proven = b2.block();
+    let bb_unproven = b2.block();
+    b2.terminate(
+        e2,
+        RTerm::Switch {
+            scrut: w_flag,
+            scrut_ty: BOOL,
+            cases: vec![(1, bb_proven, Vec::new())],
+            default: (bb_unproven, Vec::new()),
+        },
+    );
+    // Proven arm: `write!(out, "λ={:.5}:{}\n", w_f, w_ch)`
+    let c_f = b2.cell(F64, true, ORIGIN);
+    let c_ch = b2.cell(CHAR, true, ORIGIN);
+    b2.effect(bb_proven, OpKind::CellAlloc(c_f), ORIGIN);
+    b2.effect(bb_proven, OpKind::CellStore { cell: c_f, v: w_f }, ORIGIN);
+    b2.effect(bb_proven, OpKind::CellAlloc(c_ch), ORIGIN);
+    b2.effect(
+        bb_proven,
+        OpKind::CellStore {
+            cell: c_ch,
+            v: w_ch,
+        },
+        ORIGIN,
+    );
+    let rf2 = b2.op(
+        bb_proven,
+        OpKind::BorrowView {
+            root: Root::Cell(c_f),
+            path: vec![],
+            mutable: false,
+        },
+        F64_REF,
+        ORIGIN,
+    );
+    let rch2 = b2.op(
+        bb_proven,
+        OpKind::BorrowView {
+            root: Root::Cell(c_ch),
+            path: vec![],
+            mutable: false,
+        },
+        CHAR_REF,
+        ORIGIN,
+    );
+    let a_f2 = b2.op(
+        bb_proven,
+        mk_call(&disp, vec![rf2], CallSemantic::Ordinary),
+        ARGUMENT,
+        ORIGIN,
+    );
+    let a_ch2 = b2.op(
+        bb_proven,
+        mk_call(&disp, vec![rch2], CallSemantic::Ordinary),
+        ARGUMENT,
+        ORIGIN,
+    );
+    let list2 = b2.op(
+        bb_proven,
+        OpKind::Aggregate {
+            ty: ARG_LIST_WR,
+            variant: 0,
+            active_field: None,
+            fields: vec![a_f2, a_ch2],
+        },
+        ARG_LIST_WR,
+        ORIGIN,
+    );
+    let list2_ref = b2.op(
+        bb_proven,
+        OpKind::BorrowView {
+            root: Root::Value(list2),
+            path: vec![],
+            mutable: false,
+        },
+        ARG_LIST_WR_REF,
+        ORIGIN,
+    );
+    let tpl2_v = b2.op(
+        bb_proven,
+        OpKind::Const(ConstTree::Aggregate(
+            tpl_wr
+                .iter()
+                .map(|&byte| ConstTree::Scalar {
+                    bits: u128::from(byte),
+                    bytes: 1,
+                })
+                .collect(),
+        )),
+        TEMPLATE_WR,
+        ORIGIN,
+    );
+    let args2 = b2.op(
+        bb_proven,
+        mk_call(&args_new, vec![tpl2_v, list2_ref], CallSemantic::Ordinary),
+        ARGUMENTS,
+        ORIGIN,
+    );
+    let wr_res = b2.op(
+        bb_proven,
+        mk_call(
+            &wr_fmt,
+            vec![w_out, args2],
+            CallSemantic::Standard(StandardOperation::StringFmtWriteFmt),
+        ),
+        FMT_RESULT_INT,
+        ORIGIN,
+    );
+    b2.terminate(bb_proven, RTerm::Return(Some(wr_res)));
+
+    // Unproven arm: calls an unrecognized `arg_debug` + `args_new` + `write_fmt`.
+    let dbg_arg = b2.op(
+        bb_unproven,
+        mk_call(&unknown_arg, vec![w_f], CallSemantic::Ordinary),
+        ARGUMENT,
+        ORIGIN,
+    );
+    let list_u = b2.op(
+        bb_unproven,
+        OpKind::Aggregate {
+            ty: ARG_LIST_WR,
+            variant: 0,
+            active_field: None,
+            fields: vec![dbg_arg, dbg_arg],
+        },
+        ARG_LIST_WR,
+        ORIGIN,
+    );
+    let list_u_ref = b2.op(
+        bb_unproven,
+        OpKind::BorrowView {
+            root: Root::Value(list_u),
+            path: vec![],
+            mutable: false,
+        },
+        ARG_LIST_WR_REF,
+        ORIGIN,
+    );
+    let tpl_u = b2.op(
+        bb_unproven,
+        OpKind::Const(ConstTree::Aggregate(
+            tpl_wr
+                .iter()
+                .map(|&byte| ConstTree::Scalar {
+                    bits: u128::from(byte),
+                    bytes: 1,
+                })
+                .collect(),
+        )),
+        TEMPLATE_WR,
+        ORIGIN,
+    );
+    let args_u = b2.op(
+        bb_unproven,
+        mk_call(&args_new, vec![tpl_u, list_u_ref], CallSemantic::Ordinary),
+        ARGUMENTS,
+        ORIGIN,
+    );
+    let wr_u = b2.op(
+        bb_unproven,
+        mk_call(
+            &wr_fmt,
+            vec![w_out, args_u],
+            CallSemantic::Standard(StandardOperation::StringFmtWriteFmt),
+        ),
+        FMT_RESULT_INT,
+        ORIGIN,
+    );
+    b2.terminate(bb_unproven, RTerm::Return(Some(wr_u)));
+    let func_wr = b2.finish();
+
+    // Put `type_table` into `interns.types` so `LinkItem::jir::interns()` has the full TypeTable.
+    interns.types = type_table;
+    let make_link_item = |name: &str, func: &crate::jir::repr::Func| {
+        let mut item = LinkItem {
+            name: JsName::new(name.to_owned()),
+            kind: ItemKind::Fn,
+            js: String::new(),
+            refs: BTreeSet::new(),
+            zombies: Vec::new(),
+            linkage: ItemLinkage::internal(),
+            debug_path: name.to_owned(),
+            crate_name: "test".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: None,
+            optimization: Default::default(),
+            late_ir: Default::default(),
+            baseline_shadow: Default::default(),
+            jir: Default::default(),
+        };
+        item.jir.use_interns(interns.clone());
+        item.jir.body = Some(Body {
+            item: func.item,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: func.sig.clone(),
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        });
+        item.jir.summary = Some(ItemSummary {
+            key: SemanticKey {
+                link_name: name.to_owned(),
+                item: Some(func.item),
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        });
+        item
+    };
+
+    let n_fmt = JsName::new("fmt_all".to_owned());
+    let n_wr = JsName::new("write_int_tag".to_owned());
+    let mut link_table = BTreeMap::new();
+    link_table.insert(n_fmt.clone(), make_link_item("fmt_all", &func_fmt));
+    link_table.insert(n_wr.clone(), make_link_item("write_int_tag", &func_wr));
+    let mut funcs = BTreeMap::from([(n_fmt.clone(), Ok(func_fmt)), (n_wr.clone(), Ok(func_wr))]);
+    let live: BTreeSet<JsName> = [n_fmt.clone(), n_wr.clone()].into_iter().collect();
+    let skip = BTreeSet::new();
+
+    let touched = crate::lower::semantic_ops::fmt_kernel::commit_universal_native_string_sites(
+        &link_table,
+        &mut funcs,
+        &live,
+        &skip,
+        &items,
+    );
+    assert_eq!(
+        touched, live,
+        "both functions should commit proven universal format sites"
+    );
+
+    let heap = HeapPlan {
+        native_string_enabled: true,
+        ..HeapPlan::default()
+    };
+    let opts = Opts::default();
+    let lower_one = |name: &JsName| {
+        let li = &link_table[name];
+        let func = funcs[name].as_ref().unwrap();
+        let li_interns = li.jir.interns().unwrap();
+        let input = LowerInput {
+            name,
+            summary: li.jir.summary.as_ref().unwrap(),
+            body: li.jir.body.as_ref().unwrap(),
+            origins: None,
+            interns: li_interns,
+            table: &li_interns.types,
+            opts: &opts,
+            items: &items,
+            drop_glue: crate::lower::js::host::EMPTY_DROP_GLUE,
+            vtables: &crate::lower::js::unsize::EMPTY_VTABLES,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: Some(&heap),
+            nested_clone: crate::lower::NestedClone::default(),
+        };
+        let lowered = lower_func(&input, func)
+            .unwrap_or_else(|d| panic!("universal fmt_kernel declined `{name}`: {d}"));
+        jsast::stmt_to_string(&lowered.decl)
+    };
+
+    let js_fmt = lower_one(&n_fmt);
+    let js_wr = lower_one(&n_wr);
+    for forbidden in [
+        "arg_display",
+        "arg_lhex",
+        "arg_uhex",
+        "args_new",
+        "fmt_to_string",
+        "native_str_wf",
+    ] {
+        assert!(
+            !js_fmt.contains(forbidden),
+            "`fmt_all` should not retain `{forbidden}`:\n{js_fmt}"
+        );
+    }
+    assert!(
+        js_fmt.contains("fromCharCode") && js_fmt.contains("bstr_char"),
+        "`fmt_all` should emit fast ASCII `fromCharCode` + non-ASCII `bstr_char`:\n{js_fmt}"
+    );
+    // In `write_int_tag`, the unproven branch keeps `arg_debug`/`write_fmt`, while the proven
+    // branch lowers inline to `out.s += ...` and returns `0` (IntTag Ok).
+    assert!(
+        js_wr.contains("arg_debug") && js_wr.contains(".s +="),
+        "`write_int_tag` should commit the proven site and keep the unproven site:\n{js_wr}"
+    );
+
+    run_in_node(
+        &[js_fmt, js_wr],
+        r#"
+const assert = require('node:assert/strict');
+function toBstr(utf16) {
+  const bytes = new TextEncoder().encode(utf16);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return out;
+}
+function fromBstr(bstr) {
+  const bytes = new Uint8Array(bstr.length);
+  for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
+// 1) `format!` with ASCII char 'A' (65) and non-ASCII UTF-8 strings/template literals.
+const r1 = fmt_all(
+  42,
+  0xdeadbeef,
+  0x0000cafe,
+  3.14159265,
+  { label: { s: toBstr('héllo'), cap: 6 } },
+  { s: toBstr('wörld'), cap: 6 },
+  toBstr('naïve'),
+  65,
+  true,
+);
+const exp1 = 'café=+0042 hex=deadbeef HEX=0x00CAFE f=3.14159 s=héllo ds=wörld str=naïve ch=A b=true 🦀';
+assert.strictEqual(r1.s, toBstr(exp1));
+assert.strictEqual(fromBstr(r1.s), exp1);
+assert.strictEqual(r1.cap, r1.s.length);
+
+// 2) `format!` with non-ASCII chars ('é' = 0xe9, '🦀' = 0x1f980) and negative int / false.
+const r2 = fmt_all(
+  -7,
+  0x1a,
+  0x2b,
+  -0.5,
+  { label: { s: '', cap: 0 } },
+  { s: toBstr('π'), cap: 2 },
+  '',
+  0x1f980,
+  false,
+);
+const exp2 = 'café=-0007 hex=0000001a HEX=0x00002B f=-0.50000 s= ds=π str= ch=🦀 b=false 🦀';
+assert.strictEqual(r2.s, toBstr(exp2));
+assert.strictEqual(fromBstr(r2.s), exp2);
+assert.strictEqual(r2.cap, r2.s.length);
+
+// 3) `write!` into `{ s, cap }` with `EnumRepr::IntTag { fieldless: true }` returning `0`.
+const out = { s: toBstr('init|'), cap: 5 };
+const ret1 = write_int_tag(out, 1.25, 0x41, true);
+assert.strictEqual(ret1, 0, 'IntTag Ok(()) must return 0');
+const ret2 = write_int_tag(out, 2.7182818, 0xe9, true);
+assert.strictEqual(ret2, 0, 'IntTag Ok(()) must return 0 on second write');
+const expOut = 'init|λ=1.25000:A\nλ=2.71828:é\n';
+assert.strictEqual(out.s, toBstr(expOut));
+assert.strictEqual(fromBstr(out.s), expOut);
+"#,
+    );
+}

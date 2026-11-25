@@ -104,6 +104,11 @@ pub struct HeapPlan {
     /// Internal multi-field struct `(peeled_struct_ty, field_idx)` `u32` fields stored as
     /// signed `Int32` (V8 Smi) under `ReleaseSpeed`.
     pub smi_u32_fields: BTreeSet<(TypeId, u32)>,
+    /// Global non-ZST, non-TypedArray `Vec<T, Global>` types (`table.peeled(vec_ty)`) whose
+    /// `v.buf` is proven to stay a dense `PACKED_ELEMENTS` JS `Array` with `v.buf.length === v.len`
+    /// everywhere (never observes `.capacity()`, raw pointers `as_ptr`/`as_mut_ptr`,
+    /// `from_raw_parts`, `grow_one`, direct `.len` mutation, or `Const`/`Static` frozen `_nv_ea`).
+    pub packed_arr_vec_types: BTreeSet<TypeId>,
 }
 
 /// Conservative default heap plan (Tier A off, all indirect writes keep `_put` / `_boxes`).
@@ -119,6 +124,7 @@ pub static DEFAULT_HEAP_PLAN: HeapPlan = HeapPlan {
     all_non_adt_boxed: true,
     all_adts_boxed: true,
     smi_u32_fields: BTreeSet::new(),
+    packed_arr_vec_types: BTreeSet::new(),
 };
 
 impl Default for HeapPlan {
@@ -178,6 +184,13 @@ impl HeapPlan {
                         .is_none_or(|key| self.boxed_non_adt_keys.contains(&key))
             }
         }
+    }
+
+    /// Whether `vec_ty` (a non-ZST, non-TypedArray `Vec<T, Global>`) is proven safe for dense
+    /// `PACKED_ELEMENTS` JS Array storage (`v.buf.length === v.len`, push via `v.buf.push(x)`,
+    /// pop via `v.buf.pop()`).
+    pub fn is_packed_arr_vec(&self, table: &TypeTable, vec_ty: TypeId) -> bool {
+        self.native_vec_enabled && self.packed_arr_vec_types.contains(&table.peeled(vec_ty))
     }
 }
 
@@ -357,6 +370,9 @@ fn run_reachability(
     let mut tail_adts = BoxedSet::default();
     let mut string_internally_accessed = false;
     let mut vec_internally_accessed = false;
+    let mut packed_arr_candidates: BTreeSet<TypeId> = BTreeSet::new();
+    let mut packed_arr_disqualified: BTreeSet<TypeId> = BTreeSet::new();
+    let mut all_packed_arr_disqualified = false;
     let mut scanned_funcs: BTreeSet<JsName> = BTreeSet::new();
 
     while let Some((name, from_non_rc)) = queue.pop_front() {
@@ -436,11 +452,18 @@ fn run_reachability(
                 if skip_native_string && func_uses_string_internals(func, &interns.types, interns) {
                     string_internally_accessed = true;
                 }
-                if skip_native_vec
-                    && !is_global_vec_drop_glue(Some(item))
-                    && func_uses_vec_internals(func, &interns.types, interns)
-                {
-                    vec_internally_accessed = true;
+                if skip_native_vec {
+                    if !is_global_vec_drop_glue(Some(item))
+                        && func_uses_vec_internals(func, &interns.types, interns)
+                    {
+                        vec_internally_accessed = true;
+                    }
+                    scan_func_for_packed_arr_vecs(
+                        func,
+                        &interns.types,
+                        &mut packed_arr_candidates,
+                        &mut packed_arr_disqualified,
+                    );
                 }
             }
             // Traverse callees from JIR so we skip dead fallback bodies of intercepted
@@ -559,13 +582,30 @@ fn run_reachability(
                 {
                     string_internally_accessed = true;
                 }
-                if skip_native_vec
-                    && item.kind == ItemKind::Fn
-                    && (item.debug_path.contains("alloc::vec")
-                        || item.name.as_str().contains("alloc$vec$")
-                        || item.js.contains(".buf"))
-                {
-                    vec_internally_accessed = true;
+                if skip_native_vec {
+                    if item.kind == ItemKind::Fn {
+                        all_packed_arr_disqualified = true;
+                        if item.debug_path.contains("alloc::vec")
+                            || item.name.as_str().contains("alloc$vec$")
+                            || item.js.contains(".buf")
+                        {
+                            vec_internally_accessed = true;
+                        }
+                    } else if item.kind == ItemKind::Static {
+                        if let (Some(body), Some(interns)) =
+                            (item.jir.body.as_ref(), item.jir.interns())
+                        {
+                            let mut seen = BTreeSet::new();
+                            collect_embedded_arr_vecs(
+                                &interns.types,
+                                body.signature.result,
+                                &mut packed_arr_disqualified,
+                                &mut seen,
+                            );
+                        } else if item.js.contains("_nv_ea") || item.js.contains(".buf") {
+                            all_packed_arr_disqualified = true;
+                        }
+                    }
                 }
             }
             for r in &item.refs {
@@ -609,13 +649,21 @@ fn run_reachability(
         || boxed.all_non_adt_boxed
         || !boxed.boxed_defs.is_empty()
         || !boxed.boxed_non_adt_keys.is_empty();
+    let native_vec_enabled =
+        skip_native_vec && !vec_internally_accessed && !non_rc_raw_alloc_reachable;
+    let packed_arr_vec_types = if native_vec_enabled && !all_packed_arr_disqualified {
+        packed_arr_candidates
+            .into_iter()
+            .filter(|ty| !packed_arr_disqualified.contains(ty))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     (
         HeapPlan {
             typed_heap_enabled,
             native_string_enabled: skip_native_string && !string_internally_accessed,
-            native_vec_enabled: skip_native_vec
-                && !vec_internally_accessed
-                && !non_rc_raw_alloc_reachable,
+            native_vec_enabled,
             raw_alloc_reachable,
             non_rc_raw_alloc_reachable,
             any_boxed,
@@ -624,6 +672,7 @@ fn run_reachability(
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
             smi_u32_fields: BTreeSet::new(),
+            packed_arr_vec_types,
         },
         string_internally_accessed,
         vec_internally_accessed,
@@ -1549,6 +1598,230 @@ fn func_uses_vec_internals(func: &Func, table: &TypeTable, interns: &Interns) ->
     false
 }
 
+fn arr_global_vec_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    let peeled = table.peeled(ty);
+    let elem = global_vec_elem_ty(table, peeled)?;
+    let elem_desc = table.get(elem)?;
+    if elem_desc.layout.zst || native_vec_ta_kind(table, elem).is_some() {
+        return None;
+    }
+    Some(peeled)
+}
+
+fn collect_embedded_arr_vecs(
+    table: &TypeTable,
+    ty: TypeId,
+    out: &mut BTreeSet<TypeId>,
+    seen: &mut BTreeSet<TypeId>,
+) {
+    let peeled = table.peeled(ty);
+    if !seen.insert(peeled) {
+        return;
+    }
+    if let Some(vec_ty) = arr_global_vec_ty(table, peeled) {
+        out.insert(vec_ty);
+    }
+    let Some(desc) = table.get(peeled) else {
+        return;
+    };
+    match &desc.kind {
+        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+            collect_embedded_arr_vecs(table, *pointee, out, seen);
+        }
+        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+            collect_embedded_arr_vecs(table, *element, out, seen);
+        }
+        TypeKind::Tuple(elems) => {
+            for &e in elems {
+                collect_embedded_arr_vecs(table, e, out, seen);
+            }
+        }
+        TypeKind::Adt { variants, .. } => {
+            for v in variants {
+                for f in &v.fields {
+                    collect_embedded_arr_vecs(table, f.ty, out, seen);
+                }
+            }
+        }
+        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
+            for &u in upvars {
+                collect_embedded_arr_vecs(table, u, out, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn native_vec_call_vec_ty(
+    func: &Func,
+    table: &TypeTable,
+    op_result: Option<ValueId>,
+    std_op: rcgjs_object::jir::semantic::StandardOperation,
+    args: &[ValueId],
+) -> Option<TypeId> {
+    use rcgjs_object::jir::semantic::StandardOperation as SO;
+    match std_op {
+        SO::NativeVecNew
+        | SO::NativeVecWithCapacity
+        | SO::NativeVecFromElemZeroed
+        | SO::NativeVecFromArray
+        | SO::NativeVecFromRawParts => val_ty(func, op_result?),
+        SO::NativeVecIntoBoxedSlice => val_ty(func, *args.first()?),
+        _ => {
+            let arg_ty = val_ty(func, *args.first()?)?;
+            value::pointee_of(table, arg_ty)
+        }
+    }
+}
+
+fn record_place_arr_vec_field_crossings(
+    func: &Func,
+    table: &TypeTable,
+    root: &Root,
+    path: &[Proj],
+    disqualified: &mut BTreeSet<TypeId>,
+) {
+    let Some(mut cur) = root_ty(func, root) else {
+        return;
+    };
+    for proj in path {
+        let peeled = table.peeled(cur);
+        match proj {
+            Proj::Deref => {
+                let Some(pt) = value::pointee_of(table, peeled) else {
+                    return;
+                };
+                cur = pt;
+            }
+            Proj::Downcast { .. } => {}
+            Proj::Field { ty, .. } => {
+                if is_direct_global_vec_ty(table, cur) {
+                    if let Some(vec_ty) = arr_global_vec_ty(table, cur) {
+                        disqualified.insert(vec_ty);
+                    }
+                }
+                cur = *ty;
+            }
+            Proj::Index(_) | Proj::ConstantIndex { .. } => {
+                let next = match table.get(peeled).map(|d| &d.kind) {
+                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
+                        Some(*element)
+                    }
+                    _ => None,
+                };
+                let Some(next) = next else {
+                    return;
+                };
+                cur = next;
+            }
+            Proj::Subslice { .. } => {}
+        }
+    }
+}
+
+fn scan_func_for_packed_arr_vecs(
+    func: &Func,
+    table: &TypeTable,
+    candidates: &mut BTreeSet<TypeId>,
+    disqualified: &mut BTreeSet<TypeId>,
+) {
+    use rcgjs_object::jir::semantic::StandardOperation as SO;
+
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Call {
+                    callee,
+                    args,
+                    semantic,
+                    ..
+                } => {
+                    if let CallSemantic::Standard(std_op) = semantic {
+                        if std_op.is_native_vec() {
+                            if let Some(vec_ty) =
+                                native_vec_call_vec_ty(func, table, op.result, *std_op, args)
+                            {
+                                if let Some(peeled_vec) = arr_global_vec_ty(table, vec_ty) {
+                                    candidates.insert(peeled_vec);
+                                    if matches!(
+                                        std_op,
+                                        SO::NativeVecCapacity
+                                            | SO::NativeVecFromRawParts
+                                            | SO::NativeVecAsPtr
+                                            | SO::NativeVecAsMutPtr
+                                            | SO::NativeVecGrowOne
+                                    ) {
+                                        disqualified.insert(peeled_vec);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if matches!(
+                        callee,
+                        Callee::Foreign { .. } | Callee::Runtime { sysroot: false, .. }
+                    ) {
+                        let mut seen = BTreeSet::new();
+                        for &arg in args {
+                            if let Some(ty) = val_ty(func, arg) {
+                                collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                            }
+                        }
+                        if let Some(res) = op.result {
+                            if let Some(ty) = val_ty(func, res) {
+                                collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                            }
+                        }
+                    }
+                }
+                OpKind::SetField { base, .. } => {
+                    if let Some(ty) = val_ty(func, *base) {
+                        if is_direct_global_vec_ty(table, ty) {
+                            if let Some(vec_ty) = arr_global_vec_ty(table, ty) {
+                                disqualified.insert(vec_ty);
+                            }
+                        }
+                    }
+                }
+                OpKind::BorrowView {
+                    root,
+                    path,
+                    mutable: true,
+                }
+                | OpKind::RawView { root, path, .. } => {
+                    record_place_arr_vec_field_crossings(func, table, root, path, disqualified);
+                }
+                OpKind::Const(_) => {
+                    if let Some(res) = op.result {
+                        if let Some(ty) = val_ty(func, res) {
+                            let mut seen = BTreeSet::new();
+                            collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn vec_resize_is_ta(func: &Func, table: &TypeTable, args: &[ValueId]) -> bool {
+    let Some(&v0) = args.first() else {
+        return false;
+    };
+    let Some(arg_ty) = val_ty(func, v0) else {
+        return false;
+    };
+    let Some(vec_ty) = value::pointee_of(table, arg_ty) else {
+        return false;
+    };
+    let Some(elem_ty) = global_vec_elem_ty(table, vec_ty) else {
+        return false;
+    };
+    table.get(elem_ty).is_some_and(|d| !d.layout.zst)
+        && native_vec_ta_kind(table, elem_ty).is_some()
+}
+
 fn jir_callees(
     func: &Func,
     interns: &Interns,
@@ -1561,7 +1834,10 @@ fn jir_callees(
         for op in &block.ops {
             match &op.kind {
                 OpKind::Call {
-                    callee, semantic, ..
+                    callee,
+                    args,
+                    semantic,
+                    ..
                 } => {
                     if skip_typed_heap_hooks
                         && matches!(
@@ -1578,7 +1854,14 @@ fn jir_callees(
                         continue;
                     }
                     if skip_native_vec
-                        && matches!(semantic, CallSemantic::Standard(op) if op.is_native_vec())
+                        && matches!(
+                            semantic,
+                            CallSemantic::Standard(op)
+                                if op.is_native_vec()
+                                    || (*op
+                                        == rcgjs_object::jir::semantic::StandardOperation::VecResize
+                                        && vec_resize_is_ta(func, &interns.types, args))
+                        )
                     {
                         continue;
                     }
@@ -2726,6 +3009,7 @@ mod tests {
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
             smi_u32_fields: BTreeSet::new(),
+            packed_arr_vec_types: BTreeSet::new(),
         };
         assert!(plan.needs_box_tracking(&interns.types, boxed_adt));
         assert!(!plan.needs_box_tracking(&interns.types, plain_adt));
@@ -2912,6 +3196,7 @@ mod tests {
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
             smi_u32_fields: BTreeSet::new(),
+            packed_arr_vec_types: BTreeSet::new(),
         };
         assert!(
             !plan.needs_box_tracking(&interns.types, adt_ty),
@@ -2922,5 +3207,314 @@ mod tests {
             !plan.needs_box_tracking(&interns.types, tup_b),
             "distinct tuple shapes must stay isolated in boxed_non_adt_keys"
         );
+    }
+
+    #[test]
+    fn packed_arr_vec_analysis_admits_clean_obj_vec_and_disqualifies_raw_cap_len_const() {
+        let mut interns = Interns::new();
+        let len_key = interns.intern_str("len");
+        let x_key = interns.intern_str("x");
+        let hook_sym = interns.intern_str("alloc$vec$rcgjs_vec_hook$h1");
+
+        let unit_ty = TypeId(1);
+        let u32_ty = TypeId(2);
+        let usize_ty = TypeId(3);
+        let bool_ty = TypeId(4);
+        interns
+            .types
+            .insert(make_desc(1, TypeKind::Tuple(Vec::new()), 0, false));
+        interns.types.insert(make_desc(
+            2,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            false,
+        ));
+        interns.types.insert(make_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            false,
+        ));
+        interns.types.insert(make_desc(4, TypeKind::Bool, 1, false));
+
+        let mk_obj = |interns: &mut Interns, id: u128, hash: u64| {
+            let v = VariantDescriptor {
+                name: x_key,
+                fields: vec![FieldDescriptor {
+                    key: FieldKey::Name(x_key),
+                    ty: u32_ty,
+                    offset: 0,
+                }],
+                logical_discr: 0,
+                physical_tag: None,
+                result_ok: false,
+                saved_local_keys: Vec::new(),
+            };
+            interns.types.insert(make_desc(
+                id,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 7,
+                        local_hash: hash,
+                    },
+                    form: NominalForm::Struct,
+                    args: Vec::new(),
+                    variants: vec![v],
+                    niche: None,
+                },
+                8,
+                true,
+            ));
+            TypeId(id)
+        };
+        let obj_clean = mk_obj(&mut interns, 10, 1);
+        let obj_cap = mk_obj(&mut interns, 11, 2);
+        let obj_ptr = mk_obj(&mut interns, 12, 3);
+        let obj_setlen = mk_obj(&mut interns, 13, 4);
+        let obj_const = mk_obj(&mut interns, 14, 5);
+
+        let mk_vec = |interns: &mut Interns, vec_id: u128, ref_id: u128, elem: TypeId| {
+            let mut desc = make_desc(
+                vec_id,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 2,
+                        local_hash: 100,
+                    },
+                    form: NominalForm::Struct,
+                    args: vec![elem],
+                    variants: vec![VariantDescriptor {
+                        name: len_key,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(len_key),
+                            ty: usize_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                12,
+                true,
+            );
+            desc.meta.candidate = RepresentationCandidate::Vec;
+            desc.meta.allocator = AllocatorIdentity::Global;
+            interns.types.insert(desc);
+            let mut rdesc = make_desc(
+                ref_id,
+                TypeKind::Reference {
+                    pointee: TypeId(vec_id),
+                    mutable: true,
+                },
+                4,
+                false,
+            );
+            rdesc.js.pointer_form = Some(PointerForm::Thin);
+            interns.types.insert(rdesc);
+            (TypeId(vec_id), TypeId(ref_id))
+        };
+
+        let (vec_clean, ref_clean) = mk_vec(&mut interns, 20, 30, obj_clean);
+        let (vec_cap, ref_cap) = mk_vec(&mut interns, 21, 31, obj_cap);
+        let (vec_ptr, ref_ptr) = mk_vec(&mut interns, 22, 32, obj_ptr);
+        let (vec_setlen, _ref_setlen) = mk_vec(&mut interns, 23, 33, obj_setlen);
+        let (vec_const, _ref_const) = mk_vec(&mut interns, 24, 34, obj_const);
+        let (vec_u32, _ref_u32) = mk_vec(&mut interns, 25, 35, u32_ty);
+        let (vec_zst, _ref_zst) = mk_vec(&mut interns, 26, 36, unit_ty);
+
+        let call_std = |res: Option<ValueId>, op: StandardOperation, args: Vec<ValueId>| Op {
+            result: res,
+            origin: OriginId(0),
+            kind: OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 2,
+                            local_hash: 50,
+                        },
+                        instantiation: 1,
+                    },
+                    link_name: hook_sym,
+                },
+                function: None,
+                args,
+                track_caller: None,
+                semantic: CallSemantic::Standard(op),
+                host: None,
+            },
+        };
+
+        // Values:
+        // 0: vec_clean, 1: ref_clean, 2: obj_clean, 3: vec_cap, 4: ref_cap,
+        // 5: vec_ptr, 6: ref_ptr, 7: vec_setlen, 8: usize_ty, 9: vec_const,
+        // 10: vec_u32, 11: vec_zst, 12: bool_ty
+        let values = vec![
+            ValueDef {
+                ty: vec_clean,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: ref_clean,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: obj_clean,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_cap,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: ref_cap,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_ptr,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: ref_ptr,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_setlen,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: usize_ty,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_const,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_u32,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: vec_zst,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+            ValueDef {
+                ty: bool_ty,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            },
+        ];
+
+        let ops = vec![
+            // Clean vec: new, push, reserve, shrink_to -> stays packed!
+            call_std(Some(ValueId(0)), StandardOperation::NativeVecNew, vec![]),
+            call_std(
+                None,
+                StandardOperation::NativeVecPush,
+                vec![ValueId(1), ValueId(2)],
+            ),
+            call_std(
+                Some(ValueId(12)),
+                StandardOperation::NativeVecTryReserve,
+                vec![ValueId(1), ValueId(8), ValueId(8)],
+            ),
+            call_std(
+                None,
+                StandardOperation::NativeVecShrinkTo,
+                vec![ValueId(1), ValueId(8)],
+            ),
+            // Cap-observed vec: disqualified
+            call_std(Some(ValueId(3)), StandardOperation::NativeVecNew, vec![]),
+            call_std(
+                Some(ValueId(8)),
+                StandardOperation::NativeVecCapacity,
+                vec![ValueId(4)],
+            ),
+            // AsMutPtr vec: disqualified
+            call_std(Some(ValueId(5)), StandardOperation::NativeVecNew, vec![]),
+            call_std(None, StandardOperation::NativeVecAsMutPtr, vec![ValueId(6)]),
+            // SetField(.len) vec: disqualified
+            call_std(Some(ValueId(7)), StandardOperation::NativeVecNew, vec![]),
+            Op {
+                result: None,
+                origin: OriginId(0),
+                kind: OpKind::SetField {
+                    base: ValueId(7),
+                    variant: None,
+                    field: 0,
+                    v: ValueId(8),
+                },
+            },
+            // Const vec: disqualified
+            call_std(Some(ValueId(9)), StandardOperation::NativeVecNew, vec![]),
+            Op {
+                result: Some(ValueId(9)),
+                origin: OriginId(0),
+                kind: OpKind::Const(ConstTree::Unit),
+            },
+            // TypedArray & ZST vecs: never in packed_arr_vec_types
+            call_std(Some(ValueId(10)), StandardOperation::NativeVecNew, vec![]),
+            call_std(Some(ValueId(11)), StandardOperation::NativeVecNew, vec![]),
+        ];
+
+        let root_func = empty_func(1, ops, values);
+        let mut table = BTreeMap::new();
+        let root_name = JsName::new("entry".to_owned());
+        table.insert(
+            root_name.clone(),
+            make_item(
+                "entry",
+                "app::entry",
+                ItemKind::Fn,
+                true,
+                AllocatorProvider::Default,
+                Some(interns.clone()),
+                BodySemantic::Ordinary,
+            ),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(root_name, Ok(root_func));
+
+        let plan = analyze_reachable(
+            &table,
+            &funcs,
+            &BTreeMap::new(),
+            &Opts {
+                profile: Some(Profile::ReleaseSpeed),
+                ..Opts::default()
+            },
+            ByteViewPlan {
+                raw_byte_derefs: false,
+                elide_scale_scalar: true,
+            },
+        );
+        assert!(plan.native_vec_enabled);
+        assert!(plan.is_packed_arr_vec(&interns.types, vec_clean));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_cap));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_ptr));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_setlen));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_const));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_u32));
+        assert!(!plan.is_packed_arr_vec(&interns.types, vec_zst));
     }
 }

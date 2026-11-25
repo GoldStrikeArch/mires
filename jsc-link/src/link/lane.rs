@@ -956,6 +956,31 @@ fn run_with_opts(
     ctx.byte_views = byte_views;
     ctx.heap = heap;
 
+    // Universal `NativeString` call-site format kernel (`format!`/`write!`/`writeln!`): runs once
+    // `ctx.heap.native_string_enabled` is finalized after post-repr inlining and before `abi_flat`
+    // and Phase C, so helper functions containing `format!`/`write!` remain baseline during
+    // inlining and every proven site lowers inline to `{ s, cap }` / `out.s += ...`.
+    if emitting_plans
+        && ctx.heap.native_string_enabled
+        && opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+    {
+        let skip_bodies: BTreeSet<JsName> = repr.bodies.keys().cloned().collect();
+        let fmt_touched =
+            crate::lower::semantic_ops::fmt_kernel::commit_universal_native_string_sites(
+                &work_table,
+                &mut funcs,
+                &live,
+                &skip_bodies,
+                ctx.items,
+            );
+        for name in &fmt_touched {
+            if let Some(func) = funcs.get(name) {
+                planned_funcs.insert(name.clone(), func.clone());
+            }
+        }
+        repr.touched.extend(fmt_touched);
+    }
+
     // B2 plans against the same post-O, post-representation map D9 measured. Report mode records
     // that plan and empties it before emission.
     let mut abi_funcs = planned_funcs.clone();
@@ -2434,199 +2459,276 @@ fn o_group_with_mode(
     let mut graph = callgraph::build(funcs, &interns_map);
     let mut summaries = effects::compute(funcs, &interns_map, &graph);
     group.summaries_items = summaries.len() as u32;
+    drop(interns_map);
 
     // Use the same reserved/public-name policy as final emission. One deterministic name map
     // is shared by every probe in this group, so symbol length cannot masquerade as a body win.
-    let items: Vec<_> = live.iter().filter_map(|name| table.get(name)).collect();
-    let (program, _) = write_program("", &items);
-    let inline_renames = crate::minify::item_renames(&program, &items);
-
-    let empty_retargets = crate::lower::CallRetargets::new();
-    // One item priced through the real phase-C pipeline on a clone, exactly the solver's rule.
-    let measure_full = |name: &JsName, func: &Func| -> Option<(u64, BTreeSet<JsName>)> {
-        let item = table.get(name)?;
-        let retargets = call_retargets
-            .and_then(|map| map.get(name))
-            .unwrap_or(&empty_retargets);
-        let input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
-        crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
+    let inline_renames = {
+        let items: Vec<_> = live.iter().filter_map(|name| table.get(name)).collect();
+        let (program, _) = write_program("", &items);
+        crate::minify::item_renames(&program, &items)
     };
 
-    if run_inline {
-        // The measured program: the +0.5% budget's denominator and the per-item entry sizes. A
-        // func the probe cannot price contributes its baseline text bytes to the total only.
-        let mut sizes: BTreeMap<JsName, u64> = BTreeMap::new();
-        let mut measured_refs: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
-        let mut program: u64 = 0;
-        for (name, func) in funcs.iter() {
-            match func.as_ref().ok().and_then(|func| measure_full(name, func)) {
-                Some((bytes, refs)) => {
-                    sizes.insert(name.clone(), bytes);
-                    measured_refs.insert(name.clone(), refs);
-                    program += bytes;
-                }
-                None => program += table.get(name).map_or(0, |item| item.js.len() as u64),
-            }
-        }
-        // Recompute live reachability and reference counts from post-O measured refs so the
-        // sole-referrer oracle does not stay anchored to stale pre-opt `item.refs`.
-        let effective_live: BTreeSet<JsName> = {
-            let mut reach = BTreeSet::new();
-            let mut work: Vec<JsName> = table
-                .iter()
-                .filter(|(name, item)| {
-                    live.contains(*name)
-                        && (item.linkage.root || ctx.opts.roots.iter().any(|r| r == name.as_str()))
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            while let Some(cur) = work.pop() {
-                if !live.contains(&cur) || !reach.insert(cur.clone()) {
-                    continue;
-                }
-                if let Some(refs) = measured_refs.get(&cur) {
-                    work.extend(refs.iter().cloned());
-                } else if let Some(item) = table.get(&cur) {
-                    work.extend(item.refs.iter().cloned());
-                }
-            }
-            reach
-        };
-        // The live reference counts: the single-caller criterion's oracle.
-        let mut referrers: BTreeMap<JsName, (u32, Option<JsName>)> = BTreeMap::new();
-        for (name, item) in table.iter() {
-            if !effective_live.contains(name) {
-                continue;
-            }
-            let refs_set = measured_refs.get(name).unwrap_or(&item.refs);
-            for target in refs_set {
-                if target == name {
-                    continue;
-                }
-                let entry = referrers.entry(target.clone()).or_insert((0, None));
-                entry.0 += 1;
-                entry.1 = Some(name.clone());
-            }
-        }
-        let sole = |callee: &JsName, caller: &JsName| -> bool {
-            table.get(callee).is_some_and(|item| !item.linkage.root)
-                && !ctx.opts.roots.iter().any(|root| root == callee.as_str())
-                && referrers
-                    .get(callee)
-                    .is_some_and(|(count, who)| *count == 1 && who.as_ref() == Some(caller))
-        };
-        let zombie_free =
-            |name: &JsName| table.get(name).is_some_and(|item| item.zombies.is_empty());
-        let mut metadata: BTreeMap<_, _> = table
-            .iter()
-            .filter_map(|(name, item)| {
-                let interns = item.jir.interns()?;
-                Some((
-                    name.clone(),
-                    crate::opt::inline::Metadata {
-                        universe: interns,
-                        interns: std::borrow::Cow::Borrowed(interns),
-                        origins: item.jir.origins.as_ref().map(std::borrow::Cow::Borrowed),
-                        header: item.jir.header(),
-                        summary: item.jir.summary.as_ref().map(std::borrow::Cow::Borrowed),
-                    },
-                ))
-            })
-            .collect();
-        let measure_imported =
-            |name: &JsName, func: &Func, metadata: &crate::opt::inline::Metadata<'_>| {
+    let speed_post_repr =
+        allow_std_post_repr && matches!(ctx.opts.profile, Some(crate::opts::Profile::ReleaseSpeed));
+    let mut cached_sizes: BTreeMap<JsName, u64> = BTreeMap::new();
+    let mut cached_refs: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
+    let mut dirty_items: Option<BTreeSet<JsName>> = None;
+    let max_rounds = if speed_post_repr && run_inline { 2 } else { 1 };
+    for round in 0..max_rounds {
+        let mut round_dirty: BTreeSet<JsName> = BTreeSet::new();
+        let mut round_inline_applied = 0u32;
+        if run_inline {
+            let empty_retargets = crate::lower::CallRetargets::new();
+            let measure_full = |name: &JsName, func: &Func| -> Option<(u64, BTreeSet<JsName>)> {
                 let item = table.get(name)?;
                 let retargets = call_retargets
                     .and_then(|map| map.get(name))
                     .unwrap_or(&empty_retargets);
-                let mut input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
-                input.interns = &metadata.interns;
-                input.table = &metadata.interns.types;
-                input.origins = metadata.origins.as_deref();
-                if let Some(summary) = metadata.summary.as_deref() {
-                    input.summary = summary;
-                }
+                let input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
                 crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
             };
-        group.inline = crate::opt::inline::run_with_profile_and_retargets(
-            funcs,
-            &mut metadata,
-            &graph,
-            ctx.items,
-            &measure_imported,
-            &sole,
-            &zombie_free,
-            program,
-            &sizes,
-            allow_std_post_repr,
-            ctx.opts.profile,
-            call_retargets,
-        );
-        let updates: Vec<_> = metadata
-            .into_iter()
-            .filter_map(|(name, metadata)| {
-                let interns_owned = matches!(metadata.interns, std::borrow::Cow::Owned(_));
-                let summary_owned = matches!(metadata.summary, Some(std::borrow::Cow::Owned(_)));
-                if !interns_owned && !summary_owned {
-                    return None;
+            // The measured program: the +0.5% budget's denominator and the per-item entry sizes. A
+            // func the probe cannot price contributes its baseline text bytes to the total only.
+            let mut program: u64 = 0;
+            for (name, func) in funcs.iter() {
+                let needs_measure = dirty_items
+                    .as_ref()
+                    .is_none_or(|dirty| dirty.contains(name));
+                if needs_measure {
+                    match func.as_ref().ok().and_then(|func| measure_full(name, func)) {
+                        Some((bytes, refs)) => {
+                            cached_sizes.insert(name.clone(), bytes);
+                            cached_refs.insert(name.clone(), refs);
+                        }
+                        None => {
+                            cached_sizes.remove(name);
+                            cached_refs.remove(name);
+                        }
+                    }
                 }
-                Some((
-                    name,
-                    interns_owned.then(|| metadata.interns.into_owned()),
-                    interns_owned.then(|| metadata.origins.map(|o| o.into_owned())),
-                    summary_owned.then(|| metadata.summary.map(|s| s.into_owned())),
-                ))
-            })
-            .collect();
-        drop(interns_map);
-        for (name, interns, origins, summary) in updates {
-            let item = table
-                .get_mut(&name)
-                .expect("inlined caller remains in the item table");
-            if let Some(interns) = interns {
-                item.jir.use_interns(interns);
-                item.jir.origins = origins.flatten();
+                if let Some(&bytes) = cached_sizes.get(name) {
+                    program += bytes;
+                } else {
+                    program += table.get(name).map_or(0, |item| item.js.len() as u64);
+                }
             }
-            if let Some(Some(summary)) = summary {
-                item.jir.summary = Some(summary);
+            // Recompute live reachability and reference counts from post-O measured refs so the
+            // sole-referrer oracle does not stay anchored to stale pre-opt `item.refs`.
+            let effective_live: BTreeSet<JsName> = {
+                let mut reach = BTreeSet::new();
+                let mut work: Vec<JsName> = table
+                    .iter()
+                    .filter(|(name, item)| {
+                        live.contains(*name)
+                            && (item.linkage.root
+                                || ctx.opts.roots.iter().any(|r| r == name.as_str()))
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                while let Some(cur) = work.pop() {
+                    if !live.contains(&cur) || !reach.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Some(refs) = cached_refs.get(&cur) {
+                        work.extend(refs.iter().cloned());
+                    } else if let Some(item) = table.get(&cur) {
+                        work.extend(item.refs.iter().cloned());
+                    }
+                }
+                reach
+            };
+            // The live reference counts: the single-caller criterion's oracle.
+            let mut referrers: BTreeMap<JsName, (u32, Option<JsName>)> = BTreeMap::new();
+            for (name, item) in table.iter() {
+                if !effective_live.contains(name) {
+                    continue;
+                }
+                let refs_set = cached_refs.get(name).unwrap_or(&item.refs);
+                for target in refs_set {
+                    if target == name {
+                        continue;
+                    }
+                    let entry = referrers.entry(target.clone()).or_insert((0, None));
+                    entry.0 += 1;
+                    entry.1 = Some(name.clone());
+                }
+            }
+            let sole = |callee: &JsName, caller: &JsName| -> bool {
+                table.get(callee).is_some_and(|item| !item.linkage.root)
+                    && !ctx.opts.roots.iter().any(|root| root == callee.as_str())
+                    && referrers
+                        .get(callee)
+                        .is_some_and(|(count, who)| *count == 1 && who.as_ref() == Some(caller))
+            };
+            let zombie_free =
+                |name: &JsName| table.get(name).is_some_and(|item| item.zombies.is_empty());
+            let mut metadata: BTreeMap<_, _> = table
+                .iter()
+                .filter_map(|(name, item)| {
+                    let interns = item.jir.interns()?;
+                    Some((
+                        name.clone(),
+                        crate::opt::inline::Metadata {
+                            universe: interns,
+                            interns: std::borrow::Cow::Borrowed(interns),
+                            origins: item.jir.origins.as_ref().map(std::borrow::Cow::Borrowed),
+                            header: item.jir.header(),
+                            summary: item.jir.summary.as_ref().map(std::borrow::Cow::Borrowed),
+                        },
+                    ))
+                })
+                .collect();
+            let measure_imported =
+                |name: &JsName, func: &Func, metadata: &crate::opt::inline::Metadata<'_>| {
+                    let item = table.get(name)?;
+                    let retargets = call_retargets
+                        .and_then(|map| map.get(name))
+                        .unwrap_or(&empty_retargets);
+                    let mut input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
+                    input.interns = &metadata.interns;
+                    input.table = &metadata.interns.types;
+                    input.origins = metadata.origins.as_deref();
+                    if let Some(summary) = metadata.summary.as_deref() {
+                        input.summary = summary;
+                    }
+                    crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
+                };
+            let round_inline = crate::opt::inline::run_with_profile_and_retargets(
+                funcs,
+                &mut metadata,
+                &graph,
+                ctx.items,
+                &measure_imported,
+                &sole,
+                &zombie_free,
+                program,
+                &cached_sizes,
+                allow_std_post_repr,
+                ctx.opts.profile,
+                call_retargets,
+            );
+            round_inline_applied = round_inline.applied;
+            round_dirty.extend(round_inline.items.iter().cloned());
+            group.inline.applied += round_inline.applied;
+            group.inline.cross_object_applied += round_inline.cross_object_applied;
+            group.inline.declined_budget += round_inline.declined_budget;
+            for (reason, count) in round_inline.declined {
+                *group.inline.declined.entry(reason).or_default() += count;
+            }
+            group.inline.bytes_before += round_inline.bytes_before;
+            group.inline.bytes_after += round_inline.bytes_after;
+            group.inline.witnesses_recorded += round_inline.witnesses_recorded;
+            group.inline.witnesses_failed += round_inline.witnesses_failed;
+            group.inline.items.extend(round_inline.items);
+            let updates: Vec<_> = metadata
+                .into_iter()
+                .filter_map(|(name, metadata)| {
+                    let interns_owned = matches!(metadata.interns, std::borrow::Cow::Owned(_));
+                    let summary_owned =
+                        matches!(metadata.summary, Some(std::borrow::Cow::Owned(_)));
+                    if !interns_owned && !summary_owned {
+                        return None;
+                    }
+                    Some((
+                        name,
+                        interns_owned.then(|| metadata.interns.into_owned()),
+                        interns_owned.then(|| metadata.origins.map(|o| o.into_owned())),
+                        summary_owned.then(|| metadata.summary.map(|s| s.into_owned())),
+                    ))
+                })
+                .collect();
+            for (name, interns, origins, summary) in updates {
+                let item = table
+                    .get_mut(&name)
+                    .expect("inlined caller remains in the item table");
+                if let Some(interns) = interns {
+                    item.jir.use_interns(interns);
+                    item.jir.origins = origins.flatten();
+                }
+                if let Some(Some(summary)) = summary {
+                    item.jir.summary = Some(summary);
+                }
             }
         }
+        let had_invoke_before: BTreeSet<JsName> = if run_dce && round_inline_applied > 0 {
+            funcs
+                .iter()
+                .filter_map(|(name, res)| {
+                    res.as_ref()
+                        .ok()
+                        .filter(|f| f.has_invoke())
+                        .map(|_| name.clone())
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let pruned_post_inline = if run_dce && round_inline_applied > 0 {
+            let pruned = crate::opt::prune_invoke::run_checked(table, funcs, live);
+            group.witnesses_recorded += pruned.witnesses_recorded;
+            group.witnesses_failed += pruned.witnesses_failed;
+            if pruned.modified > 0 {
+                for name in &had_invoke_before {
+                    if funcs
+                        .get(name)
+                        .and_then(|res| res.as_ref().ok())
+                        .is_some_and(|f| !f.has_invoke())
+                    {
+                        round_dirty.insert(name.clone());
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
+            .iter()
+            .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
+            .collect();
+        if pruned_post_inline {
+            graph = callgraph::build(funcs, &interns_map);
+            summaries = effects::compute(funcs, &interns_map, &graph);
+            group.summaries_items = summaries.len() as u32;
+        }
+        let mut round_devirt_applied = 0u32;
+        if run_devirt {
+            let post_devirt =
+                crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
+            round_devirt_applied = post_devirt.applied;
+            round_dirty.extend(post_devirt.items.iter().cloned());
+            group.devirt.applied += post_devirt.applied;
+            group.devirt.witnesses_recorded += post_devirt.witnesses_recorded;
+            group.devirt.witnesses_failed += post_devirt.witnesses_failed;
+            group.devirt.items.extend(post_devirt.items);
+        }
+        if run_dce {
+            let projection = crate::opt::projection::run(funcs, &interns_map);
+            round_dirty.extend(projection.items.iter().cloned());
+            group.dce_items.extend(projection.items);
+            group.witnesses_recorded += projection.witnesses_recorded;
+            group.witnesses_failed += projection.witnesses_failed;
+        }
+        if round_inline_applied > 0 || round_devirt_applied > 0 {
+            graph = callgraph::build(funcs, &interns_map);
+        }
+        if round + 1 < max_rounds
+            && (round_inline_applied > 0 || round_devirt_applied > 0 || pruned_post_inline)
+        {
+            dirty_items = Some(round_dirty);
+            continue;
+        }
+        break;
     }
-    let pruned_post_inline = if run_dce && group.inline.applied > 0 {
-        let pruned = crate::opt::prune_invoke::run_checked(table, funcs, live);
-        group.witnesses_recorded += pruned.witnesses_recorded;
-        group.witnesses_failed += pruned.witnesses_failed;
-        pruned.modified > 0
-    } else {
-        false
-    };
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
         .collect();
-    if pruned_post_inline {
-        graph = callgraph::build(funcs, &interns_map);
-        summaries = effects::compute(funcs, &interns_map, &graph);
-        group.summaries_items = summaries.len() as u32;
-    }
-    if run_devirt {
-        let post_devirt = crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
-        group.devirt.applied += post_devirt.applied;
-        group.devirt.witnesses_recorded += post_devirt.witnesses_recorded;
-        group.devirt.witnesses_failed += post_devirt.witnesses_failed;
-        group.devirt.items.extend(post_devirt.items);
-    }
-    if run_dce {
-        let projection = crate::opt::projection::run(funcs, &interns_map);
-        group.dce_items.extend(projection.items);
-        group.witnesses_recorded += projection.witnesses_recorded;
-        group.witnesses_failed += projection.witnesses_failed;
-    }
     // D1: revalidate against the rewritten bodies; a claim the recompute cannot confirm demotes
     // to top, and everything that then reads the map sees `op.missing-summary`-shaped absence.
-    if group.inline.applied > 0 || group.devirt.applied > 0 {
-        graph = callgraph::build(funcs, &interns_map);
-    }
     let violations = summary_check::enforce(&mut summaries, funcs, &interns_map, &graph);
     group.summaries_validated = group
         .summaries_items

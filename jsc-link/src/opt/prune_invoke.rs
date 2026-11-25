@@ -14,9 +14,10 @@ use crate::analysis::refs::{self, RefScan};
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
-use crate::jir::repr::{Func, Op, OpKind, RBlockId, RTerm, ValueId};
+use crate::jir::repr::{CellId, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId};
 use crate::jir::semantic::{
-    BodyKind, BodySemantic, CallSemantic, Callee, DropGlue, HostPayload, ItemId, VtableEntry,
+    BinaryOp, BodyKind, BodySemantic, CallSemantic, Callee, CastKind, DropGlue, HostPayload,
+    ItemId, UnaryOp, VtableEntry,
 };
 use crate::jir::types::{TypeId, TypeKind, TypeTable};
 use crate::late_ir::AllocatorProvider;
@@ -206,6 +207,42 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "convert_nv_typed"
             | "bstr_block_typed"
             | "bstr_sb_block_typed"
+            | "nv_grow_u8"
+            | "nv_grow_i8"
+            | "nv_grow_u16"
+            | "nv_grow_i16"
+            | "nv_grow_u32"
+            | "nv_grow_i32"
+            | "nv_grow_f32"
+            | "nv_grow_f64"
+            | "nv_with_cap_u8"
+            | "nv_with_cap_i8"
+            | "nv_with_cap_u16"
+            | "nv_with_cap_i16"
+            | "nv_with_cap_u32"
+            | "nv_with_cap_i32"
+            | "nv_with_cap_f32"
+            | "nv_with_cap_f64"
+            | "nv_zeroed_u8"
+            | "nv_zeroed_i8"
+            | "nv_zeroed_u16"
+            | "nv_zeroed_i16"
+            | "nv_zeroed_u32"
+            | "nv_zeroed_i32"
+            | "nv_zeroed_f32"
+            | "nv_zeroed_f64"
+            | "nv_reserve_u8"
+            | "nv_reserve_i8"
+            | "nv_reserve_u16"
+            | "nv_reserve_i16"
+            | "nv_reserve_u32"
+            | "nv_reserve_i32"
+            | "nv_reserve_f32"
+            | "nv_reserve_f64"
+            | "nv_zeroed_arr_p"
+            | "nv_zeroed_arr_fn_p"
+            | "nv_zeroed_arr_fn_tracked_p"
+            | "nv_resize_zero_ta"
     )
 }
 
@@ -815,6 +852,42 @@ pub(crate) fn run_checked(
     stats
 }
 
+const MAX_NOOP_UNWIND_BLOCKS: usize = 64;
+
+fn collect_escaped_cells(func: &Func) -> BTreeSet<CellId> {
+    let mut escaped = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::Drop {
+                    root: Root::Cell(cell),
+                    glue: DropGlue::Direct { .. } | DropGlue::Dynamic,
+                    ..
+                } => {
+                    escaped.insert(*cell);
+                }
+                _ => {}
+            }
+        }
+    }
+    escaped
+}
+
+fn is_bool_or_int(ty: TypeId, types: &TypeTable) -> bool {
+    matches!(
+        types.get(types.peeled(ty)).map(|d| &d.kind),
+        Some(TypeKind::Bool | TypeKind::Integer { .. })
+    )
+}
+
 fn is_noop_unwind_chain(
     func: &Func,
     interns: &Interns,
@@ -831,37 +904,118 @@ fn is_noop_unwind_chain(
             .str(link_name)
             .is_some_and(|s| noop_funcs.contains(&JsName::new(s.to_owned())))
     };
-    let mut cur = start;
-    for _ in 0..8 {
+    let mut escaped_cells: Option<BTreeSet<CellId>> = None;
+
+    // 3-color iterative DFS over the cleanup subgraph starting at `start`:
+    // absent = unvisited, 1 = visiting (on active path), 2 = finished (acyclic, all paths
+    // terminate in `RTerm::Throw(None)`). Any back-edge (color == 1) rejects cycles.
+    let mut color: BTreeMap<RBlockId, u8> = BTreeMap::new();
+    let mut stack: Vec<(RBlockId, bool)> = vec![(start, false)];
+    while let Some((cur, exiting)) = stack.pop() {
+        if exiting {
+            color.insert(cur, 2);
+            continue;
+        }
+        match color.get(&cur).copied() {
+            Some(2) => continue,
+            Some(1) => return false,
+            _ => {}
+        }
+        if color.len() >= MAX_NOOP_UNWIND_BLOCKS {
+            return false;
+        }
         let Some(block) = func.blocks.get(cur.0 as usize) else {
             return false;
         };
-        let ops_noop = block.ops.iter().all(|op| match &op.kind {
-            OpKind::Copy(_) | OpKind::Move(_) => true,
-            OpKind::Drop { glue, .. } => match glue {
-                DropGlue::None => true,
-                DropGlue::Direct { link_name, .. } => is_noop_target(*link_name),
-                DropGlue::Dynamic => false,
-            },
-            OpKind::Call {
-                callee: Callee::Direct { link_name, .. },
-                semantic: CallSemantic::Ordinary,
-                host: None,
-                function: None,
-                ..
-            } => op.result.is_none_or(is_unused) && is_noop_target(*link_name),
-            _ => false,
-        });
+        let ops_noop =
+            block.ops.iter().all(|op| match &op.kind {
+                OpKind::Copy(_)
+                | OpKind::Move(_)
+                | OpKind::Const(_)
+                | OpKind::Field { .. }
+                | OpKind::CellLoad(_)
+                | OpKind::BorrowView { .. }
+                | OpKind::RawView { .. }
+                | OpKind::Discriminant(_) => true,
+                OpKind::CellStore { cell, .. } => {
+                    let escaped = escaped_cells.get_or_insert_with(|| collect_escaped_cells(func));
+                    !escaped.contains(cell)
+                }
+                OpKind::Unary {
+                    op: UnaryOp::Not | UnaryOp::Neg,
+                    ty,
+                    ..
+                } => is_bool_or_int(*ty, &interns.types),
+                OpKind::Binary {
+                    op:
+                        BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor,
+                    ty,
+                    ..
+                } => is_bool_or_int(*ty, &interns.types),
+                OpKind::Cast {
+                    kind: CastKind::IntToInt | CastKind::Subtype,
+                    ..
+                } => true,
+                OpKind::Drop { glue, .. } => match glue {
+                    DropGlue::None => true,
+                    DropGlue::Direct { link_name, .. } => is_noop_target(*link_name),
+                    DropGlue::Dynamic => false,
+                },
+                OpKind::Call {
+                    callee: Callee::Direct { link_name, .. },
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                    function: None,
+                    ..
+                } => op.result.is_none_or(is_unused) && is_noop_target(*link_name),
+                OpKind::Call {
+                    callee: Callee::Nop,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                    function: None,
+                    ..
+                } => op.result.is_none_or(is_unused),
+                _ => false,
+            });
         if !ops_noop {
             return false;
         }
+        color.insert(cur, 1);
+        stack.push((cur, true));
         match &block.term {
-            RTerm::Throw(None) => return true,
-            RTerm::Goto(next, _) => cur = *next,
+            RTerm::Throw(None) => {}
+            RTerm::Goto(next, _) => {
+                if color.get(next).copied() == Some(1) {
+                    return false;
+                }
+                if !color.contains_key(next) {
+                    stack.push((*next, false));
+                }
+            }
+            RTerm::Switch { cases, default, .. } => {
+                if color.get(&default.0).copied() == Some(1) {
+                    return false;
+                }
+                if !color.contains_key(&default.0) {
+                    stack.push((default.0, false));
+                }
+                for &(_, target, _) in cases {
+                    if color.get(&target).copied() == Some(1) {
+                        return false;
+                    }
+                    if !color.contains_key(&target) {
+                        stack.push((target, false));
+                    }
+                }
+            }
             _ => return false,
         }
     }
-    false
+    !color.is_empty()
 }
 
 #[cfg(test)]
@@ -1781,7 +1935,7 @@ mod tests {
         // Caller has three throwing Invokes:
         // 1) unwinds through a 4-block chain (Copy/Move + DropGlue::None + Direct noop drop +
         //    Direct noop call -> Throw(None)) => PRUNED;
-        // 2) unwinds through a 9-block Goto chain (> 8 hops) => PRESERVED;
+        // 2) unwinds through a 65-block Goto chain (> 64-block DAG cap) => PRESERVED;
         // 3) unwinds through a block calling `non_noop_fn` => PRESERVED.
         let mut interns = Interns::new();
         interns.intern_type(TypeDescriptor {
@@ -1907,9 +2061,9 @@ mod tests {
         cb.terminate(u1_c, RTerm::Goto(u1_d, Vec::new()));
         cb.terminate(u1_d, RTerm::Throw(None));
 
-        // Invoke #2 (b1): unwinds via 9 blocks (> 8 hops) -> Throw(None) => preserved.
-        let mut long_chain = Vec::with_capacity(9);
-        for _ in 0..9 {
+        // Invoke #2 (b1): unwinds via 65 blocks (> 64-block cap) -> Throw(None) => preserved.
+        let mut long_chain = Vec::with_capacity(65);
+        for _ in 0..65 {
             long_chain.push(cb.block());
         }
         cb.effect(
@@ -1930,7 +2084,7 @@ mod tests {
         for w in long_chain.windows(2) {
             cb.terminate(w[0], RTerm::Goto(w[1], Vec::new()));
         }
-        cb.terminate(long_chain[8], RTerm::Throw(None));
+        cb.terminate(long_chain[64], RTerm::Throw(None));
 
         // Invoke #3 (b2): unwinds via a block calling `non_noop_fn` => preserved.
         let u3 = cb.block();
@@ -3866,6 +4020,715 @@ mod tests {
                 )
                 .is_err());
             }
+        }
+    }
+
+    #[test]
+    fn prunes_branching_cleanup_dag_with_switch_cell_ops_and_diamond_merge() {
+        use crate::jir::semantic::ConstTree;
+        use crate::jir::types::{IntFacts, IntRepr};
+
+        let sig = |result| Signature {
+            arguments: Vec::new(),
+            result,
+            abi: AbiSignature::default(),
+        };
+        let mut noop_b = FuncBuilder::new(item_id(20), sig(UNIT));
+        noop_b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let noop_fn = noop_b.finish();
+
+        let mut interns = Interns::new();
+        let unit_ty = unit_types(&mut interns);
+        let bool_ty = TypeId(1);
+        let u8_ty = TypeId(2);
+        let u32_ty = TypeId(3);
+        let ref_unit_ty = TypeId(4);
+        interns.intern_type(TypeDescriptor {
+            id: bool_ty,
+            name: None,
+            kind: TypeKind::Bool,
+            layout: LayoutFacts {
+                size: Some(1),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: bool_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        interns.intern_type(TypeDescriptor {
+            id: u8_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            layout: LayoutFacts {
+                size: Some(1),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 8,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: u8_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        interns.intern_type(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: u32_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        interns.intern_type(TypeDescriptor {
+            id: ref_unit_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: unit_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: ref_unit_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let noop_str = interns.intern_str("noop_drop");
+        let throwing_host = HostPayload::Marker {
+            section: interns.intern_str("rcgjs.host.invoke"),
+            def: DefinitionId {
+                crate_id: 0,
+                local_hash: 51,
+            },
+            template: None,
+            helpers: Vec::new(),
+        };
+
+        let mut cb = FuncBuilder::new(item_id(21), sig(unit_ty));
+        let flag_cell = cb.cell(bool_ty, false, O);
+        let unit_val = cb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Unit),
+            unit_ty,
+            O,
+        );
+        let init_flag = cb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 1 }),
+            bool_ty,
+            O,
+        );
+        cb.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(flag_cell), O);
+        cb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::CellStore {
+                cell: flag_cell,
+                v: init_flag,
+            },
+            O,
+        );
+        cb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: throwing_host,
+                args: Vec::new(),
+            },
+            O,
+        );
+        let b_done = cb.block();
+        let u_entry = cb.block();
+        let u_left = cb.block();
+        let u_right = cb.block();
+        let u_merge = cb.block();
+        cb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Invoke {
+                normal: (b_done, Vec::new()),
+                unwind: (u_entry, Vec::new()),
+            },
+        );
+        cb.terminate(b_done, RTerm::Return(None));
+
+        // Cleanup DAG entry: reads & clears unescaped drop-flag cell, runs pure flag ops,
+        // BorrowView/Field/Discriminant, and switches to two arms that merge before Throw(None).
+        let loaded = cb.op(u_entry, OpKind::CellLoad(flag_cell), bool_ty, O);
+        let zero_bool = cb.op(
+            u_entry,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 1 }),
+            bool_ty,
+            O,
+        );
+        cb.effect(
+            u_entry,
+            OpKind::CellStore {
+                cell: flag_cell,
+                v: zero_bool,
+            },
+            O,
+        );
+        let inverted = cb.op(
+            u_entry,
+            OpKind::Unary {
+                op: UnaryOp::Not,
+                v: loaded,
+                ty: bool_ty,
+            },
+            bool_ty,
+            O,
+        );
+        let widened = cb.op(
+            u_entry,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: inverted,
+                from: bool_ty,
+                to: u8_ty,
+            },
+            u8_ty,
+            O,
+        );
+        let mask = cb.op(
+            u_entry,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 1 }),
+            u8_ty,
+            O,
+        );
+        let masked = cb.op(
+            u_entry,
+            OpKind::Binary {
+                op: BinaryOp::BitAnd,
+                l: widened,
+                r: mask,
+                ty: u8_ty,
+            },
+            u8_ty,
+            O,
+        );
+        let _view = cb.op(
+            u_entry,
+            OpKind::BorrowView {
+                root: Root::Value(unit_val),
+                path: Vec::new(),
+                mutable: false,
+            },
+            ref_unit_ty,
+            O,
+        );
+        let _field = cb.op(
+            u_entry,
+            OpKind::Field {
+                base: unit_val,
+                variant: None,
+                field: 0,
+            },
+            unit_ty,
+            O,
+        );
+        let _discr = cb.op(u_entry, OpKind::Discriminant(unit_val), u32_ty, O);
+        cb.terminate(
+            u_entry,
+            RTerm::Switch {
+                scrut: masked,
+                scrut_ty: u8_ty,
+                cases: vec![(1, u_left, Vec::new())],
+                default: (u_right, Vec::new()),
+            },
+        );
+
+        // Left arm: DropGlue::None + Callee::Nop -> Goto(u_merge).
+        cb.effect(
+            u_left,
+            OpKind::Drop {
+                root: Root::Value(unit_val),
+                path: Vec::new(),
+                glue: DropGlue::None,
+            },
+            O,
+        );
+        cb.effect(
+            u_left,
+            OpKind::Call {
+                callee: Callee::Nop,
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(u_left, RTerm::Goto(u_merge, Vec::new()));
+
+        // Right arm: direct noop drop -> Goto(u_merge).
+        cb.effect(
+            u_right,
+            OpKind::Drop {
+                root: Root::Value(unit_val),
+                path: Vec::new(),
+                glue: DropGlue::Direct {
+                    item: item_id(20),
+                    link_name: noop_str,
+                },
+            },
+            O,
+        );
+        cb.terminate(u_right, RTerm::Goto(u_merge, Vec::new()));
+
+        // Diamond merge block -> Throw(None).
+        cb.terminate(u_merge, RTerm::Throw(None));
+        let caller = cb.finish();
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("noop_drop".to_owned()),
+            test_item("noop_drop", Interns::new()),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("noop_drop".to_owned()), Ok(noop_fn));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(stats.modified, 1, "branching pure cleanup DAG must prune");
+        assert_eq!(stats.witnesses_failed, 0, "witness must accept pruned DAG");
+        assert!(!funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn preserves_cleanup_dag_with_cycle_escaped_cell_store_non_noop_drop_return_or_div() {
+        use crate::jir::semantic::ConstTree;
+        use crate::jir::types::{IntFacts, IntRepr};
+
+        #[derive(Clone, Copy, Debug)]
+        enum BadCase {
+            Cycle,
+            EscapedCellStore,
+            NonNoopDropInArm,
+            ReturnInArm,
+            DivOp,
+            ThrowValue,
+        }
+
+        for case in [
+            BadCase::Cycle,
+            BadCase::EscapedCellStore,
+            BadCase::NonNoopDropInArm,
+            BadCase::ReturnInArm,
+            BadCase::DivOp,
+            BadCase::ThrowValue,
+        ] {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut interns = Interns::new();
+            let unit_ty = unit_types(&mut interns);
+            let u32_ty = TypeId(1);
+            let ref_u32_ty = TypeId(2);
+            interns.intern_type(TypeDescriptor {
+                id: u32_ty,
+                name: None,
+                kind: TypeKind::Integer {
+                    signed: false,
+                    bits: 32,
+                },
+                layout: LayoutFacts {
+                    size: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: Some(IntFacts {
+                        signed: false,
+                        bits: 32,
+                        repr: IntRepr::Number,
+                    }),
+                    is_indirect: false,
+                    needs_clone: false,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: u32_ty,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: Vec::new(),
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: ref_u32_ty,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: u32_ty,
+                    mutable: true,
+                },
+                layout: LayoutFacts {
+                    size: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: None,
+                    is_indirect: false,
+                    needs_clone: false,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: ref_u32_ty,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: Vec::new(),
+                },
+            });
+
+            let real_drop_str = interns.intern_str("real_drop");
+            let throwing_host = HostPayload::Marker {
+                section: interns.intern_str("rcgjs.host.invoke"),
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 52,
+                },
+                template: None,
+                helpers: Vec::new(),
+            };
+
+            let mut cb = FuncBuilder::new(
+                item_id(22),
+                Signature {
+                    arguments: Vec::new(),
+                    result: unit_ty,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let unit_val = cb.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Unit),
+                unit_ty,
+                O,
+            );
+            let one = cb.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+                u32_ty,
+                O,
+            );
+            let escaped_cell = cb.cell(u32_ty, true, O);
+            if matches!(case, BadCase::EscapedCellStore) {
+                cb.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(escaped_cell), O);
+                let _escaped_ref = cb.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::BorrowView {
+                        root: Root::Cell(escaped_cell),
+                        path: Vec::new(),
+                        mutable: true,
+                    },
+                    ref_u32_ty,
+                    O,
+                );
+            }
+            cb.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Host {
+                    payload: throwing_host,
+                    args: Vec::new(),
+                },
+                O,
+            );
+            let b_done = cb.block();
+            let u0 = cb.block();
+            let u1 = cb.block();
+            let u2 = cb.block();
+            cb.terminate(
+                FuncBuilder::ENTRY,
+                RTerm::Invoke {
+                    normal: (b_done, Vec::new()),
+                    unwind: (u0, Vec::new()),
+                },
+            );
+            cb.terminate(b_done, RTerm::Return(None));
+
+            match case {
+                BadCase::Cycle => {
+                    cb.terminate(
+                        u0,
+                        RTerm::Switch {
+                            scrut: one,
+                            scrut_ty: u32_ty,
+                            cases: vec![(1, u1, Vec::new())],
+                            default: (u2, Vec::new()),
+                        },
+                    );
+                    cb.terminate(u1, RTerm::Goto(u0, Vec::new()));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+                BadCase::EscapedCellStore => {
+                    cb.effect(
+                        u0,
+                        OpKind::CellStore {
+                            cell: escaped_cell,
+                            v: one,
+                        },
+                        O,
+                    );
+                    cb.terminate(u0, RTerm::Throw(None));
+                    cb.terminate(u1, RTerm::Throw(None));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+                BadCase::NonNoopDropInArm => {
+                    cb.terminate(
+                        u0,
+                        RTerm::Switch {
+                            scrut: one,
+                            scrut_ty: u32_ty,
+                            cases: vec![(1, u1, Vec::new())],
+                            default: (u2, Vec::new()),
+                        },
+                    );
+                    cb.effect(
+                        u1,
+                        OpKind::Drop {
+                            root: Root::Value(unit_val),
+                            path: Vec::new(),
+                            glue: DropGlue::Direct {
+                                item: item_id(99),
+                                link_name: real_drop_str,
+                            },
+                        },
+                        O,
+                    );
+                    cb.terminate(u1, RTerm::Throw(None));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+                BadCase::ReturnInArm => {
+                    cb.terminate(
+                        u0,
+                        RTerm::Switch {
+                            scrut: one,
+                            scrut_ty: u32_ty,
+                            cases: vec![(1, u1, Vec::new())],
+                            default: (u2, Vec::new()),
+                        },
+                    );
+                    cb.terminate(u1, RTerm::Return(None));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+                BadCase::DivOp => {
+                    let _q = cb.op(
+                        u0,
+                        OpKind::Binary {
+                            op: BinaryOp::Div,
+                            l: one,
+                            r: one,
+                            ty: u32_ty,
+                        },
+                        u32_ty,
+                        O,
+                    );
+                    cb.terminate(u0, RTerm::Throw(None));
+                    cb.terminate(u1, RTerm::Throw(None));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+                BadCase::ThrowValue => {
+                    cb.terminate(u0, RTerm::Throw(Some(one)));
+                    cb.terminate(u1, RTerm::Throw(None));
+                    cb.terminate(u2, RTerm::Throw(None));
+                }
+            }
+
+            let caller = cb.finish();
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            let caller_item = test_item("caller", interns);
+            let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+            table.insert(JsName::new("caller".to_owned()), caller_item);
+
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let stats = run_checked(&table, &mut funcs, &live);
+            assert_eq!(
+                stats.modified, 0,
+                "unsafe cleanup DAG {case:?} must NOT prune"
+            );
+            assert!(funcs[&JsName::new("caller".to_owned())]
+                .as_ref()
+                .unwrap()
+                .has_invoke());
+
+            let forged = [InvokePrunedSite {
+                block: FuncBuilder::ENTRY,
+                reason: InvokePruneReason::NoopUnwindChain,
+            }];
+            assert!(
+                witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &forged,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err(),
+                "witness must reject forged NoopUnwindChain for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn monomorphic_typed_array_nv_helpers_prune_with_witness_parity() {
+        let nv_helpers = [
+            "nv_grow_u8",
+            "nv_grow_i8",
+            "nv_grow_u16",
+            "nv_grow_i16",
+            "nv_grow_u32",
+            "nv_grow_i32",
+            "nv_grow_f32",
+            "nv_grow_f64",
+            "nv_with_cap_u8",
+            "nv_with_cap_i8",
+            "nv_with_cap_u16",
+            "nv_with_cap_i16",
+            "nv_with_cap_u32",
+            "nv_with_cap_i32",
+            "nv_with_cap_f32",
+            "nv_with_cap_f64",
+            "nv_zeroed_u8",
+            "nv_zeroed_i8",
+            "nv_zeroed_u16",
+            "nv_zeroed_i16",
+            "nv_zeroed_u32",
+            "nv_zeroed_i32",
+            "nv_zeroed_f32",
+            "nv_zeroed_f64",
+            "nv_resize_zero_ta",
+        ];
+        for sym in nv_helpers {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let sym_id = caller_interns.intern_str(sym);
+            let caller = build_caller_with_cleanup_drop(
+                &mut caller_interns,
+                unit_c,
+                Callee::Runtime {
+                    member: sym_id,
+                    sysroot: true,
+                },
+                "real_drop",
+            );
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            table.insert(
+                JsName::new("caller".to_owned()),
+                test_item("caller", caller_interns),
+            );
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let stats = run_checked(&table, &mut funcs, &live);
+            assert_eq!(
+                stats.modified, 1,
+                "monomorphic TypedArray helper `{sym}` must prune"
+            );
+            assert_eq!(
+                stats.witnesses_failed, 0,
+                "witness must accept monomorphic TypedArray helper `{sym}`"
+            );
         }
     }
 }
