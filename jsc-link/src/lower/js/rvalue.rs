@@ -2160,6 +2160,11 @@ impl<'a> JsCx<'a> {
                     }
                     None => {
                         for (field, value) in descriptor.fields.iter().zip(values) {
+                            if *form == NominalForm::Enum
+                                && matches!(field.key, FieldKey::Transparent)
+                            {
+                                continue;
+                            }
                             entries.push((self.aggregate_key(field.key)?, value));
                         }
                     }
@@ -2393,20 +2398,22 @@ impl<'a> JsCx<'a> {
                 "SetDiscriminant of a type that is not an enum",
             ));
         };
-        if let EnumRepr::NullNiche {
-            none_variant,
-            some_variant,
-        } = repr
-        {
+        if let Some((none_variant, some_variant, _)) = repr.niche_variants() {
             if variant == some_variant {
                 return Ok(Vec::new());
             }
             if variant == none_variant {
-                return self.write_place(place, ty, jsast::null());
+                let Some(none_expr) = value::niche_none_expr(table, repr) else {
+                    return Err(decline(
+                        OpClass::Statement,
+                        "SetDiscriminant of a SentinelNiche enum without a sentinel binding",
+                    ));
+                };
+                return self.write_place(place, ty, none_expr);
             }
             return Err(decline(
                 OpClass::Statement,
-                "SetDiscriminant of an out-of-range NullNiche variant",
+                "SetDiscriminant of an out-of-range niche enum variant",
             ));
         }
         let Some(tag) = value::variant_tag(table, self.interns, ty, variant) else {
@@ -2425,7 +2432,7 @@ impl<'a> JsCx<'a> {
             EnumRepr::Number { .. }
             | EnumRepr::Tag { fieldless: true }
             | EnumRepr::IntTag { fieldless: true } => self.write_place(place, ty, tag),
-            EnumRepr::NullNiche { .. } => unreachable!(),
+            EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. } => unreachable!(),
         }
     }
 

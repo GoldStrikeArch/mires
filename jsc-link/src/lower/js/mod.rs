@@ -67,6 +67,43 @@ pub fn decline(op: OpClass, detail: impl Into<String>) -> Decline {
 /// The name of the trailing caller `Location` parameter (`intrinsics.rs:65`).
 pub const CALLER_LOCATION_PARAM: &str = "$loc";
 
+/// Pending `RTerm::Return` payload for a callee returning
+/// [`crate::plan::abi_flat::SentinelResultShape`].
+pub(super) enum PendingSentinelReturn {
+    Ok(Expr),
+    Err(Option<Expr>),
+    Virtual {
+        val: Expr,
+        err: Option<Expr>,
+    },
+    Canonical {
+        value: Expr,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+    },
+}
+
+/// How a virtual [`crate::plan::abi_flat::SentinelResultShape`] value is represented in [`JsCx`].
+#[derive(Clone, Debug)]
+pub(super) enum VirtualSentinelRep {
+    /// Materialized in local variables `(val_var, err_var)` where `val_var === $se` signals
+    /// `err_variant` and `err_var` holds the captured error payload (when non-ZST).
+    Slot {
+        val_var: String,
+        err_var: Option<String>,
+    },
+    /// Inline `Move`/`Copy` alias forwarding lazily to `source`.
+    InlineAlias(ValueId),
+    /// Inline `Aggregate` or `Const(ConstTree::Variant)` emitted directly at `Return` or a
+    /// virtual `Phi` edge copy.
+    InlineConstruct,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VirtualSentinel {
+    pub shape: crate::plan::abi_flat::SentinelResultShape,
+    pub rep: VirtualSentinelRep,
+}
+
 /// The state of one function's lowering.
 pub struct JsCx<'a> {
     pub func: &'a Func,
@@ -150,6 +187,12 @@ pub struct JsCx<'a> {
     pending_return: RefCell<Option<Expr>>,
     /// The `(lo, hi)` pair parked for a `flat_abi` `i64_pair` `Region::Return`.
     pending_return_pair: RefCell<Option<(Expr, Expr)>>,
+    /// The parked payload for a `flat_abi` `SentinelResult` `Region::Return`.
+    pending_return_sentinel: RefCell<Option<PendingSentinelReturn>>,
+    /// Virtual `SentinelResult` values kept unboxed across calls, phis, and returns (lazy).
+    virtual_sentinels: std::cell::OnceCell<BTreeMap<ValueId, VirtualSentinel>>,
+    /// Error-payload companion temps for `CopyOperand::Temp` edge-copy cycles on virtual sentinels.
+    copy_temp_errs: RefCell<BTreeMap<u32, String>>,
     /// The defining op of every value an op defines: `(block, index)`.
     defs: BTreeMap<ValueId, (u32, u32)>,
     /// Overflow pairs that are never built, and how each is spelled
@@ -230,6 +273,9 @@ impl<'a> JsCx<'a> {
             origin: Cell::new(None),
             pending_return: RefCell::new(None),
             pending_return_pair: RefCell::new(None),
+            pending_return_sentinel: RefCell::new(None),
+            virtual_sentinels: std::cell::OnceCell::new(),
+            copy_temp_errs: RefCell::new(BTreeMap::new()),
             defs,
             carried_pairs,
             int32_only,
@@ -1068,25 +1114,441 @@ impl<'a> JsCx<'a> {
         })
     }
 
+    /// Allocates a hoisted `$tN` temporary name declared in the function prelude.
+    pub fn alloc_temp(&self) -> String {
+        let mut temps = self.temps.borrow_mut();
+        let base = format!("$t{}", temps.len());
+        let mut name = base.clone();
+        let mut suffix = 0;
+        while self.plan.globals.contains(&name) {
+            suffix += 1;
+            name = format!("{base}${suffix}");
+        }
+        temps.push(name.clone());
+        name
+    }
+
     /// Allocates a hoisted temporary holding `value` (`base.rs::temp`): the statement that fills
     /// it and the expression that reads it. Declared in the prelude.
     pub fn temp(&self, value: Expr) -> (Stmt, Expr) {
-        let name = {
-            let mut temps = self.temps.borrow_mut();
-            let base = format!("$t{}", temps.len());
-            let mut name = base.clone();
-            let mut suffix = 0;
-            while self.plan.globals.contains(&name) {
-                suffix += 1;
-                name = format!("{base}${suffix}");
-            }
-            temps.push(name.clone());
-            name
-        };
+        let name = self.alloc_temp();
         (
             jsast::assign_stmt(jsast::id(name.clone()), value),
             jsast::id(name),
         )
+    }
+
+    /// The private module-scope sentinel expression (`$sn`) for [`EnumRepr::SentinelNiche`].
+    #[allow(dead_code)]
+    pub fn sentinel_none_expr(&self) -> Option<Expr> {
+        value::sentinel_none_expr(self.table)
+    }
+
+    /// The private module-scope sentinel expression (`$se`) for `SentinelResult` flat returns.
+    pub fn sentinel_err_expr(&self) -> Option<Expr> {
+        self.abi
+            .and_then(|abi| abi.sentinel_err_name())
+            .map(|name| jsast::id(name.as_str()))
+    }
+
+    /// Companion error-payload temp for `CopyOperand::Temp(index)` during parallel edge-copy cycles.
+    pub(super) fn copy_temp_err_var(&self, temp_index: u32) -> String {
+        if let Some(existing) = self.copy_temp_errs.borrow().get(&temp_index) {
+            return existing.clone();
+        }
+        let name = self.alloc_temp();
+        self.copy_temp_errs
+            .borrow_mut()
+            .insert(temp_index, name.clone());
+        name
+    }
+
+    /// Returns the `SentinelResultShape` if `op` is a direct call to a `SentinelResult` callee.
+    pub(super) fn sentinel_call_shape(
+        &self,
+        op: &Op,
+    ) -> Option<crate::plan::abi_flat::SentinelResultShape> {
+        let OpKind::Call {
+            callee: rcgjs_object::jir::semantic::Callee::Direct { item, .. },
+            host: None,
+            ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        self.abi?.call_signature(*item)?.result.as_ref()?.sentinel
+    }
+
+    /// Returns virtual `SentinelResult` metadata for `v`, if `v` is kept unboxed in this body.
+    pub(super) fn virtual_sentinel(&self, v: ValueId) -> Option<&VirtualSentinel> {
+        self.virtual_sentinels().get(&v)
+    }
+
+    /// Follows any `InlineAlias` chain to its backing `Slot` or `InlineConstruct` value.
+    pub(super) fn resolve_virtual_sentinel(&self, mut v: ValueId) -> ValueId {
+        let map = self.virtual_sentinels();
+        for _ in 0..32 {
+            match map.get(&v).map(|vs| &vs.rep) {
+                Some(VirtualSentinelRep::InlineAlias(src)) => v = *src,
+                _ => break,
+            }
+        }
+        v
+    }
+
+    fn virtual_sentinels(&self) -> &BTreeMap<ValueId, VirtualSentinel> {
+        self.virtual_sentinels.get_or_init(|| {
+            use crate::plan::abi_flat::SentinelResultShape;
+            use rcgjs_object::jir::repr::{Carrier, RBlockId, RTerm};
+            use rcgjs_object::jir::semantic::{ConstTree, DropGlue};
+            use std::collections::BTreeSet;
+
+            #[derive(Clone, Copy, Eq, PartialEq)]
+            enum CandKind {
+                Call,
+                Phi,
+                Construct,
+                Alias(ValueId),
+            }
+
+            if self.sentinel_err_expr().is_none() {
+                return BTreeMap::new();
+            }
+            let target_sentinel = self
+                .target_abi
+                .and_then(|sig| sig.result.as_ref())
+                .and_then(|result| result.sentinel);
+            let mut call_shapes: BTreeMap<ValueId, SentinelResultShape> = BTreeMap::new();
+            let mut relevant_shapes: BTreeMap<TypeId, SentinelResultShape> = BTreeMap::new();
+            if let Some(shape) = target_sentinel {
+                relevant_shapes.insert(shape.ty, shape);
+            }
+            for block in &self.func.blocks {
+                for op in &block.ops {
+                    if let Some(shape) = self.sentinel_call_shape(op) {
+                        relevant_shapes.insert(shape.ty, shape);
+                        if let Some(res) = op.result {
+                            call_shapes.insert(res, shape);
+                        }
+                    }
+                }
+            }
+            if relevant_shapes.is_empty() {
+                return BTreeMap::new();
+            }
+
+            let block_index: BTreeMap<RBlockId, usize> = self
+                .func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.id, i))
+                .collect();
+            let mut incoming: BTreeMap<RBlockId, Vec<&[ValueId]>> = BTreeMap::new();
+            for block in &self.func.blocks {
+                for (target, args) in block.term.edges() {
+                    incoming.entry(target).or_default().push(args);
+                }
+            }
+
+            let mut cands: BTreeMap<ValueId, (SentinelResultShape, CandKind)> = BTreeMap::new();
+            let has_slot_or_inline = |v: ValueId| self.is_inline(v) || self.name_of(v).is_some();
+            for (&res, &shape) in &call_shapes {
+                let Some(def) = self.func.values.get(res.0 as usize) else {
+                    continue;
+                };
+                if def.ty == shape.ty && def.carrier == Carrier::Baseline && has_slot_or_inline(res)
+                {
+                    cands.insert(res, (shape, CandKind::Call));
+                }
+            }
+            for block in &self.func.blocks {
+                if block.id == RBlockId(0) {
+                    continue;
+                }
+                for &param in &block.params {
+                    let Some(def) = self.func.values.get(param.0 as usize) else {
+                        continue;
+                    };
+                    let Some(&shape) = relevant_shapes.get(&def.ty) else {
+                        continue;
+                    };
+                    if def.carrier == Carrier::Baseline
+                        && !self.plan.physical_slices.contains(&param)
+                        && !self.plan.physical_slots.contains(&param)
+                        && self.name_of(param).is_some()
+                    {
+                        cands.insert(param, (shape, CandKind::Phi));
+                    }
+                }
+            }
+            for block in &self.func.blocks {
+                for op in &block.ops {
+                    let Some(res) = op.result else { continue };
+                    if cands.contains_key(&res) || !has_slot_or_inline(res) {
+                        continue;
+                    }
+                    let Some(def) = self.func.values.get(res.0 as usize) else {
+                        continue;
+                    };
+                    if def.carrier != Carrier::Baseline {
+                        continue;
+                    }
+                    let Some(&shape) = relevant_shapes.get(&def.ty) else {
+                        continue;
+                    };
+                    match &op.kind {
+                        OpKind::Aggregate {
+                            ty,
+                            variant,
+                            active_field: None,
+                            fields,
+                        } if *ty == shape.ty => {
+                            let valid = (*variant == shape.ok_variant
+                                && shape
+                                    .ok_field
+                                    .is_none_or(|(fi, _)| (fi as usize) < fields.len()))
+                                || (*variant == shape.err_variant
+                                    && shape
+                                        .err_field
+                                        .is_none_or(|(fi, _)| (fi as usize) < fields.len()));
+                            if valid {
+                                cands.insert(res, (shape, CandKind::Construct));
+                            }
+                        }
+                        OpKind::Const(ConstTree::Variant { variant, fields }) => {
+                            let valid = (*variant == shape.ok_variant
+                                && shape
+                                    .ok_field
+                                    .is_none_or(|(fi, _)| (fi as usize) < fields.len()))
+                                || (*variant == shape.err_variant
+                                    && shape
+                                        .err_field
+                                        .is_none_or(|(fi, _)| (fi as usize) < fields.len()));
+                            if valid {
+                                cands.insert(res, (shape, CandKind::Construct));
+                            }
+                        }
+                        OpKind::Move(src) => {
+                            cands.insert(res, (shape, CandKind::Alias(*src)));
+                        }
+                        OpKind::Copy(src) => {
+                            let payload_needs_clone = shape
+                                .ok_field
+                                .is_some_and(|(_, t)| self.table.needs_clone(t))
+                                || shape
+                                    .err_field
+                                    .is_some_and(|(_, t)| self.table.needs_clone(t));
+                            if !payload_needs_clone {
+                                cands.insert(res, (shape, CandKind::Alias(*src)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let resolves_to_inline_construct =
+                |mut v: ValueId, cands: &BTreeMap<ValueId, (SentinelResultShape, CandKind)>| {
+                    for _ in 0..32 {
+                        match cands.get(&v) {
+                            Some((_, CandKind::Construct)) => return self.is_inline(v),
+                            Some((_, CandKind::Alias(src))) if self.is_inline(v) => v = *src,
+                            _ => return false,
+                        }
+                    }
+                    true
+                };
+
+            loop {
+                let mut remove: BTreeSet<ValueId> = BTreeSet::new();
+
+                // 1. Prune Phis whose incoming edges do not all supply matching candidates.
+                for block in &self.func.blocks {
+                    if block.id == RBlockId(0) {
+                        continue;
+                    }
+                    let edges = incoming.get(&block.id);
+                    for (pos, &param) in block.params.iter().enumerate() {
+                        let Some(&(shape, CandKind::Phi)) = cands.get(&param) else {
+                            continue;
+                        };
+                        let Some(edges) = edges.filter(|e| !e.is_empty()) else {
+                            remove.insert(param);
+                            continue;
+                        };
+                        let all_ok = edges.iter().all(|args| {
+                            args.get(pos)
+                                .and_then(|arg| cands.get(arg))
+                                .is_some_and(|(s, _)| *s == shape)
+                        });
+                        if !all_ok {
+                            remove.insert(param);
+                        }
+                    }
+                }
+
+                // 2. Prune Aliases whose source is no longer a matching candidate.
+                for (&v, &(shape, kind)) in &cands {
+                    if let CandKind::Alias(src) = kind {
+                        if !cands.get(&src).is_some_and(|(s, _)| *s == shape) {
+                            remove.insert(v);
+                        }
+                    }
+                }
+
+                // 3. Prune any candidate that has a disallowed use (and track Construct uses).
+                let mut construct_used: BTreeSet<ValueId> = BTreeSet::new();
+                for block in &self.func.blocks {
+                    for op in &block.ops {
+                        let uses = op.kind.uses();
+                        for u in uses {
+                            let Some(&(shape, kind)) = cands.get(&u) else {
+                                continue;
+                            };
+                            let allowed = match &op.kind {
+                                OpKind::Discriminant(base) if *base == u => {
+                                    !resolves_to_inline_construct(u, &cands)
+                                }
+                                OpKind::Field {
+                                    base,
+                                    variant,
+                                    field,
+                                } if *base == u => {
+                                    if resolves_to_inline_construct(u, &cands) {
+                                        false
+                                    } else {
+                                        let vi = variant.unwrap_or(0);
+                                        let res_zst = op
+                                            .result
+                                            .and_then(|r| self.func.ty(r))
+                                            .is_some_and(|t| self.table.is_zst(t));
+                                        (vi == shape.ok_variant
+                                            && (shape.ok_field.is_some_and(|(f, _)| f == *field)
+                                                || res_zst))
+                                            || (vi == shape.err_variant
+                                                && (shape
+                                                    .err_field
+                                                    .is_some_and(|(f, _)| f == *field)
+                                                    || res_zst))
+                                    }
+                                }
+                                OpKind::Move(src) | OpKind::Copy(src) if *src == u => {
+                                    let ok = op.result.is_some_and(|r| {
+                                        cands.get(&r).is_some_and(|(rs, _)| *rs == shape)
+                                    });
+                                    if ok && kind == CandKind::Construct {
+                                        construct_used.insert(u);
+                                    }
+                                    ok
+                                }
+                                OpKind::Drop {
+                                    root: Root::Value(r),
+                                    path,
+                                    glue: DropGlue::None,
+                                } if *r == u && path.is_empty() => true,
+                                _ => false,
+                            };
+                            if !allowed {
+                                remove.insert(u);
+                            }
+                        }
+                    }
+                    match &block.term {
+                        RTerm::Return(Some(u)) => {
+                            if let Some(&(shape, kind)) = cands.get(u) {
+                                if target_sentinel != Some(shape) {
+                                    remove.insert(*u);
+                                } else if kind == CandKind::Construct {
+                                    construct_used.insert(*u);
+                                }
+                            }
+                        }
+                        RTerm::Switch { scrut, .. } if cands.contains_key(scrut) => {
+                            remove.insert(*scrut);
+                        }
+                        RTerm::Throw(Some(u)) if cands.contains_key(u) => {
+                            remove.insert(*u);
+                        }
+                        _ => {}
+                    }
+                    for (target, args) in block.term.edges() {
+                        let target_params = block_index
+                            .get(&target)
+                            .map(|&bi| self.func.blocks[bi].params.as_slice());
+                        for (pos, arg) in args.iter().enumerate() {
+                            let Some(&(shape, kind)) = cands.get(arg) else {
+                                continue;
+                            };
+                            let ok = target != RBlockId(0)
+                                && target_params
+                                    .and_then(|ps| ps.get(pos))
+                                    .and_then(|p| cands.get(p))
+                                    .is_some_and(|(ps, _)| *ps == shape);
+                            if !ok {
+                                remove.insert(*arg);
+                            } else if kind == CandKind::Construct {
+                                construct_used.insert(*arg);
+                            }
+                        }
+                    }
+                }
+
+                // 4. Do not virtualize Construct values that never flow to a virtual Alias/Phi/Return.
+                for (&v, &(_, kind)) in &cands {
+                    if kind == CandKind::Construct && !construct_used.contains(&v) {
+                        remove.insert(v);
+                    }
+                }
+
+                if remove.is_empty() {
+                    break;
+                }
+                for v in remove {
+                    cands.remove(&v);
+                }
+            }
+
+            let mut out = BTreeMap::new();
+            for (v, (shape, kind)) in cands {
+                let rep = match kind {
+                    CandKind::Call => {
+                        let val_var = if self.is_inline(v) {
+                            self.alloc_temp()
+                        } else {
+                            self.name_of(v).expect("checked name").to_owned()
+                        };
+                        let err_var = shape.err_field.map(|_| self.alloc_temp());
+                        VirtualSentinelRep::Slot { val_var, err_var }
+                    }
+                    CandKind::Phi => {
+                        let val_var = self.name_of(v).expect("checked name").to_owned();
+                        let err_var = shape.err_field.map(|_| self.alloc_temp());
+                        VirtualSentinelRep::Slot { val_var, err_var }
+                    }
+                    CandKind::Construct => {
+                        if self.is_inline(v) {
+                            VirtualSentinelRep::InlineConstruct
+                        } else {
+                            let val_var = self.name_of(v).expect("checked name").to_owned();
+                            let err_var = shape.err_field.map(|_| self.alloc_temp());
+                            VirtualSentinelRep::Slot { val_var, err_var }
+                        }
+                    }
+                    CandKind::Alias(src) => {
+                        if self.is_inline(v) {
+                            VirtualSentinelRep::InlineAlias(src)
+                        } else {
+                            let val_var = self.name_of(v).expect("checked name").to_owned();
+                            let err_var = shape.err_field.map(|_| self.alloc_temp());
+                            VirtualSentinelRep::Slot { val_var, err_var }
+                        }
+                    }
+                };
+                out.insert(v, VirtualSentinel { shape, rep });
+            }
+            out
+        })
     }
 
     /// The hoisted temporaries allocated so far.

@@ -199,17 +199,33 @@ pub fn discriminant_literal(
     signed_literal(repr, descriptor.logical_discr)
 }
 
+/// The private module-scope sentinel expression (`$sn`) for [`EnumRepr::SentinelNiche`].
+pub fn sentinel_none_expr(table: &TypeTable) -> Option<Expr> {
+    table.sentinel_none().map(jsast::id)
+}
+
+/// The JavaScript expression standing for the `none_variant` of a niche enum (`null` for
+/// [`EnumRepr::NullNiche`], `$sn` for [`EnumRepr::SentinelNiche`]).
+pub fn niche_none_expr(table: &TypeTable, repr: EnumRepr) -> Option<Expr> {
+    match repr {
+        EnumRepr::NullNiche { .. } => Some(jsast::null()),
+        EnumRepr::SentinelNiche { .. } => sentinel_none_expr(table),
+        _ => None,
+    }
+}
+
 /// The tag of one variant: the value that distinguishes it from the enum's others
 /// (`value.rs:386-405`). `None` when `ty` is not an enum.
 pub fn variant_tag(table: &TypeTable, interns: &Interns, ty: TypeId, variant: u32) -> Option<Expr> {
     let peeled = table.peeled(ty);
-    Some(match table.enum_repr(peeled)? {
+    let repr = table.enum_repr(peeled)?;
+    Some(match repr {
         EnumRepr::State | EnumRepr::IntTag { .. } => jsast::num(variant as f64),
         EnumRepr::Number { .. } => discriminant_literal(table, peeled, variant, IntRepr::Number),
         EnumRepr::Tag { .. } => tag_literal(interns, table.variants(peeled).get(variant as usize)?),
-        EnumRepr::NullNiche { none_variant, .. } => {
+        EnumRepr::NullNiche { none_variant, .. } | EnumRepr::SentinelNiche { none_variant, .. } => {
             if variant == none_variant {
-                jsast::null()
+                niche_none_expr(table, repr)?
             } else {
                 return None;
             }
@@ -224,7 +240,8 @@ pub fn tag_expr(repr: EnumRepr, value: Expr) -> Expr {
         EnumRepr::Number { .. }
         | EnumRepr::Tag { fieldless: true }
         | EnumRepr::IntTag { fieldless: true }
-        | EnumRepr::NullNiche { .. } => value,
+        | EnumRepr::NullNiche { .. }
+        | EnumRepr::SentinelNiche { .. } => value,
         EnumRepr::Tag { fieldless: false }
         | EnumRepr::IntTag { fieldless: false }
         | EnumRepr::State => jsast::member(value, TAG),
@@ -486,13 +503,10 @@ pub fn discriminant_number(
     if repr == EnumRepr::State {
         return Some(tag_expr(repr, value));
     }
-    if let EnumRepr::NullNiche {
-        none_variant,
-        some_variant,
-    } = repr
-    {
+    if let Some((none_variant, some_variant, _)) = repr.niche_variants() {
+        let none_expr = niche_none_expr(table, repr)?;
         return Some(jsast::cond(
-            jsast::binary(BinOp::StrictEq, value, jsast::null()),
+            jsast::binary(BinOp::StrictEq, value, none_expr),
             discriminant_literal(table, peeled, none_variant, discr_repr),
             discriminant_literal(table, peeled, some_variant, discr_repr),
         ));
@@ -528,18 +542,41 @@ pub fn enum_value(
     interns: &Interns,
     ty: TypeId,
     variant: u32,
-    fields: Vec<(String, Expr)>,
+    mut fields: Vec<(String, Expr)>,
 ) -> Option<Expr> {
     let peeled = table.peeled(ty);
-    Some(match table.enum_repr(peeled)? {
-        EnumRepr::NullNiche {
-            none_variant,
-            some_variant,
-        } => {
+    let repr = table.enum_repr(peeled)?;
+    Some(match repr {
+        EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. } => {
+            let (none_variant, some_variant, some_field) = repr.niche_variants()?;
             if variant == none_variant {
-                jsast::null()
+                niche_none_expr(table, repr)?
             } else if variant == some_variant {
-                fields.into_iter().next().map(|(_, v)| v)?
+                let target_field = table
+                    .variants(peeled)
+                    .get(some_variant as usize)
+                    .and_then(|v| v.fields.get(some_field as usize));
+                if let Some(field_desc) = target_field {
+                    if let Some(target_key) = field_key_name(interns, field_desc.key) {
+                        if let Some(pos) = fields.iter().position(|(k, _)| k == &target_key) {
+                            return Some(fields.swap_remove(pos).1);
+                        }
+                    }
+                    if let FieldKey::Index(idx) = field_desc.key {
+                        let alt = format!("_{idx}");
+                        if let Some(pos) = fields.iter().position(|(k, _)| k == &alt) {
+                            return Some(fields.swap_remove(pos).1);
+                        }
+                    }
+                }
+                if fields.len() == 1 {
+                    fields.pop().map(|(_, v)| v)?
+                } else {
+                    fields
+                        .into_iter()
+                        .nth(some_field as usize)
+                        .map(|(_, v)| v)?
+                }
             } else {
                 return None;
             }
@@ -767,22 +804,26 @@ pub fn clone_expr_with(
             variants,
             ..
         } => {
-            if let Some(EnumRepr::NullNiche { some_variant, .. }) = descriptor.js.enum_repr {
-                if let Some(payload_ty) = variants
-                    .get(some_variant as usize)
-                    .and_then(|v| v.fields.first())
-                    .map(|f| f.ty)
-                {
-                    if !table.needs_clone(payload_ty) {
-                        return value;
+            if let Some(repr) = descriptor.js.enum_repr {
+                if let Some((_, some_variant, some_field)) = repr.niche_variants() {
+                    if let Some(payload_ty) = variants
+                        .get(some_variant as usize)
+                        .and_then(|v| v.fields.get(some_field as usize))
+                        .map(|f| f.ty)
+                    {
+                        if !table.needs_clone(payload_ty) {
+                            return value;
+                        }
+                        if let Some(none_expr) = niche_none_expr(table, repr) {
+                            return clone_once(value, "$co", |v| {
+                                jsast::cond(
+                                    jsast::binary(BinOp::StrictNe, v.clone(), none_expr.clone()),
+                                    clone_expr_with(table, interns, payload_ty, v, nested_clone),
+                                    none_expr,
+                                )
+                            });
+                        }
                     }
-                    return clone_once(value, "$co", |v| {
-                        jsast::cond(
-                            jsast::binary(BinOp::StrictNe, v.clone(), jsast::null()),
-                            clone_expr_with(table, interns, payload_ty, v, nested_clone),
-                            jsast::null(),
-                        )
-                    });
                 }
             }
             clone_enum(table, interns, peeled, variants, value, nested_clone)

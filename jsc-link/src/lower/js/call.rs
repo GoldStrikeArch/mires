@@ -246,7 +246,8 @@ impl JsCx<'_> {
         // Phase 5 fast `core::str` comparison/search hooks (`ReleaseSpeed`).
         if let CallSemantic::Standard(operation) = semantic {
             if operation.is_fast_str_op()
-                && crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed)
+                && (self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+                    || crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed))
             {
                 if let Some(lowered) = self.lower_fast_str_call(op, *operation, args)? {
                     return Ok(lowered);
@@ -299,7 +300,10 @@ impl JsCx<'_> {
         // `js-str=bytes`: a `str` method with a producer-tagged identity is the JavaScript string
         // operation it is on a byte string (`lower/bstr.rs`).
         if let CallSemantic::Standard(operation) = semantic {
-            if operation.is_str() && crate::lower::bstr::enabled() {
+            if operation.is_str()
+                && (crate::lower::bstr::enabled()
+                    || self.opts.str_repr == crate::opts::StrRepr::Bytes)
+            {
                 if let Some(lowered) =
                     self.lower_str_call(op, *operation, callee, args, *track_caller)?
                 {
@@ -319,6 +323,22 @@ impl JsCx<'_> {
             // `drop_in_place::<T>` for a `T` with empty glue: the arguments are place reads with
             // no effect, so the whole call is nothing.
             return Ok(Lowered::Done(Vec::new()));
+        }
+
+        // Phase 2C: Native ByteStr `core::slice::<impl [u8]>::{starts_with,ends_with}` and inline
+        // `core::slice::<impl [T]>::{reverse,revswap}` under `ReleaseSpeed`.
+        if (self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+            || crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed))
+            && track_caller.is_none()
+        {
+            if crate::lower::bstr::enabled() || self.opts.str_repr == crate::opts::StrRepr::Bytes {
+                if let Some(lowered) = self.lower_bstr_slice_search(op, callee, args)? {
+                    return Ok(lowered);
+                }
+            }
+            if let Some(lowered) = self.lower_slice_reverse(op, callee, args)? {
+                return Ok(lowered);
+            }
         }
 
         let physical = match (callee, self.abi) {
@@ -778,8 +798,15 @@ impl JsCx<'_> {
             }
             if is_char(value)? {
                 return Ok(Some(match self.expr_of(value)? {
-                    Expr::Num(point) if (0.0..128.0).contains(&point) => {
-                        jsast::string(char::from(point as u8).to_string())
+                    Expr::Num(point)
+                        if point.fract() == 0.0 && (0.0..=0x10_FFFF as f64).contains(&point) =>
+                    {
+                        if let Some(ch) = char::from_u32(point as u32) {
+                            let mut buf = [0u8; 4];
+                            jsast::string(crate::lower::bstr::byte_string(ch.encode_utf8(&mut buf)))
+                        } else {
+                            hold(crate::lower::bstr::char_text(Expr::Num(point)), prelude)
+                        }
                     }
                     point => hold(crate::lower::bstr::char_text(point), prelude),
                 }));
@@ -804,7 +831,15 @@ impl JsCx<'_> {
             // A byte string is ASCII when every code unit is; `core`'s word-at-a-time scan would
             // first build the string's byte array and then read it through scalar views.
             (StandardOperation::StrIsAscii, [s]) if is_str(*s)? => {
-                jsast::rt_call("_bstr_is_ascii", vec![string(*s, &mut prelude, &mut hold)?])
+                let expr = self.expr_of(*s)?;
+                if self.is_known_ascii(*s) {
+                    if !jsast::is_droppable(&expr) {
+                        prelude.push(jsast::expr_stmt(expr));
+                    }
+                    Expr::Bool(true)
+                } else {
+                    jsast::rt_call("_bstr_is_ascii", vec![hold(expr, &mut prelude)])
+                }
             }
             // The same answer one byte at a time over a `{ buf, off, len }` slice (or directly
             // over a `js-str=bytes` byte-string view).
@@ -815,18 +850,29 @@ impl JsCx<'_> {
                 ) =>
             {
                 if let Some(bv) = self.byte_view(*bytes) {
-                    match bv.mode {
-                        super::ByteViewMode::FullSlice => {
-                            jsast::rt_call("_bstr_is_ascii", vec![self.expr_of(*bytes)?])
+                    if matches!(
+                        bv.mode,
+                        super::ByteViewMode::FullSlice | super::ByteViewMode::VarSlice
+                    ) && bv.base_str.is_some_and(|b| self.is_known_ascii(b))
+                    {
+                        let expr = self.expr_of(*bytes)?;
+                        if !jsast::is_droppable(&expr) {
+                            prelude.push(jsast::expr_stmt(expr));
                         }
-                        super::ByteViewMode::VarSlice => {
-                            let base = self.byte_view_base_expr(bv, *bytes)?;
-                            let off = self.byte_view_off_expr(*bytes)?;
-                            let len = self.byte_view_len_expr(*bytes)?;
-                            jsast::rt_call("_bstr_is_ascii_range", vec![base, off, len])
-                        }
-                        super::ByteViewMode::ThinPtr => {
-                            jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+                        Expr::Bool(true)
+                    } else {
+                        match bv.mode {
+                            super::ByteViewMode::FullSlice => {
+                                jsast::rt_call("_bstr_is_ascii", vec![self.expr_of(*bytes)?])
+                            }
+                            super::ByteViewMode::VarSlice => {
+                                let (base, off, len) =
+                                    self.extract_byte_view_var_slice(bv, *bytes, &mut prelude)?;
+                                jsast::rt_call("_bstr_is_ascii_range", vec![base, off, len])
+                            }
+                            super::ByteViewMode::ThinPtr => {
+                                jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+                            }
                         }
                     }
                 } else {
@@ -834,9 +880,33 @@ impl JsCx<'_> {
                 }
             }
             (StandardOperation::StrIsCharBoundary, [s, index]) if is_str(*s)? => {
-                let s = string(*s, &mut prelude, &mut hold)?;
-                let index = hold(self.expr_of(*index)?, &mut prelude);
-                jsast::rt_call("bstr_boundary", vec![s, index])
+                let s_expr = string(*s, &mut prelude, &mut hold)?;
+                let index_expr = hold(self.expr_of(*index)?, &mut prelude);
+                if self.is_known_ascii(*s) {
+                    let is_u32 = matches!(
+                        value::kind(table, table.peeled(self.ty_of(*index)?)),
+                        Some(rcgjs_object::jir::types::TypeKind::Integer {
+                            signed: false,
+                            bits: ..=32
+                        })
+                    );
+                    let le_len = jsast::binary(
+                        jsast::BinOp::Le,
+                        index_expr.clone(),
+                        jsast::member(s_expr, "length"),
+                    );
+                    if is_u32 {
+                        le_len
+                    } else {
+                        jsast::binary(
+                            jsast::BinOp::And,
+                            jsast::binary(jsast::BinOp::Ge, index_expr, jsast::num(0)),
+                            le_len,
+                        )
+                    }
+                } else {
+                    jsast::rt_call("bstr_boundary", vec![s_expr, index_expr])
+                }
             }
             (
                 StandardOperation::StrStartsWith
@@ -861,6 +931,45 @@ impl JsCx<'_> {
                 let Some(pattern) = needle(*pattern, &mut prelude, &mut hold)? else {
                     return Ok(None);
                 };
+                if matches!(
+                    operation,
+                    StandardOperation::StrStartsWith
+                        | StandardOperation::StrEndsWith
+                        | StandardOperation::StrContains
+                ) {
+                    if let Expr::Str(ref lit) = pattern {
+                        if lit.is_empty() {
+                            if !jsast::is_droppable(&s) {
+                                prelude.push(jsast::expr_stmt(s));
+                            }
+                            return Ok(Some(Lowered::Value(prelude, Expr::Bool(true))));
+                        }
+                        if matches!(
+                            operation,
+                            StandardOperation::StrStartsWith | StandardOperation::StrEndsWith
+                        ) && lit.encode_utf16().count() == 1
+                        {
+                            let code = f64::from(lit.encode_utf16().next().unwrap());
+                            let idx = if matches!(operation, StandardOperation::StrStartsWith) {
+                                jsast::num(0)
+                            } else {
+                                jsast::binary(
+                                    jsast::BinOp::Sub,
+                                    jsast::member(s.clone(), "length"),
+                                    jsast::num(1),
+                                )
+                            };
+                            return Ok(Some(Lowered::Value(
+                                prelude,
+                                jsast::binary(
+                                    jsast::BinOp::StrictEq,
+                                    jsast::method_call(s, "charCodeAt", vec![idx]),
+                                    jsast::num(code),
+                                ),
+                            )));
+                        }
+                    }
+                }
                 let method = match operation {
                     StandardOperation::StrStartsWith => "startsWith",
                     StandardOperation::StrEndsWith => "endsWith",
@@ -987,6 +1096,7 @@ impl JsCx<'_> {
                     return Ok(None);
                 };
                 let ty = self.ty_of(result)?;
+                let s_known_ascii = self.is_known_ascii(*s);
                 let s = string(*s, &mut prelude, &mut hold)?;
                 let Some(shape) = self.decompose_str_range(*range, &mut prelude, &mut hold)? else {
                     return Ok(None);
@@ -995,6 +1105,71 @@ impl JsCx<'_> {
                 else {
                     return Ok(None);
                 };
+                if s_known_ascii {
+                    let (cond, sub) = match shape {
+                        StrRange::Full => {
+                            let Some(some_val) = value::enum_value(
+                                table,
+                                self.interns,
+                                ty,
+                                some.0,
+                                vec![(some.1, s)],
+                            ) else {
+                                return Ok(None);
+                            };
+                            return Ok(Some(Lowered::Value(prelude, some_val)));
+                        }
+                        StrRange::From { start, .. } => (
+                            jsast::binary(
+                                jsast::BinOp::And,
+                                jsast::binary(jsast::BinOp::Ge, start.clone(), jsast::num(0)),
+                                jsast::binary(
+                                    jsast::BinOp::Le,
+                                    start.clone(),
+                                    jsast::member(s.clone(), "length"),
+                                ),
+                            ),
+                            jsast::method_call(s, "slice", vec![start]),
+                        ),
+                        StrRange::To { end, .. } => (
+                            jsast::binary(
+                                jsast::BinOp::And,
+                                jsast::binary(jsast::BinOp::Ge, end.clone(), jsast::num(0)),
+                                jsast::binary(
+                                    jsast::BinOp::Le,
+                                    end.clone(),
+                                    jsast::member(s.clone(), "length"),
+                                ),
+                            ),
+                            jsast::method_call(s, "slice", vec![jsast::num(0), end]),
+                        ),
+                        StrRange::Bounds { start, end, .. } => (
+                            jsast::binary(
+                                jsast::BinOp::And,
+                                jsast::binary(
+                                    jsast::BinOp::And,
+                                    jsast::binary(jsast::BinOp::Ge, start.clone(), jsast::num(0)),
+                                    jsast::binary(jsast::BinOp::Le, start.clone(), end.clone()),
+                                ),
+                                jsast::binary(
+                                    jsast::BinOp::Le,
+                                    end.clone(),
+                                    jsast::member(s.clone(), "length"),
+                                ),
+                            ),
+                            jsast::method_call(s, "slice", vec![start, end]),
+                        ),
+                    };
+                    let Some(some_val) =
+                        value::enum_value(table, self.interns, ty, some.0, vec![(some.1, sub)])
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(Lowered::Value(
+                        prelude,
+                        jsast::cond(cond, some_val, none_val),
+                    )));
+                }
                 let got = match shape {
                     StrRange::Full => {
                         let Some(some_val) =
@@ -1706,12 +1881,22 @@ impl JsCx<'_> {
                     return Ok(None);
                 };
                 let s = self.expr_of(*s_v)?;
-                let helper = if operation == StandardOperation::StrToLowercase {
-                    "bstr_to_lowercase"
+                let converted = if self.is_known_ascii(*s_v) {
+                    let method = if operation == StandardOperation::StrToLowercase {
+                        "toLowerCase"
+                    } else {
+                        "toUpperCase"
+                    };
+                    jsast::method_call(s, method, Vec::new())
                 } else {
-                    "bstr_to_uppercase"
+                    let helper = if operation == StandardOperation::StrToLowercase {
+                        "bstr_to_lowercase"
+                    } else {
+                        "bstr_to_uppercase"
+                    };
+                    jsast::rt_call(helper, vec![s])
                 };
-                let (bind, t) = self.temp(jsast::rt_call(helper, vec![s]));
+                let (bind, t) = self.temp(converted);
                 let obj =
                     jsast::object_of(vec![("s", t.clone()), ("cap", jsast::member(t, "length"))]);
                 Ok(Some(Lowered::Value(vec![bind], obj)))
@@ -2817,7 +3002,8 @@ impl JsCx<'_> {
         operation: StandardOperation,
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
-        let is_bstr = crate::lower::bstr::enabled();
+        let is_bstr =
+            crate::lower::bstr::enabled() || self.opts.str_repr == crate::opts::StrRepr::Bytes;
         match operation {
             StandardOperation::BstrEq => {
                 let [a_v, b_v] = args else {
@@ -2867,6 +3053,23 @@ impl JsCx<'_> {
                 };
                 let h = self.expr_of(*h_v)?;
                 let n = self.expr_of(*n_v)?;
+                if let Expr::Str(ref lit) = n {
+                    if lit.is_empty() {
+                        let mut prelude = Vec::new();
+                        if !jsast::is_droppable(&h) {
+                            prelude.push(jsast::expr_stmt(h));
+                        }
+                        return Ok(Some(Lowered::Value(prelude, Expr::Bool(true))));
+                    }
+                    if lit.encode_utf16().count() == 1 {
+                        let code = f64::from(lit.encode_utf16().next().unwrap());
+                        return Ok(Some(Lowered::value(jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            jsast::method_call(h, "charCodeAt", vec![jsast::num(0)]),
+                            jsast::num(code),
+                        ))));
+                    }
+                }
                 Ok(Some(Lowered::value(jsast::method_call(
                     h,
                     "startsWith",
@@ -2879,6 +3082,39 @@ impl JsCx<'_> {
                 };
                 let h = self.expr_of(*h_v)?;
                 let n = self.expr_of(*n_v)?;
+                if let Expr::Str(ref lit) = n {
+                    if lit.is_empty() {
+                        let mut prelude = Vec::new();
+                        if !jsast::is_droppable(&h) {
+                            prelude.push(jsast::expr_stmt(h));
+                        }
+                        return Ok(Some(Lowered::Value(prelude, Expr::Bool(true))));
+                    }
+                    if lit.encode_utf16().count() == 1 {
+                        let code = f64::from(lit.encode_utf16().next().unwrap());
+                        let mut prelude = Vec::new();
+                        let h = if matches!(h, Expr::Ident(_) | Expr::Str(_)) {
+                            h
+                        } else {
+                            let (bind, id) = self.temp(h);
+                            prelude.push(bind);
+                            id
+                        };
+                        let last = jsast::binary(
+                            jsast::BinOp::Sub,
+                            jsast::member(h.clone(), "length"),
+                            jsast::num(1),
+                        );
+                        return Ok(Some(Lowered::Value(
+                            prelude,
+                            jsast::binary(
+                                jsast::BinOp::StrictEq,
+                                jsast::method_call(h, "charCodeAt", vec![last]),
+                                jsast::num(code),
+                            ),
+                        )));
+                    }
+                }
                 Ok(Some(Lowered::value(jsast::method_call(
                     h,
                     "endsWith",
@@ -2891,6 +3127,15 @@ impl JsCx<'_> {
                 };
                 let h = self.expr_of(*h_v)?;
                 let n = self.expr_of(*n_v)?;
+                if let Expr::Str(ref lit) = n {
+                    if lit.is_empty() {
+                        let mut prelude = Vec::new();
+                        if !jsast::is_droppable(&h) {
+                            prelude.push(jsast::expr_stmt(h));
+                        }
+                        return Ok(Some(Lowered::Value(prelude, Expr::Bool(true))));
+                    }
+                }
                 Ok(Some(Lowered::value(jsast::method_call(
                     h,
                     "includes",
@@ -2910,6 +3155,95 @@ impl JsCx<'_> {
                 let s = self.expr_of(*s_v)?;
                 let e = self.expr_of(*e_v)?;
                 let n = self.expr_of(*n_v)?;
+                let const_pat: Option<(Expr, usize)> = match operation {
+                    StandardOperation::BstrFindChar | StandardOperation::BstrRfindChar => {
+                        match &n {
+                            Expr::Num(point)
+                                if point.fract() == 0.0
+                                    && (0.0..=0x10_FFFF as f64).contains(point) =>
+                            {
+                                char::from_u32(*point as u32).map(|ch| {
+                                    let mut buf = [0u8; 4];
+                                    let utf8 = ch.encode_utf8(&mut buf);
+                                    (
+                                        jsast::string(crate::lower::bstr::byte_string(utf8)),
+                                        utf8.len(),
+                                    )
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
+                    StandardOperation::BstrFindStr | StandardOperation::BstrRfindStr => match &n {
+                        Expr::Str(lit) => Some((n.clone(), lit.chars().count())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((pat, plen)) = const_pat {
+                    let mut prelude = Vec::new();
+                    if plen == 0 {
+                        for expr in [h, s, e] {
+                            if !jsast::is_droppable(&expr) {
+                                prelude.push(jsast::expr_stmt(expr));
+                            }
+                        }
+                        return Ok(Some(Lowered::Value(prelude, jsast::num(4_294_967_295.0))));
+                    }
+                    let hold = |expr: Expr, prelude: &mut Vec<Stmt>| -> Expr {
+                        if matches!(expr, Expr::Ident(_) | Expr::Str(_) | Expr::Num(_)) {
+                            expr
+                        } else {
+                            let (bind, id) = self.temp(expr);
+                            prelude.push(bind);
+                            id
+                        }
+                    };
+                    let h = hold(h, &mut prelude);
+                    let s = hold(s, &mut prelude);
+                    let e = hold(e, &mut prelude);
+                    let is_forward = matches!(
+                        operation,
+                        StandardOperation::BstrFindChar | StandardOperation::BstrFindStr
+                    );
+                    if is_forward {
+                        let search_args = if matches!(s, Expr::Num(v) if v == 0.0) {
+                            vec![pat]
+                        } else {
+                            vec![pat, s]
+                        };
+                        let (bi, i) = self.temp(jsast::method_call(h, "indexOf", search_args));
+                        prelude.push(bi);
+                        let end_pos =
+                            jsast::binary(jsast::BinOp::Add, i.clone(), jsast::num(plen as f64));
+                        let cond = jsast::binary(
+                            jsast::BinOp::And,
+                            jsast::binary(jsast::BinOp::StrictNe, i.clone(), jsast::num(-1.0)),
+                            jsast::binary(jsast::BinOp::Le, end_pos, e),
+                        );
+                        return Ok(Some(Lowered::Value(
+                            prelude,
+                            jsast::cond(cond, i, jsast::num(4_294_967_295.0)),
+                        )));
+                    }
+                    let (blim, lim) =
+                        self.temp(jsast::binary(jsast::BinOp::Sub, e, jsast::num(plen as f64)));
+                    prelude.push(blim);
+                    let (bi, i) = self.temp(jsast::cond(
+                        jsast::binary(jsast::BinOp::Lt, lim.clone(), s.clone()),
+                        jsast::num(-1.0),
+                        jsast::method_call(h, "lastIndexOf", vec![pat, lim]),
+                    ));
+                    prelude.push(bi);
+                    return Ok(Some(Lowered::Value(
+                        prelude,
+                        jsast::cond(
+                            jsast::binary(jsast::BinOp::Ge, i.clone(), s),
+                            i,
+                            jsast::num(4_294_967_295.0),
+                        ),
+                    )));
+                }
                 let helper = match operation {
                     StandardOperation::BstrFindChar => "bstr_find_char",
                     StandardOperation::BstrRfindChar => "bstr_rfind_char",
@@ -2924,6 +3258,591 @@ impl JsCx<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Extracts `(base, off, len)` for a `VarSlice` byte-view while evaluating non-atomic
+    /// expressions at most once.
+    fn extract_byte_view_var_slice(
+        &self,
+        bv: super::ByteView,
+        v: ValueId,
+        prelude: &mut Vec<Stmt>,
+    ) -> Res<(Expr, Expr, Expr)> {
+        let mut hold = |expr: Expr| -> Expr {
+            if matches!(expr, Expr::Ident(_) | Expr::Str(_) | Expr::Num(_)) {
+                expr
+            } else {
+                let (bind, id) = self.temp(expr);
+                prelude.push(bind);
+                id
+            }
+        };
+        if bv.base_str.is_none() && bv.base_cell.is_none() {
+            let expr = self.expr_of(v)?;
+            if let Expr::Object(ref entries) = expr {
+                let field = |k: &str| {
+                    entries
+                        .iter()
+                        .find(|(ek, _)| ek == k)
+                        .map(|(_, ev)| ev.clone())
+                };
+                if let (Some(b), Some(o), Some(l)) = (field("buf"), field("off"), field("len")) {
+                    let b = hold(b);
+                    let o = hold(o);
+                    let l = hold(l);
+                    return Ok((b, o, l));
+                }
+            }
+            let held = hold(expr);
+            let b = hold(jsast::member(held.clone(), "buf"));
+            let o = hold(jsast::member(held.clone(), "off"));
+            let l = hold(jsast::member(held, "len"));
+            return Ok((b, o, l));
+        }
+        let base = hold(self.byte_view_base_expr(bv, v)?);
+        let off = hold(self.byte_view_off_expr(v)?);
+        let len = hold(self.byte_view_len_expr(v)?);
+        Ok((base, off, len))
+    }
+
+    /// Extracts constant raw bytes when `v` is defined purely by a constant `&[u8]` / `&[u8; N]`
+    /// / `&str` literal without side effects.
+    fn const_byte_slice(&self, mut v: ValueId) -> Option<Vec<u8>> {
+        use rcgjs_object::jir::semantic::{CastKind, ConstTree};
+        for _ in 0..8 {
+            let def = self.def_of(v)?;
+            match &def.kind {
+                OpKind::Copy(src)
+                | OpKind::Move(src)
+                | OpKind::Cast {
+                    kind:
+                        CastKind::PointerCoercion
+                        | CastKind::PtrToPtr
+                        | CastKind::Transmute
+                        | CastKind::Subtype,
+                    v: src,
+                    ..
+                } => v = *src,
+                OpKind::BorrowView {
+                    root: Root::Value(src),
+                    path,
+                    ..
+                } if path.is_empty() => v = *src,
+                OpKind::Const(tree) => {
+                    fn decode(
+                        interns: &rcgjs_object::jir::interns::Interns,
+                        tree: &ConstTree,
+                    ) -> Option<Vec<u8>> {
+                        match tree {
+                            ConstTree::Reference(inner) => decode(interns, inner),
+                            ConstTree::Slice(items) | ConstTree::Aggregate(items) => {
+                                let mut out = Vec::with_capacity(items.len());
+                                for item in items {
+                                    let ConstTree::Scalar { bits, bytes: 1 } = item else {
+                                        return None;
+                                    };
+                                    out.push(u8::try_from(*bits).ok()?);
+                                }
+                                Some(out)
+                            }
+                            ConstTree::SliceAddress { length: 0, .. } => Some(Vec::new()),
+                            ConstTree::Str(id) => Some(interns.str(*id)?.as_bytes().to_vec()),
+                            _ => None,
+                        }
+                    }
+                    return decode(self.interns, tree);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Phase 2C: Lowers authenticated `core::slice::<impl [u8]>::{starts_with,ends_with}` over
+    /// `ByteStr` (`js-str=bytes`) views directly to JS `charCodeAt` / `startsWith` / `endsWith`.
+    fn lower_bstr_slice_search(
+        &self,
+        op: &Op,
+        callee: &Callee,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let Callee::Direct { item, .. } = callee else {
+            return Ok(None);
+        };
+        let Some(ascii) = self.ascii() else {
+            return Ok(None);
+        };
+        let is_starts = ascii.is_slice_starts_with(*item);
+        let is_ends = !is_starts && ascii.is_slice_ends_with(*item);
+        if !is_starts && !is_ends {
+            return Ok(None);
+        }
+        let [h_v, n_v] = args else {
+            return Ok(None);
+        };
+        let Some(res) = op.result else {
+            return Ok(None);
+        };
+        if !matches!(
+            value::kind(self.table, self.table.peeled(self.ty_of(res)?)),
+            Some(rcgjs_object::jir::types::TypeKind::Bool)
+        ) {
+            return Ok(None);
+        }
+        let Some(hbv) = self.byte_view(*h_v) else {
+            return Ok(None);
+        };
+        let nbv = self.byte_view(*n_v);
+        self.lower_bstr_slice_search_views(is_starts, *h_v, hbv, *n_v, nbv)
+    }
+
+    fn lower_bstr_slice_search_views(
+        &self,
+        is_starts: bool,
+        h_v: ValueId,
+        hbv: super::ByteView,
+        n_v: ValueId,
+        nbv: Option<super::ByteView>,
+    ) -> Res<Option<Lowered>> {
+        if !matches!(
+            hbv.mode,
+            super::ByteViewMode::FullSlice | super::ByteViewMode::VarSlice
+        ) {
+            return Ok(None);
+        }
+        let mut prelude = Vec::new();
+        let hold = |expr: Expr, prelude: &mut Vec<Stmt>| -> Expr {
+            if matches!(expr, Expr::Ident(_) | Expr::Str(_) | Expr::Num(_)) {
+                expr
+            } else {
+                let (bind, id) = self.temp(expr);
+                prelude.push(bind);
+                id
+            }
+        };
+
+        // Case 1: Constant `&[u8]` needle literal (`b"..."`, `&[b';']`, etc.).
+        if let Some(bytes) = self.const_byte_slice(n_v) {
+            let nlen = bytes.len();
+            if nlen == 0 {
+                let h_expr = self.expr_of(h_v)?;
+                if !jsast::is_droppable(&h_expr) {
+                    prelude.push(jsast::expr_stmt(h_expr));
+                }
+                return Ok(Some(Lowered::Value(prelude, Expr::Bool(true))));
+            }
+            let pat_str: String = bytes.iter().copied().map(char::from).collect();
+            let pat = jsast::string(pat_str);
+            let expr = match hbv.mode {
+                super::ByteViewMode::FullSlice => {
+                    let h = hold(self.expr_of(h_v)?, &mut prelude);
+                    if nlen == 1 {
+                        let code = f64::from(bytes[0]);
+                        let idx = if is_starts {
+                            jsast::num(0)
+                        } else {
+                            jsast::binary(
+                                jsast::BinOp::Sub,
+                                jsast::member(h.clone(), "length"),
+                                jsast::num(1),
+                            )
+                        };
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            jsast::method_call(h, "charCodeAt", vec![idx]),
+                            jsast::num(code),
+                        )
+                    } else if is_starts {
+                        jsast::method_call(h, "startsWith", vec![pat])
+                    } else {
+                        jsast::method_call(h, "endsWith", vec![pat])
+                    }
+                }
+                super::ByteViewMode::VarSlice => {
+                    let (base, off, len) =
+                        self.extract_byte_view_var_slice(hbv, h_v, &mut prelude)?;
+                    if nlen == 1 {
+                        let code = f64::from(bytes[0]);
+                        let idx = if is_starts {
+                            off
+                        } else {
+                            jsast::binary(
+                                jsast::BinOp::Sub,
+                                jsast::binary(jsast::BinOp::Add, off, len.clone()),
+                                jsast::num(1),
+                            )
+                        };
+                        jsast::binary(
+                            jsast::BinOp::And,
+                            jsast::binary(jsast::BinOp::Gt, len, jsast::num(0)),
+                            jsast::binary(
+                                jsast::BinOp::StrictEq,
+                                jsast::method_call(base, "charCodeAt", vec![idx]),
+                                jsast::num(code),
+                            ),
+                        )
+                    } else if is_starts {
+                        jsast::binary(
+                            jsast::BinOp::And,
+                            jsast::binary(jsast::BinOp::Ge, len, jsast::num(nlen as f64)),
+                            jsast::method_call(base, "startsWith", vec![pat, off]),
+                        )
+                    } else {
+                        let end = jsast::binary(jsast::BinOp::Add, off, len.clone());
+                        jsast::binary(
+                            jsast::BinOp::And,
+                            jsast::binary(jsast::BinOp::Ge, len, jsast::num(nlen as f64)),
+                            jsast::method_call(base, "endsWith", vec![pat, end]),
+                        )
+                    }
+                }
+                super::ByteViewMode::ThinPtr => unreachable!(),
+            };
+            return Ok(Some(Lowered::Value(prelude, expr)));
+        }
+
+        // Case 2: Dynamic `ByteView` needle (`FullSlice` or `VarSlice`).
+        let Some(nbv) = nbv else {
+            return Ok(None);
+        };
+        if !matches!(
+            nbv.mode,
+            super::ByteViewMode::FullSlice | super::ByteViewMode::VarSlice
+        ) {
+            return Ok(None);
+        }
+        let expr = match (hbv.mode, nbv.mode) {
+            (super::ByteViewMode::FullSlice, super::ByteViewMode::FullSlice) => {
+                let h = hold(self.expr_of(h_v)?, &mut prelude);
+                let n = hold(self.expr_of(n_v)?, &mut prelude);
+                let method = if is_starts { "startsWith" } else { "endsWith" };
+                jsast::method_call(h, method, vec![n])
+            }
+            (super::ByteViewMode::FullSlice, super::ByteViewMode::VarSlice) => {
+                let h = hold(self.expr_of(h_v)?, &mut prelude);
+                let (nb, no, nl) = self.extract_byte_view_var_slice(nbv, n_v, &mut prelude)?;
+                let nsub = jsast::method_call(
+                    nb,
+                    "slice",
+                    vec![no.clone(), jsast::binary(jsast::BinOp::Add, no, nl.clone())],
+                );
+                let method = if is_starts { "startsWith" } else { "endsWith" };
+                jsast::binary(
+                    jsast::BinOp::And,
+                    jsast::binary(jsast::BinOp::Ge, jsast::member(h.clone(), "length"), nl),
+                    jsast::method_call(h, method, vec![nsub]),
+                )
+            }
+            (super::ByteViewMode::VarSlice, super::ByteViewMode::FullSlice) => {
+                let (hb, ho, hl) = self.extract_byte_view_var_slice(hbv, h_v, &mut prelude)?;
+                let n = hold(self.expr_of(n_v)?, &mut prelude);
+                let check = if is_starts {
+                    jsast::method_call(hb, "startsWith", vec![n.clone(), ho])
+                } else {
+                    jsast::method_call(
+                        hb,
+                        "endsWith",
+                        vec![n.clone(), jsast::binary(jsast::BinOp::Add, ho, hl.clone())],
+                    )
+                };
+                jsast::binary(
+                    jsast::BinOp::And,
+                    jsast::binary(jsast::BinOp::Ge, hl, jsast::member(n, "length")),
+                    check,
+                )
+            }
+            (super::ByteViewMode::VarSlice, super::ByteViewMode::VarSlice) => {
+                let (hb, ho, hl) = self.extract_byte_view_var_slice(hbv, h_v, &mut prelude)?;
+                let (nb, no, nl) = self.extract_byte_view_var_slice(nbv, n_v, &mut prelude)?;
+                let nsub = jsast::method_call(
+                    nb,
+                    "slice",
+                    vec![no.clone(), jsast::binary(jsast::BinOp::Add, no, nl.clone())],
+                );
+                let check = if is_starts {
+                    jsast::method_call(hb, "startsWith", vec![nsub, ho])
+                } else {
+                    jsast::method_call(
+                        hb,
+                        "endsWith",
+                        vec![nsub, jsast::binary(jsast::BinOp::Add, ho, hl.clone())],
+                    )
+                };
+                jsast::binary(
+                    jsast::BinOp::And,
+                    jsast::binary(jsast::BinOp::Ge, hl, nl),
+                    check,
+                )
+            }
+            _ => unreachable!(),
+        };
+        Ok(Some(Lowered::Value(prelude, expr)))
+    }
+
+    /// Phase 2C: Lowers authenticated `core::slice::<impl [T]>::reverse` and
+    /// `core::slice::reverse::revswap` to a tight inline two-pointer swap loop when element moves
+    /// cannot observe `_boxes` tracking or raw byte views.
+    fn lower_slice_reverse(
+        &self,
+        op: &Op,
+        callee: &Callee,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        use rcgjs_object::jir::types::TypeKind;
+        let Callee::Direct { item, link_name } = callee else {
+            return Ok(None);
+        };
+        let (is_reverse, is_revswap) = if let Some(ascii) = self.ascii() {
+            (ascii.is_slice_reverse(*item), ascii.is_slice_revswap(*item))
+        } else {
+            let core_ok = self.items.get(item).is_some_and(|e| e.is_core);
+            let name = self.interns.str(*link_name).unwrap_or("");
+            (
+                core_ok && is_core_slice_reverse_link_name(name),
+                core_ok && is_core_slice_revswap_link_name(name),
+            )
+        };
+        if !is_reverse && !is_revswap {
+            return Ok(None);
+        }
+        if op
+            .result
+            .is_some_and(|r| self.ty_of(r).ok().is_none_or(|t| !self.table.is_zst(t)))
+        {
+            return Ok(None);
+        }
+
+        let table = self.table;
+        let check_elem = |elem_ty: rcgjs_object::jir::types::TypeId| -> Option<bool> {
+            let desc = table.get(elem_ty)?;
+            if !desc.layout.sized {
+                return None;
+            }
+            if desc.layout.zst {
+                return Some(true);
+            }
+            let peeled = table.peeled(elem_ty);
+            if self.byte_views.raw_byte_derefs
+                || !self.byte_views.elide_scale_scalar
+                || !value::is_slot_pointee(table, peeled)
+                || matches!(value::kind(table, peeled), Some(TypeKind::Array { .. }))
+            {
+                return None;
+            }
+            if table.is_indirect(peeled) && !self.can_inline_copy_one(elem_ty) {
+                return None;
+            }
+            Some(false)
+        };
+
+        if is_reverse {
+            let [slice_v] = args else {
+                return Ok(None);
+            };
+            let slice_ty = table.peeled(self.ty_of(*slice_v)?);
+            let Some(TypeKind::Reference {
+                pointee,
+                mutable: true,
+            }) = value::kind(table, slice_ty)
+            else {
+                return Ok(None);
+            };
+            let Some(TypeKind::Slice(elem_ty)) = value::kind(table, *pointee) else {
+                return Ok(None);
+            };
+            let Some(is_zst) = check_elem(*elem_ty) else {
+                return Ok(None);
+            };
+            let slice_expr = self.expr_of(*slice_v)?;
+            if is_zst {
+                let mut setup = Vec::new();
+                if !jsast::is_droppable(&slice_expr) {
+                    setup.push(jsast::expr_stmt(slice_expr));
+                }
+                return Ok(Some(Lowered::Done(setup)));
+            }
+
+            let mut setup = Vec::new();
+            let (buf_raw, off_raw, len_raw) = match slice_expr {
+                Expr::Object(ref entries) if entries.len() == 3 => {
+                    let find = |k: &str| {
+                        entries
+                            .iter()
+                            .find(|(ek, _)| ek == k)
+                            .map(|(_, ev)| ev.clone())
+                    };
+                    if let (Some(b), Some(o), Some(l)) = (find("buf"), find("off"), find("len")) {
+                        (b, o, l)
+                    } else {
+                        let (bs, s) = self.temp(slice_expr);
+                        setup.push(bs);
+                        (
+                            ptr::slot_buf(s.clone()),
+                            ptr::slot_off(s.clone()),
+                            ptr::slot_len(s),
+                        )
+                    }
+                }
+                Expr::Ident(_) => (
+                    ptr::slot_buf(slice_expr.clone()),
+                    ptr::slot_off(slice_expr.clone()),
+                    ptr::slot_len(slice_expr),
+                ),
+                other => {
+                    let (bs, s) = self.temp(other);
+                    setup.push(bs);
+                    (
+                        ptr::slot_buf(s.clone()),
+                        ptr::slot_off(s.clone()),
+                        ptr::slot_len(s),
+                    )
+                }
+            };
+            let b = if matches!(buf_raw, Expr::Ident(_)) {
+                buf_raw
+            } else {
+                let (bb, id) = self.temp(buf_raw);
+                setup.push(bb);
+                id
+            };
+            let off_is_zero = matches!(off_raw, Expr::Num(v) if v == 0.0);
+            let (bl, l) = self.temp(off_raw);
+            setup.push(bl);
+            let r_init = if off_is_zero {
+                jsast::binary(jsast::BinOp::Sub, len_raw, jsast::num(1))
+            } else {
+                jsast::binary(
+                    jsast::BinOp::Sub,
+                    jsast::binary(jsast::BinOp::Add, l.clone(), len_raw),
+                    jsast::num(1),
+                )
+            };
+            let (br, r) = self.temp(r_init);
+            setup.push(br);
+            let (_, tmp) = self.temp(jsast::undefined());
+            setup.push(jsast::while_(
+                jsast::binary(jsast::BinOp::Lt, l.clone(), r.clone()),
+                vec![
+                    jsast::assign_stmt(tmp.clone(), jsast::index(b.clone(), l.clone())),
+                    jsast::assign_stmt(
+                        jsast::index(b.clone(), l.clone()),
+                        jsast::index(b.clone(), r.clone()),
+                    ),
+                    jsast::assign_stmt(jsast::index(b, r.clone()), tmp),
+                    jsast::expr_stmt(jsast::compound_assign(jsast::BinOp::Add, l, jsast::num(1))),
+                    jsast::expr_stmt(jsast::compound_assign(jsast::BinOp::Sub, r, jsast::num(1))),
+                ],
+            ));
+            return Ok(Some(Lowered::Done(setup)));
+        }
+
+        // `core::slice::reverse::revswap::<T>(a: *mut T, b: *mut T, n: usize)`
+        let [a_v, b_v, n_v] = args else {
+            return Ok(None);
+        };
+        let (
+            Some(TypeKind::RawPointer {
+                pointee: elem_a,
+                mutable: true,
+            }),
+            Some(TypeKind::RawPointer {
+                pointee: elem_b,
+                mutable: true,
+            }),
+        ) = (
+            value::kind(table, table.peeled(self.ty_of(*a_v)?)),
+            value::kind(table, table.peeled(self.ty_of(*b_v)?)),
+        )
+        else {
+            return Ok(None);
+        };
+        if table.peeled(*elem_a) != table.peeled(*elem_b) {
+            return Ok(None);
+        }
+        let Some(is_zst) = check_elem(*elem_a) else {
+            return Ok(None);
+        };
+        let a_expr = self.expr_of(*a_v)?;
+        let b_expr = self.expr_of(*b_v)?;
+        let n_expr = self.expr_of(*n_v)?;
+        if is_zst {
+            let mut setup = Vec::new();
+            for expr in [a_expr, b_expr, n_expr] {
+                if !jsast::is_droppable(&expr) {
+                    setup.push(jsast::expr_stmt(expr));
+                }
+            }
+            return Ok(Some(Lowered::Done(setup)));
+        }
+
+        let mut setup = Vec::new();
+        let mut unpack_slot = |slot: Expr| -> (Expr, Expr) {
+            let (buf_raw, off_raw) = match slot {
+                Expr::Object(ref entries) if entries.len() == 2 => {
+                    let find = |k: &str| {
+                        entries
+                            .iter()
+                            .find(|(ek, _)| ek == k)
+                            .map(|(_, ev)| ev.clone())
+                    };
+                    if let (Some(b), Some(o)) = (find("buf"), find("off")) {
+                        (b, o)
+                    } else {
+                        let (bs, s) = self.temp(slot);
+                        setup.push(bs);
+                        (ptr::slot_buf(s.clone()), ptr::slot_off(s))
+                    }
+                }
+                Expr::Ident(_) => (ptr::slot_buf(slot.clone()), ptr::slot_off(slot)),
+                other => {
+                    let (bs, s) = self.temp(other);
+                    setup.push(bs);
+                    (ptr::slot_buf(s.clone()), ptr::slot_off(s))
+                }
+            };
+            let b = if matches!(buf_raw, Expr::Ident(_)) {
+                buf_raw
+            } else {
+                let (bb, id) = self.temp(buf_raw);
+                setup.push(bb);
+                id
+            };
+            (b, off_raw)
+        };
+        let (ab, ao) = unpack_slot(a_expr);
+        let (bb, bo) = unpack_slot(b_expr);
+        let n = if matches!(n_expr, Expr::Ident(_) | Expr::Num(_)) {
+            n_expr
+        } else {
+            let (bn, id) = self.temp(n_expr);
+            setup.push(bn);
+            id
+        };
+        let (bl, l) = self.temp(ao);
+        setup.push(bl);
+        let (bend, end) = self.temp(jsast::binary(jsast::BinOp::Add, l.clone(), n.clone()));
+        setup.push(bend);
+        let (br, r) = self.temp(jsast::binary(
+            jsast::BinOp::Sub,
+            jsast::binary(jsast::BinOp::Add, bo, n),
+            jsast::num(1),
+        ));
+        setup.push(br);
+        let (_, tmp) = self.temp(jsast::undefined());
+        setup.push(jsast::while_(
+            jsast::binary(jsast::BinOp::Lt, l.clone(), end),
+            vec![
+                jsast::assign_stmt(tmp.clone(), jsast::index(ab.clone(), l.clone())),
+                jsast::assign_stmt(
+                    jsast::index(ab.clone(), l.clone()),
+                    jsast::index(bb.clone(), r.clone()),
+                ),
+                jsast::assign_stmt(jsast::index(bb, r.clone()), tmp),
+                jsast::expr_stmt(jsast::compound_assign(jsast::BinOp::Add, l, jsast::num(1))),
+                jsast::expr_stmt(jsast::compound_assign(jsast::BinOp::Sub, r, jsast::num(1))),
+            ],
+        ));
+        Ok(Some(Lowered::Done(setup)))
     }
 
     /// Three-way `Ordering` result expression `a < b ? Less : a === b ? Equal : Greater`.
@@ -3218,6 +4137,27 @@ impl JsCx<'_> {
 /// `receiver.meta[slot]`: one entry of the vtable a fat pointer carries (`abi.rs::vtable_slot`).
 pub fn vtable_slot(receiver: Expr, slot: f64) -> Expr {
     jsast::index(super::ptr::meta(receiver), jsast::num(slot))
+}
+
+fn has_16_hex_hash(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_core_slice_reverse_link_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("core$slice$impl_") else {
+        return false;
+    };
+    let Some((digits, tail)) = rest.split_once("$reverse$h") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && has_16_hex_hash(tail)
+}
+
+fn is_core_slice_revswap_link_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("core$slice$reverse$revswap$h") else {
+        return false;
+    };
+    has_16_hex_hash(rest)
 }
 
 /// Lightweight uninitialized container shell for `Box::<T>::new_uninit()` (`TypedAlloc` with
@@ -3925,5 +4865,957 @@ mod tests {
             js_obj_resize.contains("alloc$vec$Vec$resize$h1("),
             "{js_obj_resize}"
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_func_bstr(
+        interns: &Interns,
+        func: &Func,
+        heap: &HeapPlan,
+        byte_views: ByteViewPlan,
+        items: &host::ItemIndex,
+        ascii: Option<&crate::analysis::ascii::AsciiFacts>,
+    ) -> String {
+        let body = Body {
+            item: func.item,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: func.sig.clone(),
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: "test_fn".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let js_name = JsName::new("test_fn".to_owned());
+        let opts = Opts {
+            profile: Some(Profile::ReleaseSpeed),
+            str_repr: crate::opts::StrRepr::Bytes,
+            ..Opts::default()
+        };
+        let vtables = unsize::VtableIndex::new();
+        let input = LowerInput {
+            name: &js_name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns,
+            table: &interns.types,
+            opts: &opts,
+            items,
+            drop_glue: host::EMPTY_DROP_GLUE,
+            vtables: &vtables,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views,
+            heap: Some(heap),
+            nested_clone: NestedClone::default(),
+        };
+        let func_ascii = ascii.map(|a| a.for_item(&js_name));
+        jsast::stmt_to_string(
+            &crate::lower::lower_func_with_ascii(&input, func, func_ascii)
+                .expect("lower")
+                .decl,
+        )
+    }
+
+    #[test]
+    fn phase2c_known_ascii_str_and_fast_str_lowerings() {
+        let mut interns = Interns::new();
+        let sym = interns.intern_str("core$str$hook$h0123456789abcdef");
+        let start_key = interns.intern_str("start");
+        let none_name = interns.intern_str("None");
+        let some_name = interns.intern_str("Some");
+        let f0_name = interns.intern_str("_0");
+        let lit_lt = interns.intern_str("<");
+        let lit_gt = interns.intern_str(">");
+        let lit_empty = interns.intern_str("");
+        let lit_pat = interns.intern_str("ab");
+
+        let unit = TypeId(1);
+        let bool_ty = TypeId(2);
+        let usize_ty = TypeId(3);
+        let char_ty = TypeId(4);
+        let str_ty = TypeId(5);
+        let ref_str_ty = TypeId(6);
+        let range_from_ty = TypeId(7);
+        let opt_str_ty = TypeId(8);
+        let string_ty = TypeId(9);
+
+        interns
+            .types
+            .insert(mk_desc(1, TypeKind::Tuple(Vec::new()), 0, false));
+        interns.types.insert(mk_desc(2, TypeKind::Bool, 1, false));
+        interns.types.insert(mk_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            false,
+        ));
+        interns.types.insert(mk_desc(4, TypeKind::Char, 4, false));
+        let mut str_desc = mk_desc(5, TypeKind::Str, 0, false);
+        str_desc.layout.sized = false;
+        str_desc.layout.size = None;
+        str_desc.layout.zst = false;
+        interns.types.insert(str_desc);
+        let mut ref_str_desc = mk_desc(
+            6,
+            TypeKind::Reference {
+                pointee: str_ty,
+                mutable: false,
+            },
+            8,
+            false,
+        );
+        ref_str_desc.js.pointer_form = Some(PointerForm::Str);
+        interns.types.insert(ref_str_desc);
+
+        interns.types.insert(mk_desc(
+            7,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 70,
+                },
+                form: NominalForm::Struct,
+                args: vec![usize_ty],
+                variants: vec![VariantDescriptor {
+                    name: start_key,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(start_key),
+                        ty: usize_ty,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            4,
+            false,
+        ));
+
+        let mut opt_desc = mk_desc(
+            8,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 80,
+                },
+                form: NominalForm::Enum,
+                args: vec![ref_str_ty],
+                variants: vec![
+                    VariantDescriptor {
+                        name: none_name,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: some_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f0_name),
+                            ty: ref_str_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            8,
+            false,
+        );
+        opt_desc.js.enum_repr = Some(EnumRepr::NullNiche {
+            none_variant: 0,
+            some_variant: 1,
+        });
+        interns.types.insert(opt_desc);
+
+        let mut string_desc = mk_desc(
+            9,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 90,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: Vec::new(),
+                niche: None,
+            },
+            12,
+            true,
+        );
+        string_desc.meta.candidate = RepresentationCandidate::String;
+        interns.types.insert(string_desc);
+
+        let mut ascii = crate::analysis::ascii::AsciiFacts::default();
+        ascii.funcs.insert(
+            JsName::new("test_fn".to_owned()),
+            BTreeSet::from([ValueId(0)]),
+        );
+
+        let heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            ..HeapPlan::default()
+        };
+
+        let std_call = |res, op, args| Op {
+            result: res,
+            origin: OriginId(0),
+            kind: OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 1,
+                            local_hash: 50,
+                        },
+                        instantiation: 1,
+                    },
+                    link_name: sym,
+                },
+                function: None,
+                args,
+                track_caller: None,
+                semantic: CallSemantic::Standard(op),
+                host: None,
+            },
+        };
+
+        // Params: v0 = known-ASCII &str, v1 = unknown &str, v2 = usize, v3 = RangeFrom<usize>.
+        let mut values = vec![
+            ValueDef {
+                ty: ref_str_ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            },
+            ValueDef {
+                ty: ref_str_ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            },
+            ValueDef {
+                ty: usize_ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            },
+            ValueDef {
+                ty: range_from_ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            },
+        ];
+        let mut ops = Vec::new();
+        let mut push_val = |ty| {
+            let id = ValueId(values.len() as u32);
+            values.push(ValueDef {
+                ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            });
+            id
+        };
+        let c_lt = push_val(ref_str_ty);
+        ops.push(Op {
+            result: Some(c_lt),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Str(lit_lt)),
+        });
+        let c_gt = push_val(ref_str_ty);
+        ops.push(Op {
+            result: Some(c_gt),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Str(lit_gt)),
+        });
+        let c_empty = push_val(ref_str_ty);
+        ops.push(Op {
+            result: Some(c_empty),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Str(lit_empty)),
+        });
+        let c_pat = push_val(ref_str_ty);
+        ops.push(Op {
+            result: Some(c_pat),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Str(lit_pat)),
+        });
+        let c_nl = push_val(char_ty);
+        ops.push(Op {
+            result: Some(c_nl),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Scalar { bits: 10, bytes: 4 }),
+        });
+        let c_eacute = push_val(char_ty);
+        ops.push(Op {
+            result: Some(c_eacute),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Scalar {
+                bits: 0xe9,
+                bytes: 4,
+            }),
+        });
+        let c_zero = push_val(usize_ty);
+        ops.push(Op {
+            result: Some(c_zero),
+            origin: OriginId(0),
+            kind: OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        });
+
+        let r_ascii_known = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_ascii_known),
+            StandardOperation::StrIsAscii,
+            vec![ValueId(0)],
+        ));
+        let r_ascii_unk = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_ascii_unk),
+            StandardOperation::StrIsAscii,
+            vec![ValueId(1)],
+        ));
+        let r_bound_known = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_bound_known),
+            StandardOperation::StrIsCharBoundary,
+            vec![ValueId(0), ValueId(2)],
+        ));
+        let r_get_known = push_val(opt_str_ty);
+        ops.push(std_call(
+            Some(r_get_known),
+            StandardOperation::StrGet,
+            vec![ValueId(0), ValueId(3)],
+        ));
+        let r_lower_known = push_val(string_ty);
+        ops.push(std_call(
+            Some(r_lower_known),
+            StandardOperation::StrToLowercase,
+            vec![ValueId(0)],
+        ));
+        let r_sw1 = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_sw1),
+            StandardOperation::StrStartsWith,
+            vec![ValueId(1), c_lt],
+        ));
+        let r_ew1 = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_ew1),
+            StandardOperation::BstrEndsWith,
+            vec![ValueId(1), c_gt],
+        ));
+        let r_sw_empty = push_val(bool_ty);
+        ops.push(std_call(
+            Some(r_sw_empty),
+            StandardOperation::BstrStartsWith,
+            vec![ValueId(1), c_empty],
+        ));
+        let r_find_ch = push_val(usize_ty);
+        ops.push(std_call(
+            Some(r_find_ch),
+            StandardOperation::BstrFindChar,
+            vec![ValueId(1), c_zero, ValueId(2), c_nl],
+        ));
+        let r_rfind_ch = push_val(usize_ty);
+        ops.push(std_call(
+            Some(r_rfind_ch),
+            StandardOperation::BstrRfindChar,
+            vec![ValueId(1), c_zero, ValueId(2), c_eacute],
+        ));
+        let r_find_str = push_val(usize_ty);
+        ops.push(std_call(
+            Some(r_find_str),
+            StandardOperation::BstrFindStr,
+            vec![ValueId(1), ValueId(2), ValueId(2), c_pat],
+        ));
+
+        let func = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 10,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ref_str_ty, ref_str_ty, usize_ty, range_from_ty],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1), ValueId(2), ValueId(3)],
+            cells: Vec::new(),
+            values,
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1), ValueId(2), ValueId(3)],
+                ops,
+                term: RTerm::Return(None),
+            }],
+        };
+        let items = host::ItemIndex::new();
+        let js = lower_func_bstr(
+            &interns,
+            &func,
+            &heap,
+            ByteViewPlan {
+                raw_byte_derefs: false,
+                elide_scale_scalar: true,
+            },
+            &items,
+            Some(&ascii),
+        );
+        // KnownAscii elides StrIsAscii, StrIsCharBoundary, StrGet, StrToLowercase on v0.
+        assert!(js.contains("__rt._bstr_is_ascii("), "{js}");
+        assert!(!js.contains("bstr_boundary"), "{js}");
+        assert!(!js.contains("bstr_get_from"), "{js}");
+        assert!(!js.contains("bstr_to_lowercase"), "{js}");
+        assert!(js.contains(".toLowerCase()"), "{js}");
+        // 1-char startsWith/endsWith -> charCodeAt(0) === 60 / charCodeAt(len - 1) === 62.
+        assert!(js.contains(".charCodeAt(0) === 60"), "{js}");
+        assert!(js.contains("length - 1) === 62"), "{js}");
+        // Constant BstrFindChar / BstrRfindChar / BstrFindStr -> inline indexOf / lastIndexOf.
+        assert!(!js.contains("bstr_find_char"), "{js}");
+        assert!(!js.contains("bstr_rfind_char"), "{js}");
+        assert!(!js.contains("bstr_find_str"), "{js}");
+        assert!(js.contains(".indexOf(\"\\n\""), "{js}");
+        assert!(js.contains(".lastIndexOf(\"Ã©\""), "{js}");
+        assert!(js.contains(".indexOf(\"ab\""), "{js}");
+    }
+
+    #[test]
+    fn phase2c_bstr_slice_search_and_slice_reverse_lowerings() {
+        let mut interns = Interns::new();
+        let rev_sym = interns.intern_str("core$slice$impl_0$reverse$h0123456789abcdef");
+        let spoof_sym = interns.intern_str("user$slice$reverse$h0123456789abcdef");
+        let x_key = interns.intern_str("x");
+
+        let unit = TypeId(1);
+        let bool_ty = TypeId(2);
+        let u8_ty = TypeId(3);
+        let u32_ty = TypeId(4);
+        let str_ty = TypeId(5);
+        let ref_slice_u8_ty = TypeId(8);
+        let mut_slice_u32_ty = TypeId(10);
+        let struct_ty = TypeId(11);
+        let mut_slice_struct_ty = TypeId(13);
+        let mut_slice_unit_ty = TypeId(15);
+
+        interns
+            .types
+            .insert(mk_desc(1, TypeKind::Tuple(Vec::new()), 0, false));
+        interns.types.insert(mk_desc(2, TypeKind::Bool, 1, false));
+        interns.types.insert(mk_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            1,
+            false,
+        ));
+        interns.types.insert(mk_desc(
+            4,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            false,
+        ));
+        let mut str_desc = mk_desc(5, TypeKind::Str, 0, false);
+        str_desc.layout.sized = false;
+        str_desc.layout.size = None;
+        str_desc.layout.zst = false;
+        interns.types.insert(str_desc);
+        let mut ref_str_desc = mk_desc(
+            6,
+            TypeKind::Reference {
+                pointee: str_ty,
+                mutable: false,
+            },
+            8,
+            false,
+        );
+        ref_str_desc.js.pointer_form = Some(PointerForm::Str);
+        interns.types.insert(ref_str_desc);
+
+        let mk_slice_ref =
+            |interns: &mut Interns, sid: u128, rid: u128, elem: TypeId, mut_: bool| {
+                let mut sd = mk_desc(sid, TypeKind::Slice(elem), 0, false);
+                sd.layout.sized = false;
+                sd.layout.size = None;
+                sd.layout.zst = false;
+                interns.types.insert(sd);
+                let mut rd = mk_desc(
+                    rid,
+                    TypeKind::Reference {
+                        pointee: TypeId(sid),
+                        mutable: mut_,
+                    },
+                    8,
+                    false,
+                );
+                rd.js.pointer_form = Some(PointerForm::FatSlice);
+                interns.types.insert(rd);
+            };
+        mk_slice_ref(&mut interns, 7, 8, u8_ty, false);
+        mk_slice_ref(&mut interns, 9, 10, u32_ty, true);
+        interns.types.insert(mk_desc(
+            11,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 5,
+                    local_hash: 11,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: x_key,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(x_key),
+                        ty: u32_ty,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            4,
+            true,
+        ));
+        mk_slice_ref(&mut interns, 12, 13, struct_ty, true);
+        mk_slice_ref(&mut interns, 14, 15, unit, true);
+
+        let rev_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 1,
+        };
+        let rev_struct_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 2,
+        };
+        let rev_zst_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 3,
+        };
+        let spoof_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 99,
+                local_hash: 1,
+            },
+            instantiation: 1,
+        };
+        let sw_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 2,
+            },
+            instantiation: 1,
+        };
+        let ew_item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 3,
+            },
+            instantiation: 1,
+        };
+
+        let mut ascii = crate::analysis::ascii::AsciiFacts::default();
+        ascii.slice_reverse.insert(rev_item);
+        ascii.slice_reverse.insert(rev_struct_item);
+        ascii.slice_reverse.insert(rev_zst_item);
+        ascii.slice_starts_with.insert(sw_item);
+        ascii.slice_ends_with.insert(ew_item);
+
+        let mut heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            raw_alloc_reachable: false,
+            non_rc_raw_alloc_reachable: false,
+            any_boxed: false,
+            ..HeapPlan::default()
+        };
+        let items = host::ItemIndex::new();
+        let bv_clean = ByteViewPlan {
+            raw_byte_derefs: false,
+            elide_scale_scalar: true,
+        };
+
+        // 1. Primitive &mut [u32] reverse -> inline while loop, no call.
+        let mk_rev_func = |slice_ty: TypeId, callee_item: ItemId, link_name| Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 20,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![slice_ty],
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0)],
+            cells: Vec::new(),
+            values: vec![ValueDef {
+                ty: slice_ty,
+                carrier: Carrier::Baseline,
+                origin: OriginId(0),
+            }],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0)],
+                ops: vec![Op {
+                    result: None,
+                    origin: OriginId(0),
+                    kind: OpKind::Call {
+                        callee: Callee::Direct {
+                            item: callee_item,
+                            link_name,
+                        },
+                        function: None,
+                        args: vec![ValueId(0)],
+                        track_caller: None,
+                        semantic: CallSemantic::Ordinary,
+                        host: None,
+                    },
+                }],
+                term: RTerm::Return(None),
+            }],
+        };
+
+        let js_u32 = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_u32_ty, rev_item, rev_sym),
+            &heap,
+            bv_clean,
+            &items,
+            Some(&ascii),
+        );
+        assert!(js_u32.contains("while ("), "{js_u32}");
+        assert!(!js_u32.contains("core$slice$impl_0$reverse"), "{js_u32}");
+
+        // 2. Indirect untracked &mut [Struct] reverse -> inline while loop.
+        let js_struct = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_struct_ty, rev_struct_item, rev_sym),
+            &heap,
+            bv_clean,
+            &items,
+            Some(&ascii),
+        );
+        assert!(js_struct.contains("while ("), "{js_struct}");
+        assert!(
+            !js_struct.contains("core$slice$impl_0$reverse"),
+            "{js_struct}"
+        );
+
+        // 3. Indirect tracked (&mut [Struct] with needs_box_tracking) -> MUST fall back!
+        heap.any_boxed = true;
+        heap.all_adts_boxed = true;
+        let js_struct_tracked = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_struct_ty, rev_struct_item, rev_sym),
+            &heap,
+            bv_clean,
+            &items,
+            Some(&ascii),
+        );
+        assert!(
+            js_struct_tracked.contains("core$slice$impl_0$reverse"),
+            "{js_struct_tracked}"
+        );
+        heap.any_boxed = false;
+        heap.all_adts_boxed = false;
+
+        // 4. raw_byte_derefs == true -> MUST fall back!
+        let js_raw_bv = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_u32_ty, rev_item, rev_sym),
+            &heap,
+            ByteViewPlan {
+                raw_byte_derefs: true,
+                elide_scale_scalar: false,
+            },
+            &items,
+            Some(&ascii),
+        );
+        assert!(
+            js_raw_bv.contains("core$slice$impl_0$reverse"),
+            "{js_raw_bv}"
+        );
+
+        // 5. ZST &mut [()] reverse -> elided completely (no while, no call).
+        let js_zst = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_unit_ty, rev_zst_item, rev_sym),
+            &heap,
+            bv_clean,
+            &items,
+            Some(&ascii),
+        );
+        assert!(!js_zst.contains("while ("), "{js_zst}");
+        assert!(!js_zst.contains("core$slice$impl_0$reverse"), "{js_zst}");
+
+        // 6. Unauthenticated spoof -> MUST call canonical function.
+        let js_spoof = lower_func_bstr(
+            &interns,
+            &mk_rev_func(mut_slice_u32_ty, spoof_item, spoof_sym),
+            &heap,
+            bv_clean,
+            &items,
+            Some(&ascii),
+        );
+        assert!(js_spoof.contains("user$slice$reverse"), "{js_spoof}");
+
+        // 7. Native ByteStr `core::slice::<impl [u8]>::{starts_with,ends_with}` over ByteViews
+        // (FullSlice + VarSlice with const 0/1/multi-byte and dynamic ByteView needles).
+        let f_bstr_slice = Func {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 9,
+                    local_hash: 30,
+                },
+                instantiation: 1,
+            },
+            sig: Signature {
+                arguments: vec![ref_slice_u8_ty, ref_slice_u8_ty],
+                result: bool_ty,
+                abi: AbiSignature::default(),
+            },
+            params: vec![ValueId(0), ValueId(1)],
+            cells: Vec::new(),
+            values: vec![
+                ValueDef {
+                    ty: ref_slice_u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ref_slice_u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ref_slice_u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ref_slice_u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+                ValueDef {
+                    ty: ref_slice_u8_ty,
+                    carrier: Carrier::Baseline,
+                    origin: OriginId(0),
+                },
+            ],
+            blocks: vec![RBlock {
+                id: RBlockId(0),
+                params: vec![ValueId(0), ValueId(1)],
+                ops: vec![
+                    Op {
+                        result: Some(ValueId(2)),
+                        origin: OriginId(0),
+                        kind: OpKind::Const(ConstTree::Reference(Box::new(ConstTree::Slice(
+                            vec![
+                                ConstTree::Scalar { bits: 96, bytes: 1 },
+                                ConstTree::Scalar { bits: 96, bytes: 1 },
+                                ConstTree::Scalar { bits: 96, bytes: 1 },
+                            ],
+                        )))),
+                    },
+                    Op {
+                        result: Some(ValueId(3)),
+                        origin: OriginId(0),
+                        kind: OpKind::Const(ConstTree::Reference(Box::new(ConstTree::Slice(
+                            vec![ConstTree::Scalar { bits: 62, bytes: 1 }],
+                        )))),
+                    },
+                    Op {
+                        result: Some(ValueId(4)),
+                        origin: OriginId(0),
+                        kind: OpKind::Const(ConstTree::Reference(Box::new(ConstTree::Slice(
+                            Vec::new(),
+                        )))),
+                    },
+                ],
+                term: RTerm::Return(None),
+            }],
+        };
+        let opts = Opts {
+            profile: Some(Profile::ReleaseSpeed),
+            str_repr: crate::opts::StrRepr::Bytes,
+            ..Opts::default()
+        };
+        let mut plan = crate::lower::plan::Plan::default();
+        plan.names.insert(ValueId(0), "h".to_owned());
+        plan.names.insert(ValueId(1), "n".to_owned());
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: "test_fn".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let cx = super::super::JsCx::new(
+            &f_bstr_slice,
+            &plan,
+            &interns.types,
+            &interns,
+            &opts,
+            &summary,
+            None,
+        )
+        .with_byte_views(bv_clean)
+        .with_heap(Some(&heap))
+        .with_ascii(Some(ascii.for_item(&JsName::new("test_fn".to_owned()))));
+
+        let full_bv = super::super::ByteView {
+            mode: super::super::ByteViewMode::FullSlice,
+            base_str: None,
+            base_cell: None,
+            base_is_string_obj: false,
+            borrow_slice: None,
+        };
+        let var_bv = super::super::ByteView {
+            mode: super::super::ByteViewMode::VarSlice,
+            base_str: None,
+            base_cell: None,
+            base_is_string_obj: false,
+            borrow_slice: None,
+        };
+
+        let render_lowered = |l: super::Lowered| match l {
+            super::Lowered::Value(mut stmts, expr) => {
+                stmts.push(jsast::ret(expr));
+                jsast::program_to_string(&stmts)
+            }
+            _ => panic!("expected Value"),
+        };
+
+        // FullSlice + multi-byte const `b"```"` -> `h.startsWith("```")`.
+        let js_full_sw = render_lowered(
+            cx.lower_bstr_slice_search_views(true, ValueId(0), full_bv, ValueId(2), None)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(js_full_sw.contains("h.startsWith(\"```\")"), "{js_full_sw}");
+
+        // FullSlice + 1-byte const `b">"` ends_with -> `h.charCodeAt(h.length - 1) === 62`.
+        let js_full_ew1 = render_lowered(
+            cx.lower_bstr_slice_search_views(false, ValueId(0), full_bv, ValueId(3), None)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            js_full_ew1.contains("h.charCodeAt(h.length - 1) === 62"),
+            "{js_full_ew1}"
+        );
+
+        // FullSlice + empty const `b""` -> `true`.
+        let js_empty = render_lowered(
+            cx.lower_bstr_slice_search_views(true, ValueId(0), full_bv, ValueId(4), None)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(js_empty.contains("return true;"), "{js_empty}");
+
+        // VarSlice + multi-byte const `b"```"` starts_with -> `len >= 3 && buf.startsWith("```", off)`.
+        let js_var_sw = render_lowered(
+            cx.lower_bstr_slice_search_views(true, ValueId(0), var_bv, ValueId(2), None)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(js_var_sw.contains(">= 3 &&"), "{js_var_sw}");
+        assert!(js_var_sw.contains(".startsWith(\"```\","), "{js_var_sw}");
+
+        // VarSlice + multi-byte const `b"```"` ends_with -> `len >= 3 && buf.endsWith("```", off + len)`.
+        let js_var_ew = render_lowered(
+            cx.lower_bstr_slice_search_views(false, ValueId(0), var_bv, ValueId(2), None)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(js_var_ew.contains(">= 3 &&"), "{js_var_ew}");
+        assert!(js_var_ew.contains(".endsWith(\"```\","), "{js_var_ew}");
+
+        // VarSlice + dynamic FullSlice needle -> `len >= n.length && buf.startsWith(n, off)`.
+        let js_var_dyn = render_lowered(
+            cx.lower_bstr_slice_search_views(true, ValueId(0), var_bv, ValueId(1), Some(full_bv))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(js_var_dyn.contains(">= n.length &&"), "{js_var_dyn}");
+        assert!(js_var_dyn.contains(".startsWith(n,"), "{js_var_dyn}");
     }
 }

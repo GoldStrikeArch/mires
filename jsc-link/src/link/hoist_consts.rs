@@ -93,6 +93,25 @@ fn is_scalar_array_lit(expr: &Expr, min_len: usize, allow_bigint: bool) -> bool 
             .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
 }
 
+/// Matches a pure inline `new Uint8Array([b0, b1, ...])` lookup table literal (`len >= 8`, all
+/// entries exact integers in `0..=255`) such as the 128/256-byte ASCII LUTs synthesized by
+/// `post_opt::lower_dense_ascii_luts`.
+fn is_u8_lut_lit(expr: &Expr) -> bool {
+    let Expr::New(ctor, args) = expr else {
+        return false;
+    };
+    if !matches!(ctor.as_ref(), Expr::Ident(id) if id == "Uint8Array") || args.len() != 1 {
+        return false;
+    }
+    let Expr::Array(elems) = &args[0] else {
+        return false;
+    };
+    elems.len() >= 8
+        && elems
+            .iter()
+            .all(|elem| exact_int_lit(elem).is_some_and(|v| (0..=255).contains(&v)))
+}
+
 fn is_flat_scalar_aggregate(expr: &Expr, allow_bigint: bool) -> bool {
     match expr {
         Expr::Array(elems) => {
@@ -216,6 +235,7 @@ struct HoistCollector {
     allow_bigint: bool,
     bstr_strings: bool,
     speed_profile: bool,
+    allow_u8_lut: bool,
     counts: BTreeMap<String, (Expr, ConstUsage)>,
     unreachable_throws: usize,
 }
@@ -323,6 +343,12 @@ impl HoistCollector {
                 return;
             }
             if let Expr::Index(obj, idx) = expr {
+                if self.allow_u8_lut && is_u8_lut_lit(obj) {
+                    let key = format!("u8lut:{obj}");
+                    self.record(key, obj, in_loop);
+                    self.visit_expr(idx, in_loop, false);
+                    return;
+                }
                 let min_inline_arr = if self.speed_profile { 2 } else { 4 };
                 if is_scalar_array_lit(obj, min_inline_arr, self.allow_bigint) {
                     let key = format!("arr:{obj}");
@@ -1893,6 +1919,7 @@ struct HoistRewriter<'a> {
     allow_bigint: bool,
     bstr_strings: bool,
     speed_profile: bool,
+    allow_u8_lut: bool,
     const_map: &'a BTreeMap<String, JsName>,
     unreachable_fn: Option<&'a JsName>,
     changed: bool,
@@ -1984,6 +2011,15 @@ impl HoistRewriter<'_> {
                 }
             }
             if let Expr::Index(obj, idx) = expr {
+                if self.allow_u8_lut && is_u8_lut_lit(obj) {
+                    let key = format!("u8lut:{obj}");
+                    if let Some(hoisted) = self.const_map.get(&key) {
+                        **obj = Expr::Ident(hoisted.as_str().to_owned());
+                        self.changed = true;
+                        self.rewrite_expr(idx, false);
+                        return;
+                    }
+                }
                 let min_inline_arr = if self.speed_profile { 2 } else { 4 };
                 if is_scalar_array_lit(obj, min_inline_arr, self.allow_bigint) {
                     let key = format!("arr:{obj}");
@@ -2549,26 +2585,85 @@ fn run_with_opts(
     split_bigint_props(lowered, &exclusions);
     encode_internal_tags(lowered, &exclusions, speed_profile);
 
-    // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, capture-free
-    // `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt constants are hoisted
-    // afterwards by `lower::bigint::hoist` with load-safe `$BI_ok` / `$BI_no()` guards.
+    fn decl_shadows_ident(stmt: &Stmt, target: &str) -> bool {
+        fn check_stmts(stmts: &[Stmt], target: &str) -> bool {
+            for s in stmts {
+                match s {
+                    Stmt::Let(n, _) | Stmt::Const(n, _) if n == target => return true,
+                    Stmt::Lets(decls) if decls.iter().any(|(n, _)| n == target) => return true,
+                    Stmt::If(_, a, b) => {
+                        if check_stmts(a, target)
+                            || b.as_ref().is_some_and(|b| check_stmts(b, target))
+                        {
+                            return true;
+                        }
+                    }
+                    Stmt::Switch(_, cases) => {
+                        if cases.iter().any(|c| check_stmts(&c.body, target)) {
+                            return true;
+                        }
+                    }
+                    Stmt::Labeled(_, inner) => {
+                        if check_stmts(std::slice::from_ref(inner.as_ref()), target) {
+                            return true;
+                        }
+                    }
+                    Stmt::LoopForever(_, b) | Stmt::While(_, b) | Stmt::Block(b) => {
+                        if check_stmts(b, target) {
+                            return true;
+                        }
+                    }
+                    Stmt::TryCatch {
+                        body,
+                        binding,
+                        handler,
+                    } => {
+                        if binding == target
+                            || check_stmts(body, target)
+                            || check_stmts(handler, target)
+                        {
+                            return true;
+                        }
+                    }
+                    Stmt::FunctionDecl { name, params, body }
+                        if name == target
+                            || params.iter().any(|p| p == target)
+                            || check_stmts(body, target) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        check_stmts(std::slice::from_ref(stmt), target)
+    }
+
+    // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, inline `new Uint8Array([...])[i]`
+    // LUTs, capture-free `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt
+    // constants are hoisted afterwards by `lower::bigint::hoist` with load-safe `$BI_ok` / `$BI_no()` guards.
     let bstr_strings = crate::lower::bstr::enabled();
     let mut collector = HoistCollector {
         allow_bigint,
         bstr_strings,
         speed_profile,
+        allow_u8_lut: true,
         counts: BTreeMap::new(),
         unreachable_throws: 0,
     };
     for (_, res, _, _) in lowered.iter() {
         if let Ok(lowered_item) = res {
+            collector.allow_u8_lut = !decl_shadows_ident(&lowered_item.decl, "Uint8Array");
             collector.visit_stmt(&lowered_item.decl, false);
         }
     }
 
     let mut const_map: BTreeMap<String, JsName> = BTreeMap::new();
     for (key, (expr, usage)) in &collector.counts {
-        let qualify = if key.starts_with("loc:") {
+        let qualify = if key.starts_with("u8lut:") {
+            true
+        } else if key.starts_with("loc:") {
             usage.in_loop || usage.count >= 2 || speed_profile
         } else if key.starts_with("str:") {
             usage.in_loop || usage.count >= 2
@@ -2589,7 +2684,7 @@ fn run_with_opts(
         } else {
             expr.clone()
         };
-        let dedup_key = if speed_profile && key.starts_with("arr:") {
+        let dedup_key = if (speed_profile && key.starts_with("arr:")) || key.starts_with("u8lut:") {
             format!("arr:{init_expr}")
         } else {
             key.clone()
@@ -2655,10 +2750,12 @@ fn run_with_opts(
     if !const_map.is_empty() || unreachable_fn.is_some() {
         for (item_name, res, _, _) in lowered.iter_mut() {
             let Ok(lowered_item) = res else { continue };
+            let allow_u8_lut = !decl_shadows_ident(&lowered_item.decl, "Uint8Array");
             let mut rewriter = HoistRewriter {
                 allow_bigint,
                 bstr_strings,
                 speed_profile,
+                allow_u8_lut,
                 const_map: &const_map,
                 unreachable_fn: unreachable_fn.as_ref(),
                 changed: false,
@@ -6349,6 +6446,122 @@ mod tests {
         assert!(
             fn_js.contains("esc_a = [1, 2, 3, 4];"),
             "escaping [1, 2, 3, 4] passed to call must NOT be hoisted:\n{fn_js}"
+        );
+    }
+
+    #[test]
+    fn hoists_and_deduplicates_inline_u8_luts_to_module_scope() {
+        let mut lut_elems = vec![Expr::Num(0.0); 128];
+        for &b in &[33usize, 42, 60, 91, 92, 95, 96, 126] {
+            lut_elems[b] = Expr::Num(1.0);
+        }
+        let mk_lut = || {
+            Expr::New(
+                Box::new(Expr::Ident("Uint8Array".to_owned())),
+                vec![Expr::Array(lut_elems.clone())],
+            )
+        };
+        let fn_a = jsast::function(
+            "scan_a",
+            vec!["c".to_owned()],
+            vec![Stmt::Return(Some(Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(Expr::Index(
+                    Box::new(mk_lut()),
+                    Box::new(Expr::Ident("c".to_owned())),
+                )),
+                Box::new(Expr::Num(1.0)),
+            )))],
+        );
+        let fn_b = jsast::function(
+            "scan_b",
+            vec!["c".to_owned()],
+            vec![Stmt::Return(Some(Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(Expr::Index(
+                    Box::new(mk_lut()),
+                    Box::new(Expr::Ident("c".to_owned())),
+                )),
+                Box::new(Expr::Num(1.0)),
+            )))],
+        );
+        // Shadowed `Uint8Array` param MUST NOT be hoisted.
+        let fn_shadowed = jsast::function(
+            "scan_shadowed",
+            vec!["Uint8Array".to_owned(), "c".to_owned()],
+            vec![Stmt::Return(Some(Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(Expr::Index(
+                    Box::new(mk_lut()),
+                    Box::new(Expr::Ident("c".to_owned())),
+                )),
+                Box::new(Expr::Num(1.0)),
+            )))],
+        );
+        // Assignment target `new Uint8Array([...])[c] = 1` MUST NOT be hoisted.
+        let fn_write = jsast::function(
+            "write_lut",
+            vec!["c".to_owned()],
+            vec![Stmt::ExprStmt(Expr::Assign(
+                Box::new(Expr::Index(
+                    Box::new(mk_lut()),
+                    Box::new(Expr::Ident("c".to_owned())),
+                )),
+                Box::new(Expr::Num(1.0)),
+            ))],
+        );
+
+        let speed_opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let (table, lowered, _, _, added) = test_run(
+            speed_opts,
+            vec![
+                ("scan_a", fn_a),
+                ("scan_b", fn_b),
+                ("scan_shadowed", fn_shadowed),
+                ("write_lut", fn_write),
+            ],
+        );
+        assert!(added, "expected hoisted Uint8Array LUT item");
+        let hc_items: Vec<&LinkItem> = table
+            .values()
+            .filter(|it| it.name.as_str().starts_with("$hc_"))
+            .collect();
+        assert_eq!(
+            hc_items.len(),
+            1,
+            "expected identical 128-byte LUTs deduplicated into 1 module const: {:?}",
+            hc_items.iter().map(|i| &i.js).collect::<Vec<_>>()
+        );
+        assert!(
+            hc_items[0].js.contains("new Uint8Array("),
+            "expected module const initialized with new Uint8Array: {}",
+            hc_items[0].js
+        );
+
+        let a_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+        let b_js = jsast::stmt_to_string(&lowered[1].1.as_ref().unwrap().decl);
+        let sh_js = jsast::stmt_to_string(&lowered[2].1.as_ref().unwrap().decl);
+        let wr_js = jsast::stmt_to_string(&lowered[3].1.as_ref().unwrap().decl);
+        let hc_name = hc_items[0].name.as_str();
+        assert!(
+            !a_js.contains("new Uint8Array") && a_js.contains(&format!("{hc_name}[c] === 1")),
+            "scan_a should index hoisted LUT: {a_js}"
+        );
+        assert!(
+            !b_js.contains("new Uint8Array") && b_js.contains(&format!("{hc_name}[c] === 1")),
+            "scan_b should share deduplicated LUT: {b_js}"
+        );
+        assert!(
+            sh_js.contains("new Uint8Array(") && !sh_js.contains(hc_name),
+            "shadowed Uint8Array param must NOT hoist: {sh_js}"
+        );
+        assert!(
+            wr_js.contains("new Uint8Array(") && !wr_js.contains(hc_name),
+            "assign-target LUT write must NOT hoist: {wr_js}"
         );
     }
 }

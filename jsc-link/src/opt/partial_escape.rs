@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::jir::origin::OriginId;
 use crate::jir::repr::{
     Carrier, CellId, Dominators, Func, FuncBuilder, Op, OpKind, Proj, RAssertMessage, RBlockId,
-    RTerm, Root, ValueId,
+    RTerm, Root, ValueDef, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, DropGlue, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
@@ -112,12 +112,86 @@ fn pointer_pointee(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
     }
 }
 
-/// Promotes `BorrowView { root: Root::Cell(c), path: [] }` whose only uses (including `Copy`/`Move`
-/// aliases and `[Proj::Deref]` reborrows) are `Deref`/`StoreThrough` into direct `CellLoad(c)` /
-/// `CellStore { cell: c, v }` ops for direct, non-cloned cell types.
+type CellProjStep = (Option<u32>, u32, TypeId);
+
+/// Extends a cell projection chain (`(downcast_variant, field_index, field_ty)`) with pure
+/// `Downcast`/`Field` steps over direct, non-cloned values.
+fn extend_cell_proj(
+    table: &TypeTable,
+    start_ty: TypeId,
+    start_steps: &[CellProjStep],
+    proj: &[Proj],
+) -> Option<(Vec<CellProjStep>, TypeId)> {
+    let mut steps = start_steps.to_vec();
+    let mut cur_ty = start_ty;
+    let mut pending_variant: Option<u32> = None;
+    for step in proj {
+        match *step {
+            Proj::Downcast { variant } => {
+                if pending_variant.is_some() {
+                    return None;
+                }
+                let peeled = table.peeled(cur_ty);
+                if !matches!(
+                    table.get(peeled).map(|d| &d.kind),
+                    Some(TypeKind::Adt {
+                        form: NominalForm::Enum,
+                        ..
+                    })
+                ) {
+                    return None;
+                }
+                pending_variant = Some(variant);
+            }
+            Proj::Field { field, ty } => {
+                let peeled = table.peeled(cur_ty);
+                match table.get(peeled).map(|d| &d.kind) {
+                    Some(TypeKind::Adt {
+                        form: NominalForm::Struct | NominalForm::Enum,
+                        ..
+                    })
+                    | Some(TypeKind::Tuple(_)) => {}
+                    _ => return None,
+                }
+                let desc = table.field(cur_ty, pending_variant, field)?;
+                if desc.ty != ty || table.is_indirect(ty) || table.needs_clone(ty) {
+                    return None;
+                }
+                steps.push((pending_variant.take(), field, ty));
+                cur_ty = ty;
+            }
+            _ => return None,
+        }
+    }
+    if pending_variant.is_some() {
+        return None;
+    }
+    Some((steps, cur_ty))
+}
+
+/// Promotes `BorrowView { root: Root::Cell(c), path }` (empty path or pure `Downcast`/`Field`
+/// projections) whose only uses (including `Copy`/`Move` aliases and `[Proj::Deref, ...]`
+/// reborrows/projections) are `Deref`/`StoreThrough` into direct `CellLoad(c)` (+ `Field` chain)
+/// or `CellStore { cell: c, v }` ops for direct, non-cloned cell types (including `NullNiche`
+/// enums such as `Option<Ordering>`).
 ///
 /// Dead `BorrowView` / alias ops are left unused for `dce` to sweep so `Func::verify` stays valid.
 pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
+    use std::collections::btree_map::Entry;
+
+    enum CellRewrite {
+        Load(CellId),
+        ProjectedLoad {
+            cell: CellId,
+            cell_ty: TypeId,
+            steps: Vec<CellProjStep>,
+        },
+        Store {
+            cell: CellId,
+            v: ValueId,
+        },
+    }
+
     let mut term_uses: BTreeSet<ValueId> = BTreeSet::new();
     let mut value_uses: BTreeMap<ValueId, Vec<(usize, usize)>> = BTreeMap::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
@@ -134,7 +208,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    let mut rewrites: Vec<(usize, usize, OpKind)> = Vec::new();
+    let mut rewrites: BTreeMap<(usize, usize), CellRewrite> = BTreeMap::new();
     for block in &func.blocks {
         for op in &block.ops {
             let OpKind::BorrowView {
@@ -145,9 +219,6 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
             else {
                 continue;
             };
-            if !path.is_empty() {
-                continue;
-            }
             let Some(root_val) = op.result else {
                 continue;
             };
@@ -158,18 +229,25 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
             if table.is_indirect(cell_ty) || table.needs_clone(cell_ty) {
                 continue;
             }
+            let Some((root_steps, root_ty)) = (if path.is_empty() {
+                Some((Vec::new(), cell_ty))
+            } else {
+                extend_cell_proj(table, cell_ty, &[], path)
+            }) else {
+                continue;
+            };
             let root_def = func.values[root_val.0 as usize];
             if root_def.carrier != Carrier::Baseline
-                || pointer_pointee(table, root_def.ty) != Some(cell_ty)
+                || pointer_pointee(table, root_def.ty) != Some(root_ty)
             {
                 continue;
             }
 
-            let mut aliases = BTreeSet::new();
-            let mut queue = Vec::new();
-            aliases.insert(root_val);
+            let mut aliases: BTreeMap<ValueId, (Vec<CellProjStep>, TypeId)> = BTreeMap::new();
+            let mut queue: Vec<ValueId> = Vec::new();
+            aliases.insert(root_val, (root_steps, root_ty));
             queue.push(root_val);
-            let mut derefs: Vec<(usize, usize)> = Vec::new();
+            let mut derefs: Vec<(usize, usize, Vec<CellProjStep>)> = Vec::new();
             let mut stores: Vec<(usize, usize, ValueId)> = Vec::new();
             let mut ok = true;
 
@@ -178,6 +256,9 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                     ok = false;
                     break;
                 }
+                let Some((ptr_steps, ptr_ty)) = aliases.get(&ptr).cloned() else {
+                    continue;
+                };
                 let Some(uses) = value_uses.get(&ptr) else {
                     continue;
                 };
@@ -188,12 +269,13 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                             if let Some(res) = use_op.result {
                                 let res_def = func.values[res.0 as usize];
                                 if res_def.carrier != Carrier::Baseline
-                                    || pointer_pointee(table, res_def.ty) != Some(cell_ty)
+                                    || pointer_pointee(table, res_def.ty) != Some(ptr_ty)
                                 {
                                     ok = false;
                                     break;
                                 }
-                                if aliases.insert(res) {
+                                if let Entry::Vacant(slot) = aliases.entry(res) {
+                                    slot.insert((ptr_steps.clone(), ptr_ty));
                                     queue.push(res);
                                 }
                             }
@@ -202,16 +284,29 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                             root: Root::Value(src),
                             path,
                             ..
-                        } if *src == ptr && path.as_slice() == [Proj::Deref] => {
+                        } if *src == ptr => {
+                            let [Proj::Deref, rest @ ..] = path.as_slice() else {
+                                ok = false;
+                                break;
+                            };
+                            let Some((next_steps, next_ty)) = (if rest.is_empty() {
+                                Some((ptr_steps.clone(), ptr_ty))
+                            } else {
+                                extend_cell_proj(table, ptr_ty, &ptr_steps, rest)
+                            }) else {
+                                ok = false;
+                                break;
+                            };
                             if let Some(res) = use_op.result {
                                 let res_def = func.values[res.0 as usize];
                                 if res_def.carrier != Carrier::Baseline
-                                    || pointer_pointee(table, res_def.ty) != Some(cell_ty)
+                                    || pointer_pointee(table, res_def.ty) != Some(next_ty)
                                 {
                                     ok = false;
                                     break;
                                 }
-                                if aliases.insert(res) {
+                                if let Entry::Vacant(slot) = aliases.entry(res) {
+                                    slot.insert((next_steps, next_ty));
                                     queue.push(res);
                                 }
                             }
@@ -219,14 +314,19 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                         OpKind::Deref(p) if *p == ptr => {
                             if let Some(res) = use_op.result {
                                 let res_def = func.values[res.0 as usize];
-                                if res_def.ty != cell_ty || res_def.carrier != Carrier::Baseline {
+                                if res_def.ty != ptr_ty || res_def.carrier != Carrier::Baseline {
                                     ok = false;
                                     break;
                                 }
+                            } else if !ptr_steps.is_empty() {
+                                ok = false;
+                                break;
                             }
-                            derefs.push((b_idx, o_idx));
+                            derefs.push((b_idx, o_idx, ptr_steps.clone()));
                         }
-                        OpKind::StoreThrough { ptr: p, v } if *p == ptr && *v != ptr => {
+                        OpKind::StoreThrough { ptr: p, v }
+                            if *p == ptr && *v != ptr && ptr_steps.is_empty() =>
+                        {
                             let val_def = func.values[v.0 as usize];
                             if val_def.ty != cell_ty || val_def.carrier != Carrier::Baseline {
                                 ok = false;
@@ -248,11 +348,20 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
             if !ok || (derefs.is_empty() && stores.is_empty()) {
                 continue;
             }
-            for (b_idx, o_idx) in derefs {
-                rewrites.push((b_idx, o_idx, OpKind::CellLoad(*cell)));
+            for (b_idx, o_idx, steps) in derefs {
+                let rw = if steps.is_empty() {
+                    CellRewrite::Load(*cell)
+                } else {
+                    CellRewrite::ProjectedLoad {
+                        cell: *cell,
+                        cell_ty,
+                        steps,
+                    }
+                };
+                rewrites.insert((b_idx, o_idx), rw);
             }
             for (b_idx, o_idx, v) in stores {
-                rewrites.push((b_idx, o_idx, OpKind::CellStore { cell: *cell, v }));
+                rewrites.insert((b_idx, o_idx), CellRewrite::Store { cell: *cell, v });
             }
         }
     }
@@ -260,8 +369,71 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
     if rewrites.is_empty() {
         return false;
     }
-    for (b_idx, o_idx, kind) in rewrites {
-        func.blocks[b_idx].ops[o_idx].kind = kind;
+    let mut by_block: BTreeMap<usize, BTreeMap<usize, CellRewrite>> = BTreeMap::new();
+    for ((b_idx, o_idx), rw) in rewrites {
+        by_block.entry(b_idx).or_default().insert(o_idx, rw);
+    }
+    for (b_idx, block_rws) in by_block {
+        let old_ops = std::mem::take(&mut func.blocks[b_idx].ops);
+        let mut new_ops = Vec::with_capacity(old_ops.len() + block_rws.len() * 2);
+        for (o_idx, mut op) in old_ops.into_iter().enumerate() {
+            match block_rws.get(&o_idx) {
+                None => new_ops.push(op),
+                Some(CellRewrite::Load(cell)) => {
+                    op.kind = OpKind::CellLoad(*cell);
+                    new_ops.push(op);
+                }
+                Some(CellRewrite::Store { cell, v }) => {
+                    op.kind = OpKind::CellStore { cell: *cell, v: *v };
+                    new_ops.push(op);
+                }
+                Some(CellRewrite::ProjectedLoad {
+                    cell,
+                    cell_ty,
+                    steps,
+                }) => {
+                    let origin = op.origin;
+                    let load_id = ValueId(func.values.len() as u32);
+                    func.values.push(ValueDef {
+                        ty: *cell_ty,
+                        carrier: Carrier::Baseline,
+                        origin,
+                    });
+                    new_ops.push(Op {
+                        result: Some(load_id),
+                        origin,
+                        kind: OpKind::CellLoad(*cell),
+                    });
+                    let mut cur = load_id;
+                    for &(variant, field, step_ty) in &steps[..steps.len() - 1] {
+                        let mid = ValueId(func.values.len() as u32);
+                        func.values.push(ValueDef {
+                            ty: step_ty,
+                            carrier: Carrier::Baseline,
+                            origin,
+                        });
+                        new_ops.push(Op {
+                            result: Some(mid),
+                            origin,
+                            kind: OpKind::Field {
+                                base: cur,
+                                variant,
+                                field,
+                            },
+                        });
+                        cur = mid;
+                    }
+                    let &(last_variant, last_field, _) = steps.last().expect("non-empty steps");
+                    op.kind = OpKind::Field {
+                        base: cur,
+                        variant: last_variant,
+                        field: last_field,
+                    };
+                    new_ops.push(op);
+                }
+            }
+        }
+        func.blocks[b_idx].ops = new_ops;
     }
     guard_mutated_param_cells(func, table);
     true
@@ -593,8 +765,16 @@ fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
             form: NominalForm::Enum,
             variants,
             ..
-        } if matches!(descriptor.js.enum_repr, Some(EnumRepr::NullNiche { .. })) => {
-            let Some(EnumRepr::NullNiche { none_variant, .. }) = descriptor.js.enum_repr else {
+        } if matches!(
+            descriptor.js.enum_repr,
+            Some(EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. })
+        ) =>
+        {
+            let Some(
+                EnumRepr::NullNiche { none_variant, .. }
+                | EnumRepr::SentinelNiche { none_variant, .. },
+            ) = descriptor.js.enum_repr
+            else {
                 unreachable!()
             };
             let fields = variants
@@ -5492,6 +5672,340 @@ mod tests {
                     .any(|op| matches!(op.kind, OpKind::Aggregate { ty: PAIR_ARR2, .. })),
                 "exit block must lazily materialize Pair and [Pair; 2]"
             );
+        }
+
+        #[test]
+        fn null_niche_projected_cell_borrow_unboxes_with_zero_scalarized_and_invoke() {
+            use crate::jir::types::EnumRepr;
+
+            const I8: TypeId = TypeId(40);
+            const ORDERING: TypeId = TypeId(41);
+            const OPT_ORDERING: TypeId = TypeId(42);
+            const REF_OPT_ORDERING: TypeId = TypeId(43);
+            const REF_ORDERING: TypeId = TypeId(44);
+
+            let mut interns = world();
+            let v_less = interns.intern_str("Less");
+            let v_equal = interns.intern_str("Equal");
+            let v_greater = interns.intern_str("Greater");
+            let v_none = interns.intern_str("None");
+            let v_some = interns.intern_str("Some");
+            let ord_name = interns.intern_str("Ordering");
+            let opt_name = interns.intern_str("Option");
+            let callee_name = interns.intern_str("helper");
+
+            interns.intern_type(TypeDescriptor {
+                id: I8,
+                name: None,
+                kind: TypeKind::Integer {
+                    signed: true,
+                    bits: 8,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(1),
+                    align: Some(1),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: Some(IntFacts {
+                        signed: true,
+                        bits: 8,
+                        repr: IntRepr::Number,
+                    }),
+                    ..js_facts(I8)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: ORDERING,
+                name: Some(ord_name),
+                kind: TypeKind::Adt {
+                    def: item(910).definition,
+                    form: NominalForm::Enum,
+                    args: Vec::new(),
+                    variants: vec![
+                        VariantDescriptor {
+                            name: v_less,
+                            logical_discr: -1,
+                            physical_tag: None,
+                            fields: Vec::new(),
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                        VariantDescriptor {
+                            name: v_equal,
+                            logical_discr: 0,
+                            physical_tag: None,
+                            fields: Vec::new(),
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                        VariantDescriptor {
+                            name: v_greater,
+                            logical_discr: 1,
+                            physical_tag: None,
+                            fields: Vec::new(),
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                    ],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(1),
+                    align: Some(1),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    enum_repr: Some(EnumRepr::Number {
+                        signed: true,
+                        bits: 8,
+                    }),
+                    is_primitive_enum: true,
+                    ..js_facts(ORDERING)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: OPT_ORDERING,
+                name: Some(opt_name),
+                kind: TypeKind::Adt {
+                    def: item(911).definition,
+                    form: NominalForm::Enum,
+                    args: Vec::new(),
+                    variants: vec![
+                        VariantDescriptor {
+                            name: v_none,
+                            logical_discr: 0,
+                            physical_tag: None,
+                            fields: Vec::new(),
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                        VariantDescriptor {
+                            name: v_some,
+                            logical_discr: 1,
+                            physical_tag: None,
+                            fields: vec![FieldDescriptor {
+                                key: FieldKey::Index(0),
+                                ty: ORDERING,
+                                offset: 0,
+                            }],
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                    ],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(1),
+                    align: Some(1),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    enum_repr: Some(EnumRepr::NullNiche {
+                        none_variant: 0,
+                        some_variant: 1,
+                    }),
+                    ..js_facts(OPT_ORDERING)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: REF_OPT_ORDERING,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: OPT_ORDERING,
+                    mutable: false,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    pointer_form: Some(PointerForm::Slot),
+                    ..js_facts(REF_OPT_ORDERING)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: REF_ORDERING,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: ORDERING,
+                    mutable: false,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    pointer_form: Some(PointerForm::Slot),
+                    ..js_facts(REF_ORDERING)
+                },
+            });
+
+            let tbl = &interns.types;
+            for with_invoke in [false, true] {
+                let mut b = FuncBuilder::new(
+                    item(if with_invoke { 901 } else { 900 }),
+                    Signature {
+                        arguments: vec![OPT_ORDERING],
+                        result: BOOL,
+                        abi: AbiSignature {
+                            parameters: 1,
+                            spread: None,
+                            caller_location: false,
+                            inline_never: false,
+                            inline_hint: false,
+                            inline_always: false,
+                        },
+                    },
+                );
+                let arg = b.param(OPT_ORDERING, O);
+                let cell = b.cell(OPT_ORDERING, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: arg }, O);
+                let next_block = b.block();
+                if with_invoke {
+                    let unwind = b.block();
+                    let _ = b.op(
+                        FuncBuilder::ENTRY,
+                        OpKind::Call {
+                            callee: Callee::Direct {
+                                item: item(902),
+                                link_name: callee_name,
+                            },
+                            function: None,
+                            args: Vec::new(),
+                            track_caller: None,
+                            semantic: CallSemantic::Ordinary,
+                            host: None,
+                        },
+                        I32,
+                        O,
+                    );
+                    b.terminate(
+                        FuncBuilder::ENTRY,
+                        RTerm::Invoke {
+                            normal: (next_block, Vec::new()),
+                            unwind: (unwind, Vec::new()),
+                        },
+                    );
+                    b.terminate(unwind, RTerm::Throw(None));
+                } else {
+                    b.terminate(FuncBuilder::ENTRY, RTerm::Goto(next_block, Vec::new()));
+                }
+
+                let borrow_opt = b.op(
+                    next_block,
+                    OpKind::BorrowView {
+                        root: Root::Cell(cell),
+                        path: Vec::new(),
+                        mutable: false,
+                    },
+                    REF_OPT_ORDERING,
+                    O,
+                );
+                let deref_opt = b.op(next_block, OpKind::Deref(borrow_opt), OPT_ORDERING, O);
+                let discr_opt = b.op(next_block, OpKind::Discriminant(deref_opt), I8, O);
+                let some_block = b.block();
+                let none_block = b.block();
+                b.terminate(
+                    next_block,
+                    RTerm::Switch {
+                        scrut: discr_opt,
+                        scrut_ty: I8,
+                        cases: vec![(0, none_block, Vec::new())],
+                        default: (some_block, Vec::new()),
+                    },
+                );
+                let f_const = b.op(
+                    none_block,
+                    OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 1 }),
+                    BOOL,
+                    O,
+                );
+                b.terminate(none_block, RTerm::Return(Some(f_const)));
+
+                // Projected borrow `[Deref, Downcast(1), Field(0)]` mirroring inlined `Option<Ordering>::eq`.
+                let borrow_inner = b.op(
+                    some_block,
+                    OpKind::BorrowView {
+                        root: Root::Value(borrow_opt),
+                        path: vec![
+                            Proj::Deref,
+                            Proj::Downcast { variant: 1 },
+                            Proj::Field {
+                                field: 0,
+                                ty: ORDERING,
+                            },
+                        ],
+                        mutable: false,
+                    },
+                    REF_ORDERING,
+                    O,
+                );
+                let ord_val = b.op(some_block, OpKind::Deref(borrow_inner), ORDERING, O);
+                let ord_discr = b.op(some_block, OpKind::Discriminant(ord_val), I8, O);
+                let less_const = b.op(
+                    some_block,
+                    OpKind::Const(ConstTree::Scalar {
+                        bits: 255,
+                        bytes: 1,
+                    }),
+                    I8,
+                    O,
+                );
+                let is_less = b.op(
+                    some_block,
+                    OpKind::Binary {
+                        op: BinaryOp::Eq,
+                        l: ord_discr,
+                        r: less_const,
+                        ty: I8,
+                    },
+                    BOOL,
+                    O,
+                );
+                b.terminate(some_block, RTerm::Return(Some(is_less)));
+
+                let mut func = b.finish();
+                func.verify(tbl).expect("pre-opt Func::verify");
+
+                assert!(
+                    super::super::promote_cell_borrows(&mut func, tbl),
+                    "expected projected NullNiche borrow promotion (with_invoke={with_invoke})"
+                );
+                func.verify(tbl).expect("post-promote Func::verify");
+                crate::opt::dce::run(&mut func, tbl);
+                func.verify(tbl).expect("post-dce Func::verify");
+
+                // PEA finds 0 scalarizable objects (NullNiche is not indirect, and Invoke skips PEA).
+                let stats = super::super::run(&mut func, tbl);
+                assert_eq!(stats.scalarized, 0);
+                assert!(
+                    super::super::unbox_cells(&mut func, tbl),
+                    "expected NullNiche cell to flip boxed true -> false (with_invoke={with_invoke})"
+                );
+                func.verify(tbl).expect("post-unbox Func::verify");
+                assert!(!func.cells[cell.0 as usize].boxed);
+                assert!(
+                    func.blocks
+                        .iter()
+                        .flat_map(|blk| &blk.ops)
+                        .all(|op| !matches!(op.kind, OpKind::BorrowView { .. })),
+                    "dead BorrowViews must disappear (with_invoke={with_invoke})"
+                );
+            }
         }
     }
 }

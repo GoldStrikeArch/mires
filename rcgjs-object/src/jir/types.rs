@@ -495,6 +495,40 @@ pub enum EnumRepr {
     /// serialized by the backend): variant `i` uses integer `i` (`0, 1, 2, ...`) directly when
     /// `fieldless` is true or under `TAG` when `fieldless` is false.
     IntTag { fieldless: bool },
+    /// Link-time specialized 2-variant private-sentinel-niche representation (append-only, never
+    /// serialized by the backend): `none_variant` lowers directly to a private module-scope
+    /// sentinel object (`const $sn = {};`) and `some_variant` lowers directly to its single
+    /// non-ZST payload field (`some_field`) whenever the payload may inhabit `null` (such as
+    /// `Option<JsValue>` or `Option<Option<T>>`) but cannot inhabit the private sentinel.
+    SentinelNiche {
+        none_variant: u32,
+        some_variant: u32,
+        some_field: u32,
+    },
+}
+
+impl EnumRepr {
+    /// Returns `(none_variant, some_variant, some_field)` for a 2-variant niche encoding
+    /// (`NullNiche` or `SentinelNiche`).
+    pub const fn niche_variants(self) -> Option<(u32, u32, u32)> {
+        match self {
+            EnumRepr::NullNiche {
+                none_variant,
+                some_variant,
+            } => Some((none_variant, some_variant, 0)),
+            EnumRepr::SentinelNiche {
+                none_variant,
+                some_variant,
+                some_field,
+            } => Some((none_variant, some_variant, some_field)),
+            _ => None,
+        }
+    }
+
+    /// Whether this enum uses a 2-variant niche encoding (`NullNiche` or `SentinelNiche`).
+    pub const fn is_null_or_sentinel_niche(self) -> bool {
+        self.niche_variants().is_some()
+    }
 }
 
 /// The JavaScript shape of a reference or raw pointer, decided by its pointee (`ptr.rs`).
@@ -560,6 +594,9 @@ pub struct TypeTable {
     /// Strictly sorted by `id`.
     descriptors: Vec<TypeDescriptor>,
     index: BTreeMap<TypeId, u32>,
+    /// Link-time private module-scope sentinel binding (`const $sn = {};`) used by
+    /// [`EnumRepr::SentinelNiche`], never serialized in `.o` files.
+    sentinel_none: Option<String>,
 }
 
 impl From<Vec<TypeDescriptor>> for TypeTable {
@@ -572,7 +609,11 @@ impl From<Vec<TypeDescriptor>> for TypeTable {
             .enumerate()
             .map(|(position, descriptor)| (descriptor.id, position as u32))
             .collect();
-        Self { descriptors, index }
+        Self {
+            descriptors,
+            index,
+            sentinel_none: None,
+        }
     }
 }
 
@@ -721,6 +762,16 @@ impl TypeTable {
         self.get(id).and_then(|descriptor| descriptor.js.enum_repr)
     }
 
+    /// Link-time module-scope sentinel identifier for [`EnumRepr::SentinelNiche`], if active.
+    pub fn sentinel_none(&self) -> Option<&str> {
+        self.sentinel_none.as_deref()
+    }
+
+    /// Sets the link-time module-scope sentinel identifier for [`EnumRepr::SentinelNiche`].
+    pub fn set_sentinel_none(&mut self, name: Option<String>) {
+        self.sentinel_none = name;
+    }
+
     /// Whether the type is an enum whose JavaScript value is a primitive.
     pub fn is_primitive_enum(&self, id: TypeId) -> bool {
         self.get(id)
@@ -801,15 +852,15 @@ impl TypeTable {
                 } else {
                     0
                 };
-                if *form == NominalForm::Enum
-                    && matches!(
-                        descriptor.js.enum_repr,
-                        Some(EnumRepr::NullNiche { some_variant, .. }) if index == some_variant
-                    )
-                    && field == 0
-                {
-                    let ty = variants.get(index as usize)?.fields.first()?.ty;
-                    return transparent(ty);
+                if *form == NominalForm::Enum {
+                    if let Some((_, some_variant, some_field)) =
+                        descriptor.js.enum_repr.and_then(EnumRepr::niche_variants)
+                    {
+                        if index == some_variant && field == some_field {
+                            let ty = variants.get(index as usize)?.fields.get(field as usize)?.ty;
+                            return transparent(ty);
+                        }
+                    }
                 }
                 variants
                     .get(index as usize)?

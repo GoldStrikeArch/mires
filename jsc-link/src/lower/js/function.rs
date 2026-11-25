@@ -367,6 +367,7 @@ pub fn lower_with_ascii(
             .filter(|(_, init)| init.is_none())
             .map(|(name, _)| name.clone())
             .collect();
+        collapse_ephemeral_rt_box_deref(&mut body, &uninit_locals);
         eliminate_dead_local_writes(&mut body, &local_names);
         fuse_local_bytes_str_with(&mut body, &uninit_locals, cx.needs_byte_slice_ref());
         fold_offset_slot_derefs(&mut body, &uninit_locals);
@@ -382,6 +383,7 @@ pub fn lower_with_ascii(
             cse_slice_loads(&mut body, &mut declarations, &mut local_names);
         }
         eliminate_dead_local_writes(&mut body, &local_names);
+        unbox_single_slot_array_locals(&mut body, &mut declarations);
     }
     if crate::lower::bstr::enabled() {
         fold_bstr_in_bytes_stmts(&mut body);
@@ -2066,10 +2068,42 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
     }
 }
 
-/// Removes assignments to compiler locals that no expression ever reads. JIR values are SSA,
-/// but range/projection cleanup can leave a pure snapshot behind after the last JIR DCE run. At
-/// this point the structured JavaScript is authoritative, so a function-wide zero-read test is
-/// both smaller and more exact than trying to predict the structurizer's final spelling.
+/// Whether `expr` is strictly side-effect-free and cannot throw even on `null`/`undefined`
+/// (unlike property/index access), so a bare expression statement `expr;` can be dropped safely.
+fn is_strictly_pure_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Undefined
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::Arrow(..) => true,
+        Expr::Unary(_, inner) => is_strictly_pure_expr(inner),
+        Expr::Binary(_, lhs, rhs) => is_strictly_pure_expr(lhs) && is_strictly_pure_expr(rhs),
+        Expr::Cond(c, t, e) => {
+            is_strictly_pure_expr(c) && is_strictly_pure_expr(t) && is_strictly_pure_expr(e)
+        }
+        Expr::Array(items) | Expr::Seq(items) => items.iter().all(is_strictly_pure_expr),
+        Expr::Object(entries) => entries.iter().all(|(_, v)| is_strictly_pure_expr(v)),
+        Expr::Member(..)
+        | Expr::Index(..)
+        | Expr::Call(..)
+        | Expr::New(..)
+        | Expr::Assign(..)
+        | Expr::CompoundAssign(..)
+        | Expr::Raw(_) => false,
+    }
+}
+
+/// Removes assignments to compiler locals that no expression ever reads, plus strictly-pure bare
+/// expression statements (such as dead `select_unpredictable` ternaries `cond ? a : b;`). JIR
+/// values are SSA, but range/projection cleanup and lowered hints can leave pure expressions
+/// behind after the last JIR DCE run. At this point the structured JavaScript is authoritative, so
+/// a function-wide zero-read test is both smaller and more exact than trying to predict the
+/// structurizer's final spelling.
 fn eliminate_dead_local_writes(body: &mut Vec<Stmt>, locals: &HashSet<String>) {
     loop {
         let mut mentions: std::collections::HashMap<String, usize> =
@@ -2088,7 +2122,7 @@ fn eliminate_dead_local_writes(body: &mut Vec<Stmt>, locals: &HashSet<String>) {
             })
             .map(|(name, _)| name.clone())
             .collect();
-        if unread.is_empty() || !remove_unread_writes(body, &unread) {
+        if !remove_unread_writes(body, &unread) {
             return;
         }
     }
@@ -2154,6 +2188,10 @@ fn remove_unread_writes(body: &mut Vec<Stmt>, unread: &HashSet<String>) -> bool 
                     _ => Some(Expr::Seq(out)),
                 }
             }
+            other if is_strictly_pure_expr(&other) => {
+                *changed = true;
+                None
+            }
             other => Some(other),
         }
     }
@@ -2180,6 +2218,10 @@ fn remove_unread_writes(body: &mut Vec<Stmt>, unread: &HashSet<String>) -> bool 
             Stmt::LoopForever(_, inner) | Stmt::While(_, inner) | Stmt::Block(inner) => {
                 changed |= remove_unread_writes(inner, unread);
             }
+            Stmt::TryCatch { body, handler, .. } => {
+                changed |= remove_unread_writes(body, unread);
+                changed |= remove_unread_writes(handler, unread);
+            }
             _ => {}
         }
         let replacement = match stmt {
@@ -2192,6 +2234,452 @@ fn remove_unread_writes(body: &mut Vec<Stmt>, unread: &HashSet<String>) -> bool 
     }
     *body = kept;
     changed
+}
+
+/// Collapses ephemeral `(tmp = __rt.box(inner), tmp.buf[tmp.off])` expressions into `inner` when
+/// `tmp` is an uninitialized compiler temporary used nowhere else in the function body.
+fn collapse_ephemeral_rt_box_deref(body: &mut [Stmt], locals: &HashSet<String>) {
+    let mut mentions: HashMap<String, usize> = HashMap::new();
+    for stmt in body.iter() {
+        jsast::visit_idents(stmt, &mut |name| {
+            *mentions.entry(name.to_owned()).or_default() += 1;
+        });
+    }
+
+    fn is_rt_box_call(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Call(callee, args)
+                if args.len() == 1
+                    && matches!(
+                        callee.as_ref(),
+                        Expr::Member(obj, method)
+                            if method == "box"
+                                && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
+                    )
+        )
+    }
+
+    fn is_slot_deref_of(expr: &Expr, tmp: &str) -> bool {
+        let Expr::Index(buf, off) = expr else {
+            return false;
+        };
+        matches!(
+            (buf.as_ref(), off.as_ref()),
+            (Expr::Member(b_obj, b_prop), Expr::Member(o_obj, o_prop))
+                if b_prop == "buf"
+                    && o_prop == "off"
+                    && matches!(b_obj.as_ref(), Expr::Ident(a) if a == tmp)
+                    && matches!(o_obj.as_ref(), Expr::Ident(b) if b == tmp)
+        )
+    }
+
+    fn rewrite_expr(expr: &mut Expr, locals: &HashSet<String>, mentions: &HashMap<String, usize>) {
+        match expr {
+            Expr::Seq(items) => {
+                for item in items.iter_mut() {
+                    rewrite_expr(item, locals, mentions);
+                }
+                if items.len() >= 2 {
+                    let n = items.len();
+                    let can_collapse = match (&items[n - 2], &items[n - 1]) {
+                        (Expr::Assign(lhs, rhs), tail) => matches!(
+                            lhs.as_ref(),
+                            Expr::Ident(tmp)
+                                if locals.contains(tmp)
+                                    && mentions.get(tmp).copied() == Some(3)
+                                    && is_rt_box_call(rhs)
+                                    && is_slot_deref_of(tail, tmp)
+                        ),
+                        _ => false,
+                    };
+                    if can_collapse {
+                        items.pop();
+                        let assign = items.pop().expect("assign");
+                        if let Expr::Assign(_, rhs) = assign {
+                            if let Expr::Call(_, mut args) = *rhs {
+                                let inner = args.pop().expect("1 arg");
+                                items.push(inner);
+                            }
+                        }
+                        if items.len() == 1 {
+                            let single = items.pop().expect("single");
+                            *expr = single;
+                        }
+                    }
+                }
+            }
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => rewrite_expr(obj, locals, mentions),
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => {
+                rewrite_expr(a, locals, mentions);
+                rewrite_expr(b, locals, mentions);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                rewrite_expr(c, locals, mentions);
+                for a in args {
+                    rewrite_expr(a, locals, mentions);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                rewrite_expr(c, locals, mentions);
+                rewrite_expr(t, locals, mentions);
+                rewrite_expr(e, locals, mentions);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    rewrite_expr(v, locals, mentions);
+                }
+            }
+            Expr::Array(items) => {
+                for item in items {
+                    rewrite_expr(item, locals, mentions);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => rewrite_expr(b, locals, mentions),
+            Expr::Arrow(_, ArrowBody::Block(stmts)) => rewrite_stmts(stmts, locals, mentions),
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts(
+        stmts: &mut [Stmt],
+        locals: &HashSet<String>,
+        mentions: &HashMap<String, usize>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => rewrite_expr(e, locals, mentions),
+                Stmt::Lets(decls) => {
+                    for (_, init) in decls {
+                        if let Some(e) = init {
+                            rewrite_expr(e, locals, mentions);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    rewrite_expr(test, locals, mentions);
+                    rewrite_stmts(a, locals, mentions);
+                    if let Some(b) = b {
+                        rewrite_stmts(b, locals, mentions);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rewrite_expr(d, locals, mentions);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rewrite_expr(t, locals, mentions);
+                        }
+                        rewrite_stmts(&mut c.body, locals, mentions);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts(std::slice::from_mut(inner.as_mut()), locals, mentions);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_stmts(b, locals, mentions),
+                Stmt::While(t, b) => {
+                    rewrite_expr(t, locals, mentions);
+                    rewrite_stmts(b, locals, mentions);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts(body, locals, mentions);
+                    rewrite_stmts(handler, locals, mentions);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    rewrite_stmts(body, locals, &mentions);
+}
+
+/// Unboxes compiler-declared single-slot array cells (`let m = [];`) into plain scalars (`let m;`)
+/// when every mention of `m` in `body` is strictly `m[0]` (read or write) outside any closure or
+/// nested function. This cleans up boxed cells whose `{ buf: m, off: 0 }` views became dead after
+/// lowering (such as `core::hint::select_unpredictable` in `slice::partition_point`).
+fn unbox_single_slot_array_locals(body: &mut [Stmt], declarations: &mut [(String, Option<Expr>)]) {
+    let candidates: HashSet<String> = declarations
+        .iter()
+        .filter(|(_, init)| matches!(init, Some(Expr::Array(items)) if items.is_empty()))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    fn is_zero_index(expr: &Expr) -> bool {
+        match expr {
+            Expr::Num(n) => *n == 0.0,
+            Expr::RawNum(s) => s == "0",
+            _ => false,
+        }
+    }
+
+    fn scan_expr(
+        expr: &Expr,
+        candidates: &HashSet<String>,
+        in_closure: bool,
+        disqualified: &mut HashSet<String>,
+        slot_uses: &mut HashSet<String>,
+    ) {
+        if !in_closure {
+            if let Expr::Index(obj, idx) = expr {
+                if let Expr::Ident(name) = obj.as_ref() {
+                    if candidates.contains(name) && is_zero_index(idx) {
+                        slot_uses.insert(name.clone());
+                        return;
+                    }
+                }
+            }
+        }
+        match expr {
+            Expr::Ident(name) => {
+                if candidates.contains(name) {
+                    disqualified.insert(name.clone());
+                }
+            }
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => {
+                scan_expr(obj, candidates, in_closure, disqualified, slot_uses);
+            }
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => {
+                scan_expr(a, candidates, in_closure, disqualified, slot_uses);
+                scan_expr(b, candidates, in_closure, disqualified, slot_uses);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_expr(c, candidates, in_closure, disqualified, slot_uses);
+                for a in args {
+                    scan_expr(a, candidates, in_closure, disqualified, slot_uses);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                scan_expr(c, candidates, in_closure, disqualified, slot_uses);
+                scan_expr(t, candidates, in_closure, disqualified, slot_uses);
+                scan_expr(e, candidates, in_closure, disqualified, slot_uses);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_expr(v, candidates, in_closure, disqualified, slot_uses);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    scan_expr(item, candidates, in_closure, disqualified, slot_uses);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => {
+                scan_expr(b, candidates, true, disqualified, slot_uses);
+            }
+            Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+                scan_stmts(stmts, candidates, true, disqualified, slot_uses);
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(
+        stmts: &[Stmt],
+        candidates: &HashSet<String>,
+        in_closure: bool,
+        disqualified: &mut HashSet<String>,
+        slot_uses: &mut HashSet<String>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    scan_expr(e, candidates, in_closure, disqualified, slot_uses);
+                }
+                Stmt::Const(name, e) => {
+                    if candidates.contains(name) {
+                        disqualified.insert(name.clone());
+                    }
+                    scan_expr(e, candidates, in_closure, disqualified, slot_uses);
+                }
+                Stmt::Let(name, init) => {
+                    if candidates.contains(name) {
+                        disqualified.insert(name.clone());
+                    }
+                    if let Some(e) = init {
+                        scan_expr(e, candidates, in_closure, disqualified, slot_uses);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if candidates.contains(name) {
+                            disqualified.insert(name.clone());
+                        }
+                        if let Some(e) = init {
+                            scan_expr(e, candidates, in_closure, disqualified, slot_uses);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    scan_expr(test, candidates, in_closure, disqualified, slot_uses);
+                    scan_stmts(a, candidates, in_closure, disqualified, slot_uses);
+                    if let Some(b) = b {
+                        scan_stmts(b, candidates, in_closure, disqualified, slot_uses);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_expr(d, candidates, in_closure, disqualified, slot_uses);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_expr(t, candidates, in_closure, disqualified, slot_uses);
+                        }
+                        scan_stmts(&c.body, candidates, in_closure, disqualified, slot_uses);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        candidates,
+                        in_closure,
+                        disqualified,
+                        slot_uses,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    scan_stmts(b, candidates, in_closure, disqualified, slot_uses);
+                }
+                Stmt::While(t, b) => {
+                    scan_expr(t, candidates, in_closure, disqualified, slot_uses);
+                    scan_stmts(b, candidates, in_closure, disqualified, slot_uses);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if candidates.contains(binding) {
+                        disqualified.insert(binding.clone());
+                    }
+                    scan_stmts(body, candidates, in_closure, disqualified, slot_uses);
+                    scan_stmts(handler, candidates, in_closure, disqualified, slot_uses);
+                }
+                Stmt::FunctionDecl { body, .. } => {
+                    scan_stmts(body, candidates, true, disqualified, slot_uses);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_expr(expr: &mut Expr, unbox: &HashSet<String>) {
+        if let Expr::Index(obj, idx) = expr {
+            if let Expr::Ident(name) = obj.as_ref() {
+                if unbox.contains(name) && is_zero_index(idx) {
+                    let name = name.clone();
+                    *expr = Expr::Ident(name);
+                    return;
+                }
+            }
+        }
+        match expr {
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => rewrite_expr(obj, unbox),
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => {
+                rewrite_expr(a, unbox);
+                rewrite_expr(b, unbox);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                rewrite_expr(c, unbox);
+                for a in args {
+                    rewrite_expr(a, unbox);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                rewrite_expr(c, unbox);
+                rewrite_expr(t, unbox);
+                rewrite_expr(e, unbox);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    rewrite_expr(v, unbox);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    rewrite_expr(item, unbox);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts(stmts: &mut [Stmt], unbox: &HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => rewrite_expr(e, unbox),
+                Stmt::Lets(decls) => {
+                    for (_, init) in decls {
+                        if let Some(e) = init {
+                            rewrite_expr(e, unbox);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    rewrite_expr(test, unbox);
+                    rewrite_stmts(a, unbox);
+                    if let Some(b) = b {
+                        rewrite_stmts(b, unbox);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rewrite_expr(d, unbox);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rewrite_expr(t, unbox);
+                        }
+                        rewrite_stmts(&mut c.body, unbox);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts(std::slice::from_mut(inner.as_mut()), unbox);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_stmts(b, unbox),
+                Stmt::While(t, b) => {
+                    rewrite_expr(t, unbox);
+                    rewrite_stmts(b, unbox);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts(body, unbox);
+                    rewrite_stmts(handler, unbox);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut disqualified = HashSet::new();
+    let mut slot_uses = HashSet::new();
+    scan_stmts(body, &candidates, false, &mut disqualified, &mut slot_uses);
+    let unbox: HashSet<String> = candidates
+        .into_iter()
+        .filter(|name| !disqualified.contains(name) && slot_uses.contains(name))
+        .collect();
+    if unbox.is_empty() {
+        return;
+    }
+    rewrite_stmts(body, &unbox);
+    for (name, init) in declarations.iter_mut() {
+        if unbox.contains(name) {
+            *init = None;
+        }
+    }
 }
 
 /// Folds single-assignment local slot objects (`v = idx === 0 ? base : { buf: base.buf, off:
@@ -4742,6 +5230,113 @@ mod tests {
         assert!(
             declarations.iter().any(|(l, _)| l.starts_with("$sl")),
             "expected hoisted slice temp in {declarations:?}"
+        );
+    }
+
+    #[test]
+    fn dead_pure_ternary_and_single_slot_array_cells_unbox() {
+        let mut declarations = vec![
+            ("m".to_owned(), Some(jsast::array(Vec::new()))),
+            ("k".to_owned(), Some(jsast::array(Vec::new()))),
+            ("esc".to_owned(), Some(jsast::array(Vec::new()))),
+            ("o".to_owned(), None),
+            ("p".to_owned(), None),
+            ("q".to_owned(), None),
+            ("r".to_owned(), None),
+            ("s".to_owned(), None),
+        ];
+        let local_names: HashSet<String> = declarations.iter().map(|(n, _)| n.clone()).collect();
+        let mut body = vec![
+            jsast::assign_stmt(
+                jsast::index(jsast::id("m"), jsast::num(0.0)),
+                jsast::id("b"),
+            ),
+            jsast::assign_stmt(
+                jsast::index(jsast::id("k"), jsast::num(0.0)),
+                jsast::id("e"),
+            ),
+            jsast::assign_stmt(
+                jsast::id("o"),
+                jsast::object_of(vec![("buf", jsast::id("m")), ("off", jsast::num(0.0))]),
+            ),
+            jsast::assign_stmt(
+                jsast::id("p"),
+                jsast::object_of(vec![("buf", jsast::id("k")), ("off", jsast::num(0.0))]),
+            ),
+            Stmt::ExprStmt(jsast::cond(jsast::id("j"), jsast::id("o"), jsast::id("p"))),
+            jsast::assign_stmt(
+                jsast::id("q"),
+                jsast::index(jsast::id("m"), jsast::num(0.0)),
+            ),
+            jsast::assign_stmt(
+                jsast::id("r"),
+                jsast::index(jsast::id("k"), jsast::num(0.0)),
+            ),
+            jsast::assign_stmt(
+                jsast::id("s"),
+                jsast::cond(jsast::id("j"), jsast::id("q"), jsast::id("r")),
+            ),
+            jsast::assign_stmt(
+                jsast::index(jsast::id("esc"), jsast::num(0.0)),
+                jsast::id("s"),
+            ),
+            Stmt::Return(Some(jsast::object_of(vec![
+                ("buf", jsast::id("esc")),
+                ("off", jsast::num(0.0)),
+            ]))),
+        ];
+        eliminate_dead_local_writes(&mut body, &local_names);
+        unbox_single_slot_array_locals(&mut body, &mut declarations);
+        let printed = jsast::stmt_to_string(&Stmt::Block(body));
+        assert!(!printed.contains("j ? o : p"), "{printed}");
+        assert!(!printed.contains("m[0]"), "{printed}");
+        assert!(!printed.contains("k[0]"), "{printed}");
+        assert!(printed.contains("m = b;"), "{printed}");
+        assert!(printed.contains("esc[0] = s;"), "{printed}");
+        assert_eq!(declarations[0], ("m".to_owned(), None));
+        assert_eq!(declarations[1], ("k".to_owned(), None));
+        assert!(declarations[2].1.is_some(), "escaping cell must stay boxed");
+    }
+
+    #[test]
+    fn collapse_ephemeral_rt_box_deref_elides_temp_box() {
+        let locals: HashSet<String> = ["f".to_owned(), "g".to_owned(), "kept".to_owned()]
+            .into_iter()
+            .collect();
+        let ephemeral = Expr::Seq(vec![
+            Expr::Assign(
+                Box::new(jsast::id("f")),
+                Box::new(jsast::rt_call(
+                    "box",
+                    vec![jsast::member(jsast::id("obj"), "value")],
+                )),
+            ),
+            Expr::Index(
+                Box::new(jsast::member(jsast::id("f"), "buf")),
+                Box::new(jsast::member(jsast::id("f"), "off")),
+            ),
+        ]);
+        let retained = Expr::Seq(vec![
+            Expr::Assign(
+                Box::new(jsast::id("kept")),
+                Box::new(jsast::rt_call("box", vec![jsast::id("other")])),
+            ),
+            Expr::Index(
+                Box::new(jsast::member(jsast::id("kept"), "buf")),
+                Box::new(jsast::member(jsast::id("kept"), "off")),
+            ),
+        ]);
+        let mut body = vec![
+            jsast::assign_stmt(jsast::id("g"), ephemeral),
+            jsast::assign_stmt(jsast::id("h"), retained),
+            Stmt::Return(Some(jsast::id("kept"))),
+        ];
+        collapse_ephemeral_rt_box_deref(&mut body, &locals);
+        let printed = jsast::stmt_to_string(&Stmt::Block(body));
+        assert!(printed.contains("g = obj.value;"), "{printed}");
+        assert!(
+            printed.contains("__rt.box(other)"),
+            "multi-use boxed slot must stay intact:\n{printed}"
         );
     }
 }

@@ -73,6 +73,7 @@ pub struct ScrutTy {
     pub ty: TypeId,
     pub tag_enum: Option<TypeId>,
     pub strict_i32: bool,
+    pub sentinel_result: Option<crate::plan::abi_flat::SentinelResultShape>,
 }
 
 /// The body of one function, and the names of the temporaries its prelude has to declare.
@@ -430,92 +431,88 @@ impl Emitter<'_, '_> {
             Scrut::Payload(scrutinee) => self.cx.scrut_ty(scrutinee),
             Scrut::Tmp(tmp) => self.tmp_ty(*tmp),
         };
-        if let Some(enum_ty) = scrut_ty.tag_enum {
-            if let Some(EnumRepr::NullNiche {
-                none_variant,
-                some_variant,
-            }) = self.cx.table.enum_repr(self.cx.table.peeled(enum_ty))
-            {
-                let (value, _) = self.scrutinee(scrut)?;
-                let mut setup = Vec::new();
-                let variants = value::enum_variants(self.cx.table, enum_ty);
-                let (signed, bits) = self.cx.table.int_info(scrut_ty.ty).unwrap_or((false, 128));
-                let none_d = variants
-                    .get(none_variant as usize)
-                    .map(|v| resign(signed, bits, v.logical_discr as u128));
-                let some_d = variants
-                    .get(some_variant as usize)
-                    .map(|v| resign(signed, bits, v.logical_discr as u128));
-                let mut seen_none = false;
-                let mut seen_some = false;
-                let mut used_value = false;
-                let mut compiled_arms = Vec::with_capacity(arms.len());
-                let mut exhaustive_tail: Option<Vec<Stmt>> = None;
-                for (values, body) in arms {
-                    let mut has_none = false;
-                    let mut has_some = false;
-                    for v in values {
-                        let d = self.cx.case_value(scrut_ty.ty, v);
-                        if Some(d) == none_d {
-                            has_none = true;
-                        }
-                        if Some(d) == some_d {
-                            has_some = true;
-                        }
+        if let Some((enum_ty, none_variant, some_variant, none_expr)) =
+            self.two_variant_niche_info(scrut_ty)
+        {
+            let (value, _) = self.scrutinee(scrut)?;
+            let mut setup = Vec::new();
+            let variants = value::enum_variants(self.cx.table, enum_ty);
+            let (signed, bits) = self.cx.table.int_info(scrut_ty.ty).unwrap_or((false, 128));
+            let none_d = variants
+                .get(none_variant as usize)
+                .map(|v| resign(signed, bits, v.logical_discr as u128));
+            let some_d = variants
+                .get(some_variant as usize)
+                .map(|v| resign(signed, bits, v.logical_discr as u128));
+            let mut seen_none = false;
+            let mut seen_some = false;
+            let mut used_value = false;
+            let mut compiled_arms = Vec::with_capacity(arms.len());
+            let mut exhaustive_tail: Option<Vec<Stmt>> = None;
+            for (values, body) in arms {
+                let mut has_none = false;
+                let mut has_some = false;
+                for v in values {
+                    let d = self.cx.case_value(scrut_ty.ty, v);
+                    if Some(d) == none_d {
+                        has_none = true;
                     }
-                    let eff_none = has_none && !seen_none;
-                    let eff_some = has_some && !seen_some;
-                    if !eff_none && !eff_some {
-                        continue;
+                    if Some(d) == some_d {
+                        has_some = true;
                     }
-                    let body = self.region(body)?;
-                    seen_none |= eff_none;
-                    seen_some |= eff_some;
-                    // `value === null` and `value !== null` partition every JS value, so once both
-                    // variants are covered this arm is unconditionally reached as the `else` tail
-                    // (eliminating redundant `else if (x !== null) ... else throw $ur()`).
-                    if seen_none && seen_some {
-                        exhaustive_tail = Some(body);
-                        break;
-                    }
-                    let op = if eff_none {
-                        BinOp::StrictEq
-                    } else {
-                        BinOp::StrictNe
-                    };
-                    used_value = true;
-                    compiled_arms.push((jsast::binary(op, value.clone(), jsast::null()), body));
                 }
-                if !used_value && !jsast::is_droppable(&value) {
-                    setup.push(jsast::expr_stmt(value));
+                let eff_none = has_none && !seen_none;
+                let eff_some = has_some && !seen_some;
+                if !eff_none && !eff_some {
+                    continue;
                 }
-                let mut chain = match exhaustive_tail {
-                    Some(tail) => tail,
-                    None => self.region(default)?,
-                };
-                for (cond, body) in compiled_arms.into_iter().rev() {
-                    chain = if chain.is_empty() {
-                        vec![jsast::if_(cond, body)]
-                    } else {
-                        vec![jsast::if_else(cond, body, chain)]
-                    };
+                let body = self.region(body)?;
+                seen_none |= eff_none;
+                seen_some |= eff_some;
+                // `value === none_expr` and `value !== none_expr` partition every JS value, so
+                // once both variants are covered this arm is unconditionally reached as the `else`
+                // tail (eliminating redundant `else if (x !== null) ... else throw $ur()`).
+                if seen_none && seen_some {
+                    exhaustive_tail = Some(body);
+                    break;
                 }
-                let (sw_label, needs_label) = match label {
-                    Some(label) => (label_name(label), true),
-                    None => {
-                        let id = self.next_switch_label;
-                        self.next_switch_label += 1;
-                        (format!("$sw{id}"), false)
-                    }
-                };
-                let rewrote = rewrite_unlabeled_breaks(&mut chain, &sw_label);
-                if needs_label || rewrote {
-                    setup.push(jsast::labeled(sw_label, Stmt::Block(chain)));
+                let op = if eff_none {
+                    BinOp::StrictEq
                 } else {
-                    setup.extend(chain);
-                }
-                return Ok(with_loc(loc, setup));
+                    BinOp::StrictNe
+                };
+                used_value = true;
+                compiled_arms.push((jsast::binary(op, value.clone(), none_expr.clone()), body));
             }
+            if !used_value && !jsast::is_droppable(&value) {
+                setup.push(jsast::expr_stmt(value));
+            }
+            let mut chain = match exhaustive_tail {
+                Some(tail) => tail,
+                None => self.region(default)?,
+            };
+            for (cond, body) in compiled_arms.into_iter().rev() {
+                chain = if chain.is_empty() {
+                    vec![jsast::if_(cond, body)]
+                } else {
+                    vec![jsast::if_else(cond, body, chain)]
+                };
+            }
+            let (sw_label, needs_label) = match label {
+                Some(label) => (label_name(label), true),
+                None => {
+                    let id = self.next_switch_label;
+                    self.next_switch_label += 1;
+                    (format!("$sw{id}"), false)
+                }
+            };
+            let rewrote = rewrite_unlabeled_breaks(&mut chain, &sw_label);
+            if needs_label || rewrote {
+                setup.push(jsast::labeled(sw_label, Stmt::Block(chain)));
+            } else {
+                setup.extend(chain);
+            }
+            return Ok(with_loc(loc, setup));
         }
         let mut cases = Vec::with_capacity(arms.len() + 1);
         for (values, body) in arms {
@@ -597,7 +594,22 @@ impl Emitter<'_, '_> {
             ty: self.cx.usize_ty(),
             tag_enum: None,
             strict_i32: false,
+            sentinel_result: None,
         })
+    }
+
+    /// Returns `(enum_ty, sentinel_variant, payload_variant, sentinel_expr)` when `scrut_ty`
+    /// tests a 2-variant `NullNiche`, `SentinelNiche`, or virtual `SentinelResult` scrutinee.
+    fn two_variant_niche_info(&self, scrut_ty: ScrutTy) -> Option<(TypeId, u32, u32, Expr)> {
+        if let Some(shape) = scrut_ty.sentinel_result {
+            let se = self.cx.sentinel_err_expr()?;
+            return Some((shape.ty, shape.err_variant, shape.ok_variant, se));
+        }
+        let enum_ty = scrut_ty.tag_enum?;
+        let repr = self.cx.table.enum_repr(self.cx.table.peeled(enum_ty))?;
+        let (none_variant, some_variant, _) = repr.niche_variants()?;
+        let none_expr = value::niche_none_expr(self.cx.table, repr)?;
+        Some((enum_ty, none_variant, some_variant, none_expr))
     }
 
     /// A case value as a JavaScript literal, unbiased back into the scrutinee's own type.
@@ -664,56 +676,54 @@ impl Emitter<'_, '_> {
     /// How a test on a scrutinee reads in JavaScript, or its exact negation (`emit.rs::test`).
     fn test(&self, value: Expr, scrut: ScrutTy, test: Test, negated: bool) -> Expr {
         let ty = scrut.ty;
-        if let Some(enum_ty) = scrut.tag_enum {
-            if let Some(EnumRepr::NullNiche {
-                none_variant,
-                some_variant,
-            }) = self.cx.table.enum_repr(self.cx.table.peeled(enum_ty))
-            {
-                if !matches!(test, Test::IsTrue) {
-                    let variants = value::enum_variants(self.cx.table, enum_ty);
-                    let (signed, bits) = self.cx.table.int_info(ty).unwrap_or((false, 128));
-                    let none_d = variants
-                        .get(none_variant as usize)
-                        .map(|v| resign(signed, bits, v.logical_discr as u128));
-                    let some_d = variants
-                        .get(some_variant as usize)
-                        .map(|v| resign(signed, bits, v.logical_discr as u128));
-                    let bound = |v: u128| self.cx.case_value(ty, v);
-                    let matches_d = |d: Option<i128>| -> bool {
-                        let Some(d) = d else {
-                            return false;
-                        };
-                        match test {
-                            Test::Eq(v) => d == bound(v),
-                            Test::Lt(v) => d > bound(v),
-                            Test::Le(v) => d >= bound(v),
-                            Test::InRange { lo, len } => d >= bound(lo) && d <= bound(lo + len - 1),
-                            Test::IsTrue => false,
-                        }
+        if let Some((enum_ty, none_variant, some_variant, none_expr)) =
+            self.two_variant_niche_info(scrut)
+        {
+            if !matches!(test, Test::IsTrue) {
+                let variants = value::enum_variants(self.cx.table, enum_ty);
+                let (signed, bits) = self.cx.table.int_info(ty).unwrap_or((false, 128));
+                let none_d = variants
+                    .get(none_variant as usize)
+                    .map(|v| resign(signed, bits, v.logical_discr as u128));
+                let some_d = variants
+                    .get(some_variant as usize)
+                    .map(|v| resign(signed, bits, v.logical_discr as u128));
+                let bound = |v: u128| self.cx.case_value(ty, v);
+                let matches_d = |d: Option<i128>| -> bool {
+                    let Some(d) = d else {
+                        return false;
                     };
-                    let m_none = matches_d(none_d) ^ negated;
-                    let m_some = matches_d(some_d) ^ negated;
-                    return match (m_none, m_some) {
-                        (true, true) => {
-                            if jsast::is_droppable(&value) {
-                                jsast::boolean(true)
-                            } else {
-                                jsast::seq(vec![value, jsast::boolean(true)])
-                            }
+                    match test {
+                        Test::Eq(v) => d == bound(v),
+                        Test::Lt(v) => d > bound(v),
+                        Test::Le(v) => d >= bound(v),
+                        Test::InRange { lo, len } => d >= bound(lo) && d <= bound(lo + len - 1),
+                        Test::IsTrue => false,
+                    }
+                };
+                let m_none = matches_d(none_d) ^ negated;
+                let m_some = matches_d(some_d) ^ negated;
+                return match (m_none, m_some) {
+                    (true, true) => {
+                        if jsast::is_droppable(&value) {
+                            jsast::boolean(true)
+                        } else {
+                            jsast::seq(vec![value, jsast::boolean(true)])
                         }
-                        (false, false) => {
-                            if jsast::is_droppable(&value) {
-                                jsast::boolean(false)
-                            } else {
-                                jsast::seq(vec![value, jsast::boolean(false)])
-                            }
+                    }
+                    (false, false) => {
+                        if jsast::is_droppable(&value) {
+                            jsast::boolean(false)
+                        } else {
+                            jsast::seq(vec![value, jsast::boolean(false)])
                         }
-                        (true, false) => jsast::binary(BinOp::StrictEq, value, jsast::null()),
-                        (false, true) => jsast::binary(BinOp::StrictNe, value, jsast::null()),
-                    };
-                }
+                    }
+                    (true, false) => jsast::binary(BinOp::StrictEq, value, none_expr),
+                    (false, true) => jsast::binary(BinOp::StrictNe, value, none_expr),
+                };
             }
+        }
+        if let Some(enum_ty) = scrut.tag_enum {
             let bound = |v: u128| self.cx.case_value(ty, v);
             match test {
                 Test::Eq(_) | Test::IsTrue => {}
@@ -924,15 +934,30 @@ impl<'a> JsCx<'a> {
                 value,
                 ty,
                 tag_enum,
-            } => ScrutTy {
-                ty,
-                tag_enum,
-                strict_i32: tag_enum.is_none() && self.is_strict_i32_u32(value),
-            },
+            } => {
+                let sentinel_result = if tag_enum.is_some() && self.plan.tag_values.contains(&value)
+                {
+                    self.def_of(value).and_then(|op| match &op.kind {
+                        OpKind::Discriminant(base) => {
+                            self.virtual_sentinel(*base).map(|vs| vs.shape)
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                ScrutTy {
+                    ty,
+                    tag_enum,
+                    strict_i32: tag_enum.is_none() && self.is_strict_i32_u32(value),
+                    sentinel_result,
+                }
+            }
             RScrut::Invoke(_) => ScrutTy {
                 ty: self.usize_ty(),
                 tag_enum: None,
                 strict_i32: false,
+                sentinel_result: None,
             },
         }
     }
@@ -1100,6 +1125,60 @@ impl<'a> JsCx<'a> {
                         out.extend(pair_stmts);
                         continue;
                     }
+                    match (copy.dst, copy.src) {
+                        (CopyOperand::Value(dst_v), CopyOperand::Value(src_v))
+                            if self.virtual_sentinel(dst_v).is_some() =>
+                        {
+                            let super::VirtualSentinelRep::Slot { val_var, err_var } =
+                                &self.virtual_sentinel(dst_v).expect("checked").rep
+                            else {
+                                return Err(decline(
+                                    OpClass::Terminator,
+                                    "virtual sentinel edge copy target has no slot",
+                                ));
+                            };
+                            out.extend(self.emit_assign_virtual_sentinel(
+                                val_var,
+                                err_var.as_deref(),
+                                src_v,
+                            )?);
+                            continue;
+                        }
+                        (CopyOperand::Temp(tmp_idx), CopyOperand::Value(src_v))
+                            if self.virtual_sentinel(src_v).is_some() =>
+                        {
+                            let vs = self.virtual_sentinel(src_v).expect("checked");
+                            let dst_val = self.copy_operand_name(copy.dst)?;
+                            let dst_err =
+                                vs.shape.err_field.map(|_| self.copy_temp_err_var(tmp_idx));
+                            out.extend(self.emit_assign_virtual_sentinel(
+                                &dst_val,
+                                dst_err.as_deref(),
+                                src_v,
+                            )?);
+                            continue;
+                        }
+                        (CopyOperand::Value(dst_v), CopyOperand::Temp(tmp_idx))
+                            if self.virtual_sentinel(dst_v).is_some() =>
+                        {
+                            let super::VirtualSentinelRep::Slot { val_var, err_var } =
+                                &self.virtual_sentinel(dst_v).expect("checked").rep
+                            else {
+                                return Err(decline(
+                                    OpClass::Terminator,
+                                    "virtual sentinel edge copy target has no slot",
+                                ));
+                            };
+                            let src_val = jsast::id(self.copy_operand_name(copy.src)?);
+                            out.push(jsast::assign_stmt(jsast::id(val_var.clone()), src_val));
+                            if let Some(de) = err_var {
+                                let src_err = jsast::id(self.copy_temp_err_var(tmp_idx));
+                                out.push(jsast::assign_stmt(jsast::id(de.clone()), src_err));
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let dst = self.copy_operand_name(copy.dst)?;
                     let src = match (copy.dst, copy.src) {
                         (CopyOperand::Value(dst_val), CopyOperand::Value(v))
@@ -1255,6 +1334,18 @@ impl<'a> JsCx<'a> {
         };
         match term {
             RTerm::Return(Some(v)) => {
+                if let Some(shape) = self
+                    .target_abi
+                    .and_then(|sig| sig.result.as_ref())
+                    .and_then(|result| result.sentinel)
+                {
+                    let pending = self.prepare_sentinel_return(*v, shape)?;
+                    self.pending_return_sentinel.replace(Some(pending));
+                    self.pending_return_pair.replace(None);
+                    self.pending_return.replace(None);
+                    return Ok(Vec::new());
+                }
+                self.pending_return_sentinel.replace(None);
                 if self
                     .target_abi
                     .and_then(|sig| sig.result.as_ref())
@@ -1276,6 +1367,7 @@ impl<'a> JsCx<'a> {
                 Ok(Vec::new())
             }
             RTerm::Return(None) => {
+                self.pending_return_sentinel.replace(None);
                 self.pending_return_pair.replace(None);
                 self.pending_return.replace(None);
                 Ok(Vec::new())
@@ -1291,6 +1383,9 @@ impl<'a> JsCx<'a> {
     /// `Region::Return`: `return <value>` with the value the returning block parked, or a bare
     /// `return` for a `()` function.
     fn return_stmt(&self) -> Res<Stmt> {
+        if let Some(pending) = self.pending_return_sentinel.borrow_mut().take() {
+            return self.emit_sentinel_return(pending);
+        }
         if let Some((lo, hi)) = self.pending_return_pair.borrow_mut().take() {
             let spill = jsast::id(spill_name_of(self.spills, 1));
             return Ok(jsast::ret(jsast::seq(vec![jsast::assign(spill, hi), lo])));
@@ -1363,6 +1458,48 @@ impl<'a> JsCx<'a> {
     /// The statements one op becomes: nothing for an inlined value (its expression is cached), an
     /// assignment for a named one, the effect's statements otherwise.
     pub fn op_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
+        if let OpKind::Drop {
+            root: Root::Value(v),
+            path,
+            glue: rcgjs_object::jir::semantic::DropGlue::None,
+        } = &op.kind
+        {
+            if path.is_empty() && self.virtual_sentinel(*v).is_some() {
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(shape) = self.sentinel_call_shape(op) {
+            return self.sentinel_call_stmts(op, shape);
+        }
+        if let Some(result) = op.result {
+            if let Some(vs) = self.virtual_sentinel(result) {
+                match &vs.rep {
+                    super::VirtualSentinelRep::InlineAlias(_)
+                    | super::VirtualSentinelRep::InlineConstruct => return Ok(Vec::new()),
+                    super::VirtualSentinelRep::Slot { val_var, err_var } => match &op.kind {
+                        OpKind::Move(src) | OpKind::Copy(src) => {
+                            return self.emit_assign_virtual_sentinel(
+                                val_var,
+                                err_var.as_deref(),
+                                *src,
+                            );
+                        }
+                        OpKind::Aggregate { .. }
+                        | OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Variant {
+                            ..
+                        }) => {
+                            return self.emit_construct_virtual_sentinel(
+                                val_var,
+                                err_var.as_deref(),
+                                vs.shape,
+                                op,
+                            );
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
         // A tagged result is a virtual canonical object backed by captured scalar locals. Its
         // admission proof permits only field/discriminant reads and Move/Copy aliases leading to
         // those reads or another prepared direct call, so cloning the description would add an
@@ -2783,11 +2920,50 @@ impl<'a> JsCx<'a> {
                 if let Some(&pair) = self.carried_pairs.get(base) {
                     return self.carried_pair_field(pair, *base, *field);
                 }
+                if let Some(vs) = self.virtual_sentinel(*base) {
+                    if table.is_zst(result_ty) {
+                        return Ok(jsast::undefined());
+                    }
+                    let resolved = self.resolve_virtual_sentinel(*base);
+                    let super::VirtualSentinelRep::Slot { val_var, err_var } =
+                        &self.virtual_sentinel(resolved).expect("checked").rep
+                    else {
+                        return Err(decline(
+                            OpClass::Place,
+                            "virtual sentinel field read has no backing slot",
+                        ));
+                    };
+                    let vi = variant.unwrap_or(0);
+                    if vi == vs.shape.ok_variant
+                        && vs.shape.ok_field.is_some_and(|(f, _)| f == *field)
+                    {
+                        return Ok(jsast::id(val_var.clone()));
+                    }
+                    if vi == vs.shape.err_variant
+                        && vs.shape.err_field.is_some_and(|(f, _)| f == *field)
+                    {
+                        let Some(ev) = err_var else {
+                            return Err(decline(
+                                OpClass::Place,
+                                "virtual sentinel err payload slot missing",
+                            ));
+                        };
+                        return Ok(jsast::id(ev.clone()));
+                    }
+                    return Err(decline(
+                        OpClass::Place,
+                        format!("field {field} on variant {vi} of virtual sentinel result"),
+                    ));
+                }
                 let base_ty = self.ty_of(*base)?;
                 if table.is_zst(result_ty)
                     && matches!(
                         table.enum_repr(table.peeled(base_ty)),
-                        Some(EnumRepr::IntTag { fieldless: true } | EnumRepr::NullNiche { .. })
+                        Some(
+                            EnumRepr::IntTag { fieldless: true }
+                                | EnumRepr::NullNiche { .. }
+                                | EnumRepr::SentinelNiche { .. }
+                        )
                     )
                 {
                     return Ok(jsast::undefined());
@@ -2809,6 +2985,42 @@ impl<'a> JsCx<'a> {
                 }
             }
             OpKind::Discriminant(base) => {
+                if let Some(vs) = self.virtual_sentinel(*base) {
+                    let resolved = self.resolve_virtual_sentinel(*base);
+                    let super::VirtualSentinelRep::Slot { val_var, .. } =
+                        &self.virtual_sentinel(resolved).expect("checked").rep
+                    else {
+                        return Err(decline(
+                            OpClass::Rvalue,
+                            "virtual sentinel discriminant read has no backing slot",
+                        ));
+                    };
+                    if self.plan.tag_values.contains(&result) {
+                        return Ok(jsast::id(val_var.clone()));
+                    }
+                    let Some(se) = self.sentinel_err_expr() else {
+                        return Err(decline(
+                            OpClass::Rvalue,
+                            "virtual sentinel discriminant missing sentinel binding",
+                        ));
+                    };
+                    let discr_repr = table.int_repr(result_ty);
+                    return Ok(jsast::cond(
+                        jsast::binary(BinOp::StrictEq, jsast::id(val_var.clone()), se),
+                        value::discriminant_literal(
+                            table,
+                            vs.shape.ty,
+                            vs.shape.err_variant,
+                            discr_repr,
+                        ),
+                        value::discriminant_literal(
+                            table,
+                            vs.shape.ty,
+                            vs.shape.ok_variant,
+                            discr_repr,
+                        ),
+                    ));
+                }
                 let base_ty = self.ty_of(*base)?;
                 let as_tag = self.plan.tag_values.contains(&result);
                 self.discriminant(base_ty, self.expr_of(*base)?, result_ty, as_tag)
@@ -3014,7 +3226,11 @@ impl<'a> JsCx<'a> {
                 if table.is_zst(descriptor.ty)
                     && matches!(
                         table.enum_repr(table.peeled(base_ty)),
-                        Some(EnumRepr::IntTag { fieldless: true } | EnumRepr::NullNiche { .. })
+                        Some(
+                            EnumRepr::IntTag { fieldless: true }
+                                | EnumRepr::NullNiche { .. }
+                                | EnumRepr::SentinelNiche { .. }
+                        )
                     )
                 {
                     let val = self.expr_of(*v)?;
@@ -3172,6 +3388,414 @@ impl<'a> JsCx<'a> {
             None => out.push(jsast::expr_stmt(value)),
         }
         Ok(out)
+    }
+
+    /// Lowers a direct call to a `SentinelResult` callee: captures into a virtual `(val, err)`
+    /// pair on the fast unboxed path, materializes canonical `{ TAG, ... }` at escaping call
+    /// sites, or clears `$r1` when the result is discarded.
+    fn sentinel_call_stmts(
+        &self,
+        op: &Op,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+    ) -> Res<Vec<Stmt>> {
+        let (mut out, call_expr) = match self.lower_call_like(op)? {
+            Lowered::Done(stmts) => return Ok(stmts),
+            Lowered::Value(prelude, value) => (prelude, value),
+            _ => {
+                return Err(decline(
+                    OpClass::Call,
+                    "sentinel result call did not produce a JS call expression",
+                ));
+            }
+        };
+        let Some(se) = self.sentinel_err_expr() else {
+            return Err(decline(
+                OpClass::Call,
+                "sentinel result call missing sentinel error binding",
+            ));
+        };
+        if let Some(result) = op.result {
+            if let Some(vs) = self.virtual_sentinel(result) {
+                let super::VirtualSentinelRep::Slot { val_var, err_var } = &vs.rep else {
+                    return Err(decline(
+                        OpClass::Call,
+                        "virtual sentinel call result has no backing slot",
+                    ));
+                };
+                out.push(jsast::assign_stmt(jsast::id(val_var.clone()), call_expr));
+                if shape.err_field.is_some() {
+                    let spill = jsast::id(spill_name_of(self.spills, 1));
+                    let mut err_stmts = Vec::with_capacity(2);
+                    if let Some(ev) = err_var {
+                        err_stmts.push(jsast::assign_stmt(jsast::id(ev.clone()), spill.clone()));
+                    }
+                    err_stmts.push(jsast::assign_stmt(spill, jsast::undefined()));
+                    out.push(jsast::if_(
+                        jsast::binary(BinOp::StrictEq, jsast::id(val_var.clone()), se),
+                        err_stmts,
+                    ));
+                }
+                return Ok(out);
+            }
+            let dst = if self.is_inline(result) {
+                let tmp_out = self.alloc_temp();
+                self.cache_expr(result, jsast::id(tmp_out.clone()));
+                Some(jsast::id(tmp_out))
+            } else {
+                self.name_of(result).map(jsast::id)
+            };
+            if let Some(dst) = dst {
+                let (bind, raw_id) = self.temp(call_expr);
+                out.push(bind);
+                let ok_obj = self.build_canonical_sentinel_variant(
+                    shape,
+                    shape.ok_variant,
+                    shape.ok_field.map(|_| raw_id.clone()),
+                )?;
+                let spill = jsast::id(spill_name_of(self.spills, 1));
+                let err_obj = self.build_canonical_sentinel_variant(
+                    shape,
+                    shape.err_variant,
+                    shape.err_field.map(|_| spill.clone()),
+                )?;
+                let mut then_stmts = vec![jsast::assign_stmt(dst.clone(), err_obj)];
+                if shape.err_field.is_some() {
+                    then_stmts.push(jsast::assign_stmt(spill, jsast::undefined()));
+                }
+                let else_stmts = vec![jsast::assign_stmt(dst, ok_obj)];
+                out.push(jsast::if_else(
+                    jsast::binary(BinOp::StrictEq, raw_id, se),
+                    then_stmts,
+                    else_stmts,
+                ));
+                return Ok(out);
+            }
+        }
+        // Discarded result: still clear `$r1` on `Err` so GC does not retain the error value.
+        if shape.err_field.is_some() {
+            let spill = jsast::id(spill_name_of(self.spills, 1));
+            out.push(jsast::if_(
+                jsast::binary(BinOp::StrictEq, call_expr, se),
+                vec![jsast::assign_stmt(spill, jsast::undefined())],
+            ));
+        } else {
+            out.push(jsast::expr_stmt(call_expr));
+        }
+        Ok(out)
+    }
+
+    /// Rebuilds the canonical `{ TAG, ... }` enum object for one variant of `SentinelResultShape`
+    /// at an escaping call site.
+    fn build_canonical_sentinel_variant(
+        &self,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+        variant: u32,
+        payload: Option<Expr>,
+    ) -> Res<Expr> {
+        let variants = value::enum_variants(self.table, shape.ty);
+        let Some(vdesc) = variants.get(variant as usize) else {
+            return Err(decline(
+                OpClass::Call,
+                "sentinel result variant out of range",
+            ));
+        };
+        let active_field = if variant == shape.ok_variant {
+            shape.ok_field.map(|(f, _)| f)
+        } else {
+            shape.err_field.map(|(f, _)| f)
+        };
+        let mut entries = Vec::with_capacity(vdesc.fields.len());
+        let mut payload = payload;
+        for (fi, field) in vdesc.fields.iter().enumerate() {
+            if matches!(field.key, rcgjs_object::jir::types::FieldKey::Transparent) {
+                continue;
+            }
+            let key = match field.key {
+                rcgjs_object::jir::types::FieldKey::Name(id) => {
+                    self.interns.str(id).unwrap_or("").to_owned()
+                }
+                rcgjs_object::jir::types::FieldKey::Index(i) => i.to_string(),
+                rcgjs_object::jir::types::FieldKey::Transparent => unreachable!(),
+            };
+            let expr = if active_field == Some(fi as u32) {
+                payload.take().unwrap_or_else(jsast::undefined)
+            } else {
+                jsast::undefined()
+            };
+            entries.push((key, expr));
+        }
+        value::enum_value(self.table, self.interns, shape.ty, variant, entries).ok_or_else(|| {
+            decline(
+                OpClass::Call,
+                "sentinel result canonical materialization failed",
+            )
+        })
+    }
+
+    /// Extracts `(is_ok, payload_expr)` from a virtual `Aggregate` or `Const(Variant)` op.
+    fn extract_sentinel_construct(
+        &self,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+        op: &Op,
+    ) -> Res<(bool, Option<Expr>)> {
+        match &op.kind {
+            OpKind::Aggregate {
+                variant, fields, ..
+            } => {
+                if *variant == shape.ok_variant {
+                    let expr = match shape.ok_field {
+                        Some((fi, _)) => Some(self.expr_of(fields[fi as usize])?),
+                        None => None,
+                    };
+                    Ok((true, expr))
+                } else if *variant == shape.err_variant {
+                    let expr = match shape.err_field {
+                        Some((fi, _)) => Some(self.expr_of(fields[fi as usize])?),
+                        None => None,
+                    };
+                    Ok((false, expr))
+                } else {
+                    Err(decline(
+                        OpClass::Rvalue,
+                        "sentinel result aggregate variant out of range",
+                    ))
+                }
+            }
+            OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Variant { variant, fields }) => {
+                if *variant == shape.ok_variant {
+                    let expr = match shape.ok_field {
+                        Some((fi, fty)) => Some(self.const_expr(&fields[fi as usize], fty)?),
+                        None => None,
+                    };
+                    Ok((true, expr))
+                } else if *variant == shape.err_variant {
+                    let expr = match shape.err_field {
+                        Some((fi, fty)) => Some(self.const_expr(&fields[fi as usize], fty)?),
+                        None => None,
+                    };
+                    Ok((false, expr))
+                } else {
+                    Err(decline(
+                        OpClass::Constant,
+                        "sentinel result constant variant out of range",
+                    ))
+                }
+            }
+            _ => Err(decline(
+                OpClass::Rvalue,
+                "expected Aggregate or Const(Variant) for virtual sentinel construct",
+            )),
+        }
+    }
+
+    /// Writes a constructed `Ok(v)` / `Err(e)` directly into virtual sentinel slot `(dst_val, dst_err)`.
+    fn emit_construct_virtual_sentinel(
+        &self,
+        dst_val: &str,
+        dst_err: Option<&str>,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+        op: &Op,
+    ) -> Res<Vec<Stmt>> {
+        let (is_ok, payload) = self.extract_sentinel_construct(shape, op)?;
+        if is_ok {
+            Ok(vec![jsast::assign_stmt(
+                jsast::id(dst_val),
+                payload.unwrap_or_else(jsast::undefined),
+            )])
+        } else {
+            let Some(se) = self.sentinel_err_expr() else {
+                return Err(decline(
+                    OpClass::Rvalue,
+                    "virtual sentinel construct missing sentinel error binding",
+                ));
+            };
+            let mut stmts = vec![jsast::assign_stmt(jsast::id(dst_val), se)];
+            if let (Some(de), Some(err_expr)) = (dst_err, payload) {
+                stmts.push(jsast::assign_stmt(jsast::id(de), err_expr));
+            }
+            Ok(stmts)
+        }
+    }
+
+    /// Copies a virtual sentinel value `src` into `(dst_val, dst_err)`.
+    fn emit_assign_virtual_sentinel(
+        &self,
+        dst_val: &str,
+        dst_err: Option<&str>,
+        src: ValueId,
+    ) -> Res<Vec<Stmt>> {
+        let resolved = self.resolve_virtual_sentinel(src);
+        let Some(vs) = self.virtual_sentinel(resolved) else {
+            return Err(decline(
+                OpClass::Terminator,
+                "virtual sentinel assignment source is not virtual",
+            ));
+        };
+        match &vs.rep {
+            super::VirtualSentinelRep::InlineConstruct => {
+                let Some(def) = self.def_of(resolved) else {
+                    return Err(decline(
+                        OpClass::Rvalue,
+                        "inline virtual sentinel construct has no defining op",
+                    ));
+                };
+                self.emit_construct_virtual_sentinel(dst_val, dst_err, vs.shape, def)
+            }
+            super::VirtualSentinelRep::Slot { val_var, err_var } => {
+                let mut stmts = Vec::with_capacity(2);
+                if dst_val != val_var {
+                    stmts.push(jsast::assign_stmt(
+                        jsast::id(dst_val),
+                        jsast::id(val_var.clone()),
+                    ));
+                }
+                if let (Some(de), Some(se)) = (dst_err, err_var.as_deref()) {
+                    if de != se {
+                        stmts.push(jsast::assign_stmt(jsast::id(de), jsast::id(se)));
+                    }
+                }
+                Ok(stmts)
+            }
+            super::VirtualSentinelRep::InlineAlias(_) => unreachable!("resolved above"),
+        }
+    }
+
+    /// Parks the pending return payload for a callee returning `SentinelResultShape`.
+    fn prepare_sentinel_return(
+        &self,
+        v: ValueId,
+        shape: crate::plan::abi_flat::SentinelResultShape,
+    ) -> Res<super::PendingSentinelReturn> {
+        if let Some(vs) = self.virtual_sentinel(v) {
+            if vs.shape == shape {
+                let resolved = self.resolve_virtual_sentinel(v);
+                let vs = self.virtual_sentinel(resolved).expect("checked");
+                return match &vs.rep {
+                    super::VirtualSentinelRep::InlineConstruct => {
+                        let Some(def) = self.def_of(resolved) else {
+                            return Err(decline(
+                                OpClass::Terminator,
+                                "inline sentinel return construct has no defining op",
+                            ));
+                        };
+                        let (is_ok, payload) = self.extract_sentinel_construct(shape, def)?;
+                        if is_ok {
+                            Ok(super::PendingSentinelReturn::Ok(
+                                payload.unwrap_or_else(jsast::undefined),
+                            ))
+                        } else {
+                            Ok(super::PendingSentinelReturn::Err(payload))
+                        }
+                    }
+                    super::VirtualSentinelRep::Slot { val_var, err_var } => {
+                        Ok(super::PendingSentinelReturn::Virtual {
+                            val: jsast::id(val_var.clone()),
+                            err: err_var.as_ref().map(|e| jsast::id(e.clone())),
+                        })
+                    }
+                    super::VirtualSentinelRep::InlineAlias(_) => unreachable!("resolved above"),
+                };
+            }
+        }
+        Ok(super::PendingSentinelReturn::Canonical {
+            value: self.expr_of(v)?,
+            shape,
+        })
+    }
+
+    /// Emits `return` for a callee returning `SentinelResultShape`.
+    fn emit_sentinel_return(&self, pending: super::PendingSentinelReturn) -> Res<Stmt> {
+        let Some(se) = self.sentinel_err_expr() else {
+            return Err(decline(
+                OpClass::Terminator,
+                "sentinel result return missing sentinel error binding",
+            ));
+        };
+        match pending {
+            super::PendingSentinelReturn::Ok(expr) => {
+                if matches!(expr, Expr::Undefined) {
+                    Ok(jsast::ret_void())
+                } else {
+                    Ok(jsast::ret(expr))
+                }
+            }
+            super::PendingSentinelReturn::Err(Some(err_expr)) => {
+                let spill = jsast::id(spill_name_of(self.spills, 1));
+                Ok(jsast::ret(jsast::seq(vec![
+                    jsast::assign(spill, err_expr),
+                    se,
+                ])))
+            }
+            super::PendingSentinelReturn::Err(None) => Ok(jsast::ret(se)),
+            super::PendingSentinelReturn::Virtual { val, err: None } => Ok(jsast::ret(val)),
+            super::PendingSentinelReturn::Virtual {
+                val,
+                err: Some(err_expr),
+            } => {
+                let spill = jsast::id(spill_name_of(self.spills, 1));
+                Ok(jsast::ret(jsast::cond(
+                    jsast::binary(BinOp::StrictEq, val.clone(), se.clone()),
+                    jsast::seq(vec![jsast::assign(spill, err_expr), se]),
+                    val,
+                )))
+            }
+            super::PendingSentinelReturn::Canonical { value, shape } => {
+                let peeled = self.table.peeled(shape.ty);
+                let Some(repr) = self.table.enum_repr(peeled) else {
+                    return Err(decline(
+                        OpClass::Terminator,
+                        "canonical sentinel return at non-enum type",
+                    ));
+                };
+                let Some(err_tag) =
+                    value::variant_tag(self.table, self.interns, shape.ty, shape.err_variant)
+                else {
+                    return Err(decline(
+                        OpClass::Terminator,
+                        "canonical sentinel return err variant tag missing",
+                    ));
+                };
+                let ok_key = shape
+                    .ok_field
+                    .and_then(|(f, _)| self.table.field(shape.ty, Some(shape.ok_variant), f))
+                    .map(|fd| fd.key);
+                let err_key = shape
+                    .err_field
+                    .and_then(|(f, _)| self.table.field(shape.ty, Some(shape.err_variant), f))
+                    .map(|fd| fd.key);
+                let mut read_names = vec![value::TAG.to_owned()];
+                for key in ok_key.into_iter().chain(err_key) {
+                    if let rcgjs_object::jir::types::FieldKey::Name(id) = key {
+                        if let Some(s) = self.interns.str(id) {
+                            read_names.push(s.to_owned());
+                        }
+                    }
+                }
+                let reads: Vec<&str> = read_names.iter().map(String::as_str).collect();
+                let (setup, v) = self.reread(value, &reads);
+                let is_err =
+                    jsast::binary(BinOp::StrictEq, value::tag_expr(repr, v.clone()), err_tag);
+                let err_branch = match err_key {
+                    Some(key) => {
+                        let spill = jsast::id(spill_name_of(self.spills, 1));
+                        jsast::seq(vec![
+                            jsast::assign(spill, value::field_expr(self.interns, v.clone(), key)),
+                            se.clone(),
+                        ])
+                    }
+                    None => se,
+                };
+                let ok_branch = match ok_key {
+                    Some(key) => value::field_expr(self.interns, v, key),
+                    None => jsast::undefined(),
+                };
+                let body = jsast::cond(is_err, err_branch, ok_branch);
+                Ok(jsast::ret(match setup {
+                    Some(setup) => jsast::seq(vec![setup, body]),
+                    None => body,
+                }))
+            }
+        }
     }
 
     /// Whether the one use of an inlined pointer value reads the pointer record more than once.
@@ -3625,5 +4249,613 @@ impl<'a> JsCx<'a> {
             return Some(DroppedStringKind::NoOp);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod sentinel_tests {
+    use rcgjs_object::item::JsName;
+    use rcgjs_object::jir::interns::Interns;
+    use rcgjs_object::jir::origin::OriginId;
+    use rcgjs_object::jir::repr::{Func, FuncBuilder, OpKind, RTerm};
+    use rcgjs_object::jir::semantic::{
+        AbiSignature, CallSemantic, Callee, ConstTree, DefinitionId, ItemId, Signature, TypeId,
+    };
+    use rcgjs_object::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+    use rcgjs_object::jir::types::{
+        EnumRepr, FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts,
+        NominalDiscriminant, NominalForm, PinnedBoundary, TypeDescriptor, TypeKind, TypeMeta,
+        VariantDescriptor,
+    };
+    use rcgjs_object::jsast;
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+    use rcgjs_object::opts::{OptimizerMode, Opts, Profile};
+
+    use crate::lower::fuse;
+    use crate::lower::js::JsCx;
+    use crate::plan::abi_flat::{AbiPlan, FlatResult, FlatSig, SentinelResultShape};
+
+    fn render_func(
+        name: &str,
+        func: &Func,
+        interns: &Interns,
+        abi: Option<&AbiPlan>,
+        target_abi: Option<&FlatSig>,
+    ) -> String {
+        let opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let plan = fuse::plan(func, None, &interns.types, interns, &opts);
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: name.to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let spills = vec![JsName::new("$r1".to_owned())];
+        let cx = JsCx::new(func, &plan, &interns.types, interns, &opts, &summary, None)
+            .with_spills(&spills)
+            .with_abi(abi)
+            .with_target_abi(target_abi);
+        let structured = crate::lower::structure::structure(func, &plan, &interns.types, false)
+            .expect("structure");
+        let (body, _tmps) = super::emit(&cx, structured.region).expect("emit");
+        let params = func
+            .params
+            .iter()
+            .map(|v| plan.names.get(v).cloned().unwrap_or_default())
+            .collect();
+        let decl = jsast::function(name.to_owned(), params, body);
+        jsast::stmt_to_string(&decl)
+    }
+
+    fn base_facts(id: TypeId) -> JsFacts {
+        JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled: id,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sentinel_niche_lowers_switch_const_and_aggregate_without_tag_objects() {
+        let mut interns = Interns::new();
+        let s_none = interns.intern_str("None");
+        let s_some = interns.intern_str("Some");
+        let s_f0 = interns.intern_str("_0");
+
+        let t_u32 = TypeId(1);
+        let t_js = TypeId(2);
+        let t_opt_js = TypeId(3);
+
+        let mut u32_d = TypeDescriptor {
+            id: t_u32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_u32),
+        };
+        u32_d.js.int = Some(IntFacts {
+            signed: false,
+            bits: 32,
+            repr: IntRepr::Number,
+        });
+        interns.types.insert(u32_d);
+        interns.types.insert(TypeDescriptor {
+            id: t_js,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 1,
+                },
+                args: Vec::new(),
+                form: NominalForm::Opaque,
+                variants: Vec::new(),
+                niche: None,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta {
+                boundary: PinnedBoundary::Host,
+                ..Default::default()
+            },
+            js: base_facts(t_js),
+        });
+        let mut opt_js = TypeDescriptor {
+            id: t_opt_js,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 2,
+                },
+                args: vec![t_js],
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: s_none,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: s_some,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: t_js,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(NominalDiscriminant { bits: 1, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                size: Some(8),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_opt_js),
+        };
+        opt_js.js.enum_repr = Some(EnumRepr::SentinelNiche {
+            none_variant: 0,
+            some_variant: 1,
+            some_field: 0,
+        });
+        interns.types.insert(opt_js);
+        interns.types.set_sentinel_none(Some("$sn".to_owned()));
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 10,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                arguments: vec![t_opt_js],
+                result: t_opt_js,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            },
+        );
+        let p = b.param(t_opt_js, OriginId(0));
+        let b_none = b.block();
+        let b_some = b.block();
+        let discr = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Discriminant(p),
+            t_u32,
+            OriginId(0),
+        );
+        b.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: t_u32,
+                cases: vec![(0, b_none, Vec::new())],
+                default: (b_some, Vec::new()),
+            },
+        );
+        let none_v = b.op(
+            b_none,
+            OpKind::Const(ConstTree::Variant {
+                variant: 0,
+                fields: Vec::new(),
+            }),
+            t_opt_js,
+            OriginId(0),
+        );
+        b.terminate(b_none, RTerm::Return(Some(none_v)));
+        let inner = b.op(
+            b_some,
+            OpKind::Field {
+                base: p,
+                variant: Some(1),
+                field: 0,
+            },
+            t_js,
+            OriginId(0),
+        );
+        let some_v = b.op(
+            b_some,
+            OpKind::Aggregate {
+                ty: t_opt_js,
+                variant: 1,
+                active_field: None,
+                fields: vec![inner],
+            },
+            t_opt_js,
+            OriginId(0),
+        );
+        b.terminate(b_some, RTerm::Return(Some(some_v)));
+        let func = b.finish();
+
+        let js = render_func("id_opt_js", &func, &interns, None, None);
+        assert!(js.contains("=== $sn"), "expected `=== $sn` in:\n{js}");
+        assert!(
+            js.contains("return $sn;"),
+            "expected `return $sn;` in:\n{js}"
+        );
+        assert!(
+            !js.contains("TAG"),
+            "SentinelNiche must not emit TAG objects:\n{js}"
+        );
+    }
+
+    #[test]
+    fn sentinel_result_lowers_recursive_invoke_zero_alloc_and_materializes_escaping_caller() {
+        let mut interns = Interns::new();
+        let s_ok = interns.intern_str("Ok");
+        let s_err = interns.intern_str("Err");
+        let s_f0 = interns.intern_str("_0");
+        let s_eval = interns.intern_str("eval");
+
+        let t_u32 = TypeId(1);
+        let t_res = TypeId(2);
+        let mut u32_d = TypeDescriptor {
+            id: t_u32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_u32),
+        };
+        u32_d.js.int = Some(IntFacts {
+            signed: false,
+            bits: 32,
+            repr: IntRepr::Number,
+        });
+        interns.types.insert(u32_d);
+        let mut res_d = TypeDescriptor {
+            id: t_res,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 20,
+                },
+                args: vec![t_u32, t_u32],
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: s_ok,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: t_u32,
+                            offset: 4,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                        result_ok: true,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: s_err,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: t_u32,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(NominalDiscriminant { bits: 1, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                size: Some(8),
+                align: Some(4),
+                sized: true,
+                needs_drop: true,
+                ..Default::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_facts(t_res),
+        };
+        res_d.js.is_indirect = true;
+        res_d.js.needs_clone = true;
+        res_d.js.enum_repr = Some(EnumRepr::IntTag { fieldless: false });
+        interns.types.insert(res_d);
+
+        let eval_id = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 30,
+            },
+            instantiation: 0,
+        };
+        let shape = SentinelResultShape {
+            ty: t_res,
+            ok_variant: 0,
+            ok_field: Some((0, t_u32)),
+            err_variant: 1,
+            err_field: Some((0, t_u32)),
+        };
+        let eval_sig = FlatSig {
+            params: vec![None],
+            result: Some(FlatResult {
+                ty: t_res,
+                field_tys: vec![t_u32, t_u32],
+                passed: vec![0, 1],
+                i64_pair: false,
+                tagged: None,
+                recursive: None,
+                sentinel: Some(shape),
+            }),
+            spill: 1,
+            returns_out_field: false,
+        };
+        let abi =
+            AbiPlan::for_target_test(eval_id, JsName::new("eval".to_owned()), eval_sig.clone())
+                .with_sentinel_err_test(JsName::new("$se".to_owned()));
+
+        // Recursive `eval` with `RTerm::Invoke`, `?`, and block-param join before return.
+        let mut eb = FuncBuilder::new(
+            eval_id,
+            Signature {
+                arguments: vec![t_u32],
+                result: t_res,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            },
+        );
+        let x = eb.param(t_u32, OriginId(0));
+        let b_rec = eb.block();
+        let b_norm = eb.block();
+        let b_unwind = eb.block();
+        let b_ok = eb.block();
+        let b_err = eb.block();
+        let b_ret = eb.block();
+        let p_ret = eb.block_param(b_ret, t_res, OriginId(0));
+        eb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: x,
+                scrut_ty: t_u32,
+                cases: vec![(0, b_rec, Vec::new())],
+                default: (b_ret, Vec::new()),
+            },
+        );
+        // Fix up default arm cleanly via a separate base block.
+        let b_base = eb.block();
+        let base_ok = eb.op(
+            b_base,
+            OpKind::Aggregate {
+                ty: t_res,
+                variant: 0,
+                active_field: None,
+                fields: vec![x],
+            },
+            t_res,
+            OriginId(0),
+        );
+        eb.terminate(b_base, RTerm::Goto(b_ret, vec![base_ok]));
+        eb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: x,
+                scrut_ty: t_u32,
+                cases: vec![(0, b_base, Vec::new())],
+                default: (b_rec, Vec::new()),
+            },
+        );
+
+        let sub = eb.op(
+            b_rec,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: eval_id,
+                    link_name: s_eval,
+                },
+                function: None,
+                args: vec![x],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            t_res,
+            OriginId(0),
+        );
+        eb.terminate(
+            b_rec,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unwind, Vec::new()),
+            },
+        );
+        eb.terminate(b_unwind, RTerm::Throw(None));
+        let discr = eb.op(b_norm, OpKind::Discriminant(sub), t_u32, OriginId(0));
+        eb.terminate(
+            b_norm,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: t_u32,
+                cases: vec![(0, b_ok, Vec::new())],
+                default: (b_err, Vec::new()),
+            },
+        );
+        let ok_v = eb.op(
+            b_ok,
+            OpKind::Field {
+                base: sub,
+                variant: Some(0),
+                field: 0,
+            },
+            t_u32,
+            OriginId(0),
+        );
+        let ret_ok = eb.op(
+            b_ok,
+            OpKind::Aggregate {
+                ty: t_res,
+                variant: 0,
+                active_field: None,
+                fields: vec![ok_v],
+            },
+            t_res,
+            OriginId(0),
+        );
+        eb.terminate(b_ok, RTerm::Goto(b_ret, vec![ret_ok]));
+        let err_v = eb.op(
+            b_err,
+            OpKind::Field {
+                base: sub,
+                variant: Some(1),
+                field: 0,
+            },
+            t_u32,
+            OriginId(0),
+        );
+        let ret_err = eb.op(
+            b_err,
+            OpKind::Aggregate {
+                ty: t_res,
+                variant: 1,
+                active_field: None,
+                fields: vec![err_v],
+            },
+            t_res,
+            OriginId(0),
+        );
+        eb.terminate(b_err, RTerm::Goto(b_ret, vec![ret_err]));
+        eb.terminate(b_ret, RTerm::Return(Some(p_ret)));
+        let eval_func = eb.finish();
+
+        let eval_js = render_func("eval", &eval_func, &interns, Some(&abi), Some(&eval_sig));
+        assert!(
+            eval_js.contains("try {"),
+            "Invoke must stay guarded:\n{eval_js}"
+        );
+        assert!(
+            eval_js.contains("=== $se"),
+            "must test against $se:\n{eval_js}"
+        );
+        assert!(
+            eval_js.contains("$r1 = void 0") || eval_js.contains("$r1 = undefined"),
+            "must clear $r1 after capturing err:\n{eval_js}"
+        );
+        assert!(
+            !eval_js.contains("TAG"),
+            "recursive SentinelResult callee must emit ZERO {{ TAG }} allocations:\n{eval_js}"
+        );
+
+        // Escaping canonical wrapper calling `eval` (no `target_abi`).
+        let mut wb = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 31,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                arguments: vec![t_u32],
+                result: t_res,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            },
+        );
+        let wx = wb.param(t_u32, OriginId(0));
+        let wres = wb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: eval_id,
+                    link_name: s_eval,
+                },
+                function: None,
+                args: vec![wx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            t_res,
+            OriginId(0),
+        );
+        wb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(wres)));
+        let wrapper_func = wb.finish();
+
+        let wrapper_js = render_func("wrapper", &wrapper_func, &interns, Some(&abi), None);
+        assert!(
+            wrapper_js.contains("=== $se"),
+            "escaping caller must branch on $se:\n{wrapper_js}"
+        );
+        assert!(
+            wrapper_js.contains("TAG: 0") && wrapper_js.contains("TAG: 1"),
+            "escaping caller must materialize canonical Ok/Err objects:\n{wrapper_js}"
+        );
+        assert!(
+            wrapper_js.contains("$r1 = void 0") || wrapper_js.contains("$r1 = undefined"),
+            "escaping caller must clear $r1 on Err:\n{wrapper_js}"
+        );
     }
 }

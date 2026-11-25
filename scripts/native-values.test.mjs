@@ -1407,3 +1407,59 @@ test("Phase 1B monomorphic TypedArray helpers, packed zeroed arrays, 32-elem cop
   assert.equal(mv.buf instanceof Uint8Array, true);
   assert.equal(mv.buf.length, 8);
 });
+
+test("branchless _bstr_is_ascii and _bstr_is_ascii_range agree across all boundary lengths and code units", () => {
+  const lengths = [0, 1, 2, 3, 4, 23, 24, 25, 64, 127, 128, 129, 256];
+  const nonAscii = ["\x80", "\u0100", "\uD800", "\uFFFF"];
+  const padL = "\u00e9\uD800";
+  const padR = "\uFFFF\x80";
+
+  for (const n of lengths) {
+    // Pure ASCII including 0x00 and 0x7f boundaries
+    const ascii =
+      n === 0
+        ? ""
+        : n === 1
+          ? "\x7f"
+          : "\x00" + "a".repeat(n - 2) + "\x7f";
+    assert.equal(rt._bstr_is_ascii(ascii), true, `ascii len=${n}`);
+    assert.equal(rt._bstr_is_ascii_range(ascii, 0, n), true, `range full ascii len=${n}`);
+    assert.equal(
+      rt._bstr_is_ascii_range(padL + ascii + padR, padL.length, n),
+      true,
+      `range padded ascii len=${n}`,
+    );
+
+    if (n === 0) continue;
+    const positions = new Set([0, n >> 1, n - 1]);
+    for (const pos of positions) {
+      for (const ch of nonAscii) {
+        const s = "a".repeat(pos) + ch + "b".repeat(n - 1 - pos);
+        assert.equal(s.length, n);
+        assert.equal(
+          rt._bstr_is_ascii(s),
+          false,
+          `non-ascii len=${n} pos=${pos} code=${ch.charCodeAt(0)}`,
+        );
+        assert.equal(
+          rt._bstr_is_ascii_range(s, 0, n),
+          false,
+          `range full non-ascii len=${n} pos=${pos} code=${ch.charCodeAt(0)}`,
+        );
+        assert.equal(
+          rt._bstr_is_ascii_range(padL + s + padR, padL.length, n),
+          false,
+          `range padded non-ascii len=${n} pos=${pos} code=${ch.charCodeAt(0)}`,
+        );
+      }
+    }
+  }
+
+  // Standalone minimal-shim extraction of `_bstr_is_ascii_range` must keep `_bstr_wide` intact.
+  const shimSrc = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const rangeOnly = minimalShim(["__rt._bstr_is_ascii_range(s, 1, 200);"], shimSrc, { direct: ["_bstr_is_ascii_range"] });
+  const ctx = {};
+  vm.runInNewContext(rangeOnly.source, ctx);
+  assert.equal(ctx.__rt._bstr_is_ascii_range("\x80" + "a".repeat(200) + "\x80", 1, 200), true);
+  assert.equal(ctx.__rt._bstr_is_ascii_range("a".repeat(100) + "\u0100" + "a".repeat(100), 1, 200), false);
+});

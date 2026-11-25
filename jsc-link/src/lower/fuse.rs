@@ -1479,7 +1479,10 @@ impl<'a> Planner<'a> {
                 if !matches!(
                     self.table.enum_repr(base_ty),
                     Some(
-                        EnumRepr::Tag { .. } | EnumRepr::IntTag { .. } | EnumRepr::NullNiche { .. }
+                        EnumRepr::Tag { .. }
+                            | EnumRepr::IntTag { .. }
+                            | EnumRepr::NullNiche { .. }
+                            | EnumRepr::SentinelNiche { .. }
                     )
                 ) {
                     continue;

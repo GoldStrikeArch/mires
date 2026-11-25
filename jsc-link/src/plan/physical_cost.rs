@@ -344,7 +344,9 @@ fn policy_benefit(
             .saturating_sub(after.balanced_score()),
         Profile::ReleaseSpeed => before
             .loop_allocations
-            .saturating_sub(after.loop_allocations),
+            .saturating_sub(after.loop_allocations)
+            .saturating_mul(16)
+            .saturating_add(before.allocations.saturating_sub(after.allocations)),
     }
 }
 
@@ -357,13 +359,16 @@ fn decide_for_plan(
     let (mut accepted, mut reason, mut hotness_source, budget_consumed_bps) =
         decide(profile, before, after);
     // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`)
-    // removes property loads (`s.buf[s.off + i]`) inside tight loops, and flattening an `i64`/`u64`
-    // parameter or return (`(lo, hi)`) eliminates BigInt heap allocations that are not counted as
-    // JS object-literal allocations. Accept either whenever it does not regress object allocations
-    // and stays within the speed size budget.
+    // removes property loads (`s.buf[s.off + i]`) inside tight loops, flattening an `i64`/`u64`
+    // parameter or return (`(lo, hi)`) eliminates BigInt heap allocations, and `SentinelResult`
+    // eliminates `{ TAG, _0 }` wrapper allocations across recursive `Result<T, E>` call trees.
+    // Accept whenever it does not regress object allocations and stays within the speed budget.
     if !accepted
         && profile == Profile::ReleaseSpeed
-        && (plan.has_slice_param() || plan.has_i64_pair_abi() || plan.has_byte_str_abi())
+        && (plan.has_slice_param()
+            || plan.has_i64_pair_abi()
+            || plan.has_byte_str_abi()
+            || plan.has_sentinel_result())
         && (reason.as_deref() == Some("cost.hotness-evidence-missing") || plan.has_byte_str_abi())
     {
         if let (Some(b), Some(a)) = (before, after) {
@@ -374,6 +379,8 @@ fn decide_for_plan(
                 reason = None;
                 hotness_source = Some(if plan.has_byte_str_abi() {
                     "bstr-slice-specialization"
+                } else if plan.has_sentinel_result() {
+                    "sentinel-result-abi"
                 } else if plan.has_i64_pair_abi() {
                     "i64-pair-abi-scalarization"
                 } else {

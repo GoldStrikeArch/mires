@@ -1329,6 +1329,15 @@ fn result_shape(types: &TypeTable, result: &FlatResult) -> ValueShape {
             LaneKind::Scalar(ScalarKind::Signed(32)),
         ]);
     }
+    if let Some(sentinel) = &result.sentinel {
+        let mut lanes = vec![sentinel
+            .ok_field
+            .map_or(LaneKind::Value, |(_, ty)| lane_kind(types, ty))];
+        if let Some((_, err_ty)) = sentinel.err_field {
+            lanes.push(lane_kind(types, err_ty));
+        }
+        return ValueShape::Product(lanes);
+    }
     if let Some(tagged) = &result.tagged {
         return ValueShape::Product(
             std::iter::once(LaneKind::Tag)

@@ -1468,6 +1468,7 @@ fn option_layout(cx: &LowerCx<'_>) -> Result<(u32, u32, String), SemanticDecline
             EnumRepr::Tag { fieldless: false }
                 | EnumRepr::IntTag { fieldless: false }
                 | EnumRepr::NullNiche { .. }
+                | EnumRepr::SentinelNiche { .. }
         )
     ) {
         return Err(SemanticDecline::WrongReturnType);

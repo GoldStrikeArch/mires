@@ -267,8 +267,13 @@ pub(crate) fn run_with_profile_and_retargets(
     };
     // Growth spent so far, signed: a site that shrinks its caller gives headroom back.
     let mut growth: i64 = 0;
+    // Mutually-recursive sole-caller helpers already spliced into their sole caller (now dead).
+    let mut inlined_mutual_callees: BTreeSet<JsName> = BTreeSet::new();
     let order: Vec<JsName> = graph.sccs.iter().flatten().cloned().collect();
     for caller in &order {
+        if inlined_mutual_callees.contains(caller) {
+            continue;
+        }
         let Some(mut current_metadata) = metadata.get(caller).cloned() else {
             continue;
         };
@@ -288,6 +293,7 @@ pub(crate) fn run_with_profile_and_retargets(
             allow_std_post_repr,
             speed,
             call_retargets,
+            &inlined_mutual_callees,
             &mut stats,
         );
         if sites.is_empty() {
@@ -506,17 +512,21 @@ pub(crate) fn run_with_profile_and_retargets(
                             || callee_func.sig.abi.inline_always
                             || site.has_track_caller)
                             && callee_bytes <= 384)));
+            const SPEED_SOLE_RECURSIVE_FOOTPRINT: u64 = 2_560;
             let speed_sole_loop = speed
                 && is_sole
-                && looping.contains(&(site.block as u32))
-                && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT;
+                && ((looping.contains(&(site.block as u32))
+                    && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT)
+                    || (graph.recursive(caller) && callee_bytes <= SPEED_SOLE_RECURSIVE_FOOTPRINT));
             let speed_budget_free = speed_hot_loop || speed_tiny_leaf || speed_sole_loop;
             // Inlining a `#[track_caller]` callee substitutes a `{filename,line,col}` literal
             // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller,
             // loop-virtualizable, or tiny leaf helper into a large caller may add temporary
             // local-renaming / `try/catch` scaffolding before downstream cleanup.
             // Account for that pre-cleanup slack under `ReleaseSpeed`.
-            let effective_callee_bytes = if speed
+            let effective_callee_bytes = if speed_sole_loop {
+                callee_bytes.saturating_add(256)
+            } else if speed
                 && (site.has_track_caller
                     || is_sole
                     || speed_tiny_leaf
@@ -571,6 +581,9 @@ pub(crate) fn run_with_profile_and_retargets(
             if !bounded_loop_virtualization && !speed_tiny_leaf {
                 growth += charge;
             }
+            if graph.recursive(&site.callee) {
+                inlined_mutual_callees.insert(site.callee.clone());
+            }
             bytes = after;
             applied_here += 1;
             stats.cross_object_applied +=
@@ -611,6 +624,7 @@ pub(crate) fn run_with_profile_and_retargets(
                     allow_std_post_repr,
                     speed,
                     call_retargets,
+                    &inlined_mutual_callees,
                     &mut throwaway_stats,
                 )
                 .into_iter()
@@ -1389,6 +1403,20 @@ fn callee_invoke_safe(callee: &Func, interns: &Interns) -> bool {
     true
 }
 
+fn directly_calls_self(func: &Func, interns: &Interns, self_name: &JsName) -> bool {
+    func.blocks.iter().any(|block| {
+        block.ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    callee: Callee::Direct { link_name, .. },
+                    ..
+                } if interns.str(*link_name) == Some(self_name.as_str())
+            )
+        })
+    })
+}
+
 /// The candidate call sites of one caller, in block-and-op order.
 #[allow(clippy::too_many_arguments)] // One call site; the arguments are the refusal oracles.
 fn collect_sites(
@@ -1404,9 +1432,30 @@ fn collect_sites(
     allow_std_post_repr: bool,
     speed: bool,
     call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
+    inlined_mutual_callees: &BTreeSet<JsName>,
     stats: &mut InlineStats,
 ) -> Vec<Site> {
     let caller_retargets = call_retargets.and_then(|map| map.get(caller));
+    let mut direct_site_counts: BTreeMap<JsName, usize> = BTreeMap::new();
+    if speed {
+        for block in &func.blocks {
+            for op in &block.ops {
+                if let OpKind::Call {
+                    callee: Callee::Direct { link_name, .. },
+                    function: None,
+                    host: None,
+                    ..
+                } = &op.kind
+                {
+                    if let Some(name) = caller_metadata.interns.str(*link_name) {
+                        *direct_site_counts
+                            .entry(JsName::new(name.to_owned()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
     let mut sites = Vec::new();
     for (block_index, block) in func.blocks.iter().enumerate() {
         for (op_index, op) in block.ops.iter().enumerate() {
@@ -1494,9 +1543,32 @@ fn collect_sites(
                 stats.decline("inline.repr-retarget");
                 continue;
             }
-            if &callee == caller || graph.recursive(&callee) {
+            if &callee == caller {
                 stats.decline("inline.recursive-budget");
                 continue;
+            }
+            if graph.recursive(&callee) {
+                // Under ReleaseSpeed, allow inlining a single-callsite sole-caller mutually
+                // recursive helper (e.g. `eval <-> comparator` / `eval <-> filter_projection`)
+                // when `callee` is not directly self-recursive. Splicing eliminates `callee`
+                // completely, converts its back-edge into direct self-recursion on `caller`, and
+                // prevents downstream minifiers from turning `callee` into a hot closure IIFE.
+                let allow_mutual_sole = speed
+                    && sole_referrer(&callee, caller)
+                    && !inlined_mutual_callees.contains(&callee)
+                    && direct_site_counts.get(&callee).copied().unwrap_or(0) == 1
+                    && funcs
+                        .get(&callee)
+                        .and_then(|r| r.as_ref().ok())
+                        .is_some_and(|cf| {
+                            metadata
+                                .get(&callee)
+                                .is_some_and(|cm| !directly_calls_self(cf, &cm.interns, &callee))
+                        });
+                if !allow_mutual_sole {
+                    stats.decline("inline.recursive-budget");
+                    continue;
+                }
             }
             // An item with recorded zombies owes the link step its compile-time diagnostic
             // chain; splicing its body would drop the item and silence the errors.
@@ -6416,5 +6488,161 @@ mod tests {
             })
             .count();
         assert_eq!(remaining_closure_calls, 0);
+    }
+
+    #[test]
+    fn sole_caller_mutually_recursive_helper_inlines_and_terminates() {
+        // `eval` calls `helper` (1 site, sole referrer), and `helper` calls `eval` (2-node SCC).
+        // Under ReleaseSpeed post-repr, `helper` should inline into `eval`, turning the mutual
+        // recursion into direct self-recursion on `eval` and stopping cleanly.
+        let mut prog = Prog::new();
+        let eval_link = prog.strid("eval");
+        let helper_link = prog.strid("helper");
+
+        let mut hb = FuncBuilder::new(item(2), sig(1));
+        let hp = hb.param(I32, O);
+        let hcall = hb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(1),
+                    link_name: eval_link,
+                },
+                function: None,
+                args: vec![hp],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        hb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(hcall)));
+        let helper_func = hb.finish();
+
+        let mut eb = FuncBuilder::new(item(1), sig(1));
+        let ep = eb.param(I32, O);
+        let b_base = eb.block();
+        let b_rec = eb.block();
+        eb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: ep,
+                scrut_ty: I32,
+                cases: vec![(0, b_base, Vec::new())],
+                default: (b_rec, Vec::new()),
+            },
+        );
+        eb.terminate(b_base, RTerm::Return(Some(ep)));
+        let ecall = eb.op(
+            b_rec,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: vec![ep],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        eb.terminate(b_rec, RTerm::Return(Some(ecall)));
+        let eval_func = eb.finish();
+
+        prog.add("eval", eval_func);
+        prog.add("helper", helper_func);
+
+        let e_name = JsName::new("eval".to_owned());
+        let h_name = JsName::new("helper".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    metadata_dummy_refs(funcs[name].as_ref().unwrap(), interns),
+                )
+            })
+            .collect();
+        assert!(graph.recursive(&e_name) && graph.recursive(&h_name));
+        let sizes = BTreeMap::from([(e_name.clone(), 1_600), (h_name.clone(), 1_400)]);
+        let stats = run_with_profile(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|name, func, _| {
+                if name != &e_name {
+                    return Some((1_400, BTreeSet::new()));
+                }
+                let calls_helper = func.blocks.iter().flat_map(|b| &b.ops).any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            callee: Callee::Direct { item: id, .. },
+                            ..
+                        } if *id == item(2)
+                    )
+                });
+                let mut refs = BTreeSet::new();
+                if calls_helper {
+                    refs.insert(h_name.clone());
+                }
+                Some((if calls_helper { 1_600 } else { 2_900 }, refs))
+            },
+            // Only `helper` has sole referrer `eval`; `eval` is an external entry point.
+            &|callee, caller| callee == &h_name && caller == &e_name,
+            &|_| true,
+            50_000,
+            &sizes,
+            true,
+            Some(crate::opts::Profile::ReleaseSpeed),
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "sole-caller mutually-recursive helper should inline once into eval (declined={:?})",
+            stats.declined
+        );
+        let calls_helper = prog
+            .func("eval")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        callee: Callee::Direct { item: id, .. },
+                        ..
+                    } if *id == item(2)
+                )
+            });
+        let calls_self = prog
+            .func("eval")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        callee: Callee::Direct { item: id, .. },
+                        ..
+                    } if *id == item(1)
+                )
+            });
+        assert!(!calls_helper, "eval must no longer call helper");
+        assert!(
+            calls_self,
+            "eval should now directly self-recurse after splicing helper"
+        );
     }
 }

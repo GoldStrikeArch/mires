@@ -278,6 +278,7 @@ fn option_layout(
             EnumRepr::Tag { fieldless: false }
                 | EnumRepr::IntTag { fieldless: false }
                 | EnumRepr::NullNiche { .. }
+                | EnumRepr::SentinelNiche { .. }
         )
     ) {
         return Err(SemanticDecline::WrongReturnType);

@@ -51,7 +51,7 @@ impl<'a> JsCx<'a> {
                     return jsast::rt_call("read_byte", args);
                 }
             }
-            slot_element_unwrapped(self, pointer)
+            slot_element_read(self, pointer)
         } else {
             pointer
         }
@@ -92,11 +92,48 @@ impl<'a> JsCx<'a> {
                 vec![pointer, value],
             ))]);
         }
-        let element = slot_element_unwrapped(self, pointer);
         if table.is_indirect(pointee) {
-            return self.write_indirect(pointee, element, value);
+            match unwrap_rt_box(pointer) {
+                Ok((prefix, inner)) => {
+                    let mut stmts: Vec<Stmt> = prefix.into_iter().map(jsast::expr_stmt).collect();
+                    stmts.extend(self.overwrite_indirect(pointee, inner, value)?);
+                    return Ok(stmts);
+                }
+                Err(pointer) => {
+                    let element = slot_element_unwrapped(self, pointer);
+                    return self.write_indirect(pointee, element, value);
+                }
+            }
         }
+        let element = slot_element_unwrapped(self, pointer);
         Ok(vec![jsast::assign_stmt(element, value)])
+    }
+
+    /// Overwrites an indirect object value in place without rebinding any parent property/slot.
+    fn overwrite_indirect(&self, pointee: TypeId, target: Expr, value: Expr) -> Res<Vec<Stmt>> {
+        let table = self.table;
+        if table.is_zst(pointee) {
+            return Ok(vec![jsast::expr_stmt(value)]);
+        }
+        if value::is_str(table, pointee) {
+            return Ok(vec![jsast::expr_stmt(self.zombie(
+                "mutating a `&mut str` is not supported by rustc_codegen_js".to_owned(),
+            ))]);
+        }
+        if self.heap().typed_heap_enabled {
+            match self.try_inline_overwrite(pointee, target, value) {
+                Ok(stmts) => Ok(stmts),
+                Err((target, value)) => Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                    "overwrite",
+                    vec![target, value],
+                ))]),
+            }
+        } else {
+            Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "overwrite",
+                vec![target, value],
+            ))])
+        }
     }
 
     /// The statements that store `value` into `target`, the pointee's own JS value
@@ -626,7 +663,7 @@ impl<'a> JsCx<'a> {
             return Vec::new();
         }
         if (count_is_one || count == jsast::num(1)) && self.can_inline_copy_one(pointee) {
-            let src_elem = slot_element_unwrapped(self, src);
+            let src_elem = slot_element_read(self, src);
             let dst_elem = slot_element_unwrapped(self, dst);
             if self.table.needs_clone(pointee) {
                 let (bind, val) = self.temp(src_elem);
@@ -728,7 +765,7 @@ impl<'a> JsCx<'a> {
             }
             return jsast::rt_call("array_ref", args);
         }
-        slot_element_unwrapped(self, raw)
+        slot_element_read(self, raw)
     }
 
     /// The zero element factory `__rt.unscale`/`retype` take (`alloc_support.rs::zero_factory`).
@@ -1808,6 +1845,27 @@ pub(super) fn unwrap_offset_cond(expr: Expr) -> Expr {
             Expr::Seq(items)
         }
         other => other,
+    }
+}
+
+/// If `expr` (optionally after a `Seq` setup) is `__rt.box(inner)`, returns `Ok((prefix, inner))`.
+fn unwrap_rt_box(expr: Expr) -> Result<(Vec<Expr>, Expr), Expr> {
+    let (prefix, tail) = peel_seq(expr);
+    match tail {
+        Expr::Call(callee, mut args) if args.len() == 1 && is_rt_call(&callee, "box") => {
+            Ok((prefix, args.pop().expect("1 arg")))
+        }
+        other => Err(sequenced_vec(prefix, other)),
+    }
+}
+
+/// Lowers `pointer.buf[pointer.off]` for a read-only slot dereference or `raw_to_ref`, collapsing
+/// ephemeral `__rt.box(x)` calls directly to `x` (since `__rt.box(x)` guarantees
+/// `slot.buf[slot.off] === x`) before falling back to [`slot_element_unwrapped`].
+pub(super) fn slot_element_read(cx: &JsCx<'_>, pointer: Expr) -> Expr {
+    match unwrap_rt_box(unwrap_offset_cond(pointer)) {
+        Ok((prefix, inner)) => sequenced_vec(prefix, inner),
+        Err(pointer) => slot_element_unwrapped(cx, pointer),
     }
 }
 

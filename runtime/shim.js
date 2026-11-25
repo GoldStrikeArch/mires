@@ -3307,24 +3307,40 @@ globalThis.__rt.bstr_in = (s) => {
   return globalThis.__rt._bstr_units(bytes, 0, bytes.length);
 };
 
-// _bstr_is_ascii(s): fast ASCII predicate. Short strings (< 24 code units) run
-// a charCodeAt loop to avoid JIT->RegExp C++ transitions; longer strings use the
-// engine's SIMD regexp scan.
+// _bstr_is_ascii(s): fast ASCII predicate. Strings <= 128 code units run a
+// branchless 4-way unrolled bitwise-OR loop over `charCodeAt` (every UTF-16
+// code unit lies in 0..=0xFFFF, so bit 31 is never set and `o < 128` iff every
+// unit is <= 0x7F), avoiding JIT->RegExp C++ transitions; longer strings use
+// the engine's SIMD regexp scan.
 globalThis.__rt._bstr_is_ascii = (s) => {
   const n = s.length;
-  if (n < 24) {
-    for (let i = 0; i < n; i++) if (s.charCodeAt(i) > 127) return false;
-    return true;
+  if (n <= 128) {
+    let o = 0;
+    let i = 0;
+    const n4 = n & ~3;
+    for (; i < n4; i += 4) {
+      o |= s.charCodeAt(i) | s.charCodeAt(i + 1) | s.charCodeAt(i + 2) | s.charCodeAt(i + 3);
+    }
+    for (; i < n; i++) o |= s.charCodeAt(i);
+    return o < 128;
   }
   return !_bstr_wide.test(s);
 };
 const _bstr_wide = /[^\x00-\x7f]/;
 
 globalThis.__rt._bstr_is_ascii_range = (s, off, len) => {
-  for (let i = off, end = off + len; i < end; i++) {
-    if (s.charCodeAt(i) > 127) return false;
+  if (len <= 128) {
+    let o = 0;
+    let i = off;
+    const end = off + len;
+    const end4 = off + (len & ~3);
+    for (; i < end4; i += 4) {
+      o |= s.charCodeAt(i) | s.charCodeAt(i + 1) | s.charCodeAt(i + 2) | s.charCodeAt(i + 3);
+    }
+    for (; i < end; i++) o |= s.charCodeAt(i);
+    return o < 128;
   }
-  return true;
+  return !_bstr_wide.test(off === 0 && len === s.length ? s : s.slice(off, off + len));
 };
 
 globalThis.__rt.bstr_cmp_range = (a, ao, b, bo, n) => {

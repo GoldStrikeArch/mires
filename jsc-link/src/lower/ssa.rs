@@ -1853,20 +1853,21 @@ impl<'a> Builder<'a> {
                 "SetDiscriminant of a place that is not an enum",
             ));
         };
-        if let EnumRepr::NullNiche {
-            none_variant,
-            some_variant,
-        } = repr
-        {
+        if let Some((none_variant, some_variant, _)) = repr.niche_variants() {
             if variant == some_variant {
-                // Writing `((opt as Some).0) = payload` already wrote the whole place.
+                // Writing `((opt as Some).<some_field>) = payload` already wrote the whole place.
                 return Ok(());
             }
             if variant == none_variant {
+                let none_fields = self
+                    .table
+                    .variants(self.table.peeled(place.ty))
+                    .get(none_variant as usize)
+                    .map_or(0, |v| v.fields.len());
                 let tag = self.op(
                     OpKind::Const(ConstTree::Variant {
                         variant: none_variant,
-                        fields: Vec::new(),
+                        fields: vec![ConstTree::Unit; none_fields],
                     }),
                     place.ty,
                 );

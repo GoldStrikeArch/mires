@@ -318,8 +318,12 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
 pub struct EnumReprPlan {
     pub decisions: BTreeMap<TypeId, EnumRepr>,
     pub null_niche_count: usize,
+    pub sentinel_niche_count: usize,
     pub int_tag_fieldless_count: usize,
     pub int_tag_payload_count: usize,
+    /// Collision-free module-scope sentinel binding (`const $sn = {};`) allocated when
+    /// `opts.chunks.is_empty()` and at least one [`EnumRepr::SentinelNiche`] enum is selected.
+    pub sentinel_none: Option<JsName>,
     /// `(peeled_struct_ty, field_idx)` pairs for internal multi-field structs whose plain `u32`
     /// fields never escape by reference/raw-pointer/transmute/static/JS-boundary and can therefore
     /// be stored as signed `Int32` (`-2^31..=2^31-1`) so V8 keeps them as Smi instead of
@@ -330,6 +334,31 @@ pub struct EnumReprPlan {
 impl EnumReprPlan {
     pub fn is_empty(&self) -> bool {
         self.decisions.is_empty() && self.smi_u32_fields.is_empty()
+    }
+
+    /// Synthesized module-scope sentinel item (`const $sn = {};`) when [`EnumRepr::SentinelNiche`]
+    /// is active; empty otherwise.
+    pub fn sentinel_items(&self) -> Vec<LinkItem> {
+        let Some(name) = self.sentinel_none.clone() else {
+            return Vec::new();
+        };
+        vec![LinkItem {
+            js: format!("\nconst {} = {{}};\n", name.as_str()),
+            name,
+            kind: ItemKind::Static,
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: crate::item::Linkage::internal(),
+            debug_path: "enum SentinelNiche none sentinel".to_owned(),
+            crate_name: "generated".to_owned(),
+            order: None,
+            map: crate::item::ItemMap::default(),
+            dts: None,
+            optimization: Default::default(),
+            late_ir: Default::default(),
+            baseline_shadow: Default::default(),
+            jir: Default::default(),
+        }]
     }
 }
 
@@ -1106,7 +1135,8 @@ pub fn specialize_table(
     }
 
     // Pass A: All-ZST-field enums (`Option<()>`, `Result<(), fmt::Error>`, etc.) -> `IntTag { fieldless: true }`.
-    let mut null_niche_candidates: Vec<(u32, TypeId, u32, u32, TypeId)> = Vec::new();
+    // 2-variant enums with one all-ZST variant and one single-non-ZST-field variant go to Pass B.
+    let mut niche_candidates: Vec<(u32, TypeId, u32, u32, u32, bool, TypeId)> = Vec::new();
     let mut remaining_tag_enums: Vec<(TypeId, bool)> = Vec::new();
     for id in candidates {
         let desc = &global_types[&id];
@@ -1135,19 +1165,47 @@ pub fn specialize_table(
                 .fields
                 .iter()
                 .all(|f| is_zst_global(f.ty, &global_types));
-            let pair = if v0_zst && variants[1].fields.len() == 1 {
-                Some((0u32, 1u32, variants[1].fields[0].ty))
-            } else if v1_zst && variants[0].fields.len() == 1 {
-                Some((1u32, 0u32, variants[0].fields[0].ty))
+            let pair = if v0_zst {
+                single_non_zst_field(&variants[1].fields, &global_types).map(
+                    |(some_field, payload_ty)| {
+                        (
+                            0u32,
+                            1u32,
+                            some_field,
+                            variants[1].fields.len() == 1,
+                            payload_ty,
+                        )
+                    },
+                )
+            } else if v1_zst {
+                single_non_zst_field(&variants[0].fields, &global_types).map(
+                    |(some_field, payload_ty)| {
+                        (
+                            1u32,
+                            0u32,
+                            some_field,
+                            variants[0].fields.len() == 1,
+                            payload_ty,
+                        )
+                    },
+                )
             } else {
                 None
             };
-            if let Some((none_v, some_v, payload_ty)) = pair {
+            if let Some((none_v, some_v, some_field, single_field, payload_ty)) = pair {
                 if !is_zst_global(payload_ty, &global_types)
                     && !is_uninhabited_global(payload_ty, &global_types)
                 {
                     let depth = transparent_enum_depth(payload_ty, &global_types);
-                    null_niche_candidates.push((depth, id, none_v, some_v, payload_ty));
+                    niche_candidates.push((
+                        depth,
+                        id,
+                        none_v,
+                        some_v,
+                        some_field,
+                        single_field,
+                        payload_ty,
+                    ));
                     continue;
                 }
             }
@@ -1155,16 +1213,26 @@ pub fn specialize_table(
         remaining_tag_enums.push((id, fieldless));
     }
 
-    // Pass B: NullNiche in ascending nesting depth so inner `Option<T>` is decided before
-    // `Option<Option<T>>` / `Option<ManuallyDrop<Option<T>>>`.
-    null_niche_candidates.sort_by_key(|&(depth, id, _, _, _)| (depth, id));
-    for (_, id, none_variant, some_variant, payload_ty) in null_niche_candidates {
-        if !may_inhabit_null(
-            payload_ty,
-            &global_types,
-            &host_boundary_types,
-            &plan.decisions,
-        ) {
+    // Pass B: NullNiche / SentinelNiche in ascending nesting depth so inner `Option<T>` is decided
+    // before `Option<Option<T>>` / `Option<ManuallyDrop<Option<T>>>`.
+    let sentinel_candidate = opts
+        .chunks
+        .is_empty()
+        .then(|| allocate_sentinel_name("$sn", table))
+        .flatten();
+    niche_candidates.sort_by_key(|&(depth, id, _, _, _, _, _)| (depth, id));
+    for (_, id, none_variant, some_variant, some_field, single_field, payload_ty) in
+        niche_candidates
+    {
+        if single_field
+            && some_field == 0
+            && !may_inhabit_null(
+                payload_ty,
+                &global_types,
+                &host_boundary_types,
+                &plan.decisions,
+            )
+        {
             plan.decisions.insert(
                 id,
                 EnumRepr::NullNiche {
@@ -1173,9 +1241,24 @@ pub fn specialize_table(
                 },
             );
             plan.null_niche_count += 1;
+        } else if sentinel_candidate.is_some()
+            && !may_inhabit_sentinel_none(payload_ty, &global_types, &plan.decisions)
+        {
+            plan.decisions.insert(
+                id,
+                EnumRepr::SentinelNiche {
+                    none_variant,
+                    some_variant,
+                    some_field,
+                },
+            );
+            plan.sentinel_niche_count += 1;
         } else {
             remaining_tag_enums.push((id, false));
         }
+    }
+    if plan.sentinel_niche_count > 0 {
+        plan.sentinel_none = sentinel_candidate;
     }
 
     // Pass C: All remaining internal `EnumRepr::Tag` enums -> `EnumRepr::IntTag`.
@@ -1257,7 +1340,11 @@ pub fn specialize_table(
             cached.clone()
         } else {
             let mut cloned = orig_interns.clone();
-            apply_decisions_to_table(&mut cloned.types, &plan.decisions);
+            apply_decisions_to_table(
+                &mut cloned.types,
+                &plan.decisions,
+                plan.sentinel_none.as_ref().map(JsName::as_str),
+            );
             let arc = Arc::new(cloned);
             mutated_interns.insert(key, arc.clone());
             arc
@@ -1537,6 +1624,36 @@ fn is_uninhabited_global(ty: TypeId, global: &BTreeMap<TypeId, TypeDescriptor>) 
     }
 }
 
+fn single_non_zst_field(
+    fields: &[rcgjs_object::jir::types::FieldDescriptor],
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+) -> Option<(u32, TypeId)> {
+    let mut found = None;
+    for (idx, field) in fields.iter().enumerate() {
+        if is_zst_global(field.ty, global) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((idx as u32, field.ty));
+    }
+    found
+}
+
+fn allocate_sentinel_name(base: &str, table: &BTreeMap<JsName, LinkItem>) -> Option<JsName> {
+    let mut taken: BTreeSet<&str> = table.keys().map(JsName::as_str).collect();
+    taken.extend(
+        table
+            .values()
+            .flat_map(|item| item.refs.iter().map(JsName::as_str)),
+    );
+    std::iter::once(base.to_owned())
+        .chain((1..64).map(|suffix| format!("{base}${suffix}")))
+        .find(|name| !taken.contains(name.as_str()))
+        .map(JsName::new)
+}
+
 /// Counts transparent + single-field-enum nesting depth so `Option<T>` is decided before
 /// `Option<Option<T>>` / `Option<ManuallyDrop<Option<T>>>`.
 fn transparent_enum_depth(mut ty: TypeId, global: &BTreeMap<TypeId, TypeDescriptor>) -> u32 {
@@ -1562,13 +1679,9 @@ fn transparent_enum_depth(mut ty: TypeId, global: &BTreeMap<TypeId, TypeDescript
         } = &desc.kind
         {
             if variants.len() == 2 {
-                let next = if variants[0].fields.len() == 1 {
-                    Some(variants[0].fields[0].ty)
-                } else if variants[1].fields.len() == 1 {
-                    Some(variants[1].fields[0].ty)
-                } else {
-                    None
-                };
+                let next = single_non_zst_field(&variants[0].fields, global)
+                    .or_else(|| single_non_zst_field(&variants[1].fields, global))
+                    .map(|(_, inner)| inner);
                 if let Some(inner) = next {
                     depth += 1;
                     ty = inner;
@@ -1604,10 +1717,68 @@ fn may_inhabit_null(
         ) {
             return true;
         }
-        if matches!(decisions.get(&ty), Some(EnumRepr::NullNiche { .. }))
-            || matches!(desc.js.enum_repr, Some(EnumRepr::NullNiche { .. }))
-        {
+        if matches!(
+            decisions.get(&ty),
+            Some(EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. })
+        ) || matches!(
+            desc.js.enum_repr,
+            Some(EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. })
+        ) {
             return true;
+        }
+        if let Some(inner) = desc.js.transparent {
+            ty = inner.ty;
+            continue;
+        }
+        if let TypeKind::Pattern(base) = desc.kind {
+            ty = base;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Whether our private module-scope sentinel (`const $sn = {};`) could ever be a valid runtime
+/// value of `ty`.
+///
+/// Host-boundary types such as `JsValue` cannot inhabit `$sn` because `$sn` is a private object
+/// never exposed across any JS/host/export/static boundary; only types that already use
+/// [`EnumRepr::SentinelNiche`] (directly, via transparent/`Pattern` wrappers, or inside a
+/// `NullNiche` payload) or opaque/foreign/never types return `true`.
+fn may_inhabit_sentinel_none(
+    mut ty: TypeId,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+    decisions: &BTreeMap<TypeId, EnumRepr>,
+) -> bool {
+    for _ in 0..16 {
+        let Some(desc) = global.get(&ty) else {
+            return true;
+        };
+        if matches!(
+            desc.kind,
+            TypeKind::Opaque | TypeKind::Foreign(_) | TypeKind::Never
+        ) {
+            return true;
+        }
+        let repr = decisions.get(&ty).copied().or(desc.js.enum_repr);
+        match repr {
+            Some(EnumRepr::SentinelNiche { .. }) => return true,
+            Some(EnumRepr::NullNiche { some_variant, .. }) => {
+                let TypeKind::Adt { variants, .. } = &desc.kind else {
+                    return true;
+                };
+                let Some(payload_ty) = variants
+                    .get(some_variant as usize)
+                    .and_then(|v| v.fields.first())
+                    .map(|f| f.ty)
+                else {
+                    return true;
+                };
+                ty = payload_ty;
+                continue;
+            }
+            _ => {}
         }
         if let Some(inner) = desc.js.transparent {
             ty = inner.ty;
@@ -2401,9 +2572,13 @@ fn scan_const_tree(
 
 /// Applies `decisions` to one `TypeTable`, cascading to transparent/pattern wrappers and
 /// references whose pointee transitioned from `is_indirect = true` to `false`.
-fn apply_decisions_to_table(table: &mut TypeTable, decisions: &BTreeMap<TypeId, EnumRepr>) {
-    // Pass 1a: `IntTag { fieldless: true }` first so `needs_clone` is false when `NullNiche`
-    // queries its payload (e.g. `Option<Option<()>>` or `Result<Option<()>, ()>`).
+fn apply_decisions_to_table(
+    table: &mut TypeTable,
+    decisions: &BTreeMap<TypeId, EnumRepr>,
+    sentinel_none: Option<&str>,
+) {
+    // Pass 1a: `IntTag { fieldless: true }` first so `needs_clone` is false when `NullNiche` /
+    // `SentinelNiche` queries its payload (e.g. `Option<Option<()>>` or `Result<Option<()>, ()>`).
     for (&id, &repr) in decisions {
         if let EnumRepr::IntTag { fieldless: true } = repr {
             if let Some(desc) = table.get_mut(id) {
@@ -2415,7 +2590,8 @@ fn apply_decisions_to_table(table: &mut TypeTable, decisions: &BTreeMap<TypeId, 
         }
     }
 
-    // Pass 1b: `NullNiche` and `IntTag { fieldless: false }`.
+    // Pass 1b: `NullNiche` before `SentinelNiche`, so `Option<Option<T>>` (`SentinelNiche`)
+    // reads the updated `needs_clone` of its inner `NullNiche` `Option<T>`.
     let null_niche_updates: Vec<(TypeId, EnumRepr, bool)> = decisions
         .iter()
         .filter_map(|(&id, &repr)| {
@@ -2427,11 +2603,43 @@ fn apply_decisions_to_table(table: &mut TypeTable, decisions: &BTreeMap<TypeId, 
                 return None;
             };
             let payload_ty = variants.get(some_variant as usize)?.fields.first()?.ty;
-            let payload_needs_clone = table.needs_clone(payload_ty);
+            let payload_needs_clone = table.needs_clone(table.peeled(payload_ty));
             Some((id, repr, payload_needs_clone))
         })
         .collect();
     for (id, repr, payload_needs_clone) in null_niche_updates {
+        if let Some(desc) = table.get_mut(id) {
+            desc.js.enum_repr = Some(repr);
+            desc.js.is_indirect = false;
+            desc.js.needs_clone = payload_needs_clone;
+            desc.js.is_primitive_enum = false;
+        }
+    }
+    let sentinel_niche_updates: Vec<(TypeId, EnumRepr, bool)> = decisions
+        .iter()
+        .filter_map(|(&id, &repr)| {
+            let EnumRepr::SentinelNiche {
+                some_variant,
+                some_field,
+                ..
+            } = repr
+            else {
+                return None;
+            };
+            let desc = table.get(id)?;
+            let TypeKind::Adt { variants, .. } = &desc.kind else {
+                return None;
+            };
+            let payload_ty = variants
+                .get(some_variant as usize)?
+                .fields
+                .get(some_field as usize)?
+                .ty;
+            let payload_needs_clone = table.needs_clone(table.peeled(payload_ty));
+            Some((id, repr, payload_needs_clone))
+        })
+        .collect();
+    for (id, repr, payload_needs_clone) in sentinel_niche_updates {
         if let Some(desc) = table.get_mut(id) {
             desc.js.enum_repr = Some(repr);
             desc.js.is_indirect = false;
@@ -2446,6 +2654,7 @@ fn apply_decisions_to_table(table: &mut TypeTable, decisions: &BTreeMap<TypeId, 
             }
         }
     }
+    table.set_sentinel_none(sentinel_none.map(str::to_owned));
 
     // Pass 2: Cascade enum facts to transparent and `Pattern` wrappers whose `peeled` changed.
     let wrapper_updates: Vec<(TypeId, Option<EnumRepr>, bool, bool, bool)> = table
@@ -2819,8 +3028,14 @@ mod tests {
         );
         assert_eq!(
             plan.decisions.get(&t_opt_opt_u32),
-            Some(&EnumRepr::IntTag { fieldless: false })
+            Some(&EnumRepr::SentinelNiche {
+                none_variant: 0,
+                some_variant: 1,
+                some_field: 0,
+            })
         );
+        assert_eq!(plan.sentinel_none.as_ref().map(JsName::as_str), Some("$sn"));
+        assert_eq!(plan.sentinel_items().len(), 1);
         assert_eq!(
             plan.decisions.get(&t_opt_unit),
             Some(&EnumRepr::IntTag { fieldless: true })
@@ -3608,5 +3823,189 @@ mod tests {
             !fallback_plan.decisions.contains_key(&t_opt_u32),
             "non-offered closure body in host_try must conservatively protect captured Option<u32>"
         );
+    }
+
+    #[test]
+    fn sentinel_niche_covers_option_jsvalue_nested_options_triple_fallback_and_chunks() {
+        let mut interns = Interns::default();
+        let s_none = interns.intern_str("None");
+        let s_some = interns.intern_str("Some");
+        let s_f0 = interns.intern_str("_0");
+        let s_f1 = interns.intern_str("_1");
+
+        let t_unit = TypeId(1);
+        let t_u32 = TypeId(2);
+        let t_js = TypeId(3);
+        let t_opt_js = TypeId(4);
+        let t_opt_opt_js = TypeId(5);
+        let t_opt_u32 = TypeId(6);
+        let t_opt_opt_u32 = TypeId(7);
+        let t_opt_opt_opt_u32 = TypeId(8);
+        let t_ref_opt_js = TypeId(9);
+        let t_exported_opt_js = TypeId(10);
+        let t_zst_prefix_opt = TypeId(11);
+
+        let mut zst_prefix_opt = option_desc(t_zst_prefix_opt, t_u32, s_none, s_some, s_f1);
+        if let TypeKind::Adt { variants, .. } = &mut zst_prefix_opt.kind {
+            variants[1].fields = vec![
+                FieldDescriptor {
+                    key: FieldKey::Name(s_f0),
+                    ty: t_unit,
+                    offset: 0,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(s_f1),
+                    ty: t_u32,
+                    offset: 4,
+                },
+            ];
+        }
+
+        for desc in [
+            unit_desc(t_unit),
+            u32_desc(t_u32),
+            js_value_desc(t_js),
+            option_desc(t_opt_js, t_js, s_none, s_some, s_f0),
+            option_desc(t_opt_opt_js, t_opt_js, s_none, s_some, s_f0),
+            option_desc(t_opt_u32, t_u32, s_none, s_some, s_f0),
+            option_desc(t_opt_opt_u32, t_opt_u32, s_none, s_some, s_f0),
+            option_desc(t_opt_opt_opt_u32, t_opt_opt_u32, s_none, s_some, s_f0),
+            ref_desc(t_ref_opt_js, t_opt_js, PointerForm::Thin),
+            option_desc(t_exported_opt_js, t_js, s_none, s_some, s_f0),
+            zst_prefix_opt,
+        ] {
+            interns.types.insert(desc);
+        }
+        let shared = Arc::new(interns);
+
+        let f_int = JsName::new("internal_fn".to_owned());
+        let f_exp = JsName::new("exported_fn".to_owned());
+        let f_clash = JsName::new("$sn".to_owned());
+        let mut table = BTreeMap::new();
+        table.insert(
+            f_int.clone(),
+            dummy_item("internal_fn", shared.clone(), t_opt_opt_opt_u32, false),
+        );
+        table.insert(
+            f_exp.clone(),
+            dummy_item("exported_fn", shared.clone(), t_exported_opt_js, true),
+        );
+        let reachable = vec![f_int.clone(), f_exp.clone()];
+
+        let spd_opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let mut t1 = table.clone();
+        let plan = specialize_table(&mut t1, &reachable, &reachable, &BTreeSet::new(), &spd_opts);
+
+        assert_eq!(
+            plan.decisions.get(&t_opt_js),
+            Some(&EnumRepr::SentinelNiche {
+                none_variant: 0,
+                some_variant: 1,
+                some_field: 0,
+            }),
+            "Option<JsValue> must use SentinelNiche (host JsValue cannot equal private $sn)"
+        );
+        assert_eq!(
+            plan.decisions.get(&t_opt_opt_js),
+            Some(&EnumRepr::IntTag { fieldless: false }),
+            "Option<Option<JsValue>> must fall back to IntTag (inner already inhabits $sn)"
+        );
+        assert_eq!(
+            plan.decisions.get(&t_opt_u32),
+            Some(&EnumRepr::NullNiche {
+                none_variant: 0,
+                some_variant: 1,
+            })
+        );
+        assert_eq!(
+            plan.decisions.get(&t_opt_opt_u32),
+            Some(&EnumRepr::SentinelNiche {
+                none_variant: 0,
+                some_variant: 1,
+                some_field: 0,
+            }),
+            "Option<Option<u32>> must use SentinelNiche (inner NullNiche inhabits null, not $sn)"
+        );
+        assert_eq!(
+            plan.decisions.get(&t_opt_opt_opt_u32),
+            Some(&EnumRepr::IntTag { fieldless: false }),
+            "Option<Option<Option<u32>>> must fall back to IntTag (inner inhabits both null and $sn)"
+        );
+        assert_eq!(
+            plan.decisions.get(&t_zst_prefix_opt),
+            Some(&EnumRepr::SentinelNiche {
+                none_variant: 0,
+                some_variant: 1,
+                some_field: 1,
+            }),
+            "2-variant enum with leading ZST field must use SentinelNiche at some_field=1"
+        );
+        assert!(
+            !plan.decisions.contains_key(&t_exported_opt_js),
+            "exported Option<JsValue> must stay baseline Tag"
+        );
+        assert_eq!(plan.sentinel_none.as_ref().map(JsName::as_str), Some("$sn"));
+        let sent_items = plan.sentinel_items();
+        assert_eq!(sent_items.len(), 1);
+        assert_eq!(sent_items[0].name.as_str(), "$sn");
+        assert!(sent_items[0].js.contains("const $sn = {};"));
+
+        let updated = &t1[&f_int].jir.interns().unwrap().types;
+        assert_eq!(updated.sentinel_none(), Some("$sn"));
+        assert!(!updated.is_indirect(t_opt_js));
+        assert!(!updated.needs_clone(t_opt_js));
+        assert_eq!(
+            updated.get(t_ref_opt_js).unwrap().js.pointer_form,
+            Some(PointerForm::Slot),
+            "&Option<JsValue> must cascade Thin -> Slot"
+        );
+        assert_eq!(
+            updated.field(t_zst_prefix_opt, Some(1), 1).unwrap().key,
+            FieldKey::Transparent,
+            "SentinelNiche some_field projection must be FieldKey::Transparent"
+        );
+
+        // Collision avoidance when `$sn` is already taken in the program.
+        let mut t_clash = table.clone();
+        t_clash.insert(f_clash.clone(), dummy_item("$sn", shared, t_unit, false));
+        let plan_clash = specialize_table(
+            &mut t_clash,
+            &[f_int.clone(), f_exp.clone(), f_clash],
+            &reachable,
+            &BTreeSet::new(),
+            &spd_opts,
+        );
+        assert_eq!(
+            plan_clash.sentinel_none.as_ref().map(JsName::as_str),
+            Some("$sn$1")
+        );
+
+        // Chunked mode must disable SentinelNiche cleanly (falls back to IntTag, no sentinel item).
+        let mut chunked_opts = spd_opts;
+        chunked_opts
+            .chunks
+            .push(("extra".to_owned(), "exported_fn".to_owned()));
+        let mut t_chunked = table;
+        let plan_chunked = specialize_table(
+            &mut t_chunked,
+            &reachable,
+            &reachable,
+            &BTreeSet::new(),
+            &chunked_opts,
+        );
+        assert_eq!(
+            plan_chunked.decisions.get(&t_opt_js),
+            Some(&EnumRepr::IntTag { fieldless: false })
+        );
+        assert_eq!(
+            plan_chunked.decisions.get(&t_opt_opt_u32),
+            Some(&EnumRepr::IntTag { fieldless: false })
+        );
+        assert!(plan_chunked.sentinel_none.is_none());
+        assert!(plan_chunked.sentinel_items().is_empty());
     }
 }

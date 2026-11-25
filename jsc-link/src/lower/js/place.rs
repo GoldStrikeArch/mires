@@ -358,6 +358,7 @@ impl<'a> JsCx<'a> {
                             Some(
                                 rcgjs_object::jir::types::EnumRepr::IntTag { fieldless: true }
                                     | rcgjs_object::jir::types::EnumRepr::NullNiche { .. }
+                                    | rcgjs_object::jir::types::EnumRepr::SentinelNiche { .. }
                             )
                         )
                     {

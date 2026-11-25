@@ -581,7 +581,7 @@ impl JsCx<'_> {
             return Ok(None);
         }
         let bound = jsast::id(NICHE_PARAM);
-        let payload_input = if matches!(repr, EnumRepr::NullNiche { .. }) {
+        let payload_input = if repr.is_null_or_sentinel_niche() {
             bound.clone()
         } else {
             value::field_expr(self.interns, bound.clone(), field.key)

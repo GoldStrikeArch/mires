@@ -27,9 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::jir::repr::{
-    Carrier, CellId, Dominators, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId,
+    Carrier, CellId, Dominators, Func, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueId,
 };
-use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, TypeId};
+use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, DropGlue, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind};
 use crate::jir::TypeTable;
 use crate::lower::fuse::{op_purity, Purity};
@@ -77,7 +77,14 @@ pub fn run_with(
         split_unsigned_checked_adds(func, table, witnesses)
     };
     for _ in 0..ROUNDS {
-        let mut round = fold_constant_comparisons(func, table, witnesses);
+        let mut round = false;
+        if !options.no_deletions {
+            round |= fold_const_ref_derefs(func, table);
+            round |= fold_constant_discriminants(func, table);
+            round |= forward_single_store_cells(func, table);
+            round |= elide_ref_raw_roundtrips(func, table);
+        }
+        round |= fold_constant_comparisons(func, table, witnesses);
         if !options.no_deletions {
             round |= fold_signed_lt_step_overflow(func, table);
             round |= elide_redundant_copies(func, table);
@@ -1043,6 +1050,797 @@ fn compact_values(func: &mut Func) {
         }
     }
     crate::lower::ssa::compact_values(func, &dead);
+}
+
+/// Pointer metadata helper shared by constant-reference folding and ref<->raw round-trip elision.
+fn ptr_info(table: &TypeTable, ty: TypeId) -> Option<(bool, TypeId)> {
+    match &table.get(table.peeled(ty))?.kind {
+        TypeKind::Reference { pointee, .. } => Some((false, *pointee)),
+        TypeKind::RawPointer { pointee, .. } => Some((true, *pointee)),
+        _ => None,
+    }
+}
+
+/// Whether `tree` is a self-contained value tree that can materialize directly as `OpKind::Const`
+/// for a direct, non-cloned type.
+fn is_direct_const_tree(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Unit | ConstTree::Scalar { .. } => true,
+        ConstTree::Variant { fields, .. } | ConstTree::Aggregate(fields) => {
+            fields.iter().all(is_direct_const_tree)
+        }
+        _ => false,
+    }
+}
+
+/// Steps a `(ConstTree, TypeId)` through `[Downcast?, Field]*` projections of a `BorrowView`.
+fn project_const_tree<'a>(
+    table: &TypeTable,
+    mut tree: &'a ConstTree,
+    mut ty: TypeId,
+    proj: &[Proj],
+) -> Option<(&'a ConstTree, TypeId)> {
+    let mut pending_variant: Option<u32> = None;
+    for step in proj {
+        match *step {
+            Proj::Downcast { variant } => {
+                if pending_variant.is_some() {
+                    return None;
+                }
+                pending_variant = Some(variant);
+            }
+            Proj::Field {
+                field,
+                ty: field_ty,
+            } => {
+                let desc = table.field(ty, pending_variant, field)?;
+                if desc.ty != field_ty {
+                    return None;
+                }
+                let next_tree = match tree {
+                    ConstTree::Variant { variant, fields } => {
+                        if let Some(expected) = pending_variant {
+                            if *variant != expected {
+                                return None;
+                            }
+                        }
+                        fields.get(field as usize)?
+                    }
+                    ConstTree::Aggregate(fields) if pending_variant.is_none() => {
+                        fields.get(field as usize)?
+                    }
+                    _ => return None,
+                };
+                pending_variant = None;
+                tree = next_tree;
+                ty = field_ty;
+            }
+            _ => return None,
+        }
+    }
+    if pending_variant.is_some() {
+        return None;
+    }
+    Some((tree, ty))
+}
+
+/// Folds `Deref` of promoted constant references (`Const(ConstTree::Reference(inner))`) and pure
+/// projected `BorrowView`s thereof directly into `OpKind::Const(sub_tree)` for direct, non-cloned
+/// pointees. This eliminates boxed 1-element constant arrays such as `g = [-1]` for
+/// `&Some(Ordering::Less)` after `PartialEq::eq` is inlined.
+fn fold_const_ref_derefs(func: &mut Func, table: &TypeTable) -> bool {
+    let mut const_refs: BTreeMap<ValueId, (ConstTree, TypeId)> = BTreeMap::new();
+    for _ in 0..4 {
+        let before = const_refs.len();
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(result) = op.result else {
+                    continue;
+                };
+                if const_refs.contains_key(&result) {
+                    continue;
+                }
+                let res_def = func.values[result.0 as usize];
+                if res_def.carrier != Carrier::Baseline {
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::Const(ConstTree::Reference(inner)) => {
+                        if let Some((false, pointee)) = ptr_info(table, res_def.ty) {
+                            const_refs.insert(result, ((**inner).clone(), pointee));
+                        }
+                    }
+                    OpKind::Copy(src) | OpKind::Move(src) => {
+                        if let Some((tree, pointee)) = const_refs.get(src).cloned() {
+                            if ptr_info(table, res_def.ty) == Some((false, pointee)) {
+                                const_refs.insert(result, (tree, pointee));
+                            }
+                        }
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Value(src),
+                        path,
+                        ..
+                    } => {
+                        let [Proj::Deref, rest @ ..] = path.as_slice() else {
+                            continue;
+                        };
+                        let Some((base_tree, base_ty)) = const_refs.get(src).cloned() else {
+                            continue;
+                        };
+                        if let Some((sub_tree, sub_ty)) =
+                            project_const_tree(table, &base_tree, base_ty, rest)
+                        {
+                            if ptr_info(table, res_def.ty) == Some((false, sub_ty)) {
+                                const_refs.insert(result, (sub_tree.clone(), sub_ty));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if const_refs.len() == before {
+            break;
+        }
+    }
+    if const_refs.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for block in &mut func.blocks {
+        for op in &mut block.ops {
+            let OpKind::Deref(ptr) = op.kind else {
+                continue;
+            };
+            let Some(res) = op.result else {
+                continue;
+            };
+            let Some((tree, pointee)) = const_refs.get(&ptr) else {
+                continue;
+            };
+            let res_def = func.values[res.0 as usize];
+            if res_def.carrier != Carrier::Baseline
+                || res_def.ty != *pointee
+                || table.is_indirect(*pointee)
+                || table.needs_clone(*pointee)
+                || !is_direct_const_tree(tree)
+            {
+                continue;
+            }
+            op.kind = OpKind::Const(tree.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Folds `OpKind::Discriminant(base)` to `OpKind::Const(ConstTree::Scalar { .. })` when `base`'s
+/// variant is statically known via `built_unpinned` (or the type has at most one inhabited
+/// variant) and the discriminant's result type is an integer.
+fn fold_constant_discriminants(func: &mut Func, table: &TypeTable) -> bool {
+    let built = built_unpinned(func, table);
+    let mut changed = false;
+    for block in &mut func.blocks {
+        for op in &mut block.ops {
+            let OpKind::Discriminant(base) = op.kind else {
+                continue;
+            };
+            let Some(res) = op.result else {
+                continue;
+            };
+            let res_def = func.values[res.0 as usize];
+            if res_def.carrier != Carrier::Baseline {
+                continue;
+            }
+            let Some((_, bits)) = table.int_info(res_def.ty) else {
+                continue;
+            };
+            let base_ty = func.values[base.0 as usize].ty;
+            let discr = built
+                .get(&base)
+                .and_then(|&(ty, variant)| {
+                    table
+                        .variants(table.peeled(ty))
+                        .get(variant as usize)
+                        .map(|v| v.logical_discr)
+                })
+                .or_else(|| {
+                    let peeled = table.peeled(base_ty);
+                    if table.enum_repr(peeled).is_none() {
+                        return Some(0);
+                    }
+                    let variants = table.variants(peeled);
+                    let mut inhabited = variants.iter().filter(|variant| {
+                        !variant
+                            .fields
+                            .iter()
+                            .any(|field| uninhabited(table, field.ty))
+                    });
+                    let first = inhabited.next();
+                    if inhabited.next().is_some() {
+                        return None;
+                    }
+                    Some(first.map_or(0, |variant| variant.logical_discr))
+                });
+            let Some(discr) = discr else {
+                continue;
+            };
+            let bytes = (bits / 8).max(1) as u8;
+            op.kind = OpKind::Const(ConstTree::Scalar {
+                bits: mask(discr as u128, bytes),
+                bytes,
+            });
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Forwards `CellLoad(c)` to `Copy(v)` when `c` is a direct, non-cloned cell with zero
+/// `BorrowView`/`RawView`/`Drop` references, a single `CellStore { cell: c, v }` that strictly
+/// dominates every `CellLoad(c)`, and `v` is never moved. Subsequent `remove_dead_ops` sweeps the
+/// now-unobserved `CellStore` and `CellAlloc`.
+fn forward_single_store_cells(func: &mut Func, table: &TypeTable) -> bool {
+    if func.cells.is_empty() || func.blocks.is_empty() {
+        return false;
+    }
+    let n_cells = func.cells.len();
+    let mut disqualified = vec![false; n_cells];
+    for (idx, cell) in func.cells.iter().enumerate() {
+        if table.is_indirect(cell.ty) || table.needs_clone(cell.ty) {
+            disqualified[idx] = true;
+        }
+    }
+    let mut stores: Vec<Option<(RBlockId, usize, ValueId)>> = vec![None; n_cells];
+    let mut loads: Vec<Vec<(RBlockId, usize, Option<ValueId>)>> = vec![Vec::new(); n_cells];
+    let mut moved: BTreeSet<ValueId> = BTreeSet::new();
+
+    for block in &func.blocks {
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if let Some(m) = op.kind.moved() {
+                moved.insert(m);
+            }
+            match &op.kind {
+                OpKind::CellStore { cell, v } => {
+                    let c = cell.0 as usize;
+                    if c < n_cells && !disqualified[c] {
+                        if stores[c].is_some() {
+                            disqualified[c] = true;
+                        } else {
+                            stores[c] = Some((block.id, op_idx, *v));
+                        }
+                    }
+                }
+                OpKind::CellLoad(cell) => {
+                    let c = cell.0 as usize;
+                    if c < n_cells && !disqualified[c] {
+                        loads[c].push((block.id, op_idx, op.result));
+                    }
+                }
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                } => {
+                    if let Some(slot) = disqualified.get_mut(cell.0 as usize) {
+                        *slot = true;
+                    }
+                }
+                OpKind::Drop {
+                    root: Root::Cell(cell),
+                    glue,
+                    ..
+                } if !matches!(glue, DropGlue::None) => {
+                    if let Some(slot) = disqualified.get_mut(cell.0 as usize) {
+                        *slot = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut candidate_cells = Vec::new();
+    for c in 0..n_cells {
+        if disqualified[c] || loads[c].is_empty() {
+            continue;
+        }
+        let Some((sb, si, v)) = stores[c] else {
+            continue;
+        };
+        let v_def = func.values[v.0 as usize];
+        if v_def.carrier != Carrier::Baseline || v_def.ty != func.cells[c].ty || moved.contains(&v)
+        {
+            continue;
+        }
+        candidate_cells.push((c, sb, si, v));
+    }
+    if candidate_cells.is_empty() {
+        return false;
+    }
+
+    let doms = Dominators::of(func);
+    let mut rewrites: Vec<(RBlockId, usize, ValueId)> = Vec::new();
+    for (c, sb, si, v) in candidate_cells {
+        if !doms.is_reachable(sb) {
+            continue;
+        }
+        let all_valid = loads[c].iter().all(|&(lb, li, res)| {
+            let dom_ok = if lb == sb {
+                si < li
+            } else {
+                doms.is_reachable(lb) && doms.dominates(sb, lb)
+            };
+            let ty_ok = res.is_none_or(|r| {
+                let rdef = func.values[r.0 as usize];
+                rdef.carrier == Carrier::Baseline && rdef.ty == func.cells[c].ty
+            });
+            dom_ok && ty_ok
+        });
+        if all_valid {
+            for &(lb, li, _) in &loads[c] {
+                rewrites.push((lb, li, v));
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return false;
+    }
+    for (lb, li, v) in rewrites {
+        func.blocks[lb.0 as usize].ops[li].kind = OpKind::Copy(v);
+    }
+    true
+}
+
+/// Eliminates pure `ref -> raw -> ref` round-trips over thin indirect aggregates, including through
+/// unmutated single-field wrappers such as async coroutines' `core::future::ResumeTy(NonNull<Context>)`
+/// across CFG merges and `Invoke` boundaries.
+///
+/// Rewriting the `raw -> ref` cast back to `Copy(src_ref)` / `Cast(Subtype, src_ref)` lets
+/// `remove_dead_ops` and `remove_trivial_params` sweep the wrapper aggregate, its block parameters,
+/// and the `ref -> raw` cast (`__rt.box(b)`), while leaving any escaping or address-observed raw
+/// pointer untouched.
+fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum PtrProv {
+        RawOf {
+            root_raw: ValueId,
+            src_ref: ValueId,
+            src_ty: TypeId,
+            pointee: TypeId,
+        },
+        Wrapped {
+            root_raw: ValueId,
+            src_ref: ValueId,
+            src_ty: TypeId,
+            pointee: TypeId,
+        },
+    }
+
+    impl PtrProv {
+        fn root_raw(self) -> ValueId {
+            match self {
+                Self::RawOf { root_raw, .. } | Self::Wrapped { root_raw, .. } => root_raw,
+            }
+        }
+    }
+
+    let is_thin_indirect_pointee = |pt: TypeId| -> bool {
+        let peeled = table.peeled(pt);
+        table.is_indirect(pt)
+            && table.unsized_tail(pt).is_none()
+            && !matches!(
+                table.get(peeled).map(|d| &d.kind),
+                Some(
+                    TypeKind::Array { .. }
+                        | TypeKind::Slice(_)
+                        | TypeKind::Str
+                        | TypeKind::Dynamic { .. }
+                )
+            )
+    };
+
+    let is_single_field_wrapper = |ty: TypeId| -> bool {
+        match table.get(table.peeled(ty)).map(|d| &d.kind) {
+            Some(TypeKind::Adt {
+                form: NominalForm::Struct,
+                variants,
+                ..
+            }) => variants.len() == 1 && variants[0].fields.len() == 1,
+            Some(TypeKind::Tuple(elems)) => elems.len() == 1,
+            _ => false,
+        }
+    };
+
+    if func.blocks.is_empty() {
+        return false;
+    }
+
+    let n_values = func.values.len();
+    let n_blocks = func.blocks.len();
+    let doms = Dominators::of(func);
+
+    let mut moved: BTreeSet<ValueId> = BTreeSet::new();
+    let mut def_pos: Vec<Option<(RBlockId, Option<usize>)>> = vec![None; n_values];
+    for block in &func.blocks {
+        for &p in &block.params {
+            def_pos[p.0 as usize] = Some((block.id, None));
+        }
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if let Some(m) = op.kind.moved() {
+                moved.insert(m);
+            }
+            if let Some(res) = op.result {
+                def_pos[res.0 as usize] = Some((block.id, Some(op_idx)));
+            }
+        }
+    }
+
+    let dominates_op = |v: ValueId, use_block: RBlockId, use_op_idx: usize| -> bool {
+        let Some((db, dop)) = def_pos.get(v.0 as usize).copied().flatten() else {
+            return false;
+        };
+        if db == use_block {
+            dop.is_none_or(|di| di < use_op_idx)
+        } else {
+            doms.dominates(db, use_block)
+        }
+    };
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Lat {
+        Top,
+        Known(PtrProv),
+        Bottom,
+    }
+
+    let meet = |a: Lat, b: Lat| -> Lat {
+        match (a, b) {
+            (Lat::Top, x) | (x, Lat::Top) => x,
+            (Lat::Known(x), Lat::Known(y)) if x == y => Lat::Known(x),
+            _ => Lat::Bottom,
+        }
+    };
+
+    let mut state: Vec<Lat> = vec![Lat::Bottom; n_values];
+    let mut seeded = false;
+    for block in &func.blocks {
+        if !doms.is_reachable(block.id) {
+            continue;
+        }
+        if block.id.0 > 0 {
+            for &p in &block.params {
+                if func.values[p.0 as usize].carrier == Carrier::Baseline {
+                    state[p.0 as usize] = Lat::Top;
+                }
+            }
+        }
+        for op in &block.ops {
+            let Some(res) = op.result else {
+                continue;
+            };
+            let res_def = func.values[res.0 as usize];
+            if res_def.carrier != Carrier::Baseline {
+                continue;
+            }
+            match &op.kind {
+                OpKind::Cast {
+                    kind: CastKind::Transmute | CastKind::PtrToPtr,
+                    v: src,
+                    from,
+                    to,
+                } => {
+                    let src_def = func.values[src.0 as usize];
+                    if src_def.carrier != Carrier::Baseline
+                        || src_def.ty != *from
+                        || res_def.ty != *to
+                        || moved.contains(src)
+                    {
+                        continue;
+                    }
+                    let (Some((false, from_pt)), Some((true, to_pt))) =
+                        (ptr_info(table, *from), ptr_info(table, *to))
+                    else {
+                        continue;
+                    };
+                    let peeled_pt = table.peeled(from_pt);
+                    if peeled_pt != table.peeled(to_pt) || !is_thin_indirect_pointee(from_pt) {
+                        continue;
+                    }
+                    state[res.0 as usize] = Lat::Known(PtrProv::RawOf {
+                        root_raw: res,
+                        src_ref: *src,
+                        src_ty: *from,
+                        pointee: peeled_pt,
+                    });
+                    seeded = true;
+                }
+                OpKind::Copy(_) | OpKind::Move(_) => {
+                    state[res.0 as usize] = Lat::Top;
+                }
+                OpKind::Aggregate {
+                    ty,
+                    variant: 0,
+                    active_field: None,
+                    fields,
+                } if fields.len() == 1 && is_single_field_wrapper(*ty) => {
+                    state[res.0 as usize] = Lat::Top;
+                }
+                OpKind::Field {
+                    variant: None,
+                    field: 0,
+                    ..
+                } if ptr_info(table, res_def.ty).is_some_and(|(is_raw, _)| is_raw) => {
+                    state[res.0 as usize] = Lat::Top;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !seeded {
+        return false;
+    }
+
+    let mut incoming: Vec<Vec<Vec<ValueId>>> = vec![Vec::new(); n_blocks];
+    for block in &func.blocks {
+        if !doms.is_reachable(block.id) {
+            continue;
+        }
+        for (target, args) in block.term.edges() {
+            if let Some(slot) = incoming.get_mut(target.0 as usize) {
+                slot.push(args.to_vec());
+            }
+        }
+    }
+
+    // Optimistic greatest-fixpoint propagation across Copy/Move, single-field Aggregate/Field,
+    // and mutually-recursive BlockParam cycles (e.g. `while ... { fut.await }`).
+    loop {
+        let mut progress = false;
+        for block in &func.blocks {
+            if !doms.is_reachable(block.id) {
+                continue;
+            }
+            if block.id.0 > 0 {
+                let edges = &incoming[block.id.0 as usize];
+                for (pos, &param) in block.params.iter().enumerate() {
+                    if func.values[param.0 as usize].carrier != Carrier::Baseline {
+                        continue;
+                    }
+                    let next = if edges.is_empty() {
+                        Lat::Bottom
+                    } else {
+                        let mut acc = Lat::Top;
+                        for args in edges {
+                            acc = match args.get(pos) {
+                                Some(&arg) if arg == param => acc,
+                                Some(&arg) => meet(acc, state[arg.0 as usize]),
+                                None => Lat::Bottom,
+                            };
+                        }
+                        acc
+                    };
+                    if next != state[param.0 as usize] {
+                        state[param.0 as usize] = next;
+                        progress = true;
+                    }
+                }
+            }
+            for op in &block.ops {
+                let Some(res) = op.result else {
+                    continue;
+                };
+                let cur = state[res.0 as usize];
+                if func.values[res.0 as usize].carrier != Carrier::Baseline {
+                    continue;
+                }
+                let next = match &op.kind {
+                    OpKind::Copy(u) | OpKind::Move(u) => state[u.0 as usize],
+                    OpKind::Aggregate {
+                        ty,
+                        variant: 0,
+                        active_field: None,
+                        fields,
+                    } if fields.len() == 1 && is_single_field_wrapper(*ty) => {
+                        match state[fields[0].0 as usize] {
+                            Lat::Top => Lat::Top,
+                            Lat::Known(PtrProv::RawOf {
+                                root_raw,
+                                src_ref,
+                                src_ty,
+                                pointee,
+                            }) => Lat::Known(PtrProv::Wrapped {
+                                root_raw,
+                                src_ref,
+                                src_ty,
+                                pointee,
+                            }),
+                            _ => Lat::Bottom,
+                        }
+                    }
+                    OpKind::Field {
+                        base,
+                        variant: None,
+                        field: 0,
+                    } if ptr_info(table, func.values[res.0 as usize].ty)
+                        .is_some_and(|(is_raw, _)| is_raw) =>
+                    {
+                        match state[base.0 as usize] {
+                            Lat::Top => Lat::Top,
+                            Lat::Known(PtrProv::Wrapped {
+                                root_raw,
+                                src_ref,
+                                src_ty,
+                                pointee,
+                            }) if ptr_info(table, func.values[res.0 as usize].ty).is_some_and(
+                                |(is_raw, pt)| is_raw && table.peeled(pt) == pointee,
+                            ) =>
+                            {
+                                Lat::Known(PtrProv::RawOf {
+                                    root_raw,
+                                    src_ref,
+                                    src_ty,
+                                    pointee,
+                                })
+                            }
+                            _ => Lat::Bottom,
+                        }
+                    }
+                    _ => cur,
+                };
+                if next != cur {
+                    state[res.0 as usize] = next;
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    let prov: Vec<Option<PtrProv>> = state
+        .into_iter()
+        .map(|s| match s {
+            Lat::Known(p) => Some(p),
+            Lat::Top | Lat::Bottom => None,
+        })
+        .collect();
+
+    // Verify each `root_raw` family is completely non-escaping and never written/observed as a raw
+    // pointer; any other use taints its root family so we preserve `__rt.box` faithfully.
+    let mut tainted: BTreeSet<ValueId> = BTreeSet::new();
+    let mut consumers: Vec<(usize, usize, ValueId, OpKind)> = Vec::new();
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            for used in op.kind.uses() {
+                let Some(used_prov) = prov[used.0 as usize] else {
+                    continue;
+                };
+                let root = used_prov.root_raw();
+                let res_prov = op.result.and_then(|r| prov[r.0 as usize]);
+                let safe_use = match &op.kind {
+                    OpKind::Copy(u) | OpKind::Move(u) if *u == used => res_prov == Some(used_prov),
+                    OpKind::Aggregate {
+                        variant: 0,
+                        active_field: None,
+                        fields,
+                        ..
+                    } if fields.len() == 1 && fields[0] == used => {
+                        matches!(used_prov, PtrProv::RawOf { .. })
+                            && matches!(res_prov, Some(PtrProv::Wrapped { root_raw, .. }) if root_raw == root)
+                    }
+                    OpKind::Field {
+                        base,
+                        variant: None,
+                        field: 0,
+                    } if *base == used => {
+                        matches!(used_prov, PtrProv::Wrapped { .. })
+                            && matches!(res_prov, Some(PtrProv::RawOf { root_raw, .. }) if root_raw == root)
+                    }
+                    OpKind::Cast {
+                        kind: CastKind::Transmute | CastKind::PtrToPtr,
+                        v: u,
+                        to,
+                        ..
+                    } if *u == used => match (used_prov, op.result) {
+                        (
+                            PtrProv::RawOf {
+                                src_ref,
+                                src_ty,
+                                pointee,
+                                ..
+                            },
+                            Some(res),
+                        ) if func.values[res.0 as usize].carrier == Carrier::Baseline
+                            && ptr_info(table, *to).is_some_and(|(is_raw, to_pt)| {
+                                !is_raw && table.peeled(to_pt) == pointee
+                            })
+                            && dominates_op(src_ref, block.id, op_idx) =>
+                        {
+                            let new_kind = if src_ty == *to {
+                                OpKind::Copy(src_ref)
+                            } else {
+                                OpKind::Cast {
+                                    kind: CastKind::Subtype,
+                                    v: src_ref,
+                                    from: src_ty,
+                                    to: *to,
+                                }
+                            };
+                            consumers.push((b_idx, op_idx, root, new_kind));
+                            true
+                        }
+                        _ => false,
+                    },
+                    OpKind::Deref(u) if *u == used => match (used_prov, op.result) {
+                        (
+                            PtrProv::RawOf {
+                                src_ref, src_ty, ..
+                            },
+                            Some(res),
+                        ) if func.values[res.0 as usize].carrier == Carrier::Baseline
+                            && ptr_info(table, src_ty).map(|(_, pt)| pt)
+                                == Some(func.values[res.0 as usize].ty)
+                            && dominates_op(src_ref, block.id, op_idx) =>
+                        {
+                            consumers.push((b_idx, op_idx, root, OpKind::Deref(src_ref)));
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !safe_use {
+                    tainted.insert(root);
+                }
+            }
+        }
+        // Check terminator uses: only passing into a block parameter carrying the same provenance
+        // is non-escaping.
+        match &block.term {
+            RTerm::Switch { scrut, .. } => {
+                if let Some(p) = prov[scrut.0 as usize] {
+                    tainted.insert(p.root_raw());
+                }
+            }
+            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => {
+                if let Some(p) = prov[v.0 as usize] {
+                    tainted.insert(p.root_raw());
+                }
+            }
+            _ => {}
+        }
+        for (target, args) in block.term.edges() {
+            let target_params = &func.blocks[target.0 as usize].params;
+            for (pos, &arg) in args.iter().enumerate() {
+                let Some(arg_prov) = prov[arg.0 as usize] else {
+                    continue;
+                };
+                let dst_matches = target_params
+                    .get(pos)
+                    .is_some_and(|dst| prov[dst.0 as usize] == Some(arg_prov));
+                if !dst_matches {
+                    tainted.insert(arg_prov.root_raw());
+                }
+            }
+        }
+    }
+
+    let mut changed = false;
+    for (b_idx, op_idx, root, new_kind) in consumers {
+        if tainted.contains(&root) {
+            continue;
+        }
+        func.blocks[b_idx].ops[op_idx].kind = new_kind;
+        changed = true;
+    }
+    changed
 }
 
 /// An integer comparison of two constants becomes the constant it evaluates to.
@@ -2163,13 +2961,14 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
     loop {
         let mut used = vec![false; func.values.len()];
         let mut used_cells = vec![false; func.cells.len()];
+        let mut observed_cells = vec![false; func.cells.len()];
         let mark = |v: ValueId, used: &mut Vec<bool>| {
             if let Some(slot) = used.get_mut(v.0 as usize) {
                 *slot = true;
             }
         };
-        let mark_cell = |c: CellId, used_cells: &mut Vec<bool>| {
-            if let Some(slot) = used_cells.get_mut(c.0 as usize) {
+        let mark_cell = |c: CellId, cells: &mut Vec<bool>| {
+            if let Some(slot) = cells.get_mut(c.0 as usize) {
                 *slot = true;
             }
         };
@@ -2183,7 +2982,11 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
             }
             for op in &block.ops {
                 match &op.kind {
-                    OpKind::CellLoad(cell) | OpKind::CellStore { cell, .. } => {
+                    OpKind::CellLoad(cell) => {
+                        mark_cell(*cell, &mut used_cells);
+                        mark_cell(*cell, &mut observed_cells);
+                    }
+                    OpKind::CellStore { cell, .. } => {
                         mark_cell(*cell, &mut used_cells);
                     }
                     OpKind::BorrowView {
@@ -2193,12 +2996,19 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
                     | OpKind::RawView {
                         root: Root::Cell(cell),
                         ..
+                    } => {
+                        mark_cell(*cell, &mut used_cells);
+                        mark_cell(*cell, &mut observed_cells);
                     }
-                    | OpKind::Drop {
+                    OpKind::Drop {
                         root: Root::Cell(cell),
+                        glue,
                         ..
                     } => {
                         mark_cell(*cell, &mut used_cells);
+                        if !matches!(glue, DropGlue::None) {
+                            mark_cell(*cell, &mut observed_cells);
+                        }
                     }
                     _ => {}
                 }
@@ -2213,31 +3023,55 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
         let mut round = false;
         for block in &mut func.blocks {
             let before = block.ops.len();
-            block.ops.retain(|op| match op.result {
-                Some(result) if !used[result.0 as usize] => match &op.kind {
-                    // Only a plain call is the oracle's to vouch for. A call the lowering
-                    // intercepts — a host payload, a `rcgjs.tc.*`/`rcgjs.host.*` marker, raw
-                    // JavaScript — is summarized by its Rust body, which is NOT what runs: the
-                    // DOM lowering replaces it with template/effect emission whose deletion is
-                    // observable (the trace regression this guard pins). The inliner's
-                    // `collect_sites` spells the same refusal.
-                    OpKind::Call {
-                        callee,
-                        host: None,
-                        semantic:
-                            CallSemantic::Ordinary
-                            | CallSemantic::Standard(_)
-                            | CallSemantic::GlobalAllocator,
-                        ..
-                    } => !pure_call.is_some_and(|oracle| oracle(callee)),
-                    OpKind::Call { .. } => true,
-                    kind => op_purity(kind) == Purity::Effect,
-                },
-                None => !matches!(
-                    op.kind,
-                    OpKind::CellAlloc(cell) if !used_cells.get(cell.0 as usize).copied().unwrap_or(true)
-                ),
-                _ => true,
+            let is_invoke = matches!(block.term, RTerm::Invoke { .. });
+            let last_idx = before.saturating_sub(1);
+            let mut idx = 0usize;
+            block.ops.retain(|op| {
+                let cur_idx = idx;
+                idx += 1;
+                if is_invoke && cur_idx == last_idx {
+                    return true;
+                }
+                match op.result {
+                    Some(result) if !used[result.0 as usize] => match &op.kind {
+                        // Only a plain call is the oracle's to vouch for. A call the lowering
+                        // intercepts — a host payload, a `rcgjs.tc.*`/`rcgjs.host.*` marker, raw
+                        // JavaScript — is summarized by its Rust body, which is NOT what runs: the
+                        // DOM lowering replaces it with template/effect emission whose deletion is
+                        // observable (the trace regression this guard pins). The inliner's
+                        // `collect_sites` spells the same refusal.
+                        OpKind::Call {
+                            callee,
+                            host: None,
+                            semantic:
+                                CallSemantic::Ordinary
+                                | CallSemantic::Standard(_)
+                                | CallSemantic::GlobalAllocator,
+                            ..
+                        } => !pure_call.is_some_and(|oracle| oracle(callee)),
+                        OpKind::Call { .. } => true,
+                        kind => op_purity(kind) == Purity::Effect,
+                    },
+                    None => match &op.kind {
+                        OpKind::CellAlloc(cell) => {
+                            used_cells.get(cell.0 as usize).copied().unwrap_or(true)
+                        }
+                        OpKind::CellStore { cell, .. } => {
+                            observed_cells.get(cell.0 as usize).copied().unwrap_or(true)
+                        }
+                        OpKind::Call {
+                            callee: Callee::Nop,
+                            host: None,
+                            semantic:
+                                CallSemantic::Ordinary
+                                | CallSemantic::Standard(_)
+                                | CallSemantic::GlobalAllocator,
+                            ..
+                        } => false,
+                        _ => true,
+                    },
+                    _ => true,
+                }
             });
             round |= block.ops.len() != before;
         }
@@ -2307,8 +3141,49 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
         }
     }
 
-    // An unused non-entry parameter needs no replacement at all. Drop its incoming argument
-    // slot unconditionally; the ordinary dead-op sweep then removes the value chain that fed it.
+    // Backward liveness over non-entry block parameters: any parameter with no use in an op or
+    // non-edge terminator (Return/Throw/Switch.scrut) — including a mutually recursive cycle of
+    // dead loop parameters — needs no replacement at all. Dropping all dead parameters together
+    // frees the value chains that fed them for `remove_dead_ops`.
+    let mut param_of: Vec<Option<(usize, usize)>> = vec![None; func.values.len()];
+    for block in func.blocks.iter().skip(1) {
+        let b_idx = block.id.0 as usize;
+        for (pos, &param) in block.params.iter().enumerate() {
+            param_of[param.0 as usize] = Some((b_idx, pos));
+        }
+    }
+    let mut live_param = vec![false; func.values.len()];
+    let mut work: Vec<ValueId> = Vec::new();
+    let mark_live = |v: ValueId, live_param: &mut [bool], work: &mut Vec<ValueId>| {
+        if param_of.get(v.0 as usize).copied().flatten().is_some() && !live_param[v.0 as usize] {
+            live_param[v.0 as usize] = true;
+            work.push(v);
+        }
+    };
+    for block in &func.blocks {
+        for op in &block.ops {
+            for v in op.kind.uses() {
+                mark_live(v, &mut live_param, &mut work);
+            }
+        }
+        match &block.term {
+            RTerm::Switch { scrut, .. } => mark_live(*scrut, &mut live_param, &mut work),
+            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => {
+                mark_live(*v, &mut live_param, &mut work);
+            }
+            _ => {}
+        }
+    }
+    while let Some(v) = work.pop() {
+        let Some((b_idx, pos)) = param_of[v.0 as usize] else {
+            continue;
+        };
+        for args in &incoming[b_idx] {
+            if let Some(&arg) = args.get(pos) {
+                mark_live(arg, &mut live_param, &mut work);
+            }
+        }
+    }
     let dead_params: BTreeSet<(usize, usize)> = func
         .blocks
         .iter()
@@ -2318,7 +3193,7 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
                 .params
                 .iter()
                 .enumerate()
-                .filter(|(_, param)| uses[param.0 as usize] == 0)
+                .filter(|(_, param)| !live_param[param.0 as usize])
                 .map(|(position, _)| (block.id.0 as usize, position))
                 .collect::<Vec<_>>()
         })
@@ -4453,6 +5328,973 @@ mod tests {
             assert_eq!(
                 remaining_copies, 4,
                 "param, 2-use, and cross-block Copy must remain Copy"
+            );
+        }
+    }
+
+    #[test]
+    fn const_ref_null_niche_deref_and_discriminant_fold() {
+        use crate::jir::types::{
+            EnumRepr, FieldDescriptor, FieldKey, PointerForm, VariantDescriptor,
+        };
+
+        const I8: TypeId = TypeId(10);
+        const BOOL: TypeId = TypeId(11);
+        const ORDERING: TypeId = TypeId(12);
+        const OPT_ORDERING: TypeId = TypeId(13);
+        const REF_OPT_ORDERING: TypeId = TypeId(14);
+        const REF_ORDERING: TypeId = TypeId(15);
+
+        let def_id = |local_hash| DefinitionId {
+            crate_id: 0,
+            local_hash,
+        };
+        let mut tbl = table();
+        let base_js = |id| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled: id,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        tbl.insert(TypeDescriptor {
+            id: I8,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: true,
+                bits: 8,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(1),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: true,
+                    bits: 8,
+                    repr: IntRepr::Number,
+                }),
+                ..base_js(I8)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: BOOL,
+            name: None,
+            kind: TypeKind::Bool,
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(1),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: base_js(BOOL),
+        });
+        tbl.insert(TypeDescriptor {
+            id: ORDERING,
+            name: None,
+            kind: TypeKind::Adt {
+                def: def_id(410),
+                form: NominalForm::Enum,
+                args: Vec::new(),
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(1),
+                        logical_discr: -1,
+                        physical_tag: None,
+                        fields: Vec::new(),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(2),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        fields: Vec::new(),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(3),
+                        logical_discr: 1,
+                        physical_tag: None,
+                        fields: Vec::new(),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(1),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                enum_repr: Some(EnumRepr::Number {
+                    signed: true,
+                    bits: 8,
+                }),
+                is_primitive_enum: true,
+                ..base_js(ORDERING)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: OPT_ORDERING,
+            name: None,
+            kind: TypeKind::Adt {
+                def: def_id(411),
+                form: NominalForm::Enum,
+                args: Vec::new(),
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(4),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        fields: Vec::new(),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(5),
+                        logical_discr: 1,
+                        physical_tag: None,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: ORDERING,
+                            offset: 0,
+                        }],
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(1),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                enum_repr: Some(EnumRepr::NullNiche {
+                    none_variant: 0,
+                    some_variant: 1,
+                }),
+                ..base_js(OPT_ORDERING)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: REF_OPT_ORDERING,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: OPT_ORDERING,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Slot),
+                ..base_js(REF_OPT_ORDERING)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: REF_ORDERING,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: ORDERING,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Slot),
+                ..base_js(REF_ORDERING)
+            },
+        });
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: def_id(400),
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
+                },
+                arguments: vec![ORDERING],
+                result: BOOL,
+            },
+        );
+        let lhs_ord = b.param(ORDERING, NO_ORIGIN);
+        let entry = FuncBuilder::ENTRY;
+        let rhs_ref = b.op(
+            entry,
+            OpKind::Const(ConstTree::Reference(Box::new(ConstTree::Variant {
+                variant: 1,
+                fields: vec![ConstTree::Variant {
+                    variant: 0,
+                    fields: Vec::new(),
+                }],
+            }))),
+            REF_OPT_ORDERING,
+            NO_ORIGIN,
+        );
+        let rhs_opt = b.op(entry, OpKind::Deref(rhs_ref), OPT_ORDERING, NO_ORIGIN);
+        let rhs_opt_discr = b.op(entry, OpKind::Discriminant(rhs_opt), I8, NO_ORIGIN);
+        let some_blk = b.block();
+        let none_blk = b.block();
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: rhs_opt_discr,
+                scrut_ty: I8,
+                cases: vec![(0, none_blk, Vec::new())],
+                default: (some_blk, Vec::new()),
+            },
+        );
+        let f_val = b.op(
+            none_blk,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 1 }),
+            BOOL,
+            NO_ORIGIN,
+        );
+        b.terminate(none_blk, RTerm::Return(Some(f_val)));
+
+        let rhs_ord_ref = b.op(
+            some_blk,
+            OpKind::BorrowView {
+                root: Root::Value(rhs_ref),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Downcast { variant: 1 },
+                    Proj::Field {
+                        field: 0,
+                        ty: ORDERING,
+                    },
+                ],
+                mutable: false,
+            },
+            REF_ORDERING,
+            NO_ORIGIN,
+        );
+        let rhs_ord = b.op(some_blk, OpKind::Deref(rhs_ord_ref), ORDERING, NO_ORIGIN);
+        let lhs_d = b.op(some_blk, OpKind::Discriminant(lhs_ord), I8, NO_ORIGIN);
+        let rhs_d = b.op(some_blk, OpKind::Discriminant(rhs_ord), I8, NO_ORIGIN);
+        let eq = b.op(
+            some_blk,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: lhs_d,
+                r: rhs_d,
+                ty: I8,
+            },
+            BOOL,
+            NO_ORIGIN,
+        );
+        b.terminate(some_blk, RTerm::Return(Some(eq)));
+
+        let mut func = b.finish();
+        func.verify(&tbl).expect("pre-dce Func::verify");
+        assert!(super::run(&mut func, &tbl));
+        func.verify(&tbl).expect("post-dce Func::verify");
+        for blk in &func.blocks {
+            for op in &blk.ops {
+                assert!(
+                    !matches!(op.kind, OpKind::Const(ConstTree::Reference(_))),
+                    "promoted constant reference must be eliminated: {op:?}"
+                );
+                assert!(
+                    !matches!(op.kind, OpKind::Deref(_) | OpKind::BorrowView { .. }),
+                    "deref/borrow of promoted constant must be eliminated: {op:?}"
+                );
+            }
+        }
+        assert!(
+            func.blocks.iter().flat_map(|blk| &blk.ops).any(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::Const(ConstTree::Scalar {
+                        bits: 255,
+                        bytes: 1
+                    })
+                )
+            }),
+            "Ordering::Less discriminant must fold to -1i8 (255u8)"
+        );
+    }
+
+    #[test]
+    fn async_resume_ty_ref_raw_roundtrip_elided_across_invoke() {
+        use crate::jir::types::{FieldDescriptor, FieldKey, PointerForm, VariantDescriptor};
+
+        const CONTEXT: TypeId = TypeId(20);
+        const MUT_CONTEXT: TypeId = TypeId(21);
+        const RAW_CONTEXT: TypeId = TypeId(22);
+        const NONNULL_CONTEXT: TypeId = TypeId(23);
+        const RESUME_TY: TypeId = TypeId(24);
+
+        let def_id = |local_hash| DefinitionId {
+            crate_id: 0,
+            local_hash,
+        };
+        let mut tbl = table();
+        let base_js = |id| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled: id,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        let ctx_fields = vec![FieldDescriptor {
+            key: FieldKey::Index(0),
+            ty: I32,
+            offset: 0,
+        }];
+        tbl.insert(TypeDescriptor {
+            id: CONTEXT,
+            name: None,
+            kind: TypeKind::Adt {
+                def: def_id(420),
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: StrId(1),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: ctx_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                needs_clone: true,
+                fields: ctx_fields,
+                ..base_js(CONTEXT)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: MUT_CONTEXT,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: CONTEXT,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..base_js(MUT_CONTEXT)
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: RAW_CONTEXT,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: CONTEXT,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Slot),
+                ..base_js(RAW_CONTEXT)
+            },
+        });
+        let nn_fields = vec![FieldDescriptor {
+            key: FieldKey::Transparent,
+            ty: RAW_CONTEXT,
+            offset: 0,
+        }];
+        tbl.insert(TypeDescriptor {
+            id: NONNULL_CONTEXT,
+            name: None,
+            kind: TypeKind::Adt {
+                def: def_id(421),
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: StrId(2),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: nn_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                peeled: RAW_CONTEXT,
+                pointer_form: Some(PointerForm::Slot),
+                fields: nn_fields,
+                ..base_js(NONNULL_CONTEXT)
+            },
+        });
+        let rt_fields = vec![FieldDescriptor {
+            key: FieldKey::Index(0),
+            ty: NONNULL_CONTEXT,
+            offset: 0,
+        }];
+        tbl.insert(TypeDescriptor {
+            id: RESUME_TY,
+            name: None,
+            kind: TypeKind::Adt {
+                def: def_id(422),
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: StrId(3),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: rt_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                needs_clone: true,
+                fields: rt_fields,
+                ..base_js(RESUME_TY)
+            },
+        });
+
+        // Positive case: async coroutine ResumeTy round-trip across Switch + Move + Invoke.
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: def_id(401),
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 2,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
+                },
+                arguments: vec![I32, MUT_CONTEXT],
+                result: I32,
+            },
+        );
+        let tag = b.param(I32, NO_ORIGIN);
+        let cx = b.param(MUT_CONTEXT, NO_ORIGIN);
+        let entry = FuncBuilder::ENTRY;
+        let nn = b.op(
+            entry,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: cx,
+                from: MUT_CONTEXT,
+                to: NONNULL_CONTEXT,
+            },
+            NONNULL_CONTEXT,
+            NO_ORIGIN,
+        );
+        let resume = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: RESUME_TY,
+                variant: 0,
+                active_field: None,
+                fields: vec![nn],
+            },
+            RESUME_TY,
+            NO_ORIGIN,
+        );
+        let arm0 = b.block();
+        let arm1 = b.block();
+        let poll_blk = b.block();
+        let done_blk = b.block();
+        let unwind_blk = b.block();
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: tag,
+                scrut_ty: I32,
+                cases: vec![(0, arm0, Vec::new())],
+                default: (arm1, Vec::new()),
+            },
+        );
+        b.terminate(arm0, RTerm::Goto(poll_blk, vec![resume]));
+        let moved_resume = b.op(arm1, OpKind::Move(resume), RESUME_TY, NO_ORIGIN);
+        b.terminate(arm1, RTerm::Goto(poll_blk, vec![moved_resume]));
+
+        let rt_param = b.block_param(poll_blk, RESUME_TY, NO_ORIGIN);
+        let extracted_nn = b.op(
+            poll_blk,
+            OpKind::Field {
+                base: rt_param,
+                variant: None,
+                field: 0,
+            },
+            NONNULL_CONTEXT,
+            NO_ORIGIN,
+        );
+        let recovered_cx = b.op(
+            poll_blk,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: extracted_nn,
+                from: NONNULL_CONTEXT,
+                to: MUT_CONTEXT,
+            },
+            MUT_CONTEXT,
+            NO_ORIGIN,
+        );
+        let poll_res = b.op(
+            poll_blk,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: def_id(402),
+                        instantiation: 0,
+                    },
+                    link_name: StrId(10),
+                },
+                function: None,
+                args: vec![recovered_cx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(
+            poll_blk,
+            RTerm::Invoke {
+                normal: (done_blk, Vec::new()),
+                unwind: (unwind_blk, Vec::new()),
+            },
+        );
+        b.terminate(done_blk, RTerm::Return(Some(poll_res)));
+        b.terminate(unwind_blk, RTerm::Throw(None));
+
+        let mut func = b.finish();
+        func.verify(&tbl).expect("pre-dce Func::verify");
+        assert!(super::run(&mut func, &tbl));
+        func.verify(&tbl).expect("post-dce Func::verify");
+        for blk in &func.blocks {
+            for op in &blk.ops {
+                assert!(
+                    !matches!(
+                        op.kind,
+                        OpKind::Cast {
+                            kind: CastKind::Transmute,
+                            ..
+                        }
+                    ),
+                    "ResumeTy ref->raw->ref Transmute must be elided: {op:?}"
+                );
+                assert!(
+                    !matches!(op.kind, OpKind::Aggregate { ty, .. } if ty == RESUME_TY),
+                    "ResumeTy wrapper Aggregate must be elided: {op:?}"
+                );
+            }
+        }
+
+        // Loop-carried cycle case: mutually recursive ResumeTy block parameters across `loop_hdr <-> poll_blk`
+        // (matching `while ... { fut.await }` coroutines).
+        let mut b_loop = FuncBuilder::new(
+            ItemId {
+                definition: def_id(406),
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 2,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
+                },
+                arguments: vec![I32, MUT_CONTEXT],
+                result: I32,
+            },
+        );
+        let l_tag = b_loop.param(I32, NO_ORIGIN);
+        let l_cx = b_loop.param(MUT_CONTEXT, NO_ORIGIN);
+        let l_entry = FuncBuilder::ENTRY;
+        let l_nn = b_loop.op(
+            l_entry,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: l_cx,
+                from: MUT_CONTEXT,
+                to: NONNULL_CONTEXT,
+            },
+            NONNULL_CONTEXT,
+            NO_ORIGIN,
+        );
+        let l_resume = b_loop.op(
+            l_entry,
+            OpKind::Aggregate {
+                ty: RESUME_TY,
+                variant: 0,
+                active_field: None,
+                fields: vec![l_nn],
+            },
+            RESUME_TY,
+            NO_ORIGIN,
+        );
+        let l_hdr = b_loop.block();
+        let l_poll = b_loop.block();
+        let l_done = b_loop.block();
+        let l_unwind = b_loop.block();
+        b_loop.terminate(
+            l_entry,
+            RTerm::Switch {
+                scrut: l_tag,
+                scrut_ty: I32,
+                cases: vec![(0, l_hdr, vec![l_resume])],
+                default: (l_poll, vec![l_resume]),
+            },
+        );
+        let hdr_rt = b_loop.block_param(l_hdr, RESUME_TY, NO_ORIGIN);
+        b_loop.terminate(l_hdr, RTerm::Goto(l_poll, vec![hdr_rt]));
+        let poll_rt = b_loop.block_param(l_poll, RESUME_TY, NO_ORIGIN);
+        let poll_nn = b_loop.op(
+            l_poll,
+            OpKind::Field {
+                base: poll_rt,
+                variant: None,
+                field: 0,
+            },
+            NONNULL_CONTEXT,
+            NO_ORIGIN,
+        );
+        let poll_cx = b_loop.op(
+            l_poll,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: poll_nn,
+                from: NONNULL_CONTEXT,
+                to: MUT_CONTEXT,
+            },
+            MUT_CONTEXT,
+            NO_ORIGIN,
+        );
+        let poll_out = b_loop.op(
+            l_poll,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: def_id(407),
+                        instantiation: 0,
+                    },
+                    link_name: StrId(12),
+                },
+                function: None,
+                args: vec![poll_cx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b_loop.terminate(
+            l_poll,
+            RTerm::Invoke {
+                normal: (l_done, Vec::new()),
+                unwind: (l_unwind, Vec::new()),
+            },
+        );
+        b_loop.terminate(
+            l_done,
+            RTerm::Switch {
+                scrut: poll_out,
+                scrut_ty: I32,
+                cases: vec![(0, l_hdr, vec![poll_rt])],
+                default: (l_unwind, Vec::new()),
+            },
+        );
+        b_loop.terminate(l_unwind, RTerm::Return(Some(l_tag)));
+
+        let mut func_loop = b_loop.finish();
+        func_loop.verify(&tbl).expect("pre-dce loop Func::verify");
+        assert!(super::run(&mut func_loop, &tbl));
+        func_loop.verify(&tbl).expect("post-dce loop Func::verify");
+        for blk in &func_loop.blocks {
+            for op in &blk.ops {
+                assert!(
+                    !matches!(
+                        op.kind,
+                        OpKind::Cast {
+                            kind: CastKind::Transmute,
+                            ..
+                        }
+                    ),
+                    "loop-carried ResumeTy Transmute must be elided: {op:?}"
+                );
+                assert!(
+                    !matches!(op.kind, OpKind::Aggregate { ty, .. } if ty == RESUME_TY),
+                    "loop-carried ResumeTy Aggregate must be elided: {op:?}"
+                );
+            }
+        }
+
+        // Negative case: escaping `NonNull<Context>` passed to an external call must stay boxed.
+        let mut b2 = FuncBuilder::new(
+            ItemId {
+                definition: def_id(403),
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
+                },
+                arguments: vec![MUT_CONTEXT],
+                result: I32,
+            },
+        );
+        let cx2 = b2.param(MUT_CONTEXT, NO_ORIGIN);
+        let nn2 = b2.op(
+            FuncBuilder::ENTRY,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: cx2,
+                from: MUT_CONTEXT,
+                to: NONNULL_CONTEXT,
+            },
+            NONNULL_CONTEXT,
+            NO_ORIGIN,
+        );
+        let back_ref = b2.op(
+            FuncBuilder::ENTRY,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: nn2,
+                from: NONNULL_CONTEXT,
+                to: MUT_CONTEXT,
+            },
+            MUT_CONTEXT,
+            NO_ORIGIN,
+        );
+        let res2 = b2.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: def_id(404),
+                        instantiation: 0,
+                    },
+                    link_name: StrId(11),
+                },
+                function: None,
+                args: vec![nn2, back_ref],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b2.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res2)));
+
+        let mut func2 = b2.finish();
+        func2.verify(&tbl).expect("pre-dce neg Func::verify");
+        assert!(!super::run(&mut func2, &tbl));
+        let transmute_count = func2.blocks[0]
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::Cast {
+                        kind: CastKind::Transmute,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            transmute_count, 2,
+            "escaping NonNull must preserve ref->raw and raw->ref"
+        );
+    }
+
+    #[test]
+    fn dead_nop_call_and_single_store_cell_are_eliminated() {
+        use crate::jir::types::PointerForm;
+
+        const RAW_I32: TypeId = TypeId(30);
+        let mut tbl = table();
+        tbl.insert(TypeDescriptor {
+            id: RAW_I32,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: I32,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: RAW_I32,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: Some(PointerForm::Slot),
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 405,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let x = b.param(I32, NO_ORIGIN);
+        let cell = b.cell(I32, true, NO_ORIGIN);
+        let entry = FuncBuilder::ENTRY;
+        b.effect(entry, OpKind::CellAlloc(cell), NO_ORIGIN);
+        b.effect(entry, OpKind::CellStore { cell, v: x }, NO_ORIGIN);
+        let raw = b.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Cell(cell),
+                path: Vec::new(),
+                mutable: true,
+            },
+            RAW_I32,
+            NO_ORIGIN,
+        );
+        b.effect(
+            entry,
+            OpKind::Call {
+                callee: Callee::Nop,
+                function: None,
+                args: vec![raw],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        let loaded = b.op(entry, OpKind::CellLoad(cell), I32, NO_ORIGIN);
+        b.terminate(entry, RTerm::Return(Some(loaded)));
+
+        let mut func = b.finish();
+        func.verify(&tbl).expect("pre-dce Func::verify");
+        assert!(super::run(&mut func, &tbl));
+        func.verify(&tbl).expect("post-dce Func::verify");
+        for op in &func.blocks[0].ops {
+            assert!(
+                !matches!(
+                    op.kind,
+                    OpKind::Call {
+                        callee: Callee::Nop,
+                        ..
+                    } | OpKind::RawView { .. }
+                        | OpKind::CellAlloc(_)
+                        | OpKind::CellStore { .. }
+                        | OpKind::CellLoad(_)
+                ),
+                "dead Nop call, RawView, and single-store cell must all vanish: {op:?}"
             );
         }
     }

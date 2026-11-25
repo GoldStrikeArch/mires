@@ -329,6 +329,35 @@ impl TaggedShape {
     }
 }
 
+/// A two-variant payload-bearing enum returned without allocating a `{ TAG, ... }` wrapper:
+/// `Ok(v)` returns `v` directly (`undefined` when the `Ok` payload is ZST) and `Err(e)` writes
+/// `e` to spill register 1 (when the `Err` payload is non-ZST) and returns a private module-scope
+/// sentinel object (`const $se = {};`).
+///
+/// Unlike [`TaggedShape`], this allows `needs_drop == true` (returning moves ownership without
+/// cloning), recursive / mutually-recursive SCCs, `RTerm::Invoke` call sites, and escaping callers
+/// (which materialize canonical `{ TAG, ... }` at the call site).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SentinelResultShape {
+    pub ty: TypeId,
+    pub ok_variant: u32,
+    pub ok_field: Option<(u32, TypeId)>,
+    pub err_variant: u32,
+    pub err_field: Option<(u32, TypeId)>,
+}
+
+impl SentinelResultShape {
+    /// Physical result lanes: 2 when `err_field` is non-ZST (primary return + spill register 1),
+    /// or 1 when `err_field` is ZST (primary return only — zero spill registers!).
+    pub const fn fields(&self) -> u32 {
+        if self.err_field.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+}
+
 /// One aggregate result the plan returns as independent fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlatResult {
@@ -347,6 +376,8 @@ pub struct FlatResult {
     /// The recursive fixed-product form, when nested fields remain one semantic JIR result and
     /// expand only in the JavaScript ABI.
     pub recursive: Option<RecursiveShape>,
+    /// The sentinel flat-return form for two-variant `Result`-shaped enums under `ReleaseSpeed`.
+    pub sentinel: Option<SentinelResultShape>,
 }
 
 impl FlatResult {
@@ -354,6 +385,9 @@ impl FlatResult {
     fn fields(&self) -> u32 {
         if self.i64_pair {
             return 2;
+        }
+        if let Some(sentinel) = &self.sentinel {
+            return sentinel.fields();
         }
         self.tagged.as_ref().map_or_else(
             || {
@@ -597,6 +631,9 @@ pub struct AbiPlan {
     /// The name of each register, register 1 first. Allocated against the program's own names
     /// (see [`allocate_spill_names`]), so it is `$rN` only when nothing else is called that.
     spill_names: Vec<JsName>,
+    /// Collision-free module-scope sentinel object (`const $se = {};`) allocated when at least
+    /// one selected signature uses [`SentinelResultShape`].
+    sentinel_err: Option<JsName>,
     /// Private flat bodies that retain a canonical exported or indirect entry point.
     pub(crate) clones: BTreeMap<JsName, JsName>,
     /// Synthetic `ItemId` assigned to mixed-caller private clones (e.g. `ByteStrParam` `$bs`
@@ -639,6 +676,18 @@ impl AbiPlan {
             sig.params.iter().flatten().any(|p| p.i64_pair)
                 || sig.result.as_ref().is_some_and(|r| r.i64_pair)
         })
+    }
+
+    /// Whether any flattened signature in this plan uses [`SentinelResultShape`].
+    pub(crate) fn has_sentinel_result(&self) -> bool {
+        self.flat
+            .values()
+            .any(|sig| sig.result.as_ref().is_some_and(|r| r.sentinel.is_some()))
+    }
+
+    /// The allocated module-scope sentinel binding (`$se`) for [`SentinelResultShape`], if active.
+    pub fn sentinel_err_name(&self) -> Option<&JsName> {
+        self.sentinel_err.as_ref()
     }
 
     /// Accessors for `bstr_abi` augmentation inside the same crate.
@@ -705,6 +754,9 @@ impl AbiPlan {
         }
         for spill in &self.spill_names {
             out.extend_from_slice(format!("|spill:{spill}").as_bytes());
+        }
+        if let Some(sentinel) = &self.sentinel_err {
+            out.extend_from_slice(format!("|sentinel_err:{sentinel}").as_bytes());
         }
         for (caller, retargets) in &self.call_retargets {
             out.extend_from_slice(format!("|retarget:{caller}:{retargets:?}").as_bytes());
@@ -805,6 +857,10 @@ impl AbiPlan {
             .take(registers as usize)
             .cloned()
             .collect();
+        let has_sentinel = flat
+            .values()
+            .any(|sig| sig.result.as_ref().is_some_and(|r| r.sentinel.is_some()));
+        let sentinel_err = has_sentinel.then(|| self.sentinel_err.clone()).flatten();
         AbiPlan {
             flat,
             names,
@@ -813,6 +869,7 @@ impl AbiPlan {
             touched,
             registers,
             spill_names,
+            sentinel_err,
             clones,
             synthetic_items,
             site_retargets,
@@ -1000,6 +1057,12 @@ impl AbiPlan {
         plan
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_sentinel_err_test(mut self, name: JsName) -> Self {
+        self.sentinel_err = Some(name);
+        self
+    }
+
     /// Whether `name` is a private flat body behind a canonical wrapper.
     pub(crate) fn has_canonical_wrapper(&self, name: &JsName) -> bool {
         self.clones.contains_key(name)
@@ -1050,7 +1113,8 @@ impl AbiPlan {
     /// places a binding before the items that name it, and `print_units` prints it — which is why
     /// the plan does not have to reach into the printer at all.
     pub fn spill_items(&self) -> Vec<LinkItem> {
-        self.spill_names
+        let mut items: Vec<LinkItem> = self
+            .spill_names
             .iter()
             .map(|name| {
                 let name = name.clone();
@@ -1072,7 +1136,27 @@ impl AbiPlan {
                     jir: Default::default(),
                 }
             })
-            .collect()
+            .collect();
+        if let Some(name) = self.sentinel_err.clone() {
+            items.push(LinkItem {
+                js: format!("\nconst {} = {{}};\n", name.as_str()),
+                name,
+                kind: ItemKind::Static,
+                refs: Default::default(),
+                zombies: Vec::new(),
+                linkage: Linkage::internal(),
+                debug_path: "flat direct-call ABI sentinel error token".to_owned(),
+                crate_name: "generated".to_owned(),
+                order: None,
+                map: ItemMap::default(),
+                dts: None,
+                optimization: Default::default(),
+                late_ir: Default::default(),
+                baseline_shadow: Default::default(),
+                jir: Default::default(),
+            });
+        }
+        items
     }
 
     /// The sidecar's `abi` block, or `None` when there was nothing to plan.
@@ -1271,11 +1355,20 @@ pub fn plan_excluding(
     if !opts.flat_abi || !opts.analyzes(crate::opts::OptimizerPass::Sroa) {
         return plan;
     }
+    let allow_sentinel =
+        opts.profile == Some(crate::opts::Profile::ReleaseSpeed) && opts.chunks.is_empty();
     for (name, func) in funcs {
         let aggregate_body = table
             .get(name)
             .and_then(|item| item.jir.summary.as_ref())
             .is_some_and(|summary| summary.class.contains(ItemClass::AGGREGATE));
+        let item_is_standard = matches!(
+            table
+                .get(name)
+                .and_then(|item| item.jir.body.as_ref())
+                .map(|body| body.semantic),
+            Some(BodySemantic::Standard(_))
+        );
         // A pure forwarding helper may never construct or project the aggregate itself, so the
         // body class is empty even though its signature is an essential physical edge. Validate
         // those summaries as well; otherwise a producer -> forwarder -> leaf chain is cut solely
@@ -1286,7 +1379,8 @@ pub fn plan_excluding(
                     let ty = func.values[param.0 as usize].ty;
                     slice_param(func, types, *param, ty).is_some()
                         || flat_param_with(Some(func), types, ty, true).is_some()
-                }) || flat_result(types, func.sig.result).is_some()
+                }) || flat_result_with(types, func.sig.result, allow_sentinel && !item_is_standard)
+                    .is_some()
             })
         });
         if !aggregate_body && !aggregate_signature {
@@ -1440,56 +1534,68 @@ pub fn plan_excluding(
         let mut result_forward_sites = 0;
         let mut result_hot_forward = false;
         let mut result_reason = None;
-        let result = flat_result(types, func.sig.result).filter(|result| {
-            if !returns_baseline(func, result.ty) {
-                result_reason = Some("legality.result-carrier");
-                return false;
-            }
-            let Some(direct_callers) = callers.get(&func.item).filter(|set| !set.is_empty()) else {
-                result_reason = Some("not-considered.no-direct-caller");
-                return false;
-            };
-            let mut observed_field = false;
-            let plain_speed_result = opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
-                && !result.i64_pair
-                && result.tagged.is_none()
-                && result.recursive.is_none();
-            let mut accepted_callers = 0usize;
-            let mut rejected_callers = 0usize;
-            for caller in direct_callers {
-                match caller_accepts_result(
-                    table,
-                    funcs,
-                    caller,
-                    func.item,
-                    result,
-                    &potential_params,
-                ) {
-                    Some(observed) => {
-                        accepted_callers += 1;
-                        observed_field |= observed.read || !observed.forwards.is_empty();
-                        result_forwards.extend(observed.forwards);
-                        result_forward_sites += observed.forward_sites;
-                        result_hot_forward |= observed.hot_forward;
-                    }
-                    None if plain_speed_result && funcs.get(caller).is_some_and(Result::is_ok) => {
-                        rejected_callers += 1;
-                    }
-                    None => {
-                        result_reason = Some("boundary.result-use");
-                        return false;
+        let item_is_standard = matches!(
+            table
+                .get(name)
+                .and_then(|item| item.jir.body.as_ref())
+                .map(|body| body.semantic),
+            Some(BodySemantic::Standard(_))
+        );
+        let result = flat_result_with(types, func.sig.result, allow_sentinel && !item_is_standard)
+            .filter(|result| {
+                if !returns_baseline(func, result.ty) {
+                    result_reason = Some("legality.result-carrier");
+                    return false;
+                }
+                let Some(direct_callers) = callers.get(&func.item).filter(|set| !set.is_empty())
+                else {
+                    result_reason = Some("not-considered.no-direct-caller");
+                    return false;
+                };
+                let mut observed_field = false;
+                let plain_speed_result = opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+                    && !result.i64_pair
+                    && result.tagged.is_none()
+                    && result.recursive.is_none()
+                    && result.sentinel.is_none();
+                let mut accepted_callers = 0usize;
+                let mut rejected_callers = 0usize;
+                for caller in direct_callers {
+                    match caller_accepts_result(
+                        table,
+                        funcs,
+                        caller,
+                        func.item,
+                        result,
+                        &potential_params,
+                    ) {
+                        Some(observed) => {
+                            accepted_callers += 1;
+                            observed_field |= observed.read || !observed.forwards.is_empty();
+                            result_forwards.extend(observed.forwards);
+                            result_forward_sites += observed.forward_sites;
+                            result_hot_forward |= observed.hot_forward;
+                        }
+                        None if plain_speed_result
+                            && funcs.get(caller).is_some_and(Result::is_ok) =>
+                        {
+                            rejected_callers += 1;
+                        }
+                        None => {
+                            result_reason = Some("boundary.result-use");
+                            return false;
+                        }
                     }
                 }
-            }
-            if rejected_callers > 0 && accepted_callers < rejected_callers {
-                result_reason = Some("boundary.result-use");
-                return false;
-            }
-            if !observed_field {
-                result_reason = Some("not-considered.result-unused");
-            }
-            observed_field
-        });
+                if rejected_callers > 0 && accepted_callers < rejected_callers {
+                    result_reason = Some("boundary.result-use");
+                    return false;
+                }
+                if !observed_field {
+                    result_reason = Some("not-considered.result-unused");
+                }
+                observed_field
+            });
         if shapes.iter().all(Option::is_none) && result.is_none() {
             if let Some(reason) = result_reason {
                 plan.record_reason(name, reason);
@@ -1606,7 +1712,10 @@ pub fn plan_excluding(
                 .as_ref()
                 .is_some_and(|shape| shape.is_mut_enum(Some(types)))
         });
-        if (result.is_some() || has_mut_enum) && invoke_call_sites.contains(&func.item) {
+        let has_non_sentinel_result = result
+            .as_ref()
+            .is_some_and(|result| result.sentinel.is_none());
+        if (has_non_sentinel_result || has_mut_enum) && invoke_call_sites.contains(&func.item) {
             plan.decline(
                 name.clone(),
                 Decline::Boundary(BoundaryDecline::NonCallReference),
@@ -1806,33 +1915,41 @@ pub fn plan_excluding(
     // canonical entry point. This matters for chains such as allocator wrappers, where both ends
     // retain externally named canonical bodies.
     inherit_clone_retargets(&mut plan);
+    let mut name_collision = false;
     match allocate_spill_names(plan.registers, table) {
         Some(names) => plan.spill_names = names,
-        // Nowhere left to put a register, so the program keeps its own names and the plan keeps
-        // nothing: every callee it had flattened is recorded as refused instead.
-        None => {
-            let mut declined = plan.declined;
-            let mut decisions = plan.decisions;
-            for name in plan.names.into_values() {
-                let decline = Decline::Boundary(BoundaryDecline::GeneratedNameCollision);
-                if let Some(decision) = decisions.get_mut(&name) {
-                    decision.selected = false;
-                    decision.reason = Some(terminal_reason(decline.code()));
-                }
-                declined.insert(name, decline);
-            }
-            for decision in decisions.values_mut().filter(|decision| decision.selected) {
-                decision.selected = false;
-                decision.reason = Some(terminal_reason(
-                    Decline::Boundary(BoundaryDecline::GeneratedNameCollision).code(),
-                ));
-            }
-            plan = AbiPlan {
-                declined,
-                decisions,
-                ..AbiPlan::default()
-            };
+        None => name_collision = true,
+    }
+    if !name_collision && plan.has_sentinel_result() {
+        match allocate_sentinel_err_name(table, &plan.spill_names) {
+            Some(name) => plan.sentinel_err = Some(name),
+            None => name_collision = true,
         }
+    }
+    if name_collision {
+        // Nowhere left to put a register or sentinel, so the program keeps its own names and the
+        // plan keeps nothing: every callee it had flattened is recorded as refused instead.
+        let mut declined = plan.declined;
+        let mut decisions = plan.decisions;
+        for name in plan.names.into_values() {
+            let decline = Decline::Boundary(BoundaryDecline::GeneratedNameCollision);
+            if let Some(decision) = decisions.get_mut(&name) {
+                decision.selected = false;
+                decision.reason = Some(terminal_reason(decline.code()));
+            }
+            declined.insert(name, decline);
+        }
+        for decision in decisions.values_mut().filter(|decision| decision.selected) {
+            decision.selected = false;
+            decision.reason = Some(terminal_reason(
+                Decline::Boundary(BoundaryDecline::GeneratedNameCollision).code(),
+            ));
+        }
+        plan = AbiPlan {
+            declined,
+            decisions,
+            ..AbiPlan::default()
+        };
     }
     plan
 }
@@ -1879,6 +1996,8 @@ fn signature_shape(sig: &FlatSig, types: Option<&TypeTable>) -> String {
     if let Some(result) = &sig.result {
         let kind = if result.i64_pair {
             "i64-pair-result"
+        } else if result.sentinel.is_some() {
+            "sentinel-result"
         } else if result.tagged.is_some() {
             "tagged-result"
         } else if result.recursive.is_some() {
@@ -1936,6 +2055,25 @@ fn allocate_spill_names(registers: u32, table: &BTreeMap<JsName, LinkItem>) -> O
         names.push(name);
     }
     Some(names.into_iter().map(JsName::new).collect())
+}
+
+/// A collision-free module-scope sentinel name (`$se`, `$se$1`, ...) disjoint from every program
+/// item, reference, and spill register name.
+fn allocate_sentinel_err_name(
+    table: &BTreeMap<JsName, LinkItem>,
+    spill_names: &[JsName],
+) -> Option<JsName> {
+    let mut taken: BTreeSet<&str> = table.keys().map(JsName::as_str).collect();
+    taken.extend(
+        table
+            .values()
+            .flat_map(|item| item.refs.iter().map(JsName::as_str)),
+    );
+    taken.extend(spill_names.iter().map(JsName::as_str));
+    std::iter::once("$se".to_owned())
+        .chain((1..64).map(|suffix| format!("$se${suffix}")))
+        .find(|name| !taken.contains(name.as_str()))
+        .map(JsName::new)
 }
 
 /// One callee the plan is still considering.
@@ -2336,7 +2474,14 @@ fn slice_param(func: &Func, table: &TypeTable, param: ValueId, ty: TypeId) -> Op
 }
 
 /// The flat result shape of `ty`, or `None` when it must stay one materialized value.
+#[allow(dead_code)]
 fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
+    flat_result_with(table, ty, false)
+}
+
+/// The flat result shape of `ty`, optionally enabling [`SentinelResultShape`] under
+/// `Profile::ReleaseSpeed` when `opts.chunks.is_empty()`.
+fn flat_result_with(table: &TypeTable, ty: TypeId, allow_sentinel: bool) -> Option<FlatResult> {
     if crate::lower::js::i64_pair::is_i64(table, ty) {
         return Some(FlatResult {
             ty,
@@ -2345,7 +2490,29 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
             i64_pair: true,
             tagged: None,
             recursive: None,
+            sentinel: None,
         });
+    }
+    if allow_sentinel {
+        if let Some(sentinel) = sentinel_result_shape(table, ty) {
+            let mut field_tys = Vec::new();
+            if let Some((_, ok_ty)) = sentinel.ok_field {
+                field_tys.push(ok_ty);
+            }
+            if let Some((_, err_ty)) = sentinel.err_field {
+                field_tys.push(err_ty);
+            }
+            let passed = (0..field_tys.len() as u32).collect();
+            return Some(FlatResult {
+                ty,
+                field_tys,
+                passed,
+                i64_pair: false,
+                tagged: None,
+                recursive: None,
+                sentinel: Some(sentinel),
+            });
+        }
     }
     if let Some(tagged) = tagged_shape(table, ty) {
         let field_tys = tagged.lane_types();
@@ -2357,6 +2524,7 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
             i64_pair: false,
             tagged: Some(tagged),
             recursive: None,
+            sentinel: None,
         });
     }
     if let Some(recursive) = recursive_shape(table, ty) {
@@ -2369,6 +2537,7 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
             i64_pair: false,
             tagged: None,
             recursive: Some(recursive),
+            sentinel: None,
         });
     }
     let (field_tys, passed) = flat_shape(table, ty)?;
@@ -2379,6 +2548,88 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
         i64_pair: false,
         tagged: None,
         recursive: None,
+        sentinel: None,
+    })
+}
+
+/// Checks whether `ty` is an eligible two-variant payload-bearing enum for [`SentinelResultShape`].
+///
+/// Unlike [`tagged_shape`], this deliberately allows `descriptor.layout.needs_drop == true`
+/// because returning `Ok(v)` / `Err(e)` moves ownership without copying or cloning.
+pub(crate) fn sentinel_result_shape(table: &TypeTable, ty: TypeId) -> Option<SentinelResultShape> {
+    let descriptor = table.get(ty)?;
+    if !descriptor.layout.sized
+        || descriptor.layout.zst
+        || descriptor.meta.abi == NominalAbi::C
+        || descriptor.meta.boundary != PinnedBoundary::None
+        || descriptor.js.transparent.is_some()
+        || descriptor.js.unsized_tail.is_some()
+        || !matches!(
+            descriptor.js.enum_repr,
+            Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
+        )
+    {
+        return None;
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        niche,
+        ..
+    } = &descriptor.kind
+    else {
+        return None;
+    };
+    if variants.len() != 2 {
+        return None;
+    }
+    if niche.is_none() && variants.iter().all(|v| v.physical_tag.is_none()) {
+        return None;
+    }
+    let single_non_zst = |variant_index: u32| -> Option<Option<(u32, TypeId)>> {
+        let variant = variants.get(variant_index as usize)?;
+        if variant
+            .fields
+            .iter()
+            .any(|f| crate::lower::js::value::is_uninhabited(table, f.ty))
+        {
+            return None;
+        }
+        let mut found = None;
+        for (fi, field) in variant.fields.iter().enumerate() {
+            table.field(ty, Some(variant_index), fi as u32)?;
+            if table.is_zst(field.ty) {
+                continue;
+            }
+            if field.key == FieldKey::Transparent || found.is_some() {
+                return None;
+            }
+            found = Some((fi as u32, field.ty));
+        }
+        Some(found)
+    };
+    let f0 = single_non_zst(0)?;
+    let f1 = single_non_zst(1)?;
+    if f0.is_none() && f1.is_none() {
+        return None;
+    }
+    let (ok_variant, ok_field, err_variant, err_field) = if variants[0].result_ok {
+        (0, f0, 1, f1)
+    } else if variants[1].result_ok {
+        (1, f1, 0, f0)
+    } else if f0.is_some() && f1.is_none() {
+        (0, f0, 1, None)
+    } else if f1.is_some() && f0.is_none() {
+        (1, f1, 0, None)
+    } else {
+        (0, f0, 1, f1)
+    };
+    Some(SentinelResultShape {
+        ty,
+        ok_variant,
+        ok_field,
+        err_variant,
+        err_field,
     })
 }
 
@@ -2786,6 +3037,49 @@ fn caller_accepts_result(
             ..ResultUse::default()
         });
     }
+    if let Some(sentinel) = &result.sentinel {
+        if sentinel_result_shape(types, result.ty).as_ref() != Some(sentinel) {
+            return None;
+        }
+        let func = funcs.get(caller)?.as_ref().ok()?;
+        let caller_returns_same_sentinel = func.sig.result == result.ty
+            && sentinel_result_shape(types, func.sig.result).as_ref() == Some(sentinel)
+            && !table.get(caller).is_some_and(|item| item.linkage.exported);
+        let mut use_ = ResultUse::default();
+        for block in &func.blocks {
+            for op in &block.ops {
+                let OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    host: None,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if *item != callee {
+                    continue;
+                }
+                let Some(value) = op.result else {
+                    use_.read = true;
+                    continue;
+                };
+                let definition = func.values.get(value.0 as usize)?;
+                if definition.ty != result.ty || definition.carrier != Carrier::Baseline {
+                    return None;
+                }
+                if sentinel_result_site_unboxed(
+                    func,
+                    types,
+                    value,
+                    sentinel,
+                    caller_returns_same_sentinel,
+                ) {
+                    use_.read = true;
+                }
+            }
+        }
+        return Some(use_);
+    }
     let agrees = match &result.tagged {
         Some(tagged) => tagged_shape(types, result.ty).as_ref() == Some(tagged),
         None if result.recursive.is_some() => {
@@ -2841,6 +3135,150 @@ struct ResultUse {
     forwards: BTreeSet<(ItemId, usize)>,
     forward_sites: u32,
     hot_forward: bool,
+}
+
+/// Whether `value` (returned by a `SentinelResult` direct call) is consumed without escaping —
+/// via `Discriminant`, `Field`, `Move`, non-cloning `Copy`, no-op `Drop`, non-entry block
+/// parameters, or pass-through `Return` in a non-exported caller returning the same shape.
+fn sentinel_result_site_unboxed(
+    func: &Func,
+    types: &TypeTable,
+    value: ValueId,
+    sentinel: &SentinelResultShape,
+    caller_returns_same_sentinel: bool,
+) -> bool {
+    let payload_needs_clone = sentinel
+        .ok_field
+        .is_some_and(|(_, ty)| types.needs_clone(ty))
+        || sentinel
+            .err_field
+            .is_some_and(|(_, ty)| types.needs_clone(ty));
+    let mut aliases = BTreeSet::from([value]);
+    let block_index: BTreeMap<RBlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    loop {
+        let before = aliases.len();
+        for block in &func.blocks {
+            for op in &block.ops {
+                let source = match &op.kind {
+                    OpKind::Move(src) => *src,
+                    OpKind::Copy(src) if !payload_needs_clone => *src,
+                    _ => continue,
+                };
+                if aliases.contains(&source) {
+                    if let Some(res) = op.result {
+                        aliases.insert(res);
+                    }
+                }
+            }
+            for (target, args) in block.term.edges() {
+                if target == RBlockId(0) {
+                    continue;
+                }
+                let Some(&bi) = block_index.get(&target) else {
+                    continue;
+                };
+                for (pos, arg) in args.iter().enumerate() {
+                    if aliases.contains(arg) {
+                        if let Some(&param) = func.blocks[bi].params.get(pos) {
+                            aliases.insert(param);
+                        }
+                    }
+                }
+            }
+        }
+        if aliases.len() == before {
+            break;
+        }
+    }
+    if aliases.iter().any(|alias| {
+        func.values
+            .get(alias.0 as usize)
+            .is_none_or(|d| d.ty != sentinel.ty || d.carrier != Carrier::Baseline)
+    }) {
+        return false;
+    }
+    let mut saw_use = false;
+    for block in &func.blocks {
+        for op in &block.ops {
+            if !op.kind.uses().iter().any(|u| aliases.contains(u)) {
+                continue;
+            }
+            match &op.kind {
+                OpKind::Discriminant(base) if aliases.contains(base) => {
+                    saw_use = true;
+                }
+                OpKind::Field {
+                    base,
+                    variant,
+                    field,
+                } if aliases.contains(base) => {
+                    let v = variant.unwrap_or(0);
+                    let res_zst = op
+                        .result
+                        .and_then(|r| func.ty(r))
+                        .is_some_and(|t| types.is_zst(t));
+                    let valid = (v == sentinel.ok_variant
+                        && (sentinel.ok_field.is_some_and(|(f, _)| f == *field) || res_zst))
+                        || (v == sentinel.err_variant
+                            && (sentinel.err_field.is_some_and(|(f, _)| f == *field) || res_zst));
+                    if !valid {
+                        return false;
+                    }
+                    saw_use = true;
+                }
+                OpKind::Move(src) if aliases.contains(src) => {}
+                OpKind::Copy(src) if !payload_needs_clone && aliases.contains(src) => {}
+                OpKind::Drop {
+                    root: Root::Value(r),
+                    path,
+                    glue: crate::jir::semantic::DropGlue::None,
+                } if aliases.contains(r) && path.is_empty() => {}
+                _ => return false,
+            }
+        }
+        match &block.term {
+            RTerm::Return(Some(v)) if aliases.contains(v) => {
+                if !caller_returns_same_sentinel {
+                    return false;
+                }
+                saw_use = true;
+            }
+            RTerm::Goto(_, _) | RTerm::Switch { .. } | RTerm::Invoke { .. } => {
+                if let RTerm::Switch { scrut, .. } = &block.term {
+                    if aliases.contains(scrut) {
+                        return false;
+                    }
+                }
+                for (target, args) in block.term.edges() {
+                    let Some(&bi) = block_index.get(&target) else {
+                        if args.iter().any(|a| aliases.contains(a)) {
+                            return false;
+                        }
+                        continue;
+                    };
+                    for (pos, arg) in args.iter().enumerate() {
+                        if aliases.contains(arg)
+                            && (target == RBlockId(0)
+                                || func.blocks[bi]
+                                    .params
+                                    .get(pos)
+                                    .is_none_or(|p| !aliases.contains(p)))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            RTerm::Throw(Some(v)) if aliases.contains(v) => return false,
+            _ => {}
+        }
+    }
+    saw_use || aliases.len() == 1
 }
 
 /// Whether `value` and aliases made only by `Move`/`Copy` are consumed exclusively by field reads
@@ -3603,7 +4041,10 @@ fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>
                 .result
                 .as_ref()
                 .filter(|result| {
-                    !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+                    !result.i64_pair
+                        && result.tagged.is_none()
+                        && result.recursive.is_none()
+                        && result.sentinel.is_none()
                 })
                 .into_iter()
                 .flat_map(|result| {
@@ -3689,7 +4130,10 @@ fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>
                 .result
                 .as_ref()
                 .filter(|result| {
-                    result.i64_pair || result.tagged.is_some() || result.recursive.is_some()
+                    result.i64_pair
+                        || result.tagged.is_some()
+                        || result.recursive.is_some()
+                        || result.sentinel.is_some()
                 })
                 .map_or(0, |_| sig.result_spills());
             for (index, value) in spilled.into_iter().enumerate() {
@@ -3712,7 +4156,10 @@ fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>
             }
         }
         if let Some(result) = sig.result.as_ref().filter(|result| {
-            !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+            !result.i64_pair
+                && result.tagged.is_none()
+                && result.recursive.is_none()
+                && result.sentinel.is_none()
         }) {
             func.sig.result = result.field_tys[result.passed[0] as usize];
         } else if sig.returns_out_field {
@@ -3940,7 +4387,8 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 (Some(result), Some(_))
                     if !result.i64_pair
                         && result.tagged.is_none()
-                        && result.recursive.is_none() =>
+                        && result.recursive.is_none()
+                        && result.sentinel.is_none() =>
                 {
                     let value = define(func, result.field_tys[result.passed[0] as usize], origin);
                     op.result = Some(value);
@@ -3949,7 +4397,8 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 (Some(result), None)
                     if !result.i64_pair
                         && result.tagged.is_none()
-                        && result.recursive.is_none() =>
+                        && result.recursive.is_none()
+                        && result.sentinel.is_none() =>
                 {
                     op.result = None;
                     None
@@ -3971,7 +4420,10 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 (&sig.result, aggregate_result, flat_primary)
             {
                 debug_assert!(
-                    !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+                    !result.i64_pair
+                        && result.tagged.is_none()
+                        && result.recursive.is_none()
+                        && result.sentinel.is_none()
                 );
                 let mut lane = 0_u32;
                 let mut fields = Vec::with_capacity(result.field_tys.len());
@@ -6817,5 +7269,415 @@ mod tests {
             "struct of raw slot pointers (core::fmt::Arguments) must not recursively split into buf/off"
         );
         let _ = ptr_name;
+    }
+
+    #[test]
+    fn sentinel_result_shape_accepts_needs_drop_zst_err_and_rejects_boundaries() {
+        let mut interns = interns();
+        let s_ok = interns.intern_str("Ok");
+        let s_err = interns.intern_str("Err");
+        let s_f0 = interns.intern_str("_0");
+        let t_drop_res = TypeId(900);
+        let t_zst_err_res = TypeId(901);
+        let t_host_res = TypeId(902);
+
+        let make_res = |id: TypeId,
+                        ok_ty: TypeId,
+                        err_ty: TypeId,
+                        needs_drop: bool,
+                        boundary: PinnedBoundary| {
+            let mut d = descriptor(
+                id,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 1,
+                        local_hash: id.0 as u64,
+                    },
+                    args: vec![ok_ty, err_ty],
+                    form: NominalForm::Enum,
+                    variants: vec![
+                        crate::jir::types::VariantDescriptor {
+                            name: s_ok,
+                            fields: vec![FieldDescriptor {
+                                key: FieldKey::Name(s_f0),
+                                ty: ok_ty,
+                                offset: 4,
+                            }],
+                            logical_discr: 0,
+                            physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                                bits: 0,
+                                bytes: 1,
+                            }),
+                            result_ok: true,
+                            saved_local_keys: Vec::new(),
+                        },
+                        crate::jir::types::VariantDescriptor {
+                            name: s_err,
+                            fields: vec![FieldDescriptor {
+                                key: FieldKey::Name(s_f0),
+                                ty: err_ty,
+                                offset: 4,
+                            }],
+                            logical_discr: 1,
+                            physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                                bits: 1,
+                                bytes: 1,
+                            }),
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                    ],
+                    niche: None,
+                },
+            );
+            d.layout.size = Some(8);
+            d.layout.needs_drop = needs_drop;
+            d.meta.boundary = boundary;
+            d.js.is_indirect = true;
+            d.js.needs_clone = true;
+            d.js.enum_repr = Some(EnumRepr::IntTag { fieldless: false });
+            d
+        };
+
+        interns
+            .types
+            .insert(make_res(t_drop_res, U32, U32, true, PinnedBoundary::None));
+        interns.types.insert(make_res(
+            t_zst_err_res,
+            U32,
+            UNIT,
+            true,
+            PinnedBoundary::None,
+        ));
+        interns
+            .types
+            .insert(make_res(t_host_res, U32, U32, false, PinnedBoundary::Host));
+
+        let drop_shape = sentinel_result_shape(&interns.types, t_drop_res)
+            .expect("needs_drop Result must be eligible for SentinelResult");
+        assert_eq!(drop_shape.ok_variant, 0);
+        assert_eq!(drop_shape.ok_field, Some((0, U32)));
+        assert_eq!(drop_shape.err_variant, 1);
+        assert_eq!(drop_shape.err_field, Some((0, U32)));
+        assert_eq!(drop_shape.fields(), 2);
+
+        let zst_err_shape = sentinel_result_shape(&interns.types, t_zst_err_res)
+            .expect("ZST-err Result must be eligible for SentinelResult");
+        assert_eq!(zst_err_shape.err_field, None);
+        assert_eq!(zst_err_shape.fields(), 1);
+
+        assert!(
+            sentinel_result_shape(&interns.types, t_host_res).is_none(),
+            "Host-boundary enum must not use SentinelResult"
+        );
+    }
+
+    #[test]
+    fn sentinel_result_plans_recursive_needs_drop_invoke_and_escaping_callers() {
+        use crate::jir::semantic::{BasicBlock, BlockId, Body, BodyKind, Terminator};
+        use crate::jir::summary::{Availability, ItemSummary, PhysicalSummary, SemanticKey};
+
+        let mut interns = interns();
+        let s_ok = interns.intern_str("Ok");
+        let s_err = interns.intern_str("Err");
+        let s_f0 = interns.intern_str("_0");
+        let s_eval = interns.intern_str("eval");
+        let t_drop_res = TypeId(910);
+
+        let mut res_desc = descriptor(
+            t_drop_res,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 910,
+                },
+                args: vec![U32, U32],
+                form: NominalForm::Enum,
+                variants: vec![
+                    crate::jir::types::VariantDescriptor {
+                        name: s_ok,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: U32,
+                            offset: 4,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 0,
+                            bytes: 1,
+                        }),
+                        result_ok: true,
+                        saved_local_keys: Vec::new(),
+                    },
+                    crate::jir::types::VariantDescriptor {
+                        name: s_err,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(s_f0),
+                            ty: U32,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 1,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+        );
+        res_desc.layout.size = Some(8);
+        res_desc.layout.needs_drop = true;
+        res_desc.js.is_indirect = true;
+        res_desc.js.needs_clone = true;
+        res_desc.js.enum_repr = Some(EnumRepr::IntTag { fieldless: false });
+        interns.types.insert(res_desc);
+        let shared = std::sync::Arc::new(interns);
+
+        // Recursive `eval(x: u32) -> Result<u32, u32>` with `RTerm::Invoke` self-call and `?`.
+        let eval_id = item(10);
+        let mut eb = FuncBuilder::new(eval_id, signature(vec![U32], t_drop_res));
+        let x = eb.param(U32, NO_ORIGIN);
+        let b_rec = eb.block();
+        let b_norm = eb.block();
+        let b_unwind = eb.block();
+        let b_ok = eb.block();
+        let b_err = eb.block();
+        let b_base = eb.block();
+        eb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: x,
+                scrut_ty: U32,
+                cases: vec![(0, b_base, Vec::new())],
+                default: (b_rec, Vec::new()),
+            },
+        );
+        let base_ok = eb.op(
+            b_base,
+            OpKind::Aggregate {
+                ty: t_drop_res,
+                variant: 0,
+                active_field: None,
+                fields: vec![x],
+            },
+            t_drop_res,
+            NO_ORIGIN,
+        );
+        eb.terminate(b_base, RTerm::Return(Some(base_ok)));
+
+        let sub = eb.op(
+            b_rec,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: eval_id,
+                    link_name: s_eval,
+                },
+                function: None,
+                args: vec![x],
+                track_caller: None,
+                semantic: crate::jir::semantic::CallSemantic::Ordinary,
+                host: None,
+            },
+            t_drop_res,
+            NO_ORIGIN,
+        );
+        eb.terminate(
+            b_rec,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unwind, Vec::new()),
+            },
+        );
+        eb.terminate(b_unwind, RTerm::Throw(None));
+        let discr = eb.op(b_norm, OpKind::Discriminant(sub), U32, NO_ORIGIN);
+        eb.terminate(
+            b_norm,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: U32,
+                cases: vec![(0, b_ok, Vec::new())],
+                default: (b_err, Vec::new()),
+            },
+        );
+        let ok_v = eb.op(
+            b_ok,
+            OpKind::Field {
+                base: sub,
+                variant: Some(0),
+                field: 0,
+            },
+            U32,
+            NO_ORIGIN,
+        );
+        let ret_ok = eb.op(
+            b_ok,
+            OpKind::Aggregate {
+                ty: t_drop_res,
+                variant: 0,
+                active_field: None,
+                fields: vec![ok_v],
+            },
+            t_drop_res,
+            NO_ORIGIN,
+        );
+        eb.terminate(b_ok, RTerm::Return(Some(ret_ok)));
+        let err_v = eb.op(
+            b_err,
+            OpKind::Field {
+                base: sub,
+                variant: Some(1),
+                field: 0,
+            },
+            U32,
+            NO_ORIGIN,
+        );
+        let ret_err = eb.op(
+            b_err,
+            OpKind::Aggregate {
+                ty: t_drop_res,
+                variant: 1,
+                active_field: None,
+                fields: vec![err_v],
+            },
+            t_drop_res,
+            NO_ORIGIN,
+        );
+        eb.terminate(b_err, RTerm::Return(Some(ret_err)));
+        let eval_func = eb.finish();
+
+        // Exported escaping caller `entry(x: u32) -> Result<u32, u32> { eval(x) }`.
+        let entry_id = item(11);
+        let mut mb = FuncBuilder::new(entry_id, signature(vec![U32], t_drop_res));
+        let mx = mb.param(U32, NO_ORIGIN);
+        let res = mb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: eval_id,
+                    link_name: s_eval,
+                },
+                function: None,
+                args: vec![mx],
+                track_caller: None,
+                semantic: crate::jir::semantic::CallSemantic::Ordinary,
+                host: None,
+            },
+            t_drop_res,
+            NO_ORIGIN,
+        );
+        mb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res)));
+        let entry_func = mb.finish();
+
+        let make_link_item =
+            |name: &str, id: ItemId, sig: Signature, exported: bool, refs: &[&str]| {
+                let mut it = link_item(name, refs);
+                if exported {
+                    it.linkage = Linkage::exported(name.to_owned());
+                }
+                let body = Body {
+                    item: id,
+                    kind: BodyKind::Function,
+                    semantic: BodySemantic::Ordinary,
+                    signature: sig,
+                    locals: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        cleanup: false,
+                        statements: Vec::new(),
+                        terminator: Terminator::Return,
+                    }],
+                };
+                let hash = crate::jir::summary::semantic_hash(&body, &shared);
+                let physical = PhysicalSummary::of(&body, &shared.types, hash);
+                it.jir.body = Some(body);
+                it.jir.summary = Some(ItemSummary {
+                    key: SemanticKey {
+                        link_name: name.to_owned(),
+                        item: Some(id),
+                    },
+                    body_hash: None,
+                    semantic_hash: Some(hash),
+                    availability: Availability::Available,
+                    deps: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    abi: None,
+                    physical,
+                    kind: ItemKind::Fn,
+                    linkage: it.linkage.clone(),
+                    order: None,
+                    dts: false,
+                    fallback: rcgjs_object::object::BlobRef {
+                        offset: 0,
+                        clen: 0,
+                        ulen: 0,
+                    },
+                    body: None,
+                    origin: None,
+                    estimated_bytes: 0,
+                    class: ItemClass::AGGREGATE,
+                });
+                it.jir.use_shared_interns(shared.clone());
+                it
+            };
+
+        let eval_name = JsName::new("eval".to_owned());
+        let entry_name = JsName::new("entry".to_owned());
+        let table = BTreeMap::from([
+            (
+                eval_name.clone(),
+                make_link_item("eval", eval_id, eval_func.sig.clone(), false, &["eval"]),
+            ),
+            (
+                entry_name.clone(),
+                make_link_item("entry", entry_id, entry_func.sig.clone(), true, &["eval"]),
+            ),
+        ]);
+        let funcs = BTreeMap::from([
+            (eval_name.clone(), Ok(eval_func)),
+            (entry_name, Ok(entry_func)),
+        ]);
+
+        let speed_opts = Opts {
+            optimizer: crate::opts::OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            flat_abi: true,
+            ..Opts::default()
+        };
+        let plan = plan_excluding(&table, &funcs, &speed_opts, &BTreeSet::new());
+        let sig = plan
+            .call_signature(eval_id)
+            .expect("recursive needs_drop Invoke Result callee must get SentinelResult");
+        assert!(sig.result.as_ref().is_some_and(|r| r.sentinel.is_some()));
+        assert_eq!(plan.registers, 1);
+        assert_eq!(plan.sentinel_err_name().map(JsName::as_str), Some("$se"));
+        let spills = plan.spill_items();
+        assert_eq!(spills.len(), 2);
+        assert!(spills.iter().any(|i| i.js.contains("let $r1;")));
+        assert!(spills.iter().any(|i| i.js.contains("const $se = {};")));
+
+        // Subset without sentinel items drops `$se`.
+        let empty_sub = plan.subset(&BTreeSet::new());
+        assert!(empty_sub.sentinel_err_name().is_none());
+        assert!(empty_sub.spill_items().is_empty());
+
+        // Non-ReleaseSpeed must not select SentinelResult.
+        let bal_opts = Opts {
+            optimizer: crate::opts::OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseBalanced),
+            flat_abi: true,
+            ..Opts::default()
+        };
+        let bal_plan = plan_excluding(&table, &funcs, &bal_opts, &BTreeSet::new());
+        assert!(!bal_plan.has_sentinel_result());
+
+        // Chunked mode must not select SentinelResult.
+        let mut chunked_opts = speed_opts;
+        chunked_opts
+            .chunks
+            .push(("extra".to_owned(), "entry".to_owned()));
+        let chunked_plan = plan_excluding(&table, &funcs, &chunked_opts, &BTreeSet::new());
+        assert!(!chunked_plan.has_sentinel_result());
     }
 }

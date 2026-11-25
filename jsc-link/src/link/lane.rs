@@ -677,6 +677,11 @@ fn run_with_opts(
         &enum_excluded,
         opts,
     );
+    for sentinel in enum_plan.sentinel_items() {
+        defined.insert(sentinel.name.clone());
+        live.insert(sentinel.name.clone());
+        table.insert(sentinel.name.clone(), sentinel);
+    }
 
     // Phase A, once: the plan is made over the same Funcs the first pass rewrites, and a retry
     // rebuilds them because the rewrite consumed them.
@@ -706,6 +711,10 @@ fn run_with_opts(
                     &mut enum_excluded,
                 );
                 if enum_excluded.len() > prev_len {
+                    if let Some(old_sentinel) = &enum_plan.sentinel_none {
+                        defined.remove(old_sentinel);
+                        live.remove(old_sentinel);
+                    }
                     *table = raw_table.clone();
                     enum_plan = crate::plan::enum_repr::specialize_table(
                         table,
@@ -714,6 +723,11 @@ fn run_with_opts(
                         &enum_excluded,
                         opts,
                     );
+                    for sentinel in enum_plan.sentinel_items() {
+                        defined.insert(sentinel.name.clone());
+                        live.insert(sentinel.name.clone());
+                        table.insert(sentinel.name.clone(), sentinel);
+                    }
                     let ctx = Ctx {
                         opts,
                         items: &items,
@@ -1063,6 +1077,10 @@ fn run_with_opts(
         defined.insert(register.clone());
         live.insert(register.clone());
     }
+    if let Some(sentinel) = plan.sentinel_err_name() {
+        defined.insert(sentinel.clone());
+        live.insert(sentinel.clone());
+    }
     for helper in crate::lower::js::i64_pair::HELPER_NAMES {
         let helper_name = JsName::new((*helper).to_owned());
         if !table.contains_key(&helper_name) {
@@ -1210,6 +1228,10 @@ fn run_with_opts(
             if !enum_conflict_items.is_empty() {
                 enum_retries += 1;
                 if let Some(raw_table) = &unspecialized_table {
+                    if let Some(old_sentinel) = &enum_plan.sentinel_none {
+                        defined.remove(old_sentinel);
+                        live.remove(old_sentinel);
+                    }
                     crate::plan::enum_repr::collect_item_signature_types(
                         raw_table,
                         &enum_conflict_items,
@@ -1223,6 +1245,11 @@ fn run_with_opts(
                         &enum_excluded,
                         opts,
                     );
+                    for sentinel in enum_plan.sentinel_items() {
+                        defined.insert(sentinel.name.clone());
+                        live.insert(sentinel.name.clone());
+                        table.insert(sentinel.name.clone(), sentinel);
+                    }
                 } else {
                     *table = pristine_table.clone();
                 }
@@ -1272,7 +1299,10 @@ fn run_with_opts(
     // The spill registers the plan needs are items like any other, and they have to be in the
     // table and reachable before a lowering that names them is checked against either.
     let spills = plan.spill_items();
-    let mut added_items = !spills.is_empty() || !repr.clones.is_empty() || !abi_clones.is_empty();
+    let mut added_items = !spills.is_empty()
+        || enum_plan.sentinel_none.is_some()
+        || !repr.clones.is_empty()
+        || !abi_clones.is_empty();
     if opts.optimizer == crate::opts::OptimizerMode::On {
         added_items |= super::hoist_consts::run(table, &mut lowered, &mut defined, &mut live);
         if let Some(names) = &bigint_names {
@@ -3831,6 +3861,12 @@ fn apply(
         crate::lower::bstr::rewrite(&mut lowered.decl);
         crate::lower::js::function::fold_bstr_in_bytes_decl(&mut lowered.decl);
         lowered.refs = refs_of(&lowered.decl, &item.name);
+    }
+    let opts = crate::opts::get();
+    if opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+        && opts.optimizer == crate::opts::OptimizerMode::On
+    {
+        crate::lower::js::post_opt::coalesce_disjoint_locals_decl(&mut lowered.decl);
     }
     // Before `shorten_locals`, which renames locals and so changes the identifier set: the
     // baseline's `refs` was taken at the same point in the backend.
