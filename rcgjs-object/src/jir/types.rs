@@ -340,7 +340,6 @@ pub enum PinnedBoundary {
     /// Append-only: postcard serializes this enum by index.
     None,
     Host,
-    ViewAbi,
 }
 
 /// The JavaScript representation facts, exactly the answers v1's `value.rs`/`ptr.rs` computed

@@ -6,9 +6,8 @@ use std::path::Path;
 
 use crate::diag::Sink;
 
-use crate::baseline_shadow::{BaselineShadowSummary, BASELINE_SHADOW_VERSION};
 use crate::item::{ItemKind, JsName, LinkItem, OptimizationMiss, OptimizationSelection};
-use crate::late_ir::{LateIrAnalysisSummary, LATE_IR_ANALYSIS_VERSION};
+use crate::lane_report::push_string as json_string;
 use crate::opts::OptimizerMode;
 
 mod operations;
@@ -116,28 +115,6 @@ pub(crate) fn write(
         actually_applied_passes(table, reachable, dedup).into_iter(),
     );
     out.push('}');
-    out.push_str(",\n  \"late_ir_analysis\": {\"schema\": ");
-    out.push_str(&LATE_IR_ANALYSIS_VERSION.to_string());
-    out.push_str(", \"consumer\": ");
-    json_string(
-        &mut out,
-        if crate::opts::get().optimizer == OptimizerMode::Off {
-            "disabled"
-        } else {
-            "current-codegen-identity-shadow"
-        },
-    );
-    out.push_str(
-        ", \"lowering\": \"proof-gated-native-kernel-standard-operations-or-printed-javascript\", \"fallback\": ",
-    );
-    json_string(
-        &mut out,
-        "late IR lowers only independently ABI-compatible kernel bodies, supported semantic \
-         standard operations, and opaque move identities; every other body keeps printed JavaScript",
-    );
-    out.push('}');
-    // The v1 representation planner is deleted; the key stays so the report schema is stable.
-    out.push_str(",\n  \"representation_plan\": null");
     out.push_str(",\n  \"jir_census_schema\": 1,\n  \"jir_census_scope\": ");
     json_string(&mut out, "Captured JIR-S of final reachable items. Captured calls may have been inlined or removed; link_dependencies describe the emitted item graph. Identity loss before JIR capture is not measured. Native signature validation is not a representation commit or a complete ownership proof.");
     out.push_str(",\n  \"standard_operation_registry\": ");
@@ -199,10 +176,6 @@ pub(crate) fn write(
         write_selections(&mut out, &item.optimization.selections);
         out.push_str(",\n      \"misses\": ");
         write_misses(&mut out, &item.optimization.misses);
-        out.push_str(",\n      \"late_ir_analysis\": ");
-        write_late_ir(&mut out, &item.late_ir);
-        out.push_str(",\n      \"baseline_shadow\": ");
-        write_baseline_shadow(&mut out, &item.baseline_shadow, &item.late_ir);
         out.push_str(",\n      \"link_dependencies\": ");
         write_strings(
             &mut out,
@@ -332,75 +305,6 @@ fn write_misses(out: &mut String, misses: &[OptimizationMiss]) {
     out.push(']');
 }
 
-fn write_late_ir(out: &mut String, summary: &LateIrAnalysisSummary) {
-    let counts = summary.counts();
-    out.push_str("{\"schema\": ");
-    out.push_str(&summary.version().to_string());
-    out.push_str(", \"status\": ");
-    json_string(out, summary.status());
-    out.push_str(", \"kind\": ");
-    match summary.body_kind() {
-        Some(kind) => json_string(out, kind),
-        None => out.push_str("null"),
-    }
-    out.push_str(", \"fallback\": ");
-    match summary.fallback_reason() {
-        Some(reason) => json_string(out, reason),
-        None => out.push_str("null"),
-    }
-    out.push_str(&format!(
-        ", \"facts\": {{\"locals\": {}, \"allocation_sites\": {}, \"calls\": {}, \
-         \"direct_calls\": {}, \"drops\": {}}}}}",
-        counts.locals, counts.allocations, counts.calls, counts.direct_calls, counts.drops
-    ));
-}
-
-fn write_baseline_shadow(
-    out: &mut String,
-    shadow: &BaselineShadowSummary,
-    late_ir: &LateIrAnalysisSummary,
-) {
-    out.push_str("{\"schema\": ");
-    out.push_str(&BASELINE_SHADOW_VERSION.to_string());
-    out.push_str(", \"status\": ");
-    json_string(out, shadow.status());
-    out.push_str(", \"current_codegen_replay\": ");
-    json_string(out, shadow.baseline_replay());
-    out.push_str(", \"owned_ir_roundtrip\": ");
-    json_string(out, shadow.ir_roundtrip());
-    out.push_str(", \"current_codegen_fingerprint\": ");
-    match shadow.baseline_fingerprint() {
-        Some(fingerprint) => json_string(out, &fingerprint),
-        None => out.push_str("null"),
-    }
-    out.push_str(", \"owned_ir_fingerprint\": ");
-    match shadow.ir_fingerprint() {
-        Some(fingerprint) => json_string(out, &fingerprint),
-        None => out.push_str("null"),
-    }
-    out.push_str(
-        ", \"late_ir_executable_lowerer\": \
-         \"native-kernel-standard-operations-and-opaque-move-identities\"",
-    );
-    // No executable text lowerer exists any more, so equivalence is never claimed here; the JIR
-    // lane carries its own verification.
-    out.push_str(", \"executable_equivalence\": \"unproven\", \"fallback\": ");
-    if let Some(reason) = shadow.difference() {
-        json_string(out, reason);
-    } else if shadow.status() == "disabled" {
-        json_string(out, "optimizer analysis is disabled");
-    } else if let Some(reason) = late_ir.fallback_reason() {
-        json_string(out, reason);
-    } else {
-        json_string(
-            out,
-            "this item was not accepted by an executable native lowerer; current-codegen \
-             replay and owned-IR round-trip alone do not authorize executable lowering",
-        );
-    }
-    out.push('}');
-}
-
 fn write_strings(out: &mut String, values: &[String]) {
     out.push('[');
     for (index, value) in values.iter().enumerate() {
@@ -452,27 +356,6 @@ fn actually_applied_passes(
         .collect()
 }
 
-fn json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            character if character < '\u{20}' => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", character as u32);
-            }
-            character => out.push(character),
-        }
-    }
-    out.push('"');
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,24 +375,5 @@ mod tests {
         let parents = HashMap::from([(middle.clone(), root), (leaf.clone(), middle)]);
 
         assert_eq!(root_chain(&leaf, &parents), ["root", "middle", "leaf"]);
-    }
-
-    #[test]
-    fn baseline_shadow_never_claims_executable_equivalence() {
-        let mut out = String::new();
-        write_baseline_shadow(
-            &mut out,
-            &BaselineShadowSummary::default(),
-            &LateIrAnalysisSummary::unavailable("no body"),
-        );
-
-        assert!(out.contains(
-            "\"late_ir_executable_lowerer\": \
-             \"native-kernel-standard-operations-and-opaque-move-identities\""
-        ));
-        assert!(out.contains("\"executable_equivalence\": \"unproven\""));
-        assert!(out.contains("\"fallback\": \"optimizer analysis is disabled\""));
-        assert!(!out.contains("\"executable_equivalence\": \"proven\""));
-        assert!(!out.contains("equivalent"));
     }
 }

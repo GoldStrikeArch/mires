@@ -9,9 +9,6 @@ crate-type = ["dylib"]
 [dependencies]
 object = { workspace = true, default-features = false, features = ["read", "std", "archive"] }
 sha2 = { workspace = true }
-rustc-cleanup = { path = "../rustc-cleanup" }
-# The relooper: rebuilds structured control flow out of the MIR block graph (cfg_adapter.rs).
-structurizer = { path = "../structurizer" }
 # The rustc-free JIR-S schema (Phase 1 W1a). The encoder in `jir/encode.rs` targets it.
 rcgjs-object = { path = "../rcgjs-object" }
 # The link manifest handed to `jsc-link`, and the `late_ir` summary the object carries.

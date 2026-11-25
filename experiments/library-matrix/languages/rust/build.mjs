@@ -27,8 +27,8 @@ const BACKEND_ARGS = 'js-profile=release-size js-opt=on js-ecma-target=2018 js-c
 const LEAF_ARGS = ['js-modules=esm', 'js-comments=off', 'js-lane=jir', 'js-entry-role=main']
 const TERSER = { ecma: 2018, module: true, safari10: true, format: { comments: false } }
 // The compiler inputs browser-workloads hashes as its compiler tree identity.
-const COMPILER_ROOTS = ['backend', 'rustc-cleanup', 'rcgjs-object', 'jsc-link', 'mires-build', 'mires-js', 'structurizer',
-  'view-abi', 'view-async', 'js-macro', 'js-extern-macro', 'runtime', 'scripts', 'patches']
+const COMPILER_ROOTS = ['backend', 'rcgjs-object', 'jsc-link', 'mires-build', 'mires-js', 'structurizer',
+  'js-macro', 'js-extern-macro', 'runtime', 'scripts', 'patches']
 
 await main(async () => {
   const port = openPort('rust')

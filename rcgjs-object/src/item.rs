@@ -43,12 +43,9 @@ use std::sync::Arc;
 
 use crate::jir::codec::Codec;
 use crate::jir::hash::HashAlgorithm;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::baseline_shadow::BaselineShadowSummary;
 use crate::jsast::{self, Loc, Mapping, Stmt};
-use crate::late_ir::LateIrAnalysisSummary;
 
 pub use crate::jir::hash::Hash128;
 pub use crate::jir::interns::Interns;
@@ -61,11 +58,26 @@ pub use crate::object::{
     FORMAT_VERSION,
 };
 
-/// The marker introducing a format 19 object file's item table.
-const FOOTER_PREFIX: &str = "//# rcgjs: ";
+/// The allocator implementation selected for a final linked artifact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AllocatorProvider {
+    #[default]
+    Unknown,
+    Default,
+    Custom,
+    Conflict,
+}
 
-/// The last text-footer format. Read, never written; deleted at the Phase 2 exit.
-const LEGACY_FORMAT_VERSION: u16 = 19;
+impl AllocatorProvider {
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Conflict, _) | (_, Self::Conflict) => Self::Conflict,
+            (Self::Unknown, provider) | (provider, Self::Unknown) => provider,
+            (left, right) if left == right => left,
+            _ => Self::Conflict,
+        }
+    }
+}
 
 /// A JavaScript identifier the backend owns: the name of a top level item.
 ///
@@ -274,10 +286,8 @@ pub struct JsItem {
     pub dts: Option<crate::dts::Dts>,
     /// Decisions and rejected candidates collected by representation and lowering passes.
     pub optimization: OptimizationInfo,
-    /// Typed MIR facts retained beside the printed body for report-only whole-program analysis.
-    pub late_ir: LateIrAnalysisSummary,
-    /// Exact non-emitting checks beside the future late-IR executable path.
-    pub baseline_shadow: BaselineShadowSummary,
+    /// Allocator provider metadata carried on the allocator shim marker item.
+    pub allocator_provider: AllocatorProvider,
     /// The item's JIR-S body and origins, written to the object's S3/S5 in every `js-opt` mode.
     /// `None` for a synthesized item or one the encoder declined; the decline says which.
     pub jir: Option<JirItem>,
@@ -305,44 +315,12 @@ impl JsItem {
         linkage: Linkage,
         debug_path: String,
     ) -> JsItem {
-        let scalars = crate::sroa::analyze(decl, crate::opts::get().optimizer);
-        let analysis = crate::optimizer::analyze(scalars.decl, crate::opts::get().optimizer);
-        let decl = analysis.decl;
         let mut refs = BTreeSet::new();
         jsast::visit_free_idents(&decl, &mut |ident| {
             if ident != name.as_str() {
                 refs.insert(JsName::new(ident.to_owned()));
             }
         });
-        let mut optimization = OptimizationInfo::default();
-        if crate::optimizer::contains_emitted_future_poller(&decl) {
-            optimization.apply("future-poller");
-        }
-        if scalars.changed {
-            optimization.select(
-                "sroa",
-                "scalar-aggregates",
-                "an aggregate literal consumed where it is built",
-            );
-            if crate::opts::get().applies(crate::opts::OptimizerPass::Sroa) {
-                optimization.apply("sroa");
-            }
-        }
-        if analysis.changed {
-            optimization.select(
-                "ast-dce",
-                "simplified",
-                "conservative item-local AST simplification",
-            );
-            if crate::opts::get().applies(crate::opts::OptimizerPass::AstDce) {
-                optimization.apply("ast-dce");
-            }
-        }
-        for (pass, reason) in analysis.misses {
-            optimization
-                .misses
-                .push(OptimizationMiss::new(pass, reason));
-        }
         JsItem {
             name,
             kind,
@@ -355,13 +333,22 @@ impl JsItem {
             loc: None,
             names: Vec::new(),
             dts: None,
-            optimization,
-            late_ir: LateIrAnalysisSummary::default(),
-            baseline_shadow: BaselineShadowSummary::default(),
+            optimization: OptimizationInfo::default(),
+            allocator_provider: AllocatorProvider::Unknown,
             jir: None,
             jir_decline: None,
             jir_item: None,
         }
+    }
+
+    /// Merges link-level references discovered during JIR encoding into `self.refs`.
+    pub fn with_extra_refs(mut self, extra: impl IntoIterator<Item = JsName>) -> Self {
+        for dep in extra {
+            if dep != self.name {
+                self.refs.insert(dep);
+            }
+        }
+        self
     }
 
     /// Attaches the JIR-S body, or the reason there is none.
@@ -424,15 +411,9 @@ impl JsItem {
         self.optimization.misses.push(miss);
     }
 
-    /// Attaches the representation-neutral MIR facts collected for this item.
-    pub fn with_late_ir(mut self, summary: LateIrAnalysisSummary) -> Self {
-        self.late_ir = summary;
-        self
-    }
-
-    /// Attaches the exact current-codegen replay and owned-IR round-trip checks.
-    pub fn with_baseline_shadow(mut self, summary: BaselineShadowSummary) -> Self {
-        self.baseline_shadow = summary;
+    /// Attaches allocator provider identity (set on `__rust_no_alloc_shim_is_unstable`).
+    pub fn with_allocator_provider(mut self, provider: AllocatorProvider) -> Self {
+        self.allocator_provider = provider;
         self
     }
 
@@ -619,10 +600,8 @@ pub struct LinkItem {
     pub dts: Option<crate::dts::Dts>,
     /// Optimization metadata carried through rlibs into the final link.
     pub optimization: OptimizationInfo,
-    /// Typed MIR facts carried for report-only whole-program analysis.
-    pub late_ir: LateIrAnalysisSummary,
-    /// Non-emitting current-codegen replay and owned-IR round-trip checks.
-    pub baseline_shadow: BaselineShadowSummary,
+    /// Allocator provider metadata carried on the allocator shim marker item.
+    pub allocator_provider: AllocatorProvider,
     /// The JIR half: the item's summary, and its body once the link step has decided the item is
     /// reachable and decoded it. See [`LinkJir`].
     pub jir: LinkJir,
@@ -783,12 +762,7 @@ impl LinkItem {
     /// crate and not in the other keeps the body that exists.
     pub fn merge_duplicate_metadata(&mut self, duplicate: &Self) {
         self.optimization.merge(&duplicate.optimization);
-        self.late_ir.merge_choosing(&duplicate.late_ir);
-        self.baseline_shadow
-            .merge_choosing(&duplicate.baseline_shadow);
-        // A duplicate that carries a body where this one does not (a format 19 object beside a
-        // format 20 one, or an item the encoder declined in one crate and not the other) hands
-        // its body over. When both carry one, the caller has already decided which survives.
+        self.allocator_provider = self.allocator_provider.merge(duplicate.allocator_provider);
         if !self.jir.has_body() && duplicate.jir.has_body() {
             self.jir = duplicate.jir.clone();
         }
@@ -811,29 +785,6 @@ pub fn prologue(label: &str) -> String {
     format!("// rustc_codegen_js — {label}\n")
 }
 
-/// The format 19 item table row. Read only, and only during Phase 1.
-#[derive(Serialize, Deserialize)]
-struct SerItem19 {
-    name: String,
-    kind: u8,
-    /// Byte offset of the item's JavaScript within the object file's body.
-    start: u32,
-    len: u32,
-    refs: Vec<String>,
-    zombies: Vec<SerZombie>,
-    fixed_name: Option<String>,
-    root: bool,
-    exported: bool,
-    debug_path: String,
-    crate_name: String,
-    order: Option<SourceOrder>,
-    map: ItemMap,
-    dts: Option<crate::dts::Dts>,
-    optimization: OptimizationInfo,
-    late_ir: LateIrAnalysisSummary,
-    baseline_shadow: BaselineShadowSummary,
-}
-
 #[derive(Serialize, Deserialize)]
 struct SerZombie {
     loc: String,
@@ -841,22 +792,15 @@ struct SerZombie {
     kind: u8,
 }
 
-/// The per-item S4 record: everything the baseline lane needs beyond the summary index and the
-/// text itself. Indexed like the summaries.
+/// The per-item S4 record: metadata beyond the summary index and the text itself.
 #[derive(Serialize, Deserialize)]
 struct SerBaseline {
     zombies: Vec<SerZombie>,
     debug_path: String,
     map: ItemMap,
     dts: Option<crate::dts::Dts>,
-}
-
-/// The per-item S6 compatibility and report record. Indexed like the summaries.
-#[derive(Serialize, Deserialize)]
-struct SerLegacy {
     optimization: OptimizationInfo,
-    late_ir: LateIrAnalysisSummary,
-    baseline_shadow: BaselineShadowSummary,
+    allocator_provider: AllocatorProvider,
 }
 
 /// Renders a codegen unit's items as an object file: the printed JavaScript, then the member.
@@ -880,12 +824,9 @@ pub fn write_object(
     };
     let mut writer = Writer::new(header, prologue, interns);
     let mut baseline = Vec::with_capacity(items.len());
-    let mut legacy = Vec::with_capacity(items.len());
     for item in items {
         let (js, mappings) = item.to_js_mapped(comments);
         let deps: Vec<String> = item.refs.iter().map(|r| r.as_str().to_owned()).collect();
-        // `deps` is `refs`, exactly: the reachability walk reads the summary, and it must see the
-        // same edges the format 19 table carried.
         debug_assert!(deps.windows(2).all(|pair| pair[0] < pair[1]));
         let availability = match (&item.jir, &item.jir_decline) {
             (Some(_), _) => Availability::Available,
@@ -923,16 +864,12 @@ pub fn write_object(
             debug_path: item.debug_path.clone(),
             map: item_map(mappings),
             dts: item.dts.clone(),
-        });
-        legacy.push(SerLegacy {
             optimization: item.optimization.clone(),
-            late_ir: item.late_ir.clone(),
-            baseline_shadow: item.baseline_shadow.clone(),
+            allocator_provider: item.allocator_provider,
         });
     }
     let baseline = postcard::to_allocvec(&baseline).expect("S4 records are always serializable");
-    let legacy = postcard::to_allocvec(&legacy).expect("S6 records are always serializable");
-    writer.finish(&baseline, &legacy, sources)
+    writer.finish(&baseline, sources)
 }
 
 /// Renders items as a finished program: runnable JavaScript, no item table.
@@ -989,36 +926,26 @@ impl ReadObject {
 ///
 /// Bodies are **not** decoded here; see [`LinkJir`].
 pub fn read_object(bytes: &[u8]) -> Result<Option<ReadObject>, String> {
-    if crate::object::is_object(bytes) {
-        let object = crate::object::read(bytes)
-            .map_err(|err| err.to_string())?
-            .expect("a trailer was found");
-        return read_object_20(object).map(Some);
-    }
-    let Ok(text) = std::str::from_utf8(bytes) else {
+    if !crate::object::is_object(bytes) {
         return Ok(None);
-    };
-    read_object_19(text)
+    }
+    let object = crate::object::read(bytes)
+        .map_err(|err| err.to_string())?
+        .expect("a trailer was found");
+    read_object_20(object).map(Some)
 }
 
 fn read_object_20(mut object: Object) -> Result<ReadObject, String> {
-    // The producer's own sections are decoded here and their bytes released; the shared handle
-    // below only has to keep the compressed body and origin blobs alive.
     let baseline: Vec<SerBaseline> = postcard::from_bytes(&std::mem::take(&mut object.baseline))
         .map_err(|err| format!("corrupt rcgjs baseline section (postcard: {err})"))?;
-    let legacy: Vec<SerLegacy> = postcard::from_bytes(&std::mem::take(&mut object.legacy))
-        .map_err(|err| format!("corrupt rcgjs legacy section (postcard: {err})"))?;
-    if baseline.len() != object.summaries.len() || legacy.len() != object.summaries.len() {
+    if baseline.len() != object.summaries.len() {
         return Err(format!(
-            "corrupt rcgjs object: {} summaries, {} baseline records, {} legacy records",
+            "corrupt rcgjs object: {} summaries, {} baseline records",
             object.summaries.len(),
             baseline.len(),
-            legacy.len()
         ));
     }
 
-    // Slice every item's text first, then drop the object's copy: the items own their JavaScript
-    // and the shared handle only has to keep the compressed sections alive.
     let mut texts = Vec::with_capacity(object.summaries.len());
     for summary in &object.summaries {
         texts.push(
@@ -1035,16 +962,8 @@ fn read_object_20(mut object: Object) -> Result<ReadObject, String> {
     let object = Arc::new(object);
 
     let mut items = Vec::with_capacity(summaries.len());
-    for (((summary, js), record), legacy) in
-        summaries.into_iter().zip(texts).zip(baseline).zip(legacy)
-    {
+    for ((summary, js), record) in summaries.into_iter().zip(texts).zip(baseline) {
         let name = summary.key.link_name.clone();
-        legacy.late_ir.validate().map_err(|err| {
-            format!("rcgjs item `{name}` has a stale {err}; rebuild the sysroot and dependencies")
-        })?;
-        legacy.baseline_shadow.validate().map_err(|err| {
-            format!("rcgjs item `{name}` has a stale {err}; rebuild the sysroot and dependencies")
-        })?;
         let zombies = flat_zombies(&name, record.zombies)?;
         items.push(LinkItem {
             name: JsName::new(name),
@@ -1058,9 +977,8 @@ fn read_object_20(mut object: Object) -> Result<ReadObject, String> {
             order: summary.order.clone(),
             map: record.map,
             dts: record.dts,
-            optimization: legacy.optimization,
-            late_ir: legacy.late_ir,
-            baseline_shadow: legacy.baseline_shadow,
+            optimization: record.optimization,
+            allocator_provider: record.allocator_provider,
             jir: LinkJir {
                 summary: Some(summary),
                 object: Some(Arc::clone(&object)),
@@ -1092,325 +1010,11 @@ fn flat_zombies(name: &str, zombies: Vec<SerZombie>) -> Result<Vec<FlatZombie>, 
     Ok(out)
 }
 
-/// The format 19 reader: the base64 text footer. Phase 1 only.
-fn read_object_19(text: &str) -> Result<Option<ReadObject>, String> {
-    let Some(marker) = text.rfind(FOOTER_PREFIX) else {
-        return Ok(None);
-    };
-    // The marker has to start a line, or it is JavaScript that merely looks like a footer.
-    if marker != 0 && !text[..marker].ends_with('\n') {
-        return Ok(None);
-    }
-    let body = &text[..marker];
-    let payload = text[marker + FOOTER_PREFIX.len()..].trim_end();
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|err| format!("corrupt rcgjs item table (base64: {err})"))?;
-    let (version, rest) = postcard::take_from_bytes::<u16>(&bytes)
-        .map_err(|err| format!("corrupt rcgjs item table (postcard: {err})"))?;
-    if version != LEGACY_FORMAT_VERSION {
-        return Err(ObjectError::Format { found: version }.to_string());
-    }
-    let table: Vec<SerItem19> = postcard::from_bytes(rest)
-        .map_err(|err| format!("corrupt rcgjs item table (postcard: {err})"))?;
-
-    let mut items = Vec::with_capacity(table.len());
-    for entry in table {
-        entry.late_ir.validate().map_err(|err| {
-            format!(
-                "rcgjs item `{}` has a stale {err}; rebuild the sysroot and dependencies",
-                entry.name
-            )
-        })?;
-        entry.baseline_shadow.validate().map_err(|err| {
-            format!(
-                "rcgjs item `{}` has a stale {err}; rebuild the sysroot and dependencies",
-                entry.name
-            )
-        })?;
-        let start = entry.start as usize;
-        let end = start + entry.len as usize;
-        let js = body
-            .get(start..end)
-            .ok_or_else(|| format!("rcgjs item `{}` points outside the object body", entry.name))?;
-        let kind = ItemKind::from_tag(entry.kind)
-            .ok_or_else(|| format!("rcgjs item `{}` has an unknown kind", entry.name))?;
-        let zombies = flat_zombies(&entry.name, entry.zombies)?;
-        items.push(LinkItem {
-            name: JsName::new(entry.name),
-            kind,
-            js: js.to_owned(),
-            refs: entry.refs.into_iter().map(JsName::new).collect(),
-            zombies,
-            linkage: Linkage {
-                fixed_name: entry.fixed_name,
-                root: entry.root,
-                exported: entry.exported,
-            },
-            debug_path: entry.debug_path,
-            crate_name: entry.crate_name,
-            order: entry.order,
-            map: entry.map,
-            dts: entry.dts,
-            optimization: entry.optimization,
-            late_ir: entry.late_ir,
-            baseline_shadow: entry.baseline_shadow,
-            jir: LinkJir::default(),
-        });
-    }
-    Ok(Some(ReadObject {
-        items,
-        format: LEGACY_FORMAT_VERSION,
-        header: None,
-        object: None,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::late_ir::{CarrierBridge, DefinitionId, DirectItemRef, ItemId};
 
-    #[test]
-    fn empty_object_retains_and_validates_coroutine_source_facts() {
-        use crate::jir::coroutine::{
-            CoroutineSource, RuntimeFrame, SourceBlock, SourceEdge, SourceEdgeKind,
-            SourceInitPoint, SourceInitState, SourceInitialization, SourceLiveness, SourceMovePath,
-            SourceProjection, SourceTerminator, SourceYield,
-        };
-        let definition = crate::jir::DefinitionId {
-            crate_id: 1,
-            local_hash: 2,
-        };
-        let source = CoroutineSource {
-            initialization: Some(SourceInitialization {
-                paths: vec![
-                    SourceMovePath {
-                        parent: None,
-                        local: 0,
-                        projection: Some(vec![]),
-                    },
-                    SourceMovePath {
-                        parent: Some(0),
-                        local: 0,
-                        projection: Some(vec![SourceProjection::Field(0)]),
-                    },
-                    SourceMovePath {
-                        parent: None,
-                        local: 1,
-                        projection: Some(vec![]),
-                    },
-                ],
-                points: vec![
-                    SourceInitPoint {
-                        before: Some(SourceInitState {
-                            maybe_initialized: vec![0, 1, 2],
-                            maybe_uninitialized: vec![1]
-                        }),
-                        after: Some(SourceInitState {
-                            maybe_initialized: vec![0, 1, 2],
-                            maybe_uninitialized: vec![1]
-                        }),
-                    };
-                    5
-                ],
-            }),
-            runtime_frame: Some(RuntimeFrame {
-                saved_local_sources: vec![vec![0]],
-                states: vec![vec![], vec![], vec![], vec![0]],
-            }),
-            block_count: 5,
-            local_count: 2,
-            blocks: vec![
-                SourceBlock {
-                    drop_local: None,
-                    callee: None,
-                    kind: SourceTerminator::Yield,
-                    successors: vec![
-                        SourceEdge {
-                            kind: SourceEdgeKind::Resume,
-                            target: 1,
-                        },
-                        SourceEdge {
-                            kind: SourceEdgeKind::Cancel,
-                            target: 2,
-                        },
-                    ],
-                },
-                SourceBlock {
-                    drop_local: None,
-                    callee: None,
-                    kind: SourceTerminator::Return,
-                    successors: vec![],
-                },
-                SourceBlock {
-                    drop_local: None,
-                    callee: None,
-                    kind: SourceTerminator::CoroutineDrop,
-                    successors: vec![],
-                },
-                SourceBlock {
-                    drop_local: Some(1),
-                    callee: None,
-                    kind: SourceTerminator::Drop,
-                    successors: vec![SourceEdge {
-                        kind: SourceEdgeKind::Normal,
-                        target: 1,
-                    }],
-                },
-                SourceBlock {
-                    drop_local: None,
-                    callee: Some(definition),
-                    kind: SourceTerminator::TailCall,
-                    successors: vec![],
-                },
-            ],
-            yields: vec![SourceYield {
-                liveness: Some(SourceLiveness {
-                    live: vec![0],
-                    borrowed: vec![0],
-                    storage: vec![0, 1],
-                }),
-                block: 0,
-                resume: 1,
-                drop: Some(2),
-                resume_local: Some(1),
-                source: None,
-            }],
-        };
-        let mut interns = Interns::new();
-        let file = interns.intern_str("future.rs");
-        let position = interns.intern_source_fact(crate::jir::SourceFact {
-            file,
-            line: 4,
-            col: 8,
-        });
-        interns.coroutine_sources.insert(definition, source);
-        interns
-            .coroutine_sources
-            .get_mut(&definition)
-            .unwrap()
-            .yields[0]
-            .source = Some(position);
-        let write = |interns: Interns| {
-            write_object(
-                "",
-                &[],
-                false,
-                "generic",
-                &ObjectIdentity::default(),
-                interns,
-                &BTreeMap::new(),
-            )
-        };
-        let bytes = write(interns.clone());
-        let decoded = read_object(&bytes).unwrap().unwrap();
-        assert!(decoded.items.is_empty());
-        assert_eq!(decoded.interns().unwrap(), &interns);
-        assert_eq!(bytes, write(interns.clone()));
-
-        for mutation in 0..41 {
-            let mut invalid = interns.clone();
-            let source = invalid.coroutine_sources.get_mut(&definition).unwrap();
-            match mutation {
-                0 => source.yields[0].block = source.block_count,
-                1 => source.yields[0].resume = source.block_count,
-                2 => source.yields[0].drop = Some(source.block_count),
-                3 => source.yields[0].resume_local = Some(source.local_count),
-                4 => source.yields[0].source = Some(crate::jir::SourceFactId(99)),
-                5 => source.yields.push(source.yields[0].clone()),
-                6 => invalid.source_facts[0].file = crate::jir::StrId(99),
-                7 => {
-                    source.blocks.pop();
-                }
-                8 => source.blocks[0].successors[0].target = source.block_count,
-                9 => source.blocks[0].successors[0].target = 2,
-                10 => source.blocks[0].successors[1].kind = SourceEdgeKind::Unwind,
-                11 => source.blocks[0].kind = SourceTerminator::Return,
-                12 => source.blocks[1].kind = SourceTerminator::Yield,
-                13 => source.blocks[1].successors.push(SourceEdge {
-                    kind: SourceEdgeKind::Imaginary,
-                    target: 0,
-                }),
-                14 => {
-                    source.blocks[0].successors.pop();
-                }
-                15 => source.blocks[3].drop_local = Some(source.local_count),
-                16 => source.blocks[1].drop_local = Some(1),
-                17 => source.blocks[3].callee = Some(definition),
-                18 => source.yields[0].liveness.as_mut().unwrap().live = vec![2],
-                19 => source.yields[0].liveness.as_mut().unwrap().live = vec![0, 0],
-                20 => source.yields[0].liveness.as_mut().unwrap().borrowed = vec![1],
-                21 => source.yields[0].liveness.as_mut().unwrap().live = vec![1],
-                22 => source.yields[0].liveness.as_mut().unwrap().storage = vec![2],
-                23 => source.runtime_frame.as_mut().unwrap().states.clear(),
-                24 => source.runtime_frame.as_mut().unwrap().states[0] = vec![0],
-                25 => source.runtime_frame.as_mut().unwrap().states[3] = vec![1],
-                26 => source.runtime_frame.as_mut().unwrap().states[3] = vec![0, 0],
-                27 => source.runtime_frame.as_mut().unwrap().saved_local_sources[0] = vec![2],
-                28 => source.runtime_frame.as_mut().unwrap().saved_local_sources[0] = vec![1],
-                29 => source.runtime_frame.as_mut().unwrap().saved_local_sources[0] = vec![0, 0],
-                30 => source.runtime_frame.as_mut().unwrap().states[3].clear(),
-                31 => source.initialization.as_mut().unwrap().paths[1].parent = Some(1),
-                32 => source.initialization.as_mut().unwrap().paths[0].local = 2,
-                33 => {
-                    source.initialization.as_mut().unwrap().paths[1].projection =
-                        Some(vec![SourceProjection::Index(2)])
-                }
-                34 => {
-                    source.initialization.as_mut().unwrap().points[0]
-                        .before
-                        .as_mut()
-                        .unwrap()
-                        .maybe_initialized = vec![3]
-                }
-                35 => {
-                    source.initialization.as_mut().unwrap().points[0]
-                        .after
-                        .as_mut()
-                        .unwrap()
-                        .maybe_uninitialized = vec![0, 0]
-                }
-                36 => {
-                    source.initialization.as_mut().unwrap().points.pop();
-                }
-                37 => source.initialization.as_mut().unwrap().points[0].before = None,
-                38 => source.initialization.as_mut().unwrap().paths[1].local = 1,
-                39 => source.initialization.as_mut().unwrap().paths[0].projection = None,
-                _ => source.initialization.as_mut().unwrap().paths[1].projection = Some(vec![]),
-            }
-            assert!(
-                read_object(&write(invalid))
-                    .unwrap_err()
-                    .contains("invalid coroutine source facts"),
-                "mutation {mutation}"
-            );
-        }
-    }
-
-    fn carrier_item(local_hash: u64, link_name: &str) -> DirectItemRef {
-        DirectItemRef {
-            item: ItemId {
-                definition: DefinitionId {
-                    crate_id: 1,
-                    local_hash,
-                },
-                instantiation: u128::from(local_hash),
-            },
-            link_name: link_name.to_owned(),
-        }
-    }
-
-    fn carrier_bridge() -> CarrierBridge {
-        CarrierBridge {
-            producer: carrier_item(10, "producer"),
-            as_str: carrier_item(20, "string_as_str"),
-            drop: carrier_item(30, "drop_string"),
-        }
-    }
-
-    fn link_item(pass: &str, summary: LateIrAnalysisSummary) -> LinkItem {
+    fn link_item(pass: &str) -> LinkItem {
         let mut optimization = OptimizationInfo::default();
         optimization.select(pass, "selected", "because");
         LinkItem {
@@ -1426,8 +1030,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization,
-            late_ir: summary,
-            baseline_shadow: Default::default(),
+            allocator_provider: AllocatorProvider::Unknown,
             jir: Default::default(),
         }
     }
@@ -1448,7 +1051,7 @@ mod tests {
         read_object(bytes).map(|read| read.map(|read| read.items))
     }
 
-    fn object(summary: LateIrAnalysisSummary) -> Vec<u8> {
+    fn object(provider: AllocatorProvider) -> Vec<u8> {
         let item = JsItem::new(
             JsName::new("f".to_owned()),
             ItemKind::Fn,
@@ -1457,34 +1060,20 @@ mod tests {
             Linkage::internal(),
             "crate::f".to_owned(),
         )
-        .with_late_ir(summary);
-        write(&[item])
-    }
-
-    fn object_with_shadow(shadow: BaselineShadowSummary) -> Vec<u8> {
-        let item = JsItem::new(
-            JsName::new("f".to_owned()),
-            ItemKind::Fn,
-            jsast::function("f", Vec::new(), Vec::new()),
-            Vec::new(),
-            Linkage::internal(),
-            "crate::f".to_owned(),
-        )
-        .with_baseline_shadow(shadow);
+        .with_allocator_provider(provider);
         write(&[item])
     }
 
     #[test]
-    fn analysis_metadata_does_not_change_program_bytes() {
-        let first = object(LateIrAnalysisSummary::unavailable("first reason"));
-        let second = object(LateIrAnalysisSummary::unavailable("second reason"));
-        assert_ne!(
-            first, second,
-            "the object footer carries the analysis summary"
-        );
+    fn allocator_provider_round_trips_without_changing_program_bytes() {
+        let first = object(AllocatorProvider::Default);
+        let second = object(AllocatorProvider::Custom);
+        assert_ne!(first, second);
 
         let first = read(&first).unwrap().unwrap();
         let second = read(&second).unwrap().unwrap();
+        assert_eq!(first[0].allocator_provider, AllocatorProvider::Default);
+        assert_eq!(second[0].allocator_provider, AllocatorProvider::Custom);
         let first_refs = first.iter().collect::<Vec<_>>();
         let second_refs = second.iter().collect::<Vec<_>>();
         assert_eq!(
@@ -1493,64 +1082,9 @@ mod tests {
         );
     }
 
-    /// A format 19 object: the text, then the base64 footer over a `SerItem19` table.
-    fn legacy_object(version: u16, js: &str) -> String {
-        let table = vec![SerItem19 {
-            name: "f".to_owned(),
-            kind: ItemKind::Fn.tag(),
-            start: 0,
-            len: js.len() as u32,
-            refs: vec!["g".to_owned()],
-            zombies: Vec::new(),
-            fixed_name: None,
-            root: true,
-            exported: false,
-            debug_path: "crate::f".to_owned(),
-            crate_name: "crate".to_owned(),
-            order: None,
-            map: ItemMap::default(),
-            dts: None,
-            optimization: OptimizationInfo::default(),
-            late_ir: LateIrAnalysisSummary::unavailable("no MIR"),
-            baseline_shadow: BaselineShadowSummary::default(),
-        }];
-        let mut encoded = postcard::to_allocvec(&version).unwrap();
-        encoded.extend(postcard::to_allocvec(&table).unwrap());
-        format!(
-            "{js}{FOOTER_PREFIX}{}\n",
-            base64::engine::general_purpose::STANDARD.encode(encoded)
-        )
-    }
-
-    #[test]
-    fn object_reader_still_reads_the_format_19_footer() {
-        let js = "function f() {\n  g();\n}\n";
-        let read = read_object(legacy_object(LEGACY_FORMAT_VERSION, js).as_bytes())
-            .unwrap()
-            .unwrap();
-        assert_eq!(read.format, LEGACY_FORMAT_VERSION);
-        assert_eq!(read.items.len(), 1);
-        let item = &read.items[0];
-        assert_eq!(item.js, js);
-        assert_eq!(item.name.as_str(), "f");
-        assert!(item.linkage.root);
-        assert_eq!(item.refs, BTreeSet::from([JsName::new("g".to_owned())]));
-        assert!(item.jir.summary.is_none());
-        assert!(!item.jir.has_body());
-    }
-
     #[test]
     fn object_reader_rejects_a_stale_format_with_the_rebuild_note() {
-        let stale = legacy_object(LEGACY_FORMAT_VERSION - 1, "function f() {}\n");
-        let error = read_object(stale.as_bytes()).unwrap_err();
-        assert!(error.contains(&format!(
-            "item table in format {}",
-            LEGACY_FORMAT_VERSION - 1
-        )));
-        assert!(error.contains(&format!("reads format {FORMAT_VERSION}")));
-        assert!(error.contains("build_sysroot.sh --clean"));
-
-        let mut object = object(LateIrAnalysisSummary::unavailable("no MIR"));
+        let mut object = object(AllocatorProvider::Unknown);
         let at = object.len() - 10;
         object[at..at + 2].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let error = read_object(&object).unwrap_err();
@@ -1569,7 +1103,7 @@ mod tests {
 
     #[test]
     fn the_object_starts_with_the_printed_text_and_ends_with_the_trailer() {
-        let object = object(LateIrAnalysisSummary::unavailable("no MIR"));
+        let object = object(AllocatorProvider::Unknown);
         assert!(object.starts_with(b"function f() {"), "{:?}", &object[..20]);
         assert!(crate::object::is_object(&object));
         let items = read(&object).unwrap().unwrap();
@@ -1697,80 +1231,11 @@ mod tests {
     }
 
     #[test]
-    fn emitted_future_poller_evidence_round_trips_through_an_object() {
-        let item = JsItem::new(
-            JsName::new("f".to_owned()),
-            ItemKind::Fn,
-            jsast::function(
-                "f",
-                Vec::new(),
-                vec![jsast::expr_stmt(jsast::rt_call(
-                    "host_future_promise",
-                    Vec::new(),
-                ))],
-            ),
-            Vec::new(),
-            Linkage::internal(),
-            "crate::f".to_owned(),
-        );
-
-        let items = read(&write(&[item])).unwrap().unwrap();
-        assert!(items[0].optimization.applied.contains("future-poller"));
-    }
-
-    #[test]
-    fn carrier_bridge_evidence_round_trips_through_an_object() {
-        let bridge = carrier_bridge();
-        let summary = LateIrAnalysisSummary::unavailable("unsupported MIR")
-            .with_carrier_bridges_for_test(vec![bridge.clone()]);
-        let items = read(&object(summary)).unwrap().unwrap();
-
-        assert_eq!(items[0].late_ir.carrier_bridges(), &[bridge]);
-    }
-
-    #[test]
-    fn object_reader_rejects_a_stale_analysis_summary() {
-        let stale = LateIrAnalysisSummary::unavailable("test")
-            .with_version_for_test(crate::late_ir::LATE_IR_ANALYSIS_VERSION + 1);
-        let error = read(&object(stale)).unwrap_err();
-        assert!(
-            error.contains(&format!(
-                "late-IR analysis summary has format {}",
-                crate::late_ir::LATE_IR_ANALYSIS_VERSION + 1
-            )),
-            "{error}"
-        );
-        assert!(
-            error.contains("rebuild the sysroot and dependencies"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn object_reader_rejects_a_stale_baseline_shadow_summary() {
-        let stale = BaselineShadowSummary::unavailable()
-            .with_version_for_test(crate::baseline_shadow::BASELINE_SHADOW_VERSION + 1);
-        let error = read(&object_with_shadow(stale)).unwrap_err();
-        assert!(
-            error.contains(&format!(
-                "baseline shadow summary has format {}",
-                crate::baseline_shadow::BASELINE_SHADOW_VERSION + 1
-            )),
-            "{error}"
-        );
-        assert!(
-            error.contains("rebuild the sysroot and dependencies"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn identical_duplicates_union_optimizer_metadata_canonically() {
-        let summary = LateIrAnalysisSummary::unavailable("no MIR");
-        let mut first = link_item("z-pass", summary.clone());
+        let mut first = link_item("z-pass");
         first.optimization.apply("future-poller");
         let mut forward = first.clone();
-        let mut second = link_item("a-pass", summary);
+        let mut second = link_item("a-pass");
         second.optimization.apply("ast-dce");
         let mut reverse = second.clone();
 
@@ -1789,12 +1254,11 @@ mod tests {
 
     #[test]
     fn identical_duplicates_retain_and_deduplicate_rejected_source_candidates() {
-        let summary = LateIrAnalysisSummary::unavailable("no MIR");
-        let mut first = link_item("shared-pass", summary.clone());
+        let mut first = link_item("shared-pass");
         first.optimization.misses.push(
             OptimizationMiss::new("z-pass", "z reason").at_source("src/lib.rs", "src/lib.rs:9:5"),
         );
-        let mut second = link_item("shared-pass", summary);
+        let mut second = link_item("shared-pass");
         second.optimization.misses.push(
             OptimizationMiss::new("a-pass", "a reason").at_source("src/lib.rs", "src/lib.rs:9:5"),
         );

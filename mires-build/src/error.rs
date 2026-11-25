@@ -29,20 +29,6 @@ pub enum BuildError {
     Fix { step: Step, status: ExitStatus },
     #[error("rustc exited with {status} compiling the client crate")]
     Compile { status: ExitStatus, stderr: String },
-    #[error("rustc exited with {status} expanding the client crate")]
-    Expand { status: ExitStatus, stderr: String },
-    #[error(
-        "procedure client support is not built at {}; run {}",
-        path.display(),
-        script.display()
-    )]
-    ProcedureSupportMissing { path: PathBuf, script: PathBuf },
-    #[error(
-        "procedure client support is older than {}; run {}",
-        input.display(),
-        script.display()
-    )]
-    ProcedureSupportStale { input: PathBuf, script: PathBuf },
     #[error("minimal runtime extraction exited with {status}:\n{stderr}")]
     MinimalShim { status: ExitStatus, stderr: String },
     #[error("the compiler produced no {}", path.display())]

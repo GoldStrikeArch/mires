@@ -31,9 +31,8 @@
 //! contract's cells.
 
 use rustc_abi::{FieldIdx, Size, TagEncoding, VariantIdx, Variants, FIRST_VARIANT};
-use rustc_middle::ty::{self, AdtDef, ScalarInt, Ty, TyCtxt};
+use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt};
 
-use crate::jsast::{self, Expr};
 use crate::naming::Namer;
 
 /// The typing environment every query in this backend runs in: everything is monomorphic by the
@@ -331,153 +330,6 @@ pub(crate) fn is_primitive_enum<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     ) && !is_zst(tcx, ty)
 }
 
-/// The JavaScript string standing for one variant of a [tagged](EnumRepr::Tag) enum.
-pub(crate) fn tag_literal(variant: &ty::VariantDef) -> Expr {
-    jsast::string(variant.name.as_str())
-}
-
-/// The discriminant of one variant, as the literal the value model spells it with.
-///
-/// Re-signed through [`int_literal`], so a `repr(i8)` enum's first variant is `-1` rather than
-/// `255`: the same spelling `SwitchInt`'s case values get, which is what lets the two be compared.
-pub(crate) fn discriminant_literal<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    index: VariantIdx,
-) -> Expr {
-    match ty.discriminant_for_variant(tcx, index) {
-        Some(discr) => {
-            int_literal(tcx, discr.ty, discr.val).unwrap_or_else(|| jsast::num(discr.val as f64))
-        }
-        None => jsast::num(0),
-    }
-}
-
-/// The JavaScript value of one variant of an enum, built out of that variant's already lowered
-/// fields.
-///
-/// The one place that knows what an enum value looks like. `None` when `ty` is not an enum.
-pub(crate) fn enum_value<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    index: VariantIdx,
-    fields: Vec<(String, Expr)>,
-) -> Option<Expr> {
-    let peeled = peel_pattern(peel_transparent(tcx, ty));
-    Some(match enum_repr(tcx, peeled)? {
-        // The value IS the tag, so the fields (there are none) have nowhere to go.
-        EnumRepr::Number | EnumRepr::Tag { fieldless: true } => variant_tag(tcx, peeled, index)?,
-        EnumRepr::Tag { fieldless: false } | EnumRepr::State => {
-            let mut entries = Vec::with_capacity(fields.len() + 1);
-            entries.push((TAG.to_string(), variant_tag(tcx, peeled, index)?));
-            entries.extend(fields);
-            jsast::object(entries)
-        }
-    })
-}
-
-/// The tag of one variant: the JavaScript value that distinguishes it from the enum's others.
-///
-/// A name for a [tagged](EnumRepr::Tag) enum and the discriminant number for a
-/// [numeric](EnumRepr::Number) one. This is what [`tag_expr`] reads back, so a `SwitchInt` case and
-/// a `SetDiscriminant` both spell a variant with it. `None` when `ty` is not an enum.
-pub(crate) fn variant_tag<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    index: VariantIdx,
-) -> Option<Expr> {
-    let peeled = peel_pattern(peel_transparent(tcx, ty));
-    // A coroutine's states have no names, so the index is the tag. It is also the discriminant
-    // `SwitchInt` compares against, which is what makes the numeric decision tree work unchanged.
-    if let ty::Coroutine(..) = peeled.kind() {
-        return Some(jsast::num(index.as_u32() as f64));
-    }
-    let ty::Adt(def, _) = peeled.kind() else {
-        return None;
-    };
-    Some(match enum_repr(tcx, peeled)? {
-        EnumRepr::Number => discriminant_literal(tcx, peeled, index),
-        EnumRepr::Tag { .. } | EnumRepr::State => tag_literal(def.variant(index)),
-    })
-}
-
-/// How an enum value's tag is reached: the value itself where it *is* the tag, its [`TAG`]
-/// otherwise.
-pub(crate) fn tag_expr(repr: EnumRepr, value: Expr) -> Expr {
-    match repr {
-        EnumRepr::Number | EnumRepr::Tag { fieldless: true } => value,
-        EnumRepr::Tag { fieldless: false } | EnumRepr::State => jsast::member(value, TAG),
-    }
-}
-
-/// The **number** an enum value's discriminant is, whatever shape the value has.
-///
-/// A [number](EnumRepr::Number) enum is already that number. A tagged one carries a name instead,
-/// so the number is recovered by a chain over the variants: `t === "A" ? 0 : t === "B" ? 1 : 2`,
-/// with the last variant as the fallback that needs no test. `tag` is read once per variant, so the
-/// caller passes an expression that costs nothing to repeat.
-///
-/// This is what a discriminant that is *not* immediately matched on comes out as: `E::A as i32`,
-/// `mem::discriminant`, anything that asked for the integer. `None` when `ty` is not an enum.
-pub(crate) fn discriminant_number<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    value: Expr,
-) -> Option<Expr> {
-    let peeled = peel_pattern(peel_transparent(tcx, ty));
-    let repr = enum_repr(tcx, peeled)?;
-    if repr == EnumRepr::Number {
-        return Some(value);
-    }
-    // A coroutine's tag is already the number: its states have no names to compare against, and
-    // the index under `TAG` is the discriminant the resume switches on.
-    if repr == EnumRepr::State {
-        return Some(tag_expr(repr, value));
-    }
-    let ty::Adt(def, _) = peeled.kind() else {
-        return None;
-    };
-    let tag = tag_expr(repr, value);
-    let mut indices = def.variants().indices();
-    let last = indices.next_back()?;
-    let mut number = discriminant_literal(tcx, peeled, last);
-    for index in indices.rev() {
-        number = jsast::cond(
-            jsast::binary(
-                jsast::BinOp::StrictEq,
-                tag.clone(),
-                tag_literal(def.variant(index)),
-            ),
-            discriminant_literal(tcx, peeled, index),
-            number,
-        );
-    }
-    Some(number)
-}
-
-/// The variant of `ty` whose discriminant is `discriminant`, if it has one.
-///
-/// A `SwitchInt` over a discriminant carries the discriminant *values*, and a tagged enum switches
-/// over names, so every case value has to be looked back up here.
-pub(crate) fn variant_with_discriminant<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    discriminant: u128,
-) -> Option<&'tcx ty::VariantDef> {
-    let peeled = peel_pattern(peel_transparent(tcx, ty));
-    let ty::Adt(def, _) = peeled.kind() else {
-        return None;
-    };
-    def.variants()
-        .iter_enumerated()
-        .find(|(index, _)| {
-            peeled
-                .discriminant_for_variant(tcx, *index)
-                .is_some_and(|discr| discr.val == discriminant)
-        })
-        .map(|(_, variant)| variant)
-}
-
 /// Whether a **union** is among the transparent wrappers `ty` peels down through.
 ///
 /// The two halves of [`transparent_field_indexed`] agree on the value and differ on one thing: a
@@ -510,34 +362,6 @@ pub(crate) fn peel_transparent<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> Ty<
         }
     }
     ty
-}
-
-/// The empty JavaScript container a value of `ty` is assembled in, when MIR writes its fields one
-/// by one into a local that was never assigned whole (`assembly.rs`): `[]` for a tuple, an array
-/// or the environment of a closure or an async closure, `{}` for a struct, a union or an enum with
-/// a payload.
-///
-/// `None` for everything whose value is not such a container: a scalar, a pointer, a primitive
-/// enum, a zero-sized value (`undefined`), a coroutine, and a transparent wrapper around any of
-/// those. A write to a field of such a wrapper is a write of the whole value, which needs nothing.
-pub(crate) fn fresh_container<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
-    if is_zst(tcx, ty) {
-        return None;
-    }
-    let peeled = peel_pattern(peel_transparent(tcx, ty));
-    match peeled.kind() {
-        ty::Tuple(_) | ty::Array(..) | ty::Closure(..) | ty::CoroutineClosure(..) => {
-            Some(jsast::array(Vec::new()))
-        }
-        ty::Adt(def, _) if def.is_struct() || def.is_union() => Some(jsast::object(Vec::new())),
-        ty::Adt(def, _)
-            if def.is_enum()
-                && enum_repr(tcx, peeled) == Some(EnumRepr::Tag { fieldless: false }) =>
-        {
-            Some(jsast::object(Vec::new()))
-        }
-        _ => None,
-    }
 }
 
 /// Whether a reference to a place of this type is the place's own JS value (and `Deref` a no-op).
@@ -612,176 +436,6 @@ pub(crate) fn needs_clone<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         ty::Closure(..) => true,
         _ => false,
     }
-}
-
-/// The number of enum variants past which a copy stops being rebuilt variant by variant.
-///
-/// The per variant form repeats the source expression once per variant, so it is only worth it
-/// while the chain stays small. Above the limit the copy falls back to `Object.assign`, which is
-/// one level deep — correct unless a payload is itself an aggregate.
-const MAX_CLONED_VARIANTS: usize = 8;
-
-/// A copy of an aggregate value that shares nothing with the original.
-///
-/// Structs, tuples, enums and closure environments are rebuilt field by field, so a nested
-/// aggregate is copied too; an array copies its spine with `slice()`, or with `map()` when its
-/// elements need copies of their own. This is what makes `Operand::Copy` of an aggregate a copy
-/// rather than an alias: JS objects have reference semantics, so a shallow copy of a struct
-/// holding a struct would still let a write through one be seen through the other.
-pub(crate) fn clone_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> Expr {
-    // A transparent wrapper is its field, and is copied the way the field is — except when a union
-    // is among the wrappers, where it may hold nothing at all. `MaybeUninit::uninit()` is
-    // `undefined` (see [`transparent_field_indexed`]), and a copy of an uninitialized value is
-    // another uninitialized value rather than a walk through fields that are not there:
-    // `[MaybeUninit::uninit(); N]` is exactly that copy, N times.
-    let peeled = peel_transparent(tcx, ty);
-    if peeled != ty {
-        if !needs_clone(tcx, peeled) {
-            return value;
-        }
-        let copy = clone_expr(tcx, peeled, value.clone());
-        if !crosses_transparent_union(tcx, ty) {
-            return copy;
-        }
-        return jsast::cond(
-            jsast::binary(jsast::BinOp::StrictNe, value, jsast::undefined()),
-            copy,
-            jsast::undefined(),
-        );
-    }
-    // `x` if `x` is copied as is, `clone_expr(x)` if it needs one of its own.
-    let clone_field = |field_ty: Ty<'tcx>, read: Expr| {
-        if needs_clone(tcx, field_ty) {
-            clone_expr(tcx, field_ty, read)
-        } else {
-            read
-        }
-    };
-
-    match ty.kind() {
-        ty::Adt(def, args) if def.is_struct() || def.is_union() => {
-            let variant = def.non_enum_variant();
-            let entries = variant
-                .fields
-                .iter_enumerated()
-                .map(|(idx, field)| {
-                    let key = Namer::field_name(variant, idx);
-                    let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
-                    let read = clone_field(field_ty, jsast::member(value.clone(), key.clone()));
-                    (key, read)
-                })
-                .collect();
-            jsast::object(entries)
-        }
-        ty::Adt(def, args) if def.is_enum() => clone_enum(tcx, *def, args, value),
-        ty::Tuple(tys) => jsast::array(
-            tys.iter()
-                .enumerate()
-                .map(|(i, field_ty)| {
-                    clone_field(field_ty, jsast::index(value.clone(), jsast::num(i as f64)))
-                })
-                .collect(),
-        ),
-        // `slice()` copies the spine; an element that is itself an aggregate needs its own copy,
-        // which `Array.prototype.map` provides without naming the source twice.
-        ty::Array(element_ty, _) if needs_clone(tcx, *element_ty) => jsast::method_call(
-            value,
-            "map",
-            vec![jsast::arrow(
-                vec!["$e".to_string()],
-                clone_expr(tcx, *element_ty, jsast::id("$e")),
-            )],
-        ),
-        ty::Array(..) => jsast::method_call(value, "slice", vec![]),
-        // A closure environment is an array of the captured values, in capture order.
-        ty::Closure(_, args) => jsast::array(
-            args.as_closure()
-                .upvar_tys()
-                .iter()
-                .enumerate()
-                .map(|(i, upvar_ty)| {
-                    clone_field(upvar_ty, jsast::index(value.clone(), jsast::num(i as f64)))
-                })
-                .collect(),
-        ),
-        _ => shallow_clone(value),
-    }
-}
-
-/// `Object.assign({}, value)`, a one level copy for a shape this module cannot take apart.
-fn shallow_clone(value: Expr) -> Expr {
-    jsast::call(
-        jsast::member(jsast::id("Object"), "assign"),
-        vec![jsast::object(vec![]), value],
-    )
-}
-
-/// A copy of an enum value: `TAG === "A" ? { TAG: "A", _0: ... } : ...`.
-///
-/// An enum with a payload is `{ TAG, ...fields of the active variant }`, and which fields are live
-/// depends on the variant, so the copy is a chain over the variants. Rebuilding each variant rather
-/// than spreading the source is what copies a payload that is itself an aggregate, and it also
-/// drops the keys of whatever variant the value used to hold.
-///
-/// Only reached for an enum that has an object: a [primitive](is_primitive_enum) one needs no copy
-/// at all ([`needs_clone`]).
-fn clone_enum<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
-    value: Expr,
-) -> Expr {
-    let payload_needs_clone = def.variants().iter().any(|variant| {
-        variant.fields.iter().any(|field| {
-            needs_clone(
-                tcx,
-                tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args)),
-            )
-        })
-    });
-
-    // With none of the payloads holding a JS object of their own, a one level copy is already a
-    // copy that shares nothing, and it is a fraction of the size.
-    if !payload_needs_clone || def.variants().len() > MAX_CLONED_VARIANTS {
-        return shallow_clone(value);
-    }
-
-    let variant_copy = |index: VariantIdx| {
-        let variant = def.variant(index);
-        let mut entries = vec![(TAG.to_string(), tag_literal(variant))];
-        for (idx, field) in variant.fields.iter_enumerated() {
-            let key = Namer::field_name(variant, idx);
-            let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
-            let read = jsast::member(value.clone(), key.clone());
-            let read = if needs_clone(tcx, field_ty) {
-                clone_expr(tcx, field_ty, read)
-            } else {
-                read
-            };
-            entries.push((key, read));
-        }
-        (tag_literal(variant), jsast::object(entries))
-    };
-
-    // The last variant is the fallback of the chain, so it needs no test of its own.
-    let mut indices = def.variants().indices();
-    let Some(last) = indices.next_back() else {
-        return shallow_clone(value);
-    };
-    let mut copy = variant_copy(last).1;
-    for index in indices.rev() {
-        let (tag, variant) = variant_copy(index);
-        copy = jsast::cond(
-            jsast::binary(
-                jsast::BinOp::StrictEq,
-                jsast::member(value.clone(), TAG),
-                tag,
-            ),
-            variant,
-            copy,
-        );
-    }
-    copy
 }
 
 /// How a field of an aggregate is reached in JavaScript.
@@ -869,15 +523,6 @@ fn coroutine_field_key<'tcx>(
     Some(FieldKey::Name(format!("$s{}", saved.as_usize())))
 }
 
-/// `base.name`, `base[i]`, or `base` itself for the field of a transparent union.
-pub(crate) fn field_expr(base: Expr, key: FieldKey) -> Expr {
-    match key {
-        FieldKey::Name(name) => jsast::member(base, name),
-        FieldKey::Index(i) => jsast::index(base, jsast::num(i as f64)),
-        FieldKey::Transparent => base,
-    }
-}
-
 /// Which JavaScript numeric type holds a Rust integer.
 ///
 /// A JS number is a `f64`, so it represents every integer up to 2^53 exactly and none above it.
@@ -923,33 +568,6 @@ pub(crate) fn int_info<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<(bool, u
     }
 }
 
-/// Truncates `value` to an integer of the given width and signedness, in the given representation.
-///
-/// Every arithmetic result goes through this, which is what makes the emitted JavaScript wrap the
-/// way Rust does.
-pub(crate) fn mask(repr: IntRepr, signed: bool, bits: u32, value: Expr) -> Expr {
-    match repr {
-        IntRepr::BigInt => jsast::bigint_mask(signed, bits, value),
-        // A number-repr integer is at most 32 bits wide (see `IntRepr`), so the bitwise operators
-        // — which convert to int32/uint32 first — truncate exactly.
-        IntRepr::Number => match (signed, bits) {
-            (_, 33..) => value,
-            (true, 32) => jsast::i32_wrap(value),
-            (true, _) => jsast::sign_extend(bits, value),
-            (false, 32) => jsast::u32_wrap(value),
-            (false, _) => jsast::zero_extend(bits, value),
-        },
-    }
-}
-
-/// Truncates a value of type `ty` if `ty` is an integer, and leaves it alone otherwise.
-pub(crate) fn mask_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> Expr {
-    match int_info(tcx, ty) {
-        Some((signed, bits)) => mask(int_repr(ty), signed, bits, value),
-        None => value,
-    }
-}
-
 /// Reinterprets the low `bits` bits of a raw bit pattern as an integer of that signedness.
 ///
 /// MIR stores every integer scalar — a constant, a `SwitchInt` case value — as an unsigned bit
@@ -963,33 +581,35 @@ pub(crate) fn resign(signed: bool, bits: u32, raw: u128) -> i128 {
     }
 }
 
-/// A `BigInt` literal for a raw bit pattern of the given width and signedness.
-pub(crate) fn wide_int_literal(signed: bool, bits: u32, raw: u128) -> Expr {
-    if signed {
-        jsast::bigint(resign(true, bits, raw))
-    } else {
-        jsast::bigint(raw)
+/// Whether `ty` is a one-byte element (`u8`, `i8`, or an 8-bit `repr(int)` fieldless enum,
+/// peeling transparent/pattern wrappers), so a buffer of `ty` is a byte buffer.
+pub(crate) fn is_byte_element<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    if matches!(
+        peel_pattern(peel_transparent(tcx, ty)).kind(),
+        ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8)
+    ) {
+        return true;
+    }
+    matches!(direct_tag(tcx, ty), Some((8, _)))
+}
+
+/// Whether a raw pointer to `pointee` is a `{ buf, off }` slot record.
+pub(crate) fn is_slot_pointee<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> bool {
+    let pointee = peel_pattern(pointee);
+    if matches!(pointee.kind(), ty::Str) {
+        return false;
+    }
+    match tcx.layout_of(typing_env().as_query_input(pointee)) {
+        Ok(layout) => layout.is_sized() && !layout.is_zst(),
+        Err(_) => false,
     }
 }
 
-/// A literal for a raw integer bit pattern of type `ty`, in whichever representation `ty` uses.
-///
-/// This is the one place that knows how an integer literal is spelled; `constant.rs` and the
-/// `SwitchInt` lowering both go through it, so a `i64` value comes out as `123n` and a `usize` one
-/// as `123`. Returns `None` when `ty` is not an integer type.
-pub(crate) fn int_literal<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, raw: u128) -> Option<Expr> {
-    let (signed, bits) = int_info(tcx, ty)?;
-    Some(match int_repr(ty) {
-        IntRepr::BigInt => wide_int_literal(signed, bits, raw),
-        IntRepr::Number => jsast::num(resign(signed, bits, raw) as f64),
-    })
-}
-
-/// A literal for an already decoded integer scalar of type `ty`.
-pub(crate) fn scalar_int_literal<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    int: ScalarInt,
-) -> Option<Expr> {
-    int_literal(tcx, ty, int.to_uint(int.size()))
+/// Whether a value of pointer type `pointer_ty` is a `{ buf, off }` slot record.
+pub(crate) fn is_slot<'tcx>(tcx: TyCtxt<'tcx>, pointer_ty: Ty<'tcx>) -> bool {
+    match peel_pattern(peel_transparent(tcx, pointer_ty)).kind() {
+        ty::Ref(_, pointee, _) => !is_indirect(tcx, *pointee) && is_slot_pointee(tcx, *pointee),
+        ty::RawPtr(pointee, _) => is_slot_pointee(tcx, *pointee),
+        _ => false,
+    }
 }

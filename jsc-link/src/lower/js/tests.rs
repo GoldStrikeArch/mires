@@ -10,8 +10,8 @@ use rcgjs_object::jir::repr::{
 };
 use rcgjs_object::jir::semantic::{
     AbiSignature, BinaryOp, Body, BodyKind, BodySemantic, CallSemantic, Callee, CastKind,
-    ConstTree, DefinitionId, DirectItemRef, DropGlue, HostPayload, ItemId, KeyedListCallable,
-    KeyedListPayload, Signature, UnaryOp, VtableEntry, KEYED_LIST_FORMAT_V1,
+    ConstTree, DefinitionId, DirectItemRef, DropGlue, HostPayload, ItemId, Signature, UnaryOp,
+    VtableEntry,
 };
 use rcgjs_object::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
 use rcgjs_object::jir::types::{
@@ -577,7 +577,7 @@ fn lower_retargeted(
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -1821,7 +1821,7 @@ fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amou
             vtables: &super::unsize::EMPTY_VTABLES,
             spills: &[],
             abi: None,
-            physical: None,
+            final_lowering: false,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -2276,7 +2276,7 @@ fn if_and_while_regions_spell_tests_and_loops() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -2562,7 +2562,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3522,7 +3522,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3565,7 +3565,7 @@ fn statics_and_vtables() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3613,7 +3613,7 @@ fn statics_and_vtables() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3664,7 +3664,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3706,7 +3706,7 @@ fn unsupported_ops_decline_with_a_class() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3767,7 +3767,7 @@ fn lower_with(
         vtables,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -3904,13 +3904,7 @@ fn a_call_inside_a_track_caller_body_forwards_its_own_location() {
             caller_location: true,
             caller_location_def: None,
             is_core: false,
-            used_params: BTreeSet::new(),
             standard: None,
-            keyed_purity: None,
-            keyed_read_params: None,
-            keyed_may_unwind: None,
-            keyed_row_capture: None,
-            keyed_proxy_safe_params: None,
         },
     );
     let js = lower_with(
@@ -3948,218 +3942,6 @@ fn a_call_inside_a_track_caller_body_forwards_its_own_location() {
         &super::unsize::EMPTY_VTABLES,
     );
     assert_eq!(js, "function f(x) {\n  return g$h0000000000000002();\n}\n");
-}
-
-#[test]
-fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
-    const COLLECTION_CLOSURE: TypeId = TypeId(40);
-    const KEY_CLOSURE: TypeId = TypeId(41);
-    const ROW_CLOSURE: TypeId = TypeId(42);
-
-    let mut interns = world();
-    for (ty, definition) in [
-        (COLLECTION_CLOSURE, def(40)),
-        (KEY_CLOSURE, def(41)),
-        (ROW_CLOSURE, def(42)),
-    ] {
-        interns.intern_type(descriptor(
-            ty,
-            TypeKind::Closure {
-                def: definition,
-                upvars: Vec::new(),
-                fn_pointer_shim: None,
-            },
-            0,
-        ));
-    }
-    let marker_name = interns.intern_str("keyed_list_v1$h90");
-    let collection_name = interns.intern_str("collection$h40");
-    let key_name = interns.intern_str("key$h41");
-    let row_name = interns.intern_str("row$h42");
-    let callable = |ty, item, link_name| KeyedListCallable {
-        ty,
-        body: Some(DirectItemRef { item, link_name }),
-        cleanup: DropGlue::None,
-        source: None,
-    };
-    let payload = KeyedListPayload {
-        format: KEYED_LIST_FORMAT_V1,
-        site: None,
-        def: def(90),
-        collection_ty: ARRAY,
-        item_ty: I32,
-        key_ty: I32,
-        row_ty: POINT,
-        collection: callable(COLLECTION_CLOSURE, item(40), collection_name),
-        key: callable(KEY_CLOSURE, item(41), key_name),
-        row: callable(ROW_CLOSURE, item(42), row_name),
-    };
-
-    let entry = FuncBuilder::ENTRY;
-    let mut builder = FuncBuilder::new(
-        item(1),
-        signature(vec![COLLECTION_CLOSURE, KEY_CLOSURE, ROW_CLOSURE], POINT),
-    );
-    let collection = builder.param(COLLECTION_CLOSURE, NO_ORIGIN);
-    let key = builder.param(KEY_CLOSURE, NO_ORIGIN);
-    let row = builder.param(ROW_CLOSURE, NO_ORIGIN);
-    let result = builder.op(
-        entry,
-        OpKind::Call {
-            callee: Callee::Direct {
-                item: item(90),
-                link_name: marker_name,
-            },
-            function: None,
-            args: vec![collection, key, row],
-            track_caller: None,
-            semantic: CallSemantic::ViewAbi,
-            host: Some(HostPayload::KeyedList(Box::new(payload))),
-        },
-        POINT,
-        NO_ORIGIN,
-    );
-    builder.terminate(entry, RTerm::Return(Some(result)));
-    let func = builder.finish();
-    let plan = plan_of(&func, &[(0, "collection"), (1, "key"), (2, "row")]);
-    let body = body_of(BodyKind::Function, func.sig.clone());
-    let opts = Opts::default();
-    let item_summary = summary(&[]);
-    let mut items = super::host::ItemIndex::new();
-    items.insert(
-        item(40),
-        super::host::ItemEntry {
-            abi_known: true,
-            name: "collection$h40".to_owned(),
-            params: 1,
-            result: Some(ARRAY),
-            arguments: Vec::new(),
-            caller_location: false,
-            caller_location_def: None,
-            is_core: false,
-            used_params: BTreeSet::new(),
-            standard: None,
-            keyed_purity: Some(super::host::KeyedPurity::Const),
-            keyed_read_params: Some(BTreeSet::new()),
-            keyed_may_unwind: Some(false),
-            keyed_row_capture: None,
-            keyed_proxy_safe_params: Some(BTreeSet::new()),
-        },
-    );
-    items.insert(
-        item(41),
-        super::host::ItemEntry {
-            abi_known: true,
-            name: "key$h41".to_owned(),
-            params: 2,
-            result: Some(I32),
-            arguments: Vec::new(),
-            caller_location: false,
-            caller_location_def: None,
-            is_core: false,
-            used_params: BTreeSet::new(),
-            standard: None,
-            keyed_purity: Some(super::host::KeyedPurity::Const),
-            keyed_read_params: Some(BTreeSet::new()),
-            keyed_may_unwind: Some(false),
-            keyed_row_capture: None,
-            keyed_proxy_safe_params: Some(BTreeSet::new()),
-        },
-    );
-    items.insert(
-        item(42),
-        super::host::ItemEntry {
-            abi_known: true,
-            name: "row$h42".to_owned(),
-            params: 3,
-            result: Some(POINT),
-            arguments: Vec::new(),
-            caller_location: false,
-            caller_location_def: None,
-            is_core: false,
-            used_params: BTreeSet::new(),
-            standard: None,
-            keyed_purity: Some(super::host::KeyedPurity::Const),
-            keyed_read_params: Some(BTreeSet::new()),
-            keyed_may_unwind: Some(false),
-            keyed_row_capture: Some(super::host::KeyedRowCapture::Static),
-            keyed_proxy_safe_params: Some(BTreeSet::new()),
-        },
-    );
-    let lower = |items: &super::host::ItemIndex| {
-        let input = LowerInput {
-            name: &JsName::new("f".to_owned()),
-            summary: &item_summary,
-            body: &body,
-            origins: None,
-            interns: &interns,
-            table: &interns.types,
-            opts: &opts,
-            items,
-            drop_glue: super::host::EMPTY_DROP_GLUE,
-            vtables: &super::unsize::EMPTY_VTABLES,
-            spills: &[],
-            abi: None,
-            physical: None,
-            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
-            bigints: None,
-            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
-            heap: None,
-            nested_clone: crate::lower::NestedClone::default(),
-        };
-        function::lower(&input, &func, &plan, straight(&func))
-            .map(|lowered| jsast::stmt_to_string(&lowered.decl))
-            .map_err(|decline| decline.to_string())
-    };
-    let js = lower(&items).expect("a creation-only keyed row lowers");
-    assert!(
-        js.contains("__rt.keyed_dom_view("),
-        "the executable marker uses the transactional DOM adapter: {js}"
-    );
-    for import in [
-        "_$batch",
-        "_$createRoot",
-        "_$createSignal",
-        "_$effect",
-        "_$onCleanup",
-        "_$untrack",
-    ] {
-        assert!(
-            js.contains(import),
-            "the keyed hooks include {import}: {js}"
-        );
-    }
-
-    items.get_mut(&item(42)).unwrap().keyed_row_capture = Some(super::host::KeyedRowCapture::Live);
-    assert!(
-        lower(&items)
-            .expect_err("a live row capture declines")
-            .contains("keyed.row-live-item-not-ready"),
-        "the first live lane requires an immutable item reference"
-    );
-
-    items.get_mut(&item(42)).unwrap().keyed_row_capture =
-        Some(super::host::KeyedRowCapture::Static);
-    items.get_mut(&item(41)).unwrap().keyed_purity = Some(super::host::KeyedPurity::Read);
-    items.get_mut(&item(41)).unwrap().keyed_read_params = Some(BTreeSet::from([1]));
-    lower(&items).expect("a key may read through its item argument");
-
-    items.get_mut(&item(41)).unwrap().keyed_read_params = Some(BTreeSet::from([0]));
-    assert!(
-        lower(&items)
-            .expect_err("a capture-dependent key declines")
-            .contains("keyed.key-extractor-reads-state"),
-        "a read through the closure environment is not a deterministic key proof"
-    );
-
-    items.get_mut(&item(41)).unwrap().keyed_read_params = Some(BTreeSet::from([1]));
-    items.get_mut(&item(41)).unwrap().keyed_may_unwind = Some(true);
-    assert!(
-        lower(&items)
-            .expect_err("a fallible key declines")
-            .contains("keyed.key-extractor-fallible"),
-        "key extraction must finish before any row transaction starts"
-    );
 }
 
 #[test]
@@ -4310,102 +4092,6 @@ fn a_direct_drop_calls_the_selected_glue_with_a_reference_to_the_place() {
         js,
         "function f(p) {\n  drop_point$h0000000000000003$n1(p);\n}\n"
     );
-}
-
-#[test]
-fn only_a_decoded_static_template_operand_can_disappear_into_its_marker() {
-    for case in 0..8 {
-        let mut interns = world();
-        let section = interns.intern_str(if case == 4 {
-            "rcgjs.host.unknown"
-        } else {
-            "rcgjs.tc.template"
-        });
-        let link_name = interns.intern_str("template_marker");
-        let source_name = interns.intern_str("template_source");
-        let mut builder = FuncBuilder::new(item(1), signature(Vec::new(), I32));
-        let entry = FuncBuilder::ENTRY;
-        let source = if case == 2 {
-            OpKind::Call {
-                callee: Callee::Direct {
-                    item: item(2),
-                    link_name: source_name,
-                },
-                function: None,
-                args: Vec::new(),
-                track_caller: None,
-                semantic: CallSemantic::Ordinary,
-                host: None,
-            }
-        } else {
-            OpKind::Const(ConstTree::Global {
-                target: rcgjs_object::jir::semantic::GlobalReference::Static {
-                    definition: def(2),
-                    link_name: source_name,
-                },
-                offset: if case == 1 { 4 } else { 0 },
-            })
-        };
-        let argument = builder.op(entry, source, REF_POINT, NO_ORIGIN);
-        let result = builder.op(
-            entry,
-            OpKind::Call {
-                callee: Callee::Direct {
-                    item: item(3),
-                    link_name,
-                },
-                function: None,
-                args: if case == 5 {
-                    vec![argument, argument]
-                } else {
-                    vec![argument]
-                },
-                track_caller: None,
-                semantic: CallSemantic::Ordinary,
-                host: Some(HostPayload::Marker {
-                    section,
-                    def: def(3),
-                    template: (case != 3).then_some(ConstTree::Unit),
-                    helpers: Vec::new(),
-                }),
-            },
-            I32,
-            NO_ORIGIN,
-        );
-        if case >= 6 {
-            builder.op(
-                entry,
-                OpKind::Call {
-                    callee: Callee::Direct {
-                        item: item(3),
-                        link_name,
-                    },
-                    function: None,
-                    args: vec![argument],
-                    track_caller: None,
-                    semantic: CallSemantic::Ordinary,
-                    host: (case == 6).then_some(HostPayload::Marker {
-                        section,
-                        def: def(3),
-                        template: Some(ConstTree::Unit),
-                        helpers: Vec::new(),
-                    }),
-                },
-                I32,
-                NO_ORIGIN,
-            );
-        }
-        builder.terminate(entry, RTerm::Return(Some(result)));
-        let func = builder.finish();
-        func.verify(&interns.types).unwrap();
-        let plan =
-            super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
-        assert_eq!(
-            plan.inline.contains(&argument),
-            case == 0 || case == 6,
-            "case {case}"
-        );
-    }
 }
 
 #[test]
@@ -4717,7 +4403,6 @@ fn fixed_host_arrays_require_private_unchanged_storage() {
                 host: Some(HostPayload::Marker {
                     section,
                     def: def(2),
-                    template: None,
                     helpers: Vec::new(),
                 }),
             },
@@ -5723,7 +5408,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &spills,
         abi: Some(&abi),
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -6039,92 +5724,6 @@ fn ptr_str_len_folding_bytes_str_fusion_and_single_eval_byte_ptr() {
     );
 }
 
-fn add_canonical_string_types(interns: &mut Interns) -> TypeId {
-    use crate::jir::types::{AllocatorIdentity, RepresentationCandidate};
-
-    let raw_u8 = TypeId(91);
-    let raw_vec = TypeId(94);
-    let vec_u8 = TypeId(95);
-    let string_ty = TypeId(96);
-    interns.types.insert(descriptor(
-        raw_u8,
-        TypeKind::RawPointer {
-            pointee: U8,
-            mutable: false,
-        },
-        4,
-    ));
-    let ptr_name = interns.intern_str("ptr");
-    let cap_name = interns.intern_str("cap");
-    let buf_name = interns.intern_str("buf");
-    let len_name = interns.intern_str("len");
-    let vec_name = interns.intern_str("vec");
-    let rv_name = interns.intern_str("RawVec");
-    let v_name = interns.intern_str("Vec");
-    let s_name = interns.intern_str("String");
-    interns.types.insert(descriptor(
-        raw_vec,
-        TypeKind::Adt {
-            def: def(94),
-            args: Vec::new(),
-            form: NominalForm::Struct,
-            variants: vec![variant(
-                rv_name,
-                vec![
-                    field(FieldKey::Name(ptr_name), raw_u8),
-                    field(FieldKey::Name(cap_name), USIZE),
-                ],
-                0,
-                None,
-            )],
-            niche: None,
-        },
-        8,
-    ));
-    let mut vec_desc = descriptor(
-        vec_u8,
-        TypeKind::Adt {
-            def: def(95),
-            args: vec![U8],
-            form: NominalForm::Struct,
-            variants: vec![variant(
-                v_name,
-                vec![
-                    field(FieldKey::Name(buf_name), raw_vec),
-                    field(FieldKey::Name(len_name), USIZE),
-                ],
-                0,
-                None,
-            )],
-            niche: None,
-        },
-        12,
-    );
-    vec_desc.meta.candidate = RepresentationCandidate::Vec;
-    vec_desc.meta.allocator = AllocatorIdentity::Global;
-    interns.types.insert(vec_desc);
-    let mut str_desc = descriptor(
-        string_ty,
-        TypeKind::Adt {
-            def: def(96),
-            args: Vec::new(),
-            form: NominalForm::Struct,
-            variants: vec![variant(
-                s_name,
-                vec![field(FieldKey::Name(vec_name), vec_u8)],
-                0,
-                None,
-            )],
-            niche: None,
-        },
-        12,
-    );
-    str_desc.meta.candidate = RepresentationCandidate::String;
-    str_desc.meta.allocator = AllocatorIdentity::Global;
-    interns.types.insert(str_desc);
-    string_ty
-}
-
 #[test]
 fn fuse_local_bytes_str_eliminates_roundtrip_local() {
     use crate::opts::OptimizerMode;
@@ -6222,7 +5821,7 @@ fn fuse_local_bytes_str_eliminates_roundtrip_local() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -6344,86 +5943,6 @@ fn simplify_addr_zero_eq_lowers_to_ptr_is_null() {
     assert!(!js.contains("__rt.addr("), "{js}");
     assert!(js.contains("__rt.ptr_is_null("), "{js}");
     assert!(js.contains(", 4)"), "align=4 must be preserved: {js}");
-}
-
-#[test]
-fn host_string_and_string_builder_drop_elide_baseline_conversion() {
-    use crate::jir::repr::Carrier;
-
-    let mut interns = world();
-    let string_ty = add_canonical_string_types(&mut interns);
-    let drop_name = interns.intern_str("drop_str");
-    let mut b = FuncBuilder::new(item(1), signature(vec![string_ty, string_ty], UNIT));
-    let p_host = b.param(string_ty, NO_ORIGIN);
-    let p_base = b.param(string_ty, NO_ORIGIN);
-    let e = FuncBuilder::ENTRY;
-    let host_to_base = b.op(
-        e,
-        OpKind::Convert {
-            v: p_host,
-            from: Carrier::HostString,
-            to: Carrier::Baseline,
-        },
-        string_ty,
-        NO_ORIGIN,
-    );
-    b.effect(
-        e,
-        OpKind::Drop {
-            root: Root::Value(host_to_base),
-            path: Vec::new(),
-            glue: DropGlue::Direct {
-                item: item(2),
-                link_name: drop_name,
-            },
-        },
-        NO_ORIGIN,
-    );
-    let base_to_sb = b.op(
-        e,
-        OpKind::Convert {
-            v: p_base,
-            from: Carrier::Baseline,
-            to: Carrier::StringBuilder,
-        },
-        string_ty,
-        NO_ORIGIN,
-    );
-    b.effect(
-        e,
-        OpKind::Drop {
-            root: Root::Value(base_to_sb),
-            path: Vec::new(),
-            glue: DropGlue::Direct {
-                item: item(2),
-                link_name: drop_name,
-            },
-        },
-        NO_ORIGIN,
-    );
-    b.terminate(e, RTerm::Return(None));
-
-    let mut func = b.finish();
-    func.values[p_host.0 as usize].carrier = Carrier::HostString;
-    func.values[p_base.0 as usize].carrier = Carrier::Baseline;
-    func.values[host_to_base.0 as usize].carrier = Carrier::Baseline;
-    func.values[base_to_sb.0 as usize].carrier = Carrier::StringBuilder;
-
-    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
-    let body = body_of(BodyKind::Function, func.sig.clone());
-    let js = lower_with(
-        &interns,
-        "drop_strings",
-        &body,
-        &func,
-        &plan,
-        straight(&func),
-        super::host::EMPTY_ITEMS,
-        &super::unsize::EMPTY_VTABLES,
-    );
-    assert!(!js.contains("convert_str_block"), "{js}");
-    assert!(!js.contains("bytes_str"), "{js}");
-    assert!(js.contains("__rt.dealloc("), "{js}");
 }
 
 #[test]
@@ -6582,195 +6101,6 @@ fn fuse_local_bytes_str_rejects_aliased_mutations_non_dominance_and_inner_fn() {
 }
 
 #[test]
-fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc_stays() {
-    use rcgjs_object::jir::repr::Carrier;
-    use rcgjs_object::opts::OptimizerMode;
-
-    let mut interns = world();
-    let string_ty = add_canonical_string_types(&mut interns);
-    let impure_name = interns.intern_str("impure_host_str");
-    let poke_name = interns.intern_str("poke_str");
-    let drop_name = interns.intern_str("drop_str");
-
-    // Case 1: `let _ = impure_host_str();` where Convert -> Drop inlines the HostString call.
-    let mut b1 = FuncBuilder::new(item(1), signature(Vec::new(), UNIT));
-    let e1 = FuncBuilder::ENTRY;
-    let host_call = b1.op(
-        e1,
-        OpKind::Call {
-            callee: Callee::Direct {
-                item: item(2),
-                link_name: impure_name,
-            },
-            function: None,
-            args: Vec::new(),
-            semantic: CallSemantic::Ordinary,
-            host: None,
-            track_caller: None,
-        },
-        string_ty,
-        NO_ORIGIN,
-    );
-    let host_to_base = b1.op(
-        e1,
-        OpKind::Convert {
-            v: host_call,
-            from: Carrier::HostString,
-            to: Carrier::Baseline,
-        },
-        string_ty,
-        NO_ORIGIN,
-    );
-    b1.effect(
-        e1,
-        OpKind::Drop {
-            root: Root::Value(host_to_base),
-            path: Vec::new(),
-            glue: DropGlue::Direct {
-                item: item(3),
-                link_name: drop_name,
-            },
-        },
-        NO_ORIGIN,
-    );
-    b1.terminate(e1, RTerm::Return(None));
-    let mut func1 = b1.finish();
-    func1.values[host_call.0 as usize].carrier = Carrier::HostString;
-    func1.values[host_to_base.0 as usize].carrier = Carrier::Baseline;
-
-    let opts = Opts {
-        optimizer: OptimizerMode::On,
-        ..Opts::default()
-    };
-    let plan1 = super::super::fuse::plan(&func1, None, &interns.types, &interns, &opts);
-    let body1 = body_of(BodyKind::Function, func1.sig.clone());
-    let input1 = LowerInput {
-        name: &JsName::new("keep_impure_host_str".to_owned()),
-        summary: &summary(&[]),
-        body: &body1,
-        origins: None,
-        interns: &interns,
-        table: &interns.types,
-        opts: &opts,
-        items: super::host::EMPTY_ITEMS,
-        drop_glue: super::host::EMPTY_DROP_GLUE,
-        vtables: &super::unsize::EMPTY_VTABLES,
-        spills: &[],
-        abi: None,
-        physical: None,
-        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
-        bigints: None,
-        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
-        heap: None,
-        nested_clone: crate::lower::NestedClone::default(),
-    };
-    let js1 = jsast::stmt_to_string(
-        &function::lower(&input1, &func1, &plan1, straight(&func1))
-            .expect("lowers")
-            .decl,
-    );
-    assert!(
-        js1.contains("impure_host_str()"),
-        "impure call side effect must survive drop elision:\n{js1}"
-    );
-    assert!(!js1.contains("convert_str_block"), "{js1}");
-    assert!(!js1.contains("drop_str"), "{js1}");
-
-    // Case 2: non-adjacent BaselineDealloc (intervening call between Convert and Drop) must NOT
-    // defer `src.vec` reads past the intervening call.
-    let indirect_str_ty = TypeId(97);
-    let mut indirect_str = interns
-        .types
-        .get(string_ty)
-        .expect("string descriptor")
-        .clone();
-    indirect_str.id = indirect_str_ty;
-    indirect_str.js.is_indirect = true;
-    indirect_str.js.peeled = indirect_str_ty;
-    assert!(interns.types.insert(indirect_str));
-
-    let mut b2 = FuncBuilder::new(item(4), signature(vec![indirect_str_ty], UNIT));
-    let p_base = b2.param(indirect_str_ty, NO_ORIGIN);
-    let e2 = FuncBuilder::ENTRY;
-    let base_to_sb = b2.op(
-        e2,
-        OpKind::Convert {
-            v: p_base,
-            from: Carrier::Baseline,
-            to: Carrier::StringBuilder,
-        },
-        indirect_str_ty,
-        NO_ORIGIN,
-    );
-    let _poke = b2.op(
-        e2,
-        OpKind::Call {
-            callee: Callee::Direct {
-                item: item(5),
-                link_name: poke_name,
-            },
-            function: None,
-            args: Vec::new(),
-            semantic: CallSemantic::Ordinary,
-            host: None,
-            track_caller: None,
-        },
-        UNIT,
-        NO_ORIGIN,
-    );
-    b2.effect(
-        e2,
-        OpKind::Drop {
-            root: Root::Value(base_to_sb),
-            path: Vec::new(),
-            glue: DropGlue::Direct {
-                item: item(3),
-                link_name: drop_name,
-            },
-        },
-        NO_ORIGIN,
-    );
-    b2.terminate(e2, RTerm::Return(None));
-    let mut func2 = b2.finish();
-    func2.values[p_base.0 as usize].carrier = Carrier::Baseline;
-    func2.values[base_to_sb.0 as usize].carrier = Carrier::StringBuilder;
-
-    let plan2 = super::super::fuse::plan(&func2, None, &interns.types, &interns, &opts);
-    let body2 = body_of(BodyKind::Function, func2.sig.clone());
-    let input2 = LowerInput {
-        name: &JsName::new("non_adjacent_sb_drop".to_owned()),
-        summary: &summary(&[]),
-        body: &body2,
-        origins: None,
-        interns: &interns,
-        table: &interns.types,
-        opts: &opts,
-        items: super::host::EMPTY_ITEMS,
-        drop_glue: super::host::EMPTY_DROP_GLUE,
-        vtables: &super::unsize::EMPTY_VTABLES,
-        spills: &[],
-        abi: None,
-        physical: None,
-        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
-        bigints: None,
-        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
-        heap: None,
-        nested_clone: crate::lower::NestedClone::default(),
-    };
-    let js2 = jsast::stmt_to_string(
-        &function::lower(&input2, &func2, &plan2, straight(&func2))
-            .expect("lowers")
-            .decl,
-    );
-    assert!(
-        !js2.contains("__rt.dealloc(")
-            && js2.contains("__rt.bytes_str(")
-            && js2.contains("drop_str("),
-        "non-adjacent BaselineDealloc must not defer src snapshot past intervening call:\n{js2}"
-    );
-}
-
-#[test]
 fn caller_location_value_disambiguates_core_location_from_user_location_struct() {
     use rcgjs_object::jir::{Origin, OriginId, OriginKind, OriginTable, SourceFact};
 
@@ -6903,7 +6233,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -6957,13 +6287,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             caller_location: true,
             caller_location_def: None,
             is_core: false,
-            used_params: BTreeSet::new(),
             standard: None,
-            keyed_purity: None,
-            keyed_read_params: None,
-            keyed_may_unwind: None,
-            keyed_row_capture: None,
-            keyed_proxy_safe_params: None,
         },
     );
     input1.items = &items;
@@ -7030,13 +6354,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             caller_location: true,
             caller_location_def: None,
             is_core: true,
-            used_params: BTreeSet::new(),
             standard: None,
-            keyed_purity: None,
-            keyed_read_params: None,
-            keyed_may_unwind: None,
-            keyed_row_capture: None,
-            keyed_proxy_safe_params: None,
         },
     );
     let body3 = body_of(BodyKind::Function, f3.sig.clone());
@@ -7053,7 +6371,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -8581,7 +7899,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -9096,7 +8414,7 @@ fn float_nan_payload_constants_preserve_bits_and_keep_canonical_nan_compact() {
         vtables: &super::unsize::EMPTY_VTABLES,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -10461,7 +9779,7 @@ fn release_speed_inlines_f2i_strips_int32_only_wraps_and_uses_typed_array_repeat
             vtables: &vtables,
             spills: &[],
             abi: None,
-            physical: None,
+            final_lowering: false,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -10671,7 +9989,7 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
                 vtables: &vtables,
                 spills: &[],
                 abi: None,
-                physical: None,
+                final_lowering: false,
                 call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
                 bigints: None,
                 byte_views: crate::analysis::byte_views::ByteViewPlan {
@@ -10974,7 +10292,7 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
             vtables: &vtables,
             spills: &[],
             abi: None,
-            physical: None,
+            final_lowering: false,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan {
@@ -11267,7 +10585,7 @@ fn smi_u32_struct_fields_store_and_compare_signed_i32_and_cast_back_to_u32() {
         vtables: &vtables,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -11475,7 +10793,7 @@ fn pow2_unsigned_div_rem_shifts_and_masks_while_signed_keeps_div_rem() {
         vtables: &vtables,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -11564,7 +10882,7 @@ fn pow2_unsigned_div_rem_shifts_and_masks_while_signed_keeps_div_rem() {
         vtables: &vtables,
         spills: &[],
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),

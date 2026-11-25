@@ -28,7 +28,7 @@ use rcgjs_object::jsast;
 
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
-use crate::plan::representation::NativeBody;
+use crate::plan::native_types::NativeBody;
 
 /// Whole-program lowering policy for lazy byte views.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

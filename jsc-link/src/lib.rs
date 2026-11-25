@@ -30,8 +30,7 @@ mod report;
 
 /// The shared crate's modules, under the names the moved code already spells them by.
 pub(crate) use rcgjs_object::{
-    baseline_shadow, dts, item, jir, jsast, lane_report, late_ir, manifest, minify, opts, ptr,
-    sourcemap,
+    dts, item, jir, jsast, lane_report, manifest, minify, opts, ptr, sourcemap,
 };
 
 pub use link::run;

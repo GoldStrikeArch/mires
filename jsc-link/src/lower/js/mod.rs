@@ -18,7 +18,7 @@
 //! - `loc_of(origin)`: the `Stmt::Loc` marker of an origin, deduplicated as v1 `names.rs::Locs`;
 //! - `decline(op, detail)`: the one way to say no (never panic, never emit wrong JavaScript).
 
-pub mod adapters;
+pub mod ast_util;
 pub mod call;
 pub mod constant;
 pub mod emit;
@@ -32,7 +32,6 @@ pub mod post_opt;
 pub mod ptr;
 pub mod rvalue;
 pub mod soa;
-pub mod template;
 pub mod unsize;
 pub mod value;
 
@@ -130,8 +129,6 @@ pub struct JsCx<'a> {
     pub spills: &'a [JsName],
     /// The selected whole-program call ABI, when phase C applies one.
     pub abi: Option<&'a crate::plan::abi_flat::AbiPlan>,
-    /// This item's value-local storage choices, when phase C applies them.
-    pub physical: Option<(&'a JsName, &'a crate::plan::physical::PhysicalPlan)>,
     /// This declaration's selected physical signature. Unlike `abi.call_signature(item)`, this
     /// is absent on the canonical source when only its private `$n` body is physical.
     pub target_abi: Option<&'a crate::plan::abi_flat::FlatSig>,
@@ -155,9 +152,6 @@ pub struct JsCx<'a> {
     pub nested_clone: crate::lower::NestedClone,
     /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
     ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'a>>,
-    /// What one `view!` template instantiated in this body knows, by the value the
-    /// `rcgjs.tc.template` call defined (`template.rs`).
-    pub(super) instantiations: RefCell<BTreeMap<ValueId, template::Instantiation>>,
     /// The inline expression of every value the plan inlined, once its op has been lowered.
     exprs: RefCell<BTreeMap<ValueId, Expr>>,
     /// Normalized signed-`Int32` `(lo, hi)` pair expressions for 64-bit integer (`i64`/`u64`)
@@ -178,9 +172,6 @@ pub struct JsCx<'a> {
     /// `js-str=bytes`: the `as_bytes()` views this body holds as the string itself
     /// ([`JsCx::byte_view`]). Computed on first use.
     byte_string_views: std::cell::OnceCell<std::collections::BTreeMap<ValueId, ByteView>>,
-    /// Stage 3 (`js-str=bytes`): closed MIR-inlined `String.vec` operations in this body.
-    pub(super) inlined_string_vec:
-        std::cell::OnceCell<Option<crate::lower::semantic_ops::string::InlinedStringVecAnalysis>>,
     /// Allocation-bearing expressions paired with the JIR value that produced them. The final
     /// JavaScript allocation walker uses these only for provenance; they never affect emission.
     allocation_origins: RefCell<Vec<(ValueId, Expr)>>,
@@ -244,7 +235,6 @@ impl<'a> JsCx<'a> {
         }
         let carried_pairs = rvalue::carried_overflow_pairs(func, table);
         let int32_only = rvalue::int32_only_values(func, table, interns, &carried_pairs);
-        let inlined_string_vec = std::cell::OnceCell::new();
         JsCx {
             func,
             plan,
@@ -258,7 +248,6 @@ impl<'a> JsCx<'a> {
             vtables: &unsize::EMPTY_VTABLES,
             spills: &[],
             abi: None,
-            physical: None,
             target_abi: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             hoists_bigints: false,
@@ -269,14 +258,12 @@ impl<'a> JsCx<'a> {
             soa_bool_refs: RefCell::new(BTreeMap::new()),
             nested_clone: crate::lower::NestedClone::default(),
             ascii: None,
-            instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
             pair_exprs: RefCell::new(BTreeMap::new()),
             carried_i64_overflow: RefCell::new(BTreeMap::new()),
             formal_param_names: RefCell::new(HashSet::new()),
             tagged_exprs: RefCell::new(BTreeMap::new()),
             byte_string_views: std::cell::OnceCell::new(),
-            inlined_string_vec,
             allocation_origins: RefCell::new(Vec::new()),
             temps: RefCell::new(Vec::new()),
             zombies: RefCell::new(Vec::new()),
@@ -652,16 +639,6 @@ impl<'a> JsCx<'a> {
         self
     }
 
-    /// The same context, with linker-selected value-local storage for this declaration.
-    pub fn with_physical(
-        mut self,
-        item: &'a JsName,
-        physical: Option<&'a crate::plan::physical::PhysicalPlan>,
-    ) -> Self {
-        self.physical = physical.map(|physical| (item, physical));
-        self
-    }
-
     /// The same context, carrying whether wide byte views are reachable in the program.
     pub fn with_byte_views(
         mut self,
@@ -688,29 +665,6 @@ impl<'a> JsCx<'a> {
     pub fn heap(&self) -> &crate::analysis::heap::HeapPlan {
         self.heap
             .unwrap_or(&crate::analysis::heap::DEFAULT_HEAP_PLAN)
-    }
-
-    /// Exact numeric storage selected for one value in this declaration.
-    pub(super) fn typed_storage(
-        &self,
-        mut value: ValueId,
-    ) -> Option<crate::plan::physical::TypedStorage> {
-        let (item, physical) = self.physical?;
-        for _ in 0..=8 {
-            if let Some(storage) = physical.typed_storage(item, value) {
-                return Some(storage);
-            }
-            value = match &self.def_of(value)?.kind {
-                OpKind::Move(source) | OpKind::Copy(source) | OpKind::Deref(source) => *source,
-                OpKind::BorrowView {
-                    root: Root::Value(source),
-                    path,
-                    ..
-                } if path.is_empty() => *source,
-                _ => return None,
-            };
-        }
-        None
     }
 
     /// The physical signature of this exact declaration, if it is the selected private/in-place
@@ -1020,32 +974,6 @@ impl<'a> JsCx<'a> {
             .copied()
     }
 
-    pub(super) fn inlined_string_vec(
-        &self,
-    ) -> Option<&crate::lower::semantic_ops::string::InlinedStringVecAnalysis> {
-        self.inlined_string_vec
-            .get_or_init(|| {
-                if crate::lower::bstr::enabled() {
-                    crate::lower::semantic_ops::string::analyze_inlined_string_vec(
-                        self.func,
-                        self.table,
-                        self.interns,
-                        |item, link_name| {
-                            crate::lower::semantic_ops::string::is_raw_vec_reserve_by_link_name(
-                                self.interns,
-                                Some(self.items),
-                                item,
-                                link_name,
-                            )
-                        },
-                    )
-                } else {
-                    None
-                }
-            })
-            .as_ref()
-    }
-
     fn find_byte_string_views(&self) -> std::collections::BTreeMap<ValueId, ByteView> {
         let param_roots = self
             .target_abi
@@ -1056,7 +984,6 @@ impl<'a> JsCx<'a> {
             Some(self.plan),
             self.table,
             self.interns,
-            self.inlined_string_vec(),
             &param_roots,
             false,
             &|op, arg_idx| {
@@ -1671,7 +1598,7 @@ pub(crate) mod byte_view_analysis {
 
     use rcgjs_object::jir::interns::Interns;
     use rcgjs_object::jir::repr::{
-        Carrier, CellId, Dominators, Func, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueId,
+        CellId, Dominators, Func, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueId,
     };
     use rcgjs_object::jir::semantic::{
         BinaryOp, CallSemantic, Callee, CastKind, StandardOperation, UnaryOp,
@@ -1680,13 +1607,11 @@ pub(crate) mod byte_view_analysis {
 
     use super::{value, ByteView, ByteViewMode};
     use crate::lower::plan::Plan;
-    use crate::lower::semantic_ops::string::{InlinedStringVecAnalysis, StringRoot};
     use crate::plan::abi_flat::ByteStrParam;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
     enum BaseKey {
         Value(ValueId),
-        Cell(CellId),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2029,18 +1954,8 @@ pub(crate) mod byte_view_analysis {
         plan: &Plan,
         table: &TypeTable,
         interns: &Interns,
-        inlined_vec: Option<&InlinedStringVecAnalysis>,
     ) -> BTreeMap<ValueId, ByteView> {
-        analyze_with(
-            func,
-            Some(plan),
-            table,
-            interns,
-            inlined_vec,
-            &[],
-            false,
-            &|_, _| None,
-        )
+        analyze_with(func, Some(plan), table, interns, &[], false, &|_, _| None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2049,7 +1964,6 @@ pub(crate) mod byte_view_analysis {
         plan: Option<&Plan>,
         table: &TypeTable,
         interns: &Interns,
-        inlined_vec: Option<&InlinedStringVecAnalysis>,
         param_roots: &[(usize, ByteStrParam)],
         treat_slice_phi_as_var_slice: bool,
         call_accepts: &dyn Fn(&Op, usize) -> Option<ByteStrParam>,
@@ -2785,106 +2699,179 @@ pub(crate) mod byte_view_analysis {
                 let res_kind = func.ty(res).and_then(|ty| classify_ty(table, ty));
 
                 let mut handled = false;
-                if let Some(analysis) = inlined_vec {
-                    if let Some(&cid) = analysis.value_cluster.get(&res) {
-                        let cluster = &analysis.clusters[cid];
-                        let witness_carrier = cluster
-                            .witness_values
-                            .first()
-                            .map(|w| func.values[w.0 as usize].carrier);
-                        if matches!(
-                            witness_carrier,
-                            Some(Carrier::HostString | Carrier::StringBuilder)
-                        ) {
-                            if cluster.slice_values.contains(&res)
-                                && res_kind == Some(ByteKind::Slice)
-                            {
-                                let is_str_obj = witness_carrier == Some(Carrier::StringBuilder);
-                                let (key, seed_op) = match cluster.root {
-                                    StringRoot::Value(v) => (BaseKey::Value(v), None),
-                                    StringRoot::Cell(c) => (BaseKey::Cell(c), Some(res)),
-                                };
-                                roots[r] = Some((key, is_str_obj, seed_op, ByteKind::Slice));
+                match &op.kind {
+                    OpKind::Cast {
+                        kind: CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
+                        v: src,
+                        from,
+                        to,
+                    } => {
+                        if is_immutable_str_ref(table, *from) {
+                            if let Some(k) = classify_ty(table, *to) {
+                                roots[r] = Some((BaseKey::Value(*src), false, None, k));
                                 valid_op_def[r] = true;
-                                handled = true;
-                            } else if cluster.internal_values.contains(&res)
-                                || cluster.len_values.contains(&res)
-                            {
+                                if k == ByteKind::ThinPtr {
+                                    has_non_trivial_thin_use[r] = true;
+                                }
                                 handled = true;
                             }
-                        }
-                    }
-                }
-                if !handled {
-                    match &op.kind {
-                        OpKind::Cast {
-                            kind:
-                                CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
-                            v: src,
-                            from,
-                            to,
-                        } => {
-                            if is_immutable_str_ref(table, *from) {
-                                if let Some(k) = classify_ty(table, *to) {
-                                    roots[r] = Some((BaseKey::Value(*src), false, None, k));
+                        } else if is_slice_ty(table, *from) && is_immutable_str_ref(table, *to) {
+                            handled = true;
+                        } else if matches!(
+                            &op.kind,
+                            OpKind::Cast {
+                                kind: CastKind::PointerCoercion,
+                                ..
+                            }
+                        ) && const_u8_arr[src.0 as usize]
+                            && is_immutable_byte_array_ptr(table, *from).is_some()
+                            && is_immutable_byte_slice(table, *to)
+                        {
+                            roots[r] = Some((BaseKey::Value(res), false, None, ByteKind::Slice));
+                            valid_op_def[r] = true;
+                            handled = true;
+                        } else if null_niche_byte_payload(table, *from).is_none()
+                            && null_niche_byte_payload(table, *to).is_none()
+                        {
+                            if let (Some(sk), Some(rk)) = (classify_ty(table, *from), res_kind) {
+                                if sk == ByteKind::Slice || rk == ByteKind::ThinPtr {
+                                    let s = src.0 as usize;
+                                    uf.union(s, r);
                                     valid_op_def[r] = true;
-                                    if k == ByteKind::ThinPtr {
+                                    if sk == ByteKind::Slice && rk == ByteKind::Slice {
+                                        slice_uf.union(s, r);
+                                    } else {
                                         has_non_trivial_thin_use[r] = true;
                                     }
                                     handled = true;
                                 }
-                            } else if is_slice_ty(table, *from) && is_immutable_str_ref(table, *to)
-                            {
-                                handled = true;
-                            } else if matches!(
-                                &op.kind,
-                                OpKind::Cast {
-                                    kind: CastKind::PointerCoercion,
-                                    ..
-                                }
-                            ) && const_u8_arr[src.0 as usize]
-                                && is_immutable_byte_array_ptr(table, *from).is_some()
-                                && is_immutable_byte_slice(table, *to)
-                            {
-                                roots[r] =
-                                    Some((BaseKey::Value(res), false, None, ByteKind::Slice));
-                                valid_op_def[r] = true;
-                                handled = true;
-                            } else if null_niche_byte_payload(table, *from).is_none()
-                                && null_niche_byte_payload(table, *to).is_none()
-                            {
-                                if let (Some(sk), Some(rk)) = (classify_ty(table, *from), res_kind)
-                                {
-                                    if sk == ByteKind::Slice || rk == ByteKind::ThinPtr {
-                                        let s = src.0 as usize;
-                                        uf.union(s, r);
-                                        valid_op_def[r] = true;
-                                        if sk == ByteKind::Slice && rk == ByteKind::Slice {
-                                            slice_uf.union(s, r);
-                                        } else {
-                                            has_non_trivial_thin_use[r] = true;
-                                        }
-                                        handled = true;
-                                    }
-                                }
                             }
                         }
-                        OpKind::RawView {
-                            root: Root::Value(src),
-                            path,
-                            mutable: false,
-                        } if path.as_slice() == [Proj::Deref]
+                    }
+                    OpKind::RawView {
+                        root: Root::Value(src),
+                        path,
+                        mutable: false,
+                    } if path.as_slice() == [Proj::Deref]
+                        && func
+                            .ty(*src)
+                            .is_some_and(|ty| is_immutable_str_ref(table, ty))
+                        && func.ty(res).is_some_and(|ty| is_const_str_raw(table, ty)) =>
+                    {
+                        roots[r] = Some((BaseKey::Value(*src), false, None, ByteKind::Slice));
+                        valid_op_def[r] = true;
+                        handled = true;
+                    }
+                    OpKind::Move(src) | OpKind::Copy(src) => {
+                        let sk = func.ty(*src).and_then(|ty| classify_ty(table, ty));
+                        if let (Some(sk), Some(rk)) = (sk, res_kind) {
+                            if sk == rk {
+                                let s = src.0 as usize;
+                                uf.union(s, r);
+                                valid_op_def[r] = true;
+                                if sk == ByteKind::Slice {
+                                    slice_uf.union(s, r);
+                                } else {
+                                    has_non_trivial_thin_use[s] = true;
+                                    has_non_trivial_thin_use[r] = true;
+                                }
+                                handled = true;
+                            }
+                        }
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Value(src),
+                        path,
+                        mutable: false,
+                    }
+                    | OpKind::RawView {
+                        root: Root::Value(src),
+                        path,
+                        mutable: false,
+                    } => {
+                        let src_not_niche = func
+                            .ty(*src)
+                            .is_some_and(|ty| null_niche_byte_payload(table, ty).is_none());
+                        let res_not_niche = func
+                            .ty(res)
+                            .is_some_and(|ty| null_niche_byte_payload(table, ty).is_none());
+                        if let (Some(sk), Some(rk)) = (
+                            src_not_niche
+                                .then(|| func.ty(*src).and_then(|ty| classify_ty(table, ty)))
+                                .flatten(),
+                            res_not_niche.then_some(res_kind).flatten(),
+                        ) {
+                            let s = src.0 as usize;
+                            match path.as_slice() {
+                                [Proj::Deref] if sk == rk => {
+                                    uf.union(s, r);
+                                    valid_op_def[r] = true;
+                                    if sk == ByteKind::Slice {
+                                        slice_uf.union(s, r);
+                                    } else {
+                                        has_non_trivial_thin_use[s] = true;
+                                        has_non_trivial_thin_use[r] = true;
+                                    }
+                                    handled = true;
+                                }
+                                [Proj::Deref, Proj::Index(_) | Proj::ConstantIndex { .. }]
+                                    if (sk == ByteKind::Slice
+                                        || func.ty(*src).is_some_and(|ty| {
+                                            is_immutable_byte_array_ptr(table, ty).is_some()
+                                        }))
+                                        && func
+                                            .ty(res)
+                                            .is_some_and(|ty| is_immutable_byte_ptr(table, ty)) =>
+                                {
+                                    uf.union(s, r);
+                                    valid_op_def[r] = true;
+                                    if sk == ByteKind::Slice {
+                                        borrow_slice[r] = Some(*src);
+                                    } else {
+                                        has_non_trivial_thin_use[s] = true;
+                                        has_non_trivial_thin_use[r] = true;
+                                    }
+                                    handled = true;
+                                }
+                                [Proj::Deref, Proj::Subslice { .. }]
+                                    if sk == ByteKind::Slice && rk == ByteKind::Slice =>
+                                {
+                                    uf.union(s, r);
+                                    valid_op_def[r] = true;
+                                    var_slice_seed[r] = true;
+                                    handled = true;
+                                }
+                                _ => {}
+                            }
+                        } else if matches!(&op.kind, OpKind::BorrowView { mutable: false, .. })
+                            && path.as_slice() == [Proj::Deref]
+                            && func.ty(*src).is_some_and(|ty| is_slice_ty(table, ty))
                             && func
-                                .ty(*src)
+                                .ty(res)
                                 .is_some_and(|ty| is_immutable_str_ref(table, ty))
-                            && func.ty(res).is_some_and(|ty| is_const_str_raw(table, ty)) =>
                         {
-                            roots[r] = Some((BaseKey::Value(*src), false, None, ByteKind::Slice));
-                            valid_op_def[r] = true;
                             handled = true;
                         }
-                        OpKind::Move(src) | OpKind::Copy(src) => {
-                            let sk = func.ty(*src).and_then(|ty| classify_ty(table, ty));
+                    }
+                    OpKind::Aggregate { .. } if agg_fields[r].is_some() && !agg_escaped[r] => {
+                        handled = true;
+                    }
+                    OpKind::Field {
+                        base,
+                        variant: None,
+                        field,
+                    } if agg_origin[base.0 as usize]
+                        .or(agg_ref[base.0 as usize])
+                        .is_some_and(|orig| !agg_escaped[orig]) =>
+                    {
+                        let orig = agg_origin[base.0 as usize]
+                            .or(agg_ref[base.0 as usize])
+                            .unwrap();
+                        if let Some(&src) = agg_fields[orig]
+                            .as_ref()
+                            .and_then(|fs| fs.get(*field as usize))
+                        {
+                            let sk = func.ty(src).and_then(|ty| classify_ty(table, ty));
                             if let (Some(sk), Some(rk)) = (sk, res_kind) {
                                 if sk == rk {
                                     let s = src.0 as usize;
@@ -2900,127 +2887,276 @@ pub(crate) mod byte_view_analysis {
                                 }
                             }
                         }
-                        OpKind::BorrowView {
-                            root: Root::Value(src),
-                            path,
-                            mutable: false,
-                        }
-                        | OpKind::RawView {
-                            root: Root::Value(src),
-                            path,
-                            mutable: false,
-                        } => {
-                            let src_not_niche = func
-                                .ty(*src)
-                                .is_some_and(|ty| null_niche_byte_payload(table, ty).is_none());
-                            let res_not_niche = func
+                    }
+                    OpKind::Const(tree)
+                        if const_u8_slice_str(tree).is_some()
+                            && func
                                 .ty(res)
-                                .is_some_and(|ty| null_niche_byte_payload(table, ty).is_none());
-                            if let (Some(sk), Some(rk)) = (
-                                src_not_niche
-                                    .then(|| func.ty(*src).and_then(|ty| classify_ty(table, ty)))
-                                    .flatten(),
-                                res_not_niche.then_some(res_kind).flatten(),
-                            ) {
-                                let s = src.0 as usize;
-                                match path.as_slice() {
-                                    [Proj::Deref] if sk == rk => {
-                                        uf.union(s, r);
-                                        valid_op_def[r] = true;
-                                        if sk == ByteKind::Slice {
-                                            slice_uf.union(s, r);
-                                        } else {
-                                            has_non_trivial_thin_use[s] = true;
-                                            has_non_trivial_thin_use[r] = true;
-                                        }
-                                        handled = true;
+                                .is_some_and(|ty| is_immutable_byte_slice(table, ty)) =>
+                    {
+                        roots[r] = Some((BaseKey::Value(res), false, None, ByteKind::Slice));
+                        valid_op_def[r] = true;
+                        handled = true;
+                    }
+                    OpKind::CellLoad(cell) => {
+                        let ci = cell.0 as usize;
+                        if cell_ok.get(ci).copied().unwrap_or(false) {
+                            let ck = classify_ty(table, func.cells[ci].ty).unwrap();
+                            if res_kind == Some(ck) {
+                                if let Some(rep) = cell_rep[ci] {
+                                    uf.union(rep, r);
+                                    if ck == ByteKind::Slice {
+                                        slice_uf.union(rep, r);
+                                    } else {
+                                        has_non_trivial_thin_use[rep] = true;
+                                        has_non_trivial_thin_use[r] = true;
                                     }
-                                    [Proj::Deref, Proj::Index(_) | Proj::ConstantIndex { .. }]
-                                        if (sk == ByteKind::Slice
-                                            || func.ty(*src).is_some_and(|ty| {
-                                                is_immutable_byte_array_ptr(table, ty).is_some()
-                                            }))
-                                            && func.ty(res).is_some_and(|ty| {
-                                                is_immutable_byte_ptr(table, ty)
-                                            }) =>
-                                    {
-                                        uf.union(s, r);
-                                        valid_op_def[r] = true;
-                                        if sk == ByteKind::Slice {
-                                            borrow_slice[r] = Some(*src);
-                                        } else {
-                                            has_non_trivial_thin_use[s] = true;
-                                            has_non_trivial_thin_use[r] = true;
-                                        }
-                                        handled = true;
-                                    }
-                                    [Proj::Deref, Proj::Subslice { .. }]
-                                        if sk == ByteKind::Slice && rk == ByteKind::Slice =>
-                                    {
-                                        uf.union(s, r);
-                                        valid_op_def[r] = true;
-                                        var_slice_seed[r] = true;
-                                        handled = true;
-                                    }
-                                    _ => {}
+                                } else {
+                                    cell_rep[ci] = Some(r);
                                 }
-                            } else if matches!(&op.kind, OpKind::BorrowView { mutable: false, .. })
-                                && path.as_slice() == [Proj::Deref]
-                                && func.ty(*src).is_some_and(|ty| is_slice_ty(table, ty))
-                                && func
-                                    .ty(res)
-                                    .is_some_and(|ty| is_immutable_str_ref(table, ty))
-                            {
+                                valid_op_def[r] = true;
                                 handled = true;
                             }
                         }
-                        OpKind::Aggregate { .. } if agg_fields[r].is_some() && !agg_escaped[r] => {
-                            handled = true;
-                        }
-                        OpKind::Field {
-                            base,
-                            variant: None,
-                            field,
-                        } if agg_origin[base.0 as usize]
-                            .or(agg_ref[base.0 as usize])
-                            .is_some_and(|orig| !agg_escaped[orig]) =>
-                        {
-                            let orig = agg_origin[base.0 as usize]
-                                .or(agg_ref[base.0 as usize])
-                                .unwrap();
-                            if let Some(&src) = agg_fields[orig]
-                                .as_ref()
-                                .and_then(|fs| fs.get(*field as usize))
-                            {
-                                let sk = func.ty(src).and_then(|ty| classify_ty(table, ty));
-                                if let (Some(sk), Some(rk)) = (sk, res_kind) {
-                                    if sk == rk {
-                                        let s = src.0 as usize;
-                                        uf.union(s, r);
-                                        valid_op_def[r] = true;
-                                        if sk == ByteKind::Slice {
-                                            slice_uf.union(s, r);
-                                        } else {
-                                            has_non_trivial_thin_use[s] = true;
-                                            has_non_trivial_thin_use[r] = true;
-                                        }
-                                        handled = true;
-                                    }
-                                }
-                            }
-                        }
-                        OpKind::Const(tree)
-                            if const_u8_slice_str(tree).is_some()
-                                && func
-                                    .ty(res)
-                                    .is_some_and(|ty| is_immutable_byte_slice(table, ty)) =>
-                        {
-                            roots[r] = Some((BaseKey::Value(res), false, None, ByteKind::Slice));
+                    }
+                    OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Variant {
+                        variant,
+                        ..
+                    }) if func.ty(res).is_some_and(|ty| {
+                        null_niche_byte_payload(table, ty)
+                            .is_some_and(|(none_v, _, _, _, _)| *variant == none_v)
+                    }) =>
+                    {
+                        valid_op_def[r] = true;
+                        handled = true;
+                    }
+                    OpKind::Aggregate {
+                        ty,
+                        variant,
+                        fields,
+                        ..
+                    } if null_niche_byte_payload(table, *ty).is_some() => {
+                        let (none_v, some_v, fidx, _, is_slice) =
+                            null_niche_byte_payload(table, *ty).unwrap();
+                        if *variant == none_v {
                             valid_op_def[r] = true;
                             handled = true;
+                        } else if *variant == some_v {
+                            if let Some(&src) = fields.get(fidx as usize) {
+                                let s = src.0 as usize;
+                                uf.union(s, r);
+                                valid_op_def[r] = true;
+                                if is_slice {
+                                    slice_uf.union(s, r);
+                                } else {
+                                    has_non_trivial_thin_use[s] = true;
+                                    has_non_trivial_thin_use[r] = true;
+                                }
+                                handled = true;
+                            }
                         }
-                        OpKind::CellLoad(cell) => {
-                            let ci = cell.0 as usize;
+                    }
+                    OpKind::Discriminant(base)
+                        if func
+                            .ty(*base)
+                            .and_then(|ty| null_niche_byte_payload(table, ty))
+                            .is_some() =>
+                    {
+                        handled = true;
+                    }
+                    OpKind::Field {
+                        base,
+                        variant,
+                        field,
+                    } if func
+                        .ty(*base)
+                        .and_then(|ty| null_niche_byte_payload(table, ty))
+                        .is_some() =>
+                    {
+                        let (_, some_v, fidx, _, is_slice) = func
+                            .ty(*base)
+                            .and_then(|ty| null_niche_byte_payload(table, ty))
+                            .unwrap();
+                        if *variant == Some(some_v) && *field == fidx {
+                            let s = base.0 as usize;
+                            uf.union(s, r);
+                            valid_op_def[r] = true;
+                            if is_slice {
+                                slice_uf.union(s, r);
+                            } else {
+                                has_non_trivial_thin_use[s] = true;
+                                has_non_trivial_thin_use[r] = true;
+                            }
+                            handled = true;
+                        } else if func.ty(res).is_some_and(|ty| table.is_zst(ty)) {
+                            handled = true;
+                        }
+                    }
+                    OpKind::SliceView { ptr, .. } => {
+                        let pk = func
+                            .ty(*ptr)
+                            .filter(|ty| null_niche_byte_payload(table, *ty).is_none())
+                            .and_then(|ty| classify_ty(table, ty));
+                        if pk.is_some() && func.ty(res).is_some_and(|ty| is_slice_ty(table, ty)) {
+                            let p = ptr.0 as usize;
+                            uf.union(p, r);
+                            valid_op_def[r] = true;
+                            var_slice_seed[r] = true;
+                            has_non_trivial_thin_use[p] = true;
+                            handled = true;
+                        }
+                    }
+                    OpKind::Aggregate { ty, fields, .. }
+                        if fields.len() == 2
+                            && matches!(
+                                table.get(*ty).map(|d| &d.kind),
+                                Some(TypeKind::RawPointer { .. })
+                            )
+                            && res_kind == Some(ByteKind::Slice)
+                            && func
+                                .ty(fields[0])
+                                .and_then(|t| classify_ty(table, t))
+                                .is_some() =>
+                    {
+                        let p = fields[0].0 as usize;
+                        uf.union(p, r);
+                        valid_op_def[r] = true;
+                        var_slice_seed[r] = true;
+                        has_non_trivial_thin_use[p] = true;
+                        handled = true;
+                    }
+                    OpKind::Aggregate {
+                        ty,
+                        active_field,
+                        fields,
+                        ..
+                    } if res_kind.is_some()
+                        && table
+                            .get(*ty)
+                            .and_then(|d| {
+                                let inner = d.js.transparent?;
+                                let is_union = matches!(
+                                    d.kind,
+                                    TypeKind::Adt {
+                                        form: rcgjs_object::jir::types::NominalForm::Union,
+                                        ..
+                                    }
+                                );
+                                if is_union && active_field.is_some_and(|a| a != inner.field) {
+                                    return None;
+                                }
+                                let idx = if is_union { 0 } else { inner.field as usize };
+                                fields.get(idx).copied()
+                            })
+                            .is_some_and(|src| {
+                                func.ty(src).and_then(|t| classify_ty(table, t)) == res_kind
+                            }) =>
+                    {
+                        let d = table.get(*ty).unwrap();
+                        let inner = d.js.transparent.unwrap();
+                        let is_union = matches!(
+                            d.kind,
+                            TypeKind::Adt {
+                                form: rcgjs_object::jir::types::NominalForm::Union,
+                                ..
+                            }
+                        );
+                        let idx = if is_union { 0 } else { inner.field as usize };
+                        let src = fields[idx];
+                        let s = src.0 as usize;
+                        uf.union(s, r);
+                        valid_op_def[r] = true;
+                        if res_kind == Some(ByteKind::Slice) {
+                            slice_uf.union(s, r);
+                        } else {
+                            has_non_trivial_thin_use[s] = true;
+                            has_non_trivial_thin_use[r] = true;
+                        }
+                        handled = true;
+                    }
+                    OpKind::Field { base, field, .. }
+                        if res_kind.is_some()
+                            && func.ty(*base).is_some_and(|bty| {
+                                table
+                                    .get(bty)
+                                    .and_then(|d| d.js.transparent)
+                                    .is_some_and(|inner| inner.field == *field)
+                                    && classify_ty(table, bty) == res_kind
+                            }) =>
+                    {
+                        let s = base.0 as usize;
+                        uf.union(s, r);
+                        valid_op_def[r] = true;
+                        if res_kind == Some(ByteKind::Slice) {
+                            slice_uf.union(s, r);
+                        } else {
+                            has_non_trivial_thin_use[s] = true;
+                            has_non_trivial_thin_use[r] = true;
+                        }
+                        handled = true;
+                    }
+                    OpKind::Binary {
+                        op: BinaryOp::Offset,
+                        l,
+                        ty,
+                        ..
+                    } => {
+                        if is_immutable_byte_ptr(table, *ty)
+                            && func
+                                .ty(*l)
+                                .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
+                            && func
+                                .ty(res)
+                                .is_some_and(|rt| is_immutable_byte_ptr(table, rt))
+                        {
+                            let li = l.0 as usize;
+                            uf.union(li, r);
+                            valid_op_def[r] = true;
+                            has_non_trivial_thin_use[li] = true;
+                            has_non_trivial_thin_use[r] = true;
+                            handled = true;
+                        }
+                    }
+                    OpKind::Binary {
+                        op:
+                            BinaryOp::Eq
+                            | BinaryOp::Ne
+                            | BinaryOp::Lt
+                            | BinaryOp::Le
+                            | BinaryOp::Gt
+                            | BinaryOp::Ge,
+                        l,
+                        r: rhs,
+                        ty,
+                    } => {
+                        if is_ptr_ty(table, *ty) {
+                            uf.union(l.0 as usize, rhs.0 as usize);
+                            has_non_trivial_thin_use[l.0 as usize] = true;
+                            has_non_trivial_thin_use[rhs.0 as usize] = true;
+                            handled = true;
+                        } else if !is_slice_ty(table, *ty)
+                            && !is_byte_view_candidate(func, table, *l)
+                            && !is_byte_view_candidate(func, table, *rhs)
+                        {
+                            handled = true;
+                        }
+                    }
+                    OpKind::Unary {
+                        op: UnaryOp::PtrMetadata,
+                        v,
+                        ..
+                    } => {
+                        if func.ty(*v).is_some_and(|ty| is_slice_ty(table, ty)) {
+                            handled = true;
+                        }
+                    }
+                    OpKind::Deref(ptr) => {
+                        if func
+                            .ty(*ptr)
+                            .is_some_and(|ty| is_immutable_byte_ptr(table, ty))
+                        {
+                            handled = true;
+                        } else if let Some(ci) = ref_to_cell[ptr.0 as usize] {
                             if cell_ok.get(ci).copied().unwrap_or(false) {
                                 let ck = classify_ty(table, func.cells[ci].ty).unwrap();
                                 if res_kind == Some(ck) {
@@ -3039,510 +3175,243 @@ pub(crate) mod byte_view_analysis {
                                     handled = true;
                                 }
                             }
-                        }
-                        OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Variant {
-                            variant,
-                            ..
-                        }) if func.ty(res).is_some_and(|ty| {
-                            null_niche_byte_payload(table, ty)
-                                .is_some_and(|(none_v, _, _, _, _)| *variant == none_v)
-                        }) =>
-                        {
-                            valid_op_def[r] = true;
-                            handled = true;
-                        }
-                        OpKind::Aggregate {
-                            ty,
-                            variant,
-                            fields,
-                            ..
-                        } if null_niche_byte_payload(table, *ty).is_some() => {
-                            let (none_v, some_v, fidx, _, is_slice) =
-                                null_niche_byte_payload(table, *ty).unwrap();
-                            if *variant == none_v {
-                                valid_op_def[r] = true;
-                                handled = true;
-                            } else if *variant == some_v {
-                                if let Some(&src) = fields.get(fidx as usize) {
-                                    let s = src.0 as usize;
-                                    uf.union(s, r);
-                                    valid_op_def[r] = true;
-                                    if is_slice {
-                                        slice_uf.union(s, r);
-                                    } else {
-                                        has_non_trivial_thin_use[s] = true;
-                                        has_non_trivial_thin_use[r] = true;
-                                    }
-                                    handled = true;
-                                }
-                            }
-                        }
-                        OpKind::Discriminant(base)
-                            if func
-                                .ty(*base)
-                                .and_then(|ty| null_niche_byte_payload(table, ty))
-                                .is_some() =>
-                        {
-                            handled = true;
-                        }
-                        OpKind::Field {
-                            base,
-                            variant,
-                            field,
-                        } if func
-                            .ty(*base)
-                            .and_then(|ty| null_niche_byte_payload(table, ty))
-                            .is_some() =>
-                        {
-                            let (_, some_v, fidx, _, is_slice) = func
-                                .ty(*base)
-                                .and_then(|ty| null_niche_byte_payload(table, ty))
-                                .unwrap();
-                            if *variant == Some(some_v) && *field == fidx {
-                                let s = base.0 as usize;
-                                uf.union(s, r);
-                                valid_op_def[r] = true;
-                                if is_slice {
-                                    slice_uf.union(s, r);
-                                } else {
-                                    has_non_trivial_thin_use[s] = true;
-                                    has_non_trivial_thin_use[r] = true;
-                                }
-                                handled = true;
-                            } else if func.ty(res).is_some_and(|ty| table.is_zst(ty)) {
-                                handled = true;
-                            }
-                        }
-                        OpKind::SliceView { ptr, .. } => {
-                            let pk = func
-                                .ty(*ptr)
-                                .filter(|ty| null_niche_byte_payload(table, *ty).is_none())
-                                .and_then(|ty| classify_ty(table, ty));
-                            if pk.is_some() && func.ty(res).is_some_and(|ty| is_slice_ty(table, ty))
-                            {
-                                let p = ptr.0 as usize;
-                                uf.union(p, r);
-                                valid_op_def[r] = true;
-                                var_slice_seed[r] = true;
-                                has_non_trivial_thin_use[p] = true;
-                                handled = true;
-                            }
-                        }
-                        OpKind::Aggregate { ty, fields, .. }
-                            if fields.len() == 2
-                                && matches!(
-                                    table.get(*ty).map(|d| &d.kind),
-                                    Some(TypeKind::RawPointer { .. })
-                                )
-                                && res_kind == Some(ByteKind::Slice)
-                                && func
-                                    .ty(fields[0])
-                                    .and_then(|t| classify_ty(table, t))
-                                    .is_some() =>
-                        {
-                            let p = fields[0].0 as usize;
-                            uf.union(p, r);
-                            valid_op_def[r] = true;
-                            var_slice_seed[r] = true;
-                            has_non_trivial_thin_use[p] = true;
-                            handled = true;
-                        }
-                        OpKind::Aggregate {
-                            ty,
-                            active_field,
-                            fields,
-                            ..
-                        } if res_kind.is_some()
-                            && table
-                                .get(*ty)
-                                .and_then(|d| {
-                                    let inner = d.js.transparent?;
-                                    let is_union = matches!(
-                                        d.kind,
-                                        TypeKind::Adt {
-                                            form: rcgjs_object::jir::types::NominalForm::Union,
-                                            ..
+                        } else if let Some(src) = ref_to_val[ptr.0 as usize] {
+                            if !ref_to_val_escaped[ptr.0 as usize] {
+                                let sk = func.ty(src).and_then(|ty| classify_ty(table, ty));
+                                if let (Some(sk), Some(rk)) = (sk, res_kind) {
+                                    if sk == rk {
+                                        let s = src.0 as usize;
+                                        uf.union(s, r);
+                                        valid_op_def[r] = true;
+                                        if sk == ByteKind::Slice {
+                                            slice_uf.union(s, r);
+                                        } else {
+                                            has_non_trivial_thin_use[s] = true;
+                                            has_non_trivial_thin_use[r] = true;
                                         }
-                                    );
-                                    if is_union && active_field.is_some_and(|a| a != inner.field) {
-                                        return None;
+                                        handled = true;
                                     }
-                                    let idx = if is_union { 0 } else { inner.field as usize };
-                                    fields.get(idx).copied()
-                                })
-                                .is_some_and(|src| {
-                                    func.ty(src).and_then(|t| classify_ty(table, t)) == res_kind
-                                }) =>
-                        {
-                            let d = table.get(*ty).unwrap();
-                            let inner = d.js.transparent.unwrap();
-                            let is_union = matches!(
-                                d.kind,
-                                TypeKind::Adt {
-                                    form: rcgjs_object::jir::types::NominalForm::Union,
-                                    ..
                                 }
-                            );
-                            let idx = if is_union { 0 } else { inner.field as usize };
-                            let src = fields[idx];
-                            let s = src.0 as usize;
-                            uf.union(s, r);
-                            valid_op_def[r] = true;
-                            if res_kind == Some(ByteKind::Slice) {
-                                slice_uf.union(s, r);
-                            } else {
-                                has_non_trivial_thin_use[s] = true;
-                                has_non_trivial_thin_use[r] = true;
                             }
-                            handled = true;
                         }
-                        OpKind::Field { base, field, .. }
-                            if res_kind.is_some()
-                                && func.ty(*base).is_some_and(|bty| {
-                                    table
-                                        .get(bty)
-                                        .and_then(|d| d.js.transparent)
-                                        .is_some_and(|inner| inner.field == *field)
-                                        && classify_ty(table, bty) == res_kind
-                                }) =>
-                        {
-                            let s = base.0 as usize;
-                            uf.union(s, r);
-                            valid_op_def[r] = true;
-                            if res_kind == Some(ByteKind::Slice) {
-                                slice_uf.union(s, r);
-                            } else {
-                                has_non_trivial_thin_use[s] = true;
-                                has_non_trivial_thin_use[r] = true;
-                            }
-                            handled = true;
-                        }
-                        OpKind::Binary {
-                            op: BinaryOp::Offset,
-                            l,
-                            ty,
-                            ..
-                        } => {
-                            if is_immutable_byte_ptr(table, *ty)
-                                && func
-                                    .ty(*l)
-                                    .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
-                                && func
-                                    .ty(res)
-                                    .is_some_and(|rt| is_immutable_byte_ptr(table, rt))
+                    }
+                    OpKind::Intrinsic {
+                        name, types, args, ..
+                    } => {
+                        let name_s = interns.str(*name).unwrap_or("");
+                        match name_s {
+                            "transmute" | "transmute_unchecked"
+                                if types.len() == 2 && args.len() == 1 =>
                             {
-                                let li = l.0 as usize;
+                                let (from, to, src) = (types[0], types[1], args[0]);
+                                if is_immutable_str_ref(table, from) {
+                                    if let Some(k) = classify_ty(table, to) {
+                                        roots[r] = Some((BaseKey::Value(src), false, None, k));
+                                        valid_op_def[r] = true;
+                                        if k == ByteKind::ThinPtr {
+                                            has_non_trivial_thin_use[r] = true;
+                                        }
+                                        handled = true;
+                                    }
+                                } else if is_slice_ty(table, from)
+                                    && is_immutable_str_ref(table, to)
+                                {
+                                    handled = true;
+                                } else if let (Some(sk), Some(rk)) =
+                                    (classify_ty(table, from), res_kind)
+                                {
+                                    if sk == ByteKind::Slice || rk == ByteKind::ThinPtr {
+                                        let s = src.0 as usize;
+                                        uf.union(s, r);
+                                        valid_op_def[r] = true;
+                                        if sk == ByteKind::Slice && rk == ByteKind::Slice {
+                                            slice_uf.union(s, r);
+                                        } else {
+                                            has_non_trivial_thin_use[r] = true;
+                                        }
+                                        handled = true;
+                                    }
+                                }
+                            }
+                            "offset" | "arith_offset"
+                                if args.len() == 2
+                                    && types.first().is_some_and(|t| value::is_u8(table, *t))
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
+                                    && func
+                                        .ty(res)
+                                        .is_some_and(|rt| is_immutable_byte_ptr(table, rt)) =>
+                            {
+                                let li = args[0].0 as usize;
                                 uf.union(li, r);
                                 valid_op_def[r] = true;
                                 has_non_trivial_thin_use[li] = true;
                                 has_non_trivial_thin_use[r] = true;
                                 handled = true;
                             }
-                        }
-                        OpKind::Binary {
-                            op:
-                                BinaryOp::Eq
-                                | BinaryOp::Ne
-                                | BinaryOp::Lt
-                                | BinaryOp::Le
-                                | BinaryOp::Gt
-                                | BinaryOp::Ge,
-                            l,
-                            r: rhs,
-                            ty,
-                        } => {
-                            if is_ptr_ty(table, *ty) {
-                                uf.union(l.0 as usize, rhs.0 as usize);
-                                has_non_trivial_thin_use[l.0 as usize] = true;
-                                has_non_trivial_thin_use[rhs.0 as usize] = true;
+                            "ptr_offset_from" | "ptr_offset_from_unsigned"
+                                if args.len() == 2
+                                    && types.first().is_some_and(|t| value::is_u8(table, *t))
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
+                                    && func
+                                        .ty(args[1])
+                                        .is_some_and(|rt| is_immutable_byte_ptr(table, rt)) =>
+                            {
+                                uf.union(args[0].0 as usize, args[1].0 as usize);
+                                has_non_trivial_thin_use[args[0].0 as usize] = true;
+                                has_non_trivial_thin_use[args[1].0 as usize] = true;
                                 handled = true;
-                            } else if !is_slice_ty(table, *ty)
-                                && !is_byte_view_candidate(func, table, *l)
-                                && !is_byte_view_candidate(func, table, *rhs)
+                            }
+                            "read_via_copy" | "volatile_load" | "unaligned_volatile_load"
+                                if args.len() == 1
+                                    && types.first().is_some_and(|t| value::is_u8(table, *t))
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|lt| is_immutable_byte_ptr(table, lt)) =>
+                            {
+                                has_non_trivial_thin_use[args[0].0 as usize] = true;
+                                handled = true;
+                            }
+                            "ptr_metadata"
+                                if args.len() == 1
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|ty| is_slice_ty(table, ty)) =>
                             {
                                 handled = true;
                             }
-                        }
-                        OpKind::Unary {
-                            op: UnaryOp::PtrMetadata,
-                            v,
-                            ..
-                        } => {
-                            if func.ty(*v).is_some_and(|ty| is_slice_ty(table, ty)) {
-                                handled = true;
-                            }
-                        }
-                        OpKind::Deref(ptr) => {
-                            if func
-                                .ty(*ptr)
-                                .is_some_and(|ty| is_immutable_byte_ptr(table, ty))
+                            "slice_get_unchecked"
+                                if args.len() == 2
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|ty| is_immutable_byte_slice(table, ty))
+                                    && func
+                                        .ty(res)
+                                        .is_some_and(|ty| is_immutable_byte_ptr(table, ty)) =>
                             {
+                                let s = args[0].0 as usize;
+                                uf.union(s, r);
+                                valid_op_def[r] = true;
+                                has_non_trivial_thin_use[r] = true;
                                 handled = true;
-                            } else if let Some(ci) = ref_to_cell[ptr.0 as usize] {
-                                if cell_ok.get(ci).copied().unwrap_or(false) {
-                                    let ck = classify_ty(table, func.cells[ci].ty).unwrap();
-                                    if res_kind == Some(ck) {
-                                        if let Some(rep) = cell_rep[ci] {
-                                            uf.union(rep, r);
-                                            if ck == ByteKind::Slice {
-                                                slice_uf.union(rep, r);
-                                            } else {
-                                                has_non_trivial_thin_use[rep] = true;
-                                                has_non_trivial_thin_use[r] = true;
-                                            }
-                                        } else {
-                                            cell_rep[ci] = Some(r);
-                                        }
-                                        valid_op_def[r] = true;
-                                        handled = true;
+                            }
+                            "compare_bytes" if args.len() == 3 => {
+                                let a0_cand = is_byte_view_candidate(func, table, args[0]);
+                                let a1_cand = is_byte_view_candidate(func, table, args[1]);
+                                let a0_ok = !a0_cand
+                                    || func
+                                        .ty(args[0])
+                                        .is_some_and(|lt| is_immutable_byte_ptr(table, lt));
+                                let a1_ok = !a1_cand
+                                    || func
+                                        .ty(args[1])
+                                        .is_some_and(|rt| is_immutable_byte_ptr(table, rt));
+                                if a0_ok && a1_ok {
+                                    if a0_cand {
+                                        has_non_trivial_thin_use[args[0].0 as usize] = true;
                                     }
+                                    if a1_cand {
+                                        has_non_trivial_thin_use[args[1].0 as usize] = true;
+                                    }
+                                    handled = true;
                                 }
-                            } else if let Some(src) = ref_to_val[ptr.0 as usize] {
-                                if !ref_to_val_escaped[ptr.0 as usize] {
-                                    let sk = func.ty(src).and_then(|ty| classify_ty(table, ty));
-                                    if let (Some(sk), Some(rk)) = (sk, res_kind) {
-                                        if sk == rk {
-                                            let s = src.0 as usize;
-                                            uf.union(s, r);
-                                            valid_op_def[r] = true;
-                                            if sk == ByteKind::Slice {
-                                                slice_uf.union(s, r);
-                                            } else {
-                                                has_non_trivial_thin_use[s] = true;
-                                                has_non_trivial_thin_use[r] = true;
-                                            }
-                                            handled = true;
-                                        }
+                            }
+                            "raw_eq"
+                                if args.len() == 2
+                                    && types.first().is_some_and(|pointee| {
+                                        matches!(
+                                            value::kind(table, table.peeled(*pointee)),
+                                            Some(TypeKind::Array { element, .. })
+                                                if value::is_u8(table, *element)
+                                        )
+                                    }) =>
+                            {
+                                let a0_cand = is_byte_view_candidate(func, table, args[0]);
+                                let a1_cand = is_byte_view_candidate(func, table, args[1]);
+                                let a0_ok = !a0_cand
+                                    || func.ty(args[0]).is_some_and(|lt| {
+                                        is_immutable_byte_array_ptr(table, lt).is_some()
+                                    });
+                                let a1_ok = !a1_cand
+                                    || func.ty(args[1]).is_some_and(|rt| {
+                                        is_immutable_byte_array_ptr(table, rt).is_some()
+                                    });
+                                if a0_ok && a1_ok {
+                                    if a0_cand {
+                                        has_non_trivial_thin_use[args[0].0 as usize] = true;
+                                    }
+                                    if a1_cand {
+                                        has_non_trivial_thin_use[args[1].0 as usize] = true;
+                                    }
+                                    handled = true;
+                                }
+                            }
+                            "copy_nonoverlapping" | "copy"
+                                if args.len() == 3
+                                    && types.first().is_some_and(|t| value::is_u8(table, *t))
+                                    && func
+                                        .ty(args[0])
+                                        .is_some_and(|lt| is_immutable_byte_ptr(table, lt)) =>
+                            {
+                                has_non_trivial_thin_use[args[0].0 as usize] = true;
+                                if is_byte_view_candidate(func, table, args[1]) {
+                                    poisoned[args[1].0 as usize] = true;
+                                }
+                                handled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    OpKind::Call {
+                        semantic: CallSemantic::Standard(StandardOperation::SliceIsAscii),
+                        args,
+                        ..
+                    } if args.len() == 1
+                        && func
+                            .ty(args[0])
+                            .is_some_and(|ty| is_immutable_byte_slice(table, ty)) =>
+                    {
+                        handled = true;
+                    }
+                    OpKind::Call {
+                        callee: Callee::Direct { .. },
+                        host: None,
+                        args,
+                        ..
+                    } => {
+                        let mut any_accepted = false;
+                        for (arg_idx, &arg) in args.iter().enumerate() {
+                            if call_accepts(op, arg_idx).is_some()
+                                && func
+                                    .ty(arg)
+                                    .is_some_and(|ty| is_immutable_byte_slice(table, ty))
+                            {
+                                any_accepted = true;
+                            }
+                        }
+                        if any_accepted {
+                            for (arg_idx, &arg) in args.iter().enumerate() {
+                                if is_byte_view_candidate(func, table, arg) {
+                                    let accepted = call_accepts(op, arg_idx).is_some()
+                                        && func
+                                            .ty(arg)
+                                            .is_some_and(|ty| is_immutable_byte_slice(table, ty));
+                                    if !accepted {
+                                        poisoned[arg.0 as usize] = true;
                                     }
                                 }
                             }
-                        }
-                        OpKind::Intrinsic {
-                            name, types, args, ..
-                        } => {
-                            let name_s = interns.str(*name).unwrap_or("");
-                            match name_s {
-                                "transmute" | "transmute_unchecked"
-                                    if types.len() == 2 && args.len() == 1 =>
-                                {
-                                    let (from, to, src) = (types[0], types[1], args[0]);
-                                    if is_immutable_str_ref(table, from) {
-                                        if let Some(k) = classify_ty(table, to) {
-                                            roots[r] = Some((BaseKey::Value(src), false, None, k));
-                                            valid_op_def[r] = true;
-                                            if k == ByteKind::ThinPtr {
-                                                has_non_trivial_thin_use[r] = true;
-                                            }
-                                            handled = true;
-                                        }
-                                    } else if is_slice_ty(table, from)
-                                        && is_immutable_str_ref(table, to)
-                                    {
-                                        handled = true;
-                                    } else if let (Some(sk), Some(rk)) =
-                                        (classify_ty(table, from), res_kind)
-                                    {
-                                        if sk == ByteKind::Slice || rk == ByteKind::ThinPtr {
-                                            let s = src.0 as usize;
-                                            uf.union(s, r);
-                                            valid_op_def[r] = true;
-                                            if sk == ByteKind::Slice && rk == ByteKind::Slice {
-                                                slice_uf.union(s, r);
-                                            } else {
-                                                has_non_trivial_thin_use[r] = true;
-                                            }
-                                            handled = true;
-                                        }
-                                    }
-                                }
-                                "offset" | "arith_offset"
-                                    if args.len() == 2
-                                        && types
-                                            .first()
-                                            .is_some_and(|t| value::is_u8(table, *t))
-                                        && func
-                                            .ty(args[0])
-                                            .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
-                                        && func
-                                            .ty(res)
-                                            .is_some_and(|rt| is_immutable_byte_ptr(table, rt)) =>
-                                {
-                                    let li = args[0].0 as usize;
-                                    uf.union(li, r);
-                                    valid_op_def[r] = true;
-                                    has_non_trivial_thin_use[li] = true;
-                                    has_non_trivial_thin_use[r] = true;
-                                    handled = true;
-                                }
-                                "ptr_offset_from" | "ptr_offset_from_unsigned"
-                                    if args.len() == 2
-                                        && types
-                                            .first()
-                                            .is_some_and(|t| value::is_u8(table, *t))
-                                        && func
-                                            .ty(args[0])
-                                            .is_some_and(|lt| is_immutable_byte_ptr(table, lt))
-                                        && func
-                                            .ty(args[1])
-                                            .is_some_and(|rt| is_immutable_byte_ptr(table, rt)) =>
-                                {
-                                    uf.union(args[0].0 as usize, args[1].0 as usize);
-                                    has_non_trivial_thin_use[args[0].0 as usize] = true;
-                                    has_non_trivial_thin_use[args[1].0 as usize] = true;
-                                    handled = true;
-                                }
-                                "read_via_copy" | "volatile_load" | "unaligned_volatile_load"
-                                    if args.len() == 1
-                                        && types
-                                            .first()
-                                            .is_some_and(|t| value::is_u8(table, *t))
-                                        && func
-                                            .ty(args[0])
-                                            .is_some_and(|lt| is_immutable_byte_ptr(table, lt)) =>
-                                {
-                                    has_non_trivial_thin_use[args[0].0 as usize] = true;
-                                    handled = true;
-                                }
-                                "ptr_metadata"
-                                    if args.len() == 1
-                                        && func
-                                            .ty(args[0])
-                                            .is_some_and(|ty| is_slice_ty(table, ty)) =>
-                                {
-                                    handled = true;
-                                }
-                                "slice_get_unchecked"
-                                    if args.len() == 2
-                                        && func.ty(args[0]).is_some_and(|ty| {
-                                            is_immutable_byte_slice(table, ty)
-                                        })
-                                        && func
-                                            .ty(res)
-                                            .is_some_and(|ty| is_immutable_byte_ptr(table, ty)) =>
-                                {
-                                    let s = args[0].0 as usize;
-                                    uf.union(s, r);
-                                    valid_op_def[r] = true;
-                                    has_non_trivial_thin_use[r] = true;
-                                    handled = true;
-                                }
-                                "compare_bytes" if args.len() == 3 => {
-                                    let a0_cand = is_byte_view_candidate(func, table, args[0]);
-                                    let a1_cand = is_byte_view_candidate(func, table, args[1]);
-                                    let a0_ok = !a0_cand
-                                        || func
-                                            .ty(args[0])
-                                            .is_some_and(|lt| is_immutable_byte_ptr(table, lt));
-                                    let a1_ok = !a1_cand
-                                        || func
-                                            .ty(args[1])
-                                            .is_some_and(|rt| is_immutable_byte_ptr(table, rt));
-                                    if a0_ok && a1_ok {
-                                        if a0_cand {
-                                            has_non_trivial_thin_use[args[0].0 as usize] = true;
-                                        }
-                                        if a1_cand {
-                                            has_non_trivial_thin_use[args[1].0 as usize] = true;
-                                        }
-                                        handled = true;
-                                    }
-                                }
-                                "raw_eq"
-                                    if args.len() == 2
-                                        && types.first().is_some_and(|pointee| {
-                                            matches!(
-                                                value::kind(table, table.peeled(*pointee)),
-                                                Some(TypeKind::Array { element, .. })
-                                                    if value::is_u8(table, *element)
-                                            )
-                                        }) =>
-                                {
-                                    let a0_cand = is_byte_view_candidate(func, table, args[0]);
-                                    let a1_cand = is_byte_view_candidate(func, table, args[1]);
-                                    let a0_ok = !a0_cand
-                                        || func.ty(args[0]).is_some_and(|lt| {
-                                            is_immutable_byte_array_ptr(table, lt).is_some()
-                                        });
-                                    let a1_ok = !a1_cand
-                                        || func.ty(args[1]).is_some_and(|rt| {
-                                            is_immutable_byte_array_ptr(table, rt).is_some()
-                                        });
-                                    if a0_ok && a1_ok {
-                                        if a0_cand {
-                                            has_non_trivial_thin_use[args[0].0 as usize] = true;
-                                        }
-                                        if a1_cand {
-                                            has_non_trivial_thin_use[args[1].0 as usize] = true;
-                                        }
-                                        handled = true;
-                                    }
-                                }
-                                "copy_nonoverlapping" | "copy"
-                                    if args.len() == 3
-                                        && types
-                                            .first()
-                                            .is_some_and(|t| value::is_u8(table, *t))
-                                        && func
-                                            .ty(args[0])
-                                            .is_some_and(|lt| is_immutable_byte_ptr(table, lt)) =>
-                                {
-                                    has_non_trivial_thin_use[args[0].0 as usize] = true;
-                                    if is_byte_view_candidate(func, table, args[1]) {
-                                        poisoned[args[1].0 as usize] = true;
-                                    }
-                                    handled = true;
-                                }
-                                _ => {}
+                            if res_kind.is_some() {
+                                poisoned[r] = true;
                             }
-                        }
-                        OpKind::Call {
-                            semantic: CallSemantic::Standard(StandardOperation::SliceIsAscii),
-                            args,
-                            ..
-                        } if args.len() == 1
-                            && func
-                                .ty(args[0])
-                                .is_some_and(|ty| is_immutable_byte_slice(table, ty)) =>
-                        {
                             handled = true;
                         }
-                        OpKind::Call {
-                            callee: Callee::Direct { .. },
-                            host: None,
-                            args,
-                            ..
-                        } => {
-                            let mut any_accepted = false;
-                            for (arg_idx, &arg) in args.iter().enumerate() {
-                                if call_accepts(op, arg_idx).is_some()
-                                    && func
-                                        .ty(arg)
-                                        .is_some_and(|ty| is_immutable_byte_slice(table, ty))
-                                {
-                                    any_accepted = true;
-                                }
-                            }
-                            if any_accepted {
-                                for (arg_idx, &arg) in args.iter().enumerate() {
-                                    if is_byte_view_candidate(func, table, arg) {
-                                        let accepted = call_accepts(op, arg_idx).is_some()
-                                            && func.ty(arg).is_some_and(|ty| {
-                                                is_immutable_byte_slice(table, ty)
-                                            });
-                                        if !accepted {
-                                            poisoned[arg.0 as usize] = true;
-                                        }
-                                    }
-                                }
-                                if res_kind.is_some() {
-                                    poisoned[r] = true;
-                                }
-                                handled = true;
-                            }
-                        }
-                        _ => {}
                     }
-                } // end if !handled
+                    _ => {}
+                }
 
                 if !handled {
                     for u in op.kind.uses() {
@@ -4032,11 +3901,8 @@ pub(crate) mod byte_view_analysis {
             }
 
             if has_var_slice && !needs_single_base {
-                let all_roots_reusable = comp_roots.keys().all(|&(raw_key, _)| match raw_key {
-                    BaseKey::Value(raw_base) => {
-                        is_reusable_base_str(func, plan, raw_base).is_some()
-                    }
-                    BaseKey::Cell(_) => true,
+                let all_roots_reusable = comp_roots.keys().all(|&(BaseKey::Value(raw_base), _)| {
+                    is_reusable_base_str(func, plan, raw_base).is_some()
                 });
                 if !all_roots_reusable {
                     continue;
@@ -4047,14 +3913,9 @@ pub(crate) mod byte_view_analysis {
                 if comp_roots.len() != 1 {
                     return None;
                 }
-                let (&(raw_key, is_str_obj), &seed_op) = comp_roots.iter().next()?;
-                let (base_val, base_cell, dom_val) = match raw_key {
-                    BaseKey::Value(raw_base) => {
-                        let base = is_reusable_base_str(func, plan, raw_base)?;
-                        (Some(base), None, Some(base))
-                    }
-                    BaseKey::Cell(cell) => (None, Some(cell), seed_op),
-                };
+                let (&(BaseKey::Value(raw_base), is_str_obj), _) = comp_roots.iter().next()?;
+                let base = is_reusable_base_str(func, plan, raw_base)?;
+                let (base_val, base_cell, dom_val) = (Some(base), None, Some(base));
                 let dom_v = dom_val?;
                 let base_blk = def_block[dom_v.0 as usize]?;
                 for &v in &members {
@@ -4291,7 +4152,7 @@ mod byte_view_tests {
 
     fn run_analyze(interns: &Interns, func: &Func) -> BTreeMap<ValueId, ByteView> {
         let plan = super::super::fuse::plan(func, None, &interns.types, interns, &Opts::default());
-        byte_view_analysis::analyze(func, &plan, &interns.types, interns, None)
+        byte_view_analysis::analyze(func, &plan, &interns.types, interns)
     }
 
     #[test]

@@ -31,89 +31,23 @@ use std::sync::OnceLock;
 
 use crate::analysis::js_alloc::JsAllocSites;
 use crate::jir::decline::Decline;
-use crate::jir::hash::Hash128;
-use crate::jir::repr::{Carrier, Func, ValueId};
+use crate::jir::repr::Func;
 use crate::jsast;
 use crate::lower::{LowerInput, LoweredItem};
 use crate::opt::OptStats;
 use crate::opts::{OptimizerMode, Opts};
 
-/// The solver's infinity: an illegal labeling. Matches `plan/mincut.rs`'s arc capacity ceiling,
-/// far enough from `u64::MAX` that summing terms cannot wrap.
-pub const INF: u64 = u64::MAX / 4;
-
-/// The consumer-side runtime, whose members price the `Helper` facility nodes.
+/// The consumer-side runtime, whose members price helper closures.
 pub(crate) const SHIM: &str = include_str!("../../../runtime/shim.js");
 
 pub fn runtime_source_sha256() -> String {
     rcgjs_object::artifact::sha256(SHIM.as_bytes())
 }
 
-/// The carrier chosen for each value of ONE item, sorted by value id: the unit the per-item byte
-/// cache is keyed by.
-///
-/// Only the values whose carrier differs from [`Carrier::Baseline`] need naming — an absent value
-/// is baseline — so the all-baseline vector is empty and every item starts on one shared cache
-/// entry per item… except that the cache is per label vector, not per item, so the caller keys
-/// items apart by seeding the vector with the item (see [`LabelVector::for_item`]).
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Per-item probes retain this cache; whole-program vectors are cached by the
-                    // representation planner because they include reachability outside one item.
-pub struct LabelVector {
-    /// The item the labels are of, as its emitted name: two items with identical labels must not
-    /// share a cache entry, their bodies differ.
-    item: String,
-    labels: Vec<(ValueId, Carrier)>,
-}
-
-#[allow(dead_code)] // See `LabelVector`.
-impl LabelVector {
-    /// The vector labeling `item`'s values, unnamed values baseline. Sorted; a value named twice
-    /// is a caller bug and panics here rather than mis-keying the cache.
-    pub fn for_item(item: &str, mut labels: Vec<(ValueId, Carrier)>) -> LabelVector {
-        labels.sort_unstable_by_key(|(value, _)| *value);
-        labels.retain(|(_, carrier)| *carrier != Carrier::Baseline);
-        assert!(
-            labels.windows(2).all(|pair| pair[0].0 != pair[1].0),
-            "a label vector names a value twice"
-        );
-        LabelVector {
-            item: item.to_owned(),
-            labels,
-        }
-    }
-
-    /// The stable digest the byte cache is keyed by: a canonical byte spelling through the
-    /// object format's seedless [`Hash128`], never `DefaultHasher` (determinism rule).
-    pub fn digest(&self) -> u64 {
-        let mut bytes = Vec::with_capacity(self.item.len() + 1 + self.labels.len() * 5);
-        bytes.extend_from_slice(self.item.as_bytes());
-        // Item names never contain NUL, so the terminator keeps (item, labels) unambiguous.
-        bytes.push(0);
-        for (value, carrier) in &self.labels {
-            bytes.extend_from_slice(&value.0.to_le_bytes());
-            bytes.push(*carrier as u8);
-        }
-        Hash128::of(&bytes).fold()
-    }
-}
-
-/// A cached per-item byte figure: what round it came from decides what may replace it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // See `LabelVector`.
-enum Entry {
-    /// Round 1's guess. Replaced by the first measurement and never installed over one.
-    Estimate(u64),
-    /// The real pipeline's answer, [`INF`] for a labeling the pipeline declined.
-    Measured(u64),
-}
-
-/// The byte cache and the option-fed weights: one per solve, owned by the planner.
+/// Option-fed weights for allocation cost pricing.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // See `LabelVector`.
 pub struct Cost {
     weight_alloc: u64,
-    entries: BTreeMap<u64, Entry>,
 }
 
 /// One function lowered through the measurement pipeline, with its allocation-weight term.
@@ -122,47 +56,11 @@ pub struct MeasuredItem {
     pub alloc_term: u64,
 }
 
-#[allow(dead_code)] // See `LabelVector`.
 impl Cost {
     pub fn new(opts: &Opts) -> Cost {
         Cost {
             weight_alloc: opts.weight_alloc,
-            entries: BTreeMap::new(),
         }
-    }
-
-    /// Seeds round 1's estimate for a labeling. A measurement already made wins; a second
-    /// estimate for the same labeling is ignored rather than averaged — the first guess is as
-    /// good as the second and stability is worth more.
-    pub fn estimate(&mut self, labels: &LabelVector, bytes: u64) {
-        self.entries
-            .entry(labels.digest())
-            .or_insert(Entry::Estimate(bytes));
-    }
-
-    /// The cached figure for a labeling, estimate or measured, if any.
-    pub fn get(&self, labels: &LabelVector) -> Option<u64> {
-        self.entries
-            .get(&labels.digest())
-            .map(|entry| match *entry {
-                Entry::Estimate(bytes) | Entry::Measured(bytes) => bytes,
-            })
-    }
-
-    /// The measured bytes of an item at a labeling, lowering it at most once.
-    ///
-    /// A cache hit on a measurement returns it without calling `measure`; anything else —
-    /// vacant, or an estimate — runs `measure` and installs the answer over whatever was there.
-    /// `measure` answering `None` is a declined lowering, cached as [`INF`] so the solver
-    /// labels around it without re-lowering it every round.
-    pub fn of(&mut self, labels: &LabelVector, measure: impl FnOnce() -> Option<u64>) -> u64 {
-        let key = labels.digest();
-        if let Some(Entry::Measured(bytes)) = self.entries.get(&key) {
-            return *bytes;
-        }
-        let bytes = measure().unwrap_or(INF);
-        self.entries.insert(key, Entry::Measured(bytes));
-        bytes
     }
 
     /// The allocation term of one final JavaScript declaration.
@@ -171,25 +69,8 @@ impl Cost {
     }
 }
 
-/// The measured minified bytes of one item at the labeling already applied to `func`, through
-/// the real phase-C pipeline on a clone: optimize, lower, shorten, print compact.
-///
-/// `None` is a decline anywhere along the pipeline — the labeling has no lowering, which the
-/// caller prices as [`INF`].
-///
-/// The pipeline is forced to [`OptimizerMode::On`]: under `js-opt=report`
-/// `crate::opt::optimize` measures on a clone and drops the rewrite, and a cost taken from the
-/// unoptimized print would make `report`'s solve disagree with `on`'s — `report` must say what
-/// `on` would do.
-pub fn measure_item(input: &LowerInput<'_>, func: &Func) -> Option<u64> {
-    crate::profile::bump(crate::profile::Counter::LowerReprProbe);
-    let measured = lower_item(input, func).ok()?;
-    Some(measure_decl(&measured.lowered.decl))
-}
-
 /// Lowers one function with optimizer mode forced on, returning the exact declaration and the
-/// allocation term of the final JIR-R body. This is shared by per-item probes and the final
-/// post-commit whole-program measurement.
+/// allocation term of the final JIR-R body.
 pub fn lower_item(input: &LowerInput<'_>, func: &Func) -> Result<MeasuredItem, Decline> {
     crate::profile::bump(crate::profile::Counter::LowerItem);
     let mut func = func.clone();
@@ -207,13 +88,6 @@ pub fn lower_item(input: &LowerInput<'_>, func: &Func) -> Result<MeasuredItem, D
         lowered,
         alloc_term,
     })
-}
-
-/// The bytes one declaration takes printed compact with its locals shortened — the sidecar's
-/// `bytes_min` measurement, on a clone. Prices a version clone (D9's fixed cost) as well as a
-/// solver probe's lowering.
-pub fn measure_decl(decl: &jsast::Stmt) -> u64 {
-    compact_decl(decl).len() as u64
 }
 
 /// Prices an inlining probe with the program's allocated item names.
@@ -239,18 +113,6 @@ fn compact_decl(decl: &jsast::Stmt) -> String {
         jsast::Style::Compact,
         crate::opts::get().ecma_target,
     )
-}
-
-/// The bytes one adapter expression takes printed compact: what a `Convert` costs at each edge
-/// crossing it is spelled at.
-pub fn measure_expr(expr: &jsast::Expr) -> u64 {
-    let stmt = jsast::Stmt::ExprStmt(expr.clone());
-    jsast::program_to_string_styled_for_target(
-        std::slice::from_ref(&stmt),
-        jsast::Style::Compact,
-        crate::opts::get().ecma_target,
-    )
-    .len() as u64
 }
 
 /// Every `__rt` member's source bytes, by name: the price of a `Helper(member)` facility node.
@@ -524,107 +386,6 @@ globalThis.__rt.caller = () => localHelper(7);\n";
 
     use super::*;
 
-    fn labels(item: &str, pairs: &[(u32, Carrier)]) -> LabelVector {
-        LabelVector::for_item(
-            item,
-            pairs
-                .iter()
-                .map(|(value, carrier)| (ValueId(*value), *carrier))
-                .collect(),
-        )
-    }
-
-    /// The digest is a pure function of (item, labels): order-insensitive, baseline-elision
-    /// canonical, and different for a different carrier, value or item.
-    #[test]
-    fn the_digest_keys_by_item_and_labels() {
-        let one = labels("f$h1", &[(1, Carrier::HostString), (4, Carrier::NativeVec)]);
-        let reordered = labels("f$h1", &[(4, Carrier::NativeVec), (1, Carrier::HostString)]);
-        assert_eq!(one.digest(), reordered.digest());
-
-        // A value labeled baseline is the same vector as one not naming it at all.
-        let elided = labels(
-            "f$h1",
-            &[
-                (1, Carrier::HostString),
-                (2, Carrier::Baseline),
-                (4, Carrier::NativeVec),
-            ],
-        );
-        assert_eq!(one.digest(), elided.digest());
-
-        let other_carrier = labels(
-            "f$h1",
-            &[(1, Carrier::StringBuilder), (4, Carrier::NativeVec)],
-        );
-        let other_value = labels("f$h1", &[(2, Carrier::HostString), (4, Carrier::NativeVec)]);
-        let other_item = labels("g$h2", &[(1, Carrier::HostString), (4, Carrier::NativeVec)]);
-        assert_ne!(one.digest(), other_carrier.digest());
-        assert_ne!(one.digest(), other_value.digest());
-        assert_ne!(one.digest(), other_item.digest());
-    }
-
-    /// A cache hit on a measurement never re-lowers; a different labeling does.
-    #[test]
-    fn a_measured_labeling_is_never_lowered_twice() {
-        let mut cost = Cost::default();
-        let one = labels("f$h1", &[(1, Carrier::HostString)]);
-        let two = labels("f$h1", &[(1, Carrier::StringBuilder)]);
-        let measures = std::cell::Cell::new(0);
-        let of = |cost: &mut Cost, vector: &LabelVector, bytes| {
-            cost.of(vector, || {
-                measures.set(measures.get() + 1);
-                Some(bytes)
-            })
-        };
-        assert_eq!(of(&mut cost, &one, 120), 120);
-        assert_eq!(of(&mut cost, &one, 999), 120, "the cached measurement wins");
-        assert_eq!(measures.get(), 1, "the hit must not re-lower");
-        assert_eq!(of(&mut cost, &two, 90), 90);
-        assert_eq!(measures.get(), 2);
-    }
-
-    /// Round 2's measurement replaces round 1's estimate, and no later estimate replaces a
-    /// measurement: the model only ever moves toward measured bytes.
-    #[test]
-    fn a_measurement_replaces_an_estimate_and_is_never_replaced_by_one() {
-        let mut cost = Cost::default();
-        let vector = labels("f$h1", &[(3, Carrier::NativeVec)]);
-        cost.estimate(&vector, 200);
-        assert_eq!(cost.get(&vector), Some(200));
-        cost.estimate(&vector, 300);
-        assert_eq!(cost.get(&vector), Some(200), "the first estimate stands");
-        assert_eq!(
-            cost.of(&vector, || Some(180)),
-            180,
-            "an estimate never satisfies `of`"
-        );
-        cost.estimate(&vector, 500);
-        assert_eq!(
-            cost.get(&vector),
-            Some(180),
-            "measured is final against estimates"
-        );
-        assert_eq!(cost.of(&vector, || Some(999)), 180);
-    }
-
-    /// A declined lowering is priced INF and cached like any measurement.
-    #[test]
-    fn a_declined_lowering_costs_inf_once() {
-        let mut cost = Cost::default();
-        let vector = labels("f$h1", &[(1, Carrier::Opaque)]);
-        let mut measures = 0;
-        assert_eq!(
-            cost.of(&vector, || {
-                measures += 1;
-                None
-            }),
-            INF
-        );
-        assert_eq!(cost.of(&vector, || panic!("cached")), INF);
-        assert_eq!(measures, 1);
-    }
-
     /// Final JavaScript literals, including ones introduced by lowering, feed the allocation
     /// term.
     #[test]
@@ -641,15 +402,12 @@ globalThis.__rt.caller = () => localHelper(7);\n";
             ],
         };
         let sites = JsAllocSites::of(&decl);
-        let cost = Cost {
-            weight_alloc: 24,
-            entries: BTreeMap::new(),
-        };
+        let cost = Cost { weight_alloc: 24 };
         assert_eq!(cost.alloc_term(&sites), 24 * (1 + 4));
         assert_eq!(cost.alloc_term(&JsAllocSites::default()), 0);
     }
 
-    /// `measure_decl` measures the shortened compact print, not the lowering's own local names.
+    /// `compact_decl` measures the shortened compact print, not the lowering's own local names.
     #[test]
     fn a_declaration_is_measured_with_its_locals_shortened() {
         let decl = jsast::function(
@@ -662,26 +420,12 @@ globalThis.__rt.caller = () => localHelper(7);\n";
         let raw =
             jsast::program_to_string_styled(std::slice::from_ref(&decl), jsast::Style::Compact)
                 .len() as u64;
-        let measured = measure_decl(&decl);
+        let measured = compact_decl(&decl).len() as u64;
         assert!(measured < raw, "{measured} vs {raw}");
         // Measured on a clone: the declaration itself keeps its names.
         assert!(
             jsast::program_to_string(std::slice::from_ref(&decl)).contains("a_very_long_parameter")
         );
-    }
-
-    #[test]
-    fn an_adapter_expression_is_priced_by_its_compact_print() {
-        let expr = jsast::call(
-            jsast::Expr::Ident("__rt.bytes_str".to_owned()),
-            vec![
-                jsast::Expr::Ident("buf".to_owned()),
-                jsast::num(0),
-                jsast::Expr::Ident("len".to_owned()),
-            ],
-        );
-        // `__rt.bytes_str(buf,0,len);` plus the program's trailing newline.
-        assert_eq!(measure_expr(&expr), 27);
     }
 
     /// The shim parser prices every member the runtime installs, the opening literal's entries

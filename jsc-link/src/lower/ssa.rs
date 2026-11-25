@@ -57,8 +57,8 @@ use crate::jir::repr::{
 };
 use crate::jir::semantic::{
     AggregateKind, AssertMessage, BlockId, Body, BodyKind, BorrowKind, Call, Callee, CastKind,
-    ConstTree, Constant, HostPayload, LocalId, LocalRole, Operand, OperandKind, Place, Projection,
-    Rvalue, StatementKind, TerminateReason, Terminator, TypeId, Unwind,
+    ConstTree, Constant, LocalId, LocalRole, Operand, OperandKind, Place, Projection, Rvalue,
+    StatementKind, TerminateReason, Terminator, TypeId, Unwind,
 };
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
 
@@ -188,14 +188,11 @@ struct Analysis {
     location_ty: Option<TypeId>,
     /// The id of `"copy_nonoverlapping"` in the interns, if interned (looked up on first use).
     copy_nonoverlapping: std::cell::OnceCell<Option<StrId>>,
-    /// The locals that only carry a `view-abi` marker's consumed argument (v1 `consumed`).
-    consumed: BTreeSet<LocalId>,
 }
 
 impl Analysis {
     fn of(body: &Body, table: &TypeTable, interns: &Interns) -> Analysis {
         let mut uses = vec![LocalUse::default(); body.locals.len()];
-        let consumed = consumed_locals(body, interns);
         let record_place = |uses: &mut Vec<LocalUse>, place: &Place, borrow: bool, write: bool| {
             let Some(slot) = uses.get_mut(place.local.0 as usize) else {
                 return;
@@ -215,12 +212,7 @@ impl Analysis {
             for statement in &block.statements {
                 match &statement.kind {
                     StatementKind::Assign { destination, value } => {
-                        let dropped = destination.projection.is_empty()
-                            && consumed.contains(&destination.local);
                         record_place(&mut uses, destination, false, true);
-                        if dropped {
-                            continue;
-                        }
                         match value {
                             Rvalue::Reference { place, .. }
                             | Rvalue::RawPointer { place, .. }
@@ -280,7 +272,6 @@ impl Analysis {
             references: std::cell::OnceCell::new(),
             location_ty,
             copy_nonoverlapping: std::cell::OnceCell::new(),
-            consumed,
         }
     }
 
@@ -341,193 +332,6 @@ fn names_the_local(place: &Place, body: &Body, table: &TypeTable) -> bool {
         }
     }
     true
-}
-
-/// Which arguments of a `view-abi` marker the backend reads instead of lowering (v1
-/// `abi.rs::consumed_arguments`).
-fn consumed_arguments(marker: &str) -> &'static [usize] {
-    match marker {
-        "template" => &[0],
-        "hole" | "handler" | "effect" | "component" => &[0, 1],
-        "signal" | "push" | "pushkeyed" => &[0],
-        _ => &[],
-    }
-}
-
-/// The locals that only carry such an argument to its marker (v1 `abi.rs::consumed_locals`): a
-/// borrow one of their assignments takes is not in the emitted program and forces no box.
-fn consumed_locals(body: &Body, interns: &Interns) -> BTreeSet<LocalId> {
-    const MAX_STEPS: usize = 8;
-    let mut consumed = BTreeSet::new();
-    let mut counts: BTreeMap<LocalId, (u32, u32, bool)> = BTreeMap::new();
-    // (defs, uses, borrowed) per bare local, the coarse count `inlinable` needs.
-    let count_operand = |operand: &Operand, counts: &mut BTreeMap<LocalId, (u32, u32, bool)>| {
-        if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
-            counts.entry(place.local).or_default().1 += 1;
-        }
-    };
-    for block in &body.blocks {
-        for statement in &block.statements {
-            match &statement.kind {
-                StatementKind::Assign { destination, value } => {
-                    let entry = counts.entry(destination.local).or_default();
-                    if destination.projection.is_empty() {
-                        entry.0 += 1;
-                    } else {
-                        entry.1 += 1;
-                        entry.2 = true;
-                    }
-                    for_each_operand(value, |operand| count_operand(operand, &mut counts));
-                    match value {
-                        Rvalue::Reference { place, .. }
-                        | Rvalue::RawPointer { place, .. }
-                        | Rvalue::Reborrow { place, .. }
-                        | Rvalue::Discriminant(place)
-                        | Rvalue::CopyForDeref(place) => {
-                            let entry = counts.entry(place.local).or_default();
-                            entry.1 += 1;
-                            if !matches!(value, Rvalue::Discriminant(_) | Rvalue::CopyForDeref(_)) {
-                                entry.2 = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                StatementKind::SetDiscriminant { place, .. } => {
-                    let entry = counts.entry(place.local).or_default();
-                    entry.1 += 1;
-                    entry.2 = true;
-                }
-                StatementKind::Assume(operand) => count_operand(operand, &mut counts),
-                StatementKind::CopyNonOverlapping {
-                    source,
-                    destination,
-                    count,
-                } => {
-                    count_operand(source, &mut counts);
-                    count_operand(destination, &mut counts);
-                    count_operand(count, &mut counts);
-                }
-                StatementKind::StorageLive(_)
-                | StatementKind::StorageDead(_)
-                | StatementKind::Nop => {}
-            }
-        }
-        match &block.terminator {
-            Terminator::Switch { discriminant, .. } => count_operand(discriminant, &mut counts),
-            Terminator::Call(call) => {
-                count_operand(&call.function, &mut counts);
-                for argument in &call.arguments {
-                    count_operand(argument, &mut counts);
-                }
-                let entry = counts.entry(call.destination.local).or_default();
-                if call.destination.projection.is_empty() {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                    entry.2 = true;
-                }
-            }
-            Terminator::Drop { place, .. } => {
-                let entry = counts.entry(place.local).or_default();
-                entry.1 += 1;
-                entry.2 = true;
-            }
-            Terminator::Assert { condition, .. } => count_operand(condition, &mut counts),
-            _ => {}
-        }
-    }
-    let inlinable = |local: LocalId| {
-        let Some(decl) = body.locals.get(local.0 as usize) else {
-            return false;
-        };
-        if decl.role != LocalRole::Temporary {
-            return false;
-        }
-        counts
-            .get(&local)
-            .is_some_and(|(defs, uses, borrowed)| *defs == 1 && *uses == 1 && !*borrowed)
-    };
-    let assigned_place = |local: LocalId| -> Option<Place> {
-        for block in &body.blocks {
-            for statement in &block.statements {
-                let StatementKind::Assign { destination, value } = &statement.kind else {
-                    continue;
-                };
-                if destination.local != local || !destination.projection.is_empty() {
-                    continue;
-                }
-                return match value {
-                    Rvalue::Use(Operand {
-                        kind: OperandKind::Copy(place) | OperandKind::Move(place),
-                        ..
-                    }) => Some(place.clone()),
-                    Rvalue::Reference { place, .. } | Rvalue::CopyForDeref(place) => {
-                        Some(place.clone())
-                    }
-                    _ => None,
-                };
-            }
-        }
-        None
-    };
-    for block in &body.blocks {
-        let Terminator::Call(call) = &block.terminator else {
-            continue;
-        };
-        let marker = match &call.host {
-            Some(HostPayload::ViewAbi { marker, .. }) => interns.str(*marker).map(str::to_owned),
-            Some(HostPayload::Marker { section, .. }) => interns
-                .str(*section)
-                .and_then(|section| section.strip_prefix("rcgjs.tc."))
-                .map(str::to_owned),
-            Some(HostPayload::KeyedList(_)) => Some("keyedlist.v1".to_owned()),
-            _ => None,
-        };
-        let Some(marker) = marker else {
-            continue;
-        };
-        for &index in consumed_arguments(&marker) {
-            let Some(argument) = call.arguments.get(index) else {
-                continue;
-            };
-            let mut place = match &argument.kind {
-                OperandKind::Copy(place) | OperandKind::Move(place) => Some(place.clone()),
-                _ => None,
-            };
-            for _ in 0..MAX_STEPS {
-                let Some(current) = place.filter(|place| place.projection.is_empty()) else {
-                    break;
-                };
-                if !inlinable(current.local) {
-                    break;
-                }
-                consumed.insert(current.local);
-                place = assigned_place(current.local);
-            }
-        }
-    }
-    consumed
-}
-
-fn for_each_operand(rvalue: &Rvalue, mut f: impl FnMut(&Operand)) {
-    match rvalue {
-        Rvalue::Use(operand)
-        | Rvalue::Repeat { value: operand, .. }
-        | Rvalue::Cast { value: operand, .. }
-        | Rvalue::Unary { value: operand, .. }
-        | Rvalue::WrapUnsafeBinder(operand) => f(operand),
-        Rvalue::Binary { left, right, .. } => {
-            f(left);
-            f(right);
-        }
-        Rvalue::Aggregate { operands, .. } => operands.iter().for_each(f),
-        Rvalue::Reference { .. }
-        | Rvalue::RawPointer { .. }
-        | Rvalue::Discriminant(_)
-        | Rvalue::CopyForDeref(_)
-        | Rvalue::Reborrow { .. } => {}
-    }
 }
 
 /// The type of the trailing caller `Location` parameter: the result type of a `caller_location`
@@ -1789,21 +1593,6 @@ impl<'a> Builder<'a> {
     fn statement(&mut self, statement: &StatementKind) -> Result<(), Decline> {
         match statement {
             StatementKind::Assign { destination, value } => {
-                // A borrow of a local on its way to a `view-abi` marker that reads it at lowering
-                // time (v1 `consumed`): the marker call gets the borrowed value itself, so the
-                // lowering can tell which instantiation the argument names without a box.
-                if let Rvalue::Reference { place, .. } | Rvalue::RawPointer { place, .. } = value {
-                    if destination.projection.is_empty()
-                        && self.analysis.consumed.contains(&destination.local)
-                        && matches!(self.kinds[destination.local.0 as usize], LocalKind::Value)
-                        && matches!(self.kinds[place.local.0 as usize], LocalKind::Value)
-                        && names_the_local(place, self.body, self.table)
-                    {
-                        let root = self.read_local(place.local);
-                        self.write_local(destination.local, self.block, root);
-                        return Ok(());
-                    }
-                }
                 let v = self.rvalue(value, destination.ty)?;
                 self.write_place(destination, v)
             }
@@ -4602,13 +4391,11 @@ mod fixtures {
                                     {
                                         if !table.is_indirect(place.ty) {
                                             eprintln!(
-                                                "    {:?} = &{:?} : {:?} (indirect {}) consumed? {}",
+                                                "    {:?} = &{:?} : {:?} (indirect {})",
                                                 destination.local,
                                                 place,
                                                 table.get(place.ty).map(|d| &d.kind),
                                                 table.is_indirect(place.ty),
-                                                super::consumed_locals(&body, interns)
-                                                    .contains(&destination.local)
                                             );
                                         }
                                     }

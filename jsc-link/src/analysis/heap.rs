@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use rcgjs_object::item::AllocatorProvider;
 use rcgjs_object::jir::decline::Decline;
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::repr::{Carrier, Func, OpKind, Proj, Root, ValueId};
@@ -32,14 +33,13 @@ use rcgjs_object::jir::types::{
     AllocatorIdentity, FieldKey, RepresentationCandidate, TypeId, TypeKind, TypeTable,
 };
 use rcgjs_object::jsast;
-use rcgjs_object::late_ir::AllocatorProvider;
 use rcgjs_object::object::ItemKind;
 
 use crate::analysis::byte_views::ByteViewPlan;
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
-use crate::opts::{Opts, Profile};
-use crate::plan::representation::NativeBody;
+use crate::opts::{Opts, Profile, StrRepr};
+use crate::plan::native_types::NativeBody;
 
 /// Shallow, lifetime-independent structural key for elements of non-ADT indirect aggregates
 /// (tuples) tracked in `_boxes`.
@@ -315,13 +315,16 @@ pub fn analyze_reachable(
     let allocator_provider = table
         .values()
         .fold(AllocatorProvider::Unknown, |acc, item| {
-            acc.merge(item.late_ir.artifact_allocator_provider())
+            acc.merge(item.allocator_provider)
         });
-    let typed_heap_enabled = opts.profile == Some(Profile::ReleaseSpeed)
-        && allocator_provider == AllocatorProvider::Default
+    let typed_heap_enabled = matches!(
+        opts.profile,
+        Some(Profile::ReleaseSpeed | Profile::ReleaseBalanced | Profile::ReleaseSize)
+    ) && allocator_provider == AllocatorProvider::Default
         && !byte_views.raw_byte_derefs
         && byte_views.elide_scale_scalar;
-    let mut skip_native_string = typed_heap_enabled && crate::lower::bstr::enabled();
+    let mut skip_native_string =
+        typed_heap_enabled && (crate::lower::bstr::enabled() || opts.str_repr == StrRepr::Bytes);
     let mut skip_native_vec = typed_heap_enabled;
 
     loop {
@@ -934,11 +937,12 @@ fn root_ty(func: &Func, root: &Root) -> Option<TypeId> {
     }
 }
 
-fn place_ty_and_string_field_proj(
+fn place_ty_and_forbidden_field_proj(
     func: &Func,
     table: &TypeTable,
     root: &Root,
     path: &[Proj],
+    is_forbidden: impl Fn(TypeId, u32) -> bool,
 ) -> (Option<TypeId>, bool) {
     let Some(mut cur) = root_ty(func, root) else {
         return (None, false);
@@ -953,8 +957,8 @@ fn place_ty_and_string_field_proj(
                 cur = pt;
             }
             Proj::Downcast { .. } => {}
-            Proj::Field { ty, .. } => {
-                if is_direct_string_ty(table, cur) {
+            Proj::Field { field, ty } => {
+                if is_forbidden(cur, *field) {
                     return (None, true);
                 }
                 cur = *ty;
@@ -977,13 +981,18 @@ fn place_ty_and_string_field_proj(
     (Some(cur), false)
 }
 
-/// Whether `ty` contains `String` directly by value (not behind a reference or raw pointer).
-fn ty_contains_string_by_value(table: &TypeTable, ty: TypeId, seen: &mut BTreeSet<TypeId>) -> bool {
+/// Whether `ty` contains a type matching `pred` directly by value (not behind a reference or raw pointer).
+fn ty_contains_by_value(
+    table: &TypeTable,
+    ty: TypeId,
+    pred: fn(&TypeTable, TypeId) -> bool,
+    seen: &mut BTreeSet<TypeId>,
+) -> bool {
     let peeled = table.peeled(ty);
     if !seen.insert(peeled) {
         return false;
     }
-    if is_string_ty(table, peeled) {
+    if pred(table, peeled) {
         return true;
     }
     let Some(desc) = table.get(peeled) else {
@@ -991,19 +1000,19 @@ fn ty_contains_string_by_value(table: &TypeTable, ty: TypeId, seen: &mut BTreeSe
     };
     match &desc.kind {
         TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-            ty_contains_string_by_value(table, *element, seen)
+            ty_contains_by_value(table, *element, pred, seen)
         }
         TypeKind::Tuple(elems) => elems
             .iter()
-            .any(|e| ty_contains_string_by_value(table, *e, seen)),
+            .any(|e| ty_contains_by_value(table, *e, pred, seen)),
         TypeKind::Adt { variants, .. } => variants.iter().any(|v| {
             v.fields
                 .iter()
-                .any(|f| ty_contains_string_by_value(table, f.ty, seen))
+                .any(|f| ty_contains_by_value(table, f.ty, pred, seen))
         }),
         TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => upvars
             .iter()
-            .any(|u| ty_contains_string_by_value(table, *u, seen)),
+            .any(|u| ty_contains_by_value(table, *u, pred, seen)),
         _ => false,
     }
 }
@@ -1037,31 +1046,37 @@ fn peel_ptr_pointee(table: &TypeTable, mut ty: TypeId) -> Option<TypeId> {
     None
 }
 
-/// Whether transmuting `from -> to` could observe or forge `String`'s private `.vec` layout.
-fn transmute_exposes_string_layout(table: &TypeTable, from: TypeId, to: TypeId) -> bool {
+/// Whether transmuting `from -> to` could observe or forge the private layout of a container type
+/// matching `pred`.
+fn transmute_exposes_layout(
+    table: &TypeTable,
+    from: TypeId,
+    to: TypeId,
+    pred: fn(&TypeTable, TypeId) -> bool,
+) -> bool {
     let f = table.peeled(from);
     let t = table.peeled(to);
     if f == t {
         return false;
     }
     let mut seen = BTreeSet::new();
-    if ty_contains_string_by_value(table, f, &mut seen) {
+    if ty_contains_by_value(table, f, pred, &mut seen) {
         return true;
     }
     seen.clear();
-    if ty_contains_string_by_value(table, t, &mut seen) {
+    if ty_contains_by_value(table, t, pred, &mut seen) {
         return true;
     }
-    // Check pointer/ref transmute between `&String`/`*const String` and a different concrete
-    // non-ZST pointee. Integer <-> pointer transmutes (e.g. `NonNull::<String>::dangling()`) have
-    // `None` on the integer side and do not expose `String`'s private `.vec` fields.
+    // Check pointer/ref transmute between `&C`/`*const C` and a different concrete non-ZST
+    // pointee. Integer <-> pointer transmutes (e.g. `NonNull::<C>::dangling()`) have `None` on
+    // the integer side and do not expose `C`'s private fields.
     let pt_f = peel_ptr_pointee(table, f);
     let pt_t = peel_ptr_pointee(table, t);
     match (pt_f, pt_t) {
         (Some(a), Some(b)) if a != b => {
-            let a_str = is_string_ty(table, a);
-            let b_str = is_string_ty(table, b);
-            (a_str && !table.is_zst(b)) || (b_str && !table.is_zst(a))
+            let a_hit = pred(table, a);
+            let b_hit = pred(table, b);
+            (a_hit && !table.is_zst(b)) || (b_hit && !table.is_zst(a))
         }
         _ => false,
     }
@@ -1077,9 +1092,14 @@ fn const_is_zero_vec_string(tree: &ConstTree) -> bool {
     }
 }
 
-fn const_has_nonempty_string(table: &TypeTable, tree: &ConstTree, ty: TypeId) -> bool {
+fn const_has_nonempty_container(
+    table: &TypeTable,
+    tree: &ConstTree,
+    ty: TypeId,
+    pred: fn(&TypeTable, TypeId) -> bool,
+) -> bool {
     let peeled = table.peeled(ty);
-    if is_string_ty(table, peeled) {
+    if pred(table, peeled) {
         return !const_is_zero_vec_string(tree);
     }
     match (tree, table.get(peeled).map(|d| &d.kind)) {
@@ -1088,63 +1108,63 @@ fn const_has_nonempty_string(table: &TypeTable, tree: &ConstTree, ty: TypeId) ->
                 fields
                     .iter()
                     .zip(&v.fields)
-                    .any(|(f, fd)| const_has_nonempty_string(table, f, fd.ty))
+                    .any(|(f, fd)| const_has_nonempty_container(table, f, fd.ty, pred))
             })
         }
         (ConstTree::Aggregate(fields), Some(TypeKind::Tuple(elems))) => fields
             .iter()
             .zip(elems)
-            .any(|(f, et)| const_has_nonempty_string(table, f, *et)),
+            .any(|(f, et)| const_has_nonempty_container(table, f, *et, pred)),
         (ConstTree::Aggregate(fields), Some(TypeKind::Array { element, .. })) => fields
             .iter()
-            .any(|f| const_has_nonempty_string(table, f, *element)),
+            .any(|f| const_has_nonempty_container(table, f, *element, pred)),
         (ConstTree::Variant { variant, fields }, Some(TypeKind::Adt { variants, .. })) => {
             variants.get(*variant as usize).is_some_and(|v| {
                 fields
                     .iter()
                     .zip(&v.fields)
-                    .any(|(f, fd)| const_has_nonempty_string(table, f, fd.ty))
+                    .any(|(f, fd)| const_has_nonempty_container(table, f, fd.ty, pred))
             })
         }
         (
             ConstTree::Reference(inner),
             Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }),
-        ) => const_has_nonempty_string(table, inner, *pointee),
+        ) => const_has_nonempty_container(table, inner, *pointee, pred),
         _ => false,
     }
 }
 
-/// Whether `OpKind::Drop { root, path, .. }` drops a native `String` directly or drops its
-/// rustc-elaborated `.vec` field (both are no-ops under universal native `{ s, cap }` `String`).
-pub fn drop_targets_native_string(
+fn func_uses_container_internals(
     func: &Func,
     table: &TypeTable,
-    root: &Root,
-    path: &[Proj],
+    interns: &Interns,
+    is_direct: fn(&TypeTable, TypeId) -> bool,
+    is_peeled: fn(&TypeTable, TypeId) -> bool,
+    is_forbidden_field: impl Fn(TypeId, u32) -> bool,
 ) -> bool {
-    let (ty, crosses_string_field) = place_ty_and_string_field_proj(func, table, root, path);
-    crosses_string_field || ty.is_some_and(|t| is_direct_string_ty(table, t))
-}
-
-/// Returns `true` if `func` directly accesses `String`'s private `.vec` field, constructs a
-/// `String` aggregate literal, transmutes a type mentioning `String`, or embeds a non-empty
-/// constant `String`.
-fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns) -> bool {
     for block in &func.blocks {
         for op in &block.ops {
             match &op.kind {
-                OpKind::Field { base, .. } | OpKind::SetField { base, .. } => {
-                    if val_ty(func, *base).is_some_and(|ty| is_direct_string_ty(table, ty)) {
+                OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
+                    if val_ty(func, *base).is_some_and(|ty| is_forbidden_field(ty, *field)) {
                         return true;
                     }
                 }
                 OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                    if place_ty_and_string_field_proj(func, table, root, path).1 {
+                    if place_ty_and_forbidden_field_proj(
+                        func,
+                        table,
+                        root,
+                        path,
+                        &is_forbidden_field,
+                    )
+                    .1
+                    {
                         return true;
                     }
                 }
                 OpKind::Aggregate { ty, .. } => {
-                    if is_direct_string_ty(table, *ty) {
+                    if is_direct(table, *ty) {
                         return true;
                     }
                 }
@@ -1154,7 +1174,7 @@ fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns)
                     to,
                     ..
                 } => {
-                    if transmute_exposes_string_layout(table, *from, *to) {
+                    if transmute_exposes_layout(table, *from, *to, is_peeled) {
                         return true;
                     }
                 }
@@ -1164,13 +1184,13 @@ fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns)
                         Some("transmute" | "transmute_unchecked")
                     ) {
                         if let [from, to] = types.as_slice() {
-                            if transmute_exposes_string_layout(table, *from, *to) {
+                            if transmute_exposes_layout(table, *from, *to, is_peeled) {
                                 return true;
                             }
                         } else {
                             for &t in types {
                                 let mut seen = BTreeSet::new();
-                                if ty_contains_string_by_value(table, t, &mut seen) {
+                                if ty_contains_by_value(table, t, is_peeled, &mut seen) {
                                     return true;
                                 }
                             }
@@ -1180,7 +1200,7 @@ fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns)
                 OpKind::Const(tree) => {
                     if let Some(res) = op.result {
                         if let Some(ty) = val_ty(func, res) {
-                            if const_has_nonempty_string(table, tree, ty) {
+                            if const_has_nonempty_container(table, tree, ty, is_peeled) {
                                 return true;
                             }
                         }
@@ -1191,6 +1211,35 @@ fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns)
         }
     }
     false
+}
+
+/// Whether `OpKind::Drop { root, path, .. }` drops a native `String` directly or drops its
+/// rustc-elaborated `.vec` field (both are no-ops under universal native `{ s, cap }` `String`).
+pub fn drop_targets_native_string(
+    func: &Func,
+    table: &TypeTable,
+    root: &Root,
+    path: &[Proj],
+) -> bool {
+    let (ty, crosses_string_field) =
+        place_ty_and_forbidden_field_proj(func, table, root, path, |cur, _| {
+            is_direct_string_ty(table, cur)
+        });
+    crosses_string_field || ty.is_some_and(|t| is_direct_string_ty(table, t))
+}
+
+/// Returns `true` if `func` directly accesses `String`'s private `.vec` field, constructs a
+/// `String` aggregate literal, transmutes a type mentioning `String`, or embeds a non-empty
+/// constant `String`.
+fn func_uses_string_internals(func: &Func, table: &TypeTable, interns: &Interns) -> bool {
+    func_uses_container_internals(
+        func,
+        table,
+        interns,
+        is_direct_string_ty,
+        is_string_ty,
+        |cur, _| is_direct_string_ty(table, cur),
+    )
 }
 
 fn is_native_vec_hook_item(item: Option<&LinkItem>) -> bool {
@@ -1265,7 +1314,7 @@ pub fn global_vec_elem_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
 pub fn native_vec_ta_kind(table: &TypeTable, elem: TypeId) -> Option<u8> {
     table
         .get(elem)
-        .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+        .and_then(crate::lower::semantic_ops::typed_array_kind)
 }
 
 /// Conservative check whether dropping `ty` can execute any observable drop effect when
@@ -1373,52 +1422,6 @@ pub fn is_vec_len_field(table: &TypeTable, interns: &Interns, ty: TypeId, field:
         .is_some_and(|f| matches!(f.key, FieldKey::Name(id) if interns.str(id) == Some("len")))
 }
 
-fn place_ty_and_vec_buf_proj(
-    func: &Func,
-    table: &TypeTable,
-    interns: &Interns,
-    root: &Root,
-    path: &[Proj],
-) -> (Option<TypeId>, bool) {
-    let Some(mut cur) = root_ty(func, root) else {
-        return (None, false);
-    };
-    for proj in path {
-        let peeled = table.peeled(cur);
-        match proj {
-            Proj::Deref => {
-                let Some(pt) = value::pointee_of(table, peeled) else {
-                    return (None, false);
-                };
-                cur = pt;
-            }
-            Proj::Downcast { .. } => {}
-            Proj::Field { field, ty } => {
-                if is_direct_global_vec_ty(table, cur)
-                    && !is_vec_len_field(table, interns, cur, *field)
-                {
-                    return (None, true);
-                }
-                cur = *ty;
-            }
-            Proj::Index(_) | Proj::ConstantIndex { .. } => {
-                let next = match table.get(peeled).map(|d| &d.kind) {
-                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
-                        Some(*element)
-                    }
-                    _ => None,
-                };
-                let Some(next) = next else {
-                    return (None, false);
-                };
-                cur = next;
-            }
-            Proj::Subslice { .. } => {}
-        }
-    }
-    (Some(cur), false)
-}
-
 /// Whether `OpKind::Drop` is a complete no-op under `native_vec_enabled` (either dropping `.buf`
 /// on `Vec<T, Global>` or dropping a `Vec<T, Global>` whose element `T` effectively needs no drop).
 pub fn drop_targets_noop_native_vec(
@@ -1430,7 +1433,10 @@ pub fn drop_targets_noop_native_vec(
     native_string: bool,
     native_vec_no_raw: bool,
 ) -> bool {
-    let (ty, crosses_vec_buf) = place_ty_and_vec_buf_proj(func, table, interns, root, path);
+    let (ty, crosses_vec_buf) =
+        place_ty_and_forbidden_field_proj(func, table, root, path, |cur, field| {
+            is_direct_global_vec_ty(table, cur) && !is_vec_len_field(table, interns, cur, field)
+        });
     if crosses_vec_buf {
         return true;
     }
@@ -1440,168 +1446,17 @@ pub fn drop_targets_noop_native_vec(
     })
 }
 
-fn ty_contains_global_vec_by_value(
-    table: &TypeTable,
-    ty: TypeId,
-    seen: &mut BTreeSet<TypeId>,
-) -> bool {
-    let peeled = table.peeled(ty);
-    if !seen.insert(peeled) {
-        return false;
-    }
-    if is_global_vec_ty(table, peeled) {
-        return true;
-    }
-    let Some(desc) = table.get(peeled) else {
-        return false;
-    };
-    match &desc.kind {
-        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-            ty_contains_global_vec_by_value(table, *element, seen)
-        }
-        TypeKind::Tuple(elems) => elems
-            .iter()
-            .any(|e| ty_contains_global_vec_by_value(table, *e, seen)),
-        TypeKind::Adt { variants, .. } => variants.iter().any(|v| {
-            v.fields
-                .iter()
-                .any(|f| ty_contains_global_vec_by_value(table, f.ty, seen))
-        }),
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => upvars
-            .iter()
-            .any(|u| ty_contains_global_vec_by_value(table, *u, seen)),
-        _ => false,
-    }
-}
-
-fn transmute_exposes_global_vec_layout(table: &TypeTable, from: TypeId, to: TypeId) -> bool {
-    let f = table.peeled(from);
-    let t = table.peeled(to);
-    if f == t {
-        return false;
-    }
-    let mut seen = BTreeSet::new();
-    if ty_contains_global_vec_by_value(table, f, &mut seen) {
-        return true;
-    }
-    seen.clear();
-    if ty_contains_global_vec_by_value(table, t, &mut seen) {
-        return true;
-    }
-    let pt_f = peel_ptr_pointee(table, f);
-    let pt_t = peel_ptr_pointee(table, t);
-    match (pt_f, pt_t) {
-        (Some(a), Some(b)) if a != b => {
-            let a_vec = is_global_vec_ty(table, a);
-            let b_vec = is_global_vec_ty(table, b);
-            (a_vec && !table.is_zst(b)) || (b_vec && !table.is_zst(a))
-        }
-        _ => false,
-    }
-}
-
-fn const_has_nonempty_global_vec(table: &TypeTable, tree: &ConstTree, ty: TypeId) -> bool {
-    let peeled = table.peeled(ty);
-    if is_global_vec_ty(table, peeled) {
-        return !const_is_zero_vec_string(tree);
-    }
-    match (tree, table.get(peeled).map(|d| &d.kind)) {
-        (ConstTree::Aggregate(fields), Some(TypeKind::Adt { variants, .. })) => {
-            variants.first().is_some_and(|v| {
-                fields
-                    .iter()
-                    .zip(&v.fields)
-                    .any(|(f, fd)| const_has_nonempty_global_vec(table, f, fd.ty))
-            })
-        }
-        (ConstTree::Aggregate(fields), Some(TypeKind::Tuple(elems))) => fields
-            .iter()
-            .zip(elems)
-            .any(|(f, et)| const_has_nonempty_global_vec(table, f, *et)),
-        (ConstTree::Aggregate(fields), Some(TypeKind::Array { element, .. })) => fields
-            .iter()
-            .any(|f| const_has_nonempty_global_vec(table, f, *element)),
-        (ConstTree::Variant { variant, fields }, Some(TypeKind::Adt { variants, .. })) => {
-            variants.get(*variant as usize).is_some_and(|v| {
-                fields
-                    .iter()
-                    .zip(&v.fields)
-                    .any(|(f, fd)| const_has_nonempty_global_vec(table, f, fd.ty))
-            })
-        }
-        (
-            ConstTree::Reference(inner),
-            Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }),
-        ) => const_has_nonempty_global_vec(table, inner, *pointee),
-        _ => false,
-    }
-}
-
 fn func_uses_vec_internals(func: &Func, table: &TypeTable, interns: &Interns) -> bool {
-    for block in &func.blocks {
-        for op in &block.ops {
-            match &op.kind {
-                OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
-                    if val_ty(func, *base).is_some_and(|ty| {
-                        is_direct_global_vec_ty(table, ty)
-                            && !is_vec_len_field(table, interns, ty, *field)
-                    }) {
-                        return true;
-                    }
-                }
-                OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                    if place_ty_and_vec_buf_proj(func, table, interns, root, path).1 {
-                        return true;
-                    }
-                }
-                OpKind::Aggregate { ty, .. } => {
-                    if is_direct_global_vec_ty(table, *ty) {
-                        return true;
-                    }
-                }
-                OpKind::Cast {
-                    kind: CastKind::Transmute,
-                    from,
-                    to,
-                    ..
-                } => {
-                    if transmute_exposes_global_vec_layout(table, *from, *to) {
-                        return true;
-                    }
-                }
-                OpKind::Intrinsic { name, types, .. } => {
-                    if matches!(
-                        interns.str(*name),
-                        Some("transmute" | "transmute_unchecked")
-                    ) {
-                        if let [from, to] = types.as_slice() {
-                            if transmute_exposes_global_vec_layout(table, *from, *to) {
-                                return true;
-                            }
-                        } else {
-                            for &t in types {
-                                let mut seen = BTreeSet::new();
-                                if ty_contains_global_vec_by_value(table, t, &mut seen) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-                OpKind::Const(tree) => {
-                    if let Some(res) = op.result {
-                        if let Some(ty) = val_ty(func, res) {
-                            if const_has_nonempty_global_vec(table, tree, ty) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    false
+    func_uses_container_internals(
+        func,
+        table,
+        interns,
+        is_direct_global_vec_ty,
+        is_global_vec_ty,
+        |cur, field| {
+            is_direct_global_vec_ty(table, cur) && !is_vec_len_field(table, interns, cur, field)
+        },
+    )
 }
 
 fn arr_global_vec_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
@@ -2511,7 +2366,6 @@ mod tests {
         FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, NominalForm,
         PointerForm, TypeDescriptor, TypeMeta, VariantDescriptor,
     };
-    use rcgjs_object::late_ir::LateIrAnalysisSummary;
     use rcgjs_object::object::Linkage;
 
     use crate::item::LinkJir;
@@ -2605,8 +2459,7 @@ mod tests {
             map: Default::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: LateIrAnalysisSummary::allocator_provider(provider),
-            baseline_shadow: Default::default(),
+            allocator_provider: provider,
             jir,
         }
     }
@@ -2826,14 +2679,22 @@ mod tests {
         );
         assert!(!plan.any_boxed);
 
-        // ReleaseSize disables Tier A and enters the hook fallback -> non_rc_raw_alloc_reachable = true.
+        // ReleaseSize and ReleaseBalanced also use Gen-2 universal Tier A; Dev disables Tier A.
         let size_opts = Opts {
             profile: Some(Profile::ReleaseSize),
             ..Opts::default()
         };
         let size_plan = analyze_reachable(&table, &funcs, &native, &size_opts, bv_clean);
-        assert!(!size_plan.typed_heap_enabled);
-        assert!(size_plan.non_rc_raw_alloc_reachable);
+        assert!(size_plan.typed_heap_enabled);
+        assert!(!size_plan.non_rc_raw_alloc_reachable);
+
+        let dev_opts = Opts {
+            profile: Some(Profile::Dev),
+            ..Opts::default()
+        };
+        let dev_plan = analyze_reachable(&table, &funcs, &native, &dev_opts, bv_clean);
+        assert!(!dev_plan.typed_heap_enabled);
+        assert!(dev_plan.non_rc_raw_alloc_reachable);
 
         // Raw byte derefs disable Tier A even under ReleaseSpeed.
         let bv_dirty = ByteViewPlan {

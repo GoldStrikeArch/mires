@@ -232,8 +232,7 @@ fn link_item<const N: usize>(
         names: Vec::new(),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: None,
         jir_decline: None,
         jir_item: None,
@@ -252,8 +251,7 @@ fn link_item<const N: usize>(
         map: item_map(mappings),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: Default::default(),
     }
 }

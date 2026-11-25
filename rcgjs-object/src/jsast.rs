@@ -2587,6 +2587,7 @@ pub fn wrap_panic_impl_body(body: Vec<Stmt>) -> Vec<Stmt> {
                                 && matches!(args[0], Expr::Str(_))
                     )
             }
+            Stmt::LoopForever(_, body) if body.is_empty() => true,
             _ => false,
         }
     }
@@ -2656,6 +2657,262 @@ pub fn loc(file: impl Into<String>, line: u32, col: u32) -> Stmt {
 /// here is the `if` guarding an `Assert`'s panic, which is two or three statements' worth — so
 /// counting the top level is close enough for the one decision this feeds, whether a loop
 /// continuation is small enough to be duplicated into the loop.
+/// Read-only AST visitor. Override `visit_stmt` and/or `visit_expr` and call
+/// [`walk_stmt`] / [`walk_expr`] to descend into child nodes.
+pub trait Visit: Sized {
+    fn visit_stmts(&mut self, stmts: &[Stmt]) {
+        for stmt in stmts {
+            self.visit_stmt(stmt);
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        walk_expr(self, expr);
+    }
+}
+
+/// Visits every child of `stmt` using `visitor`.
+pub fn walk_stmt<V: Visit>(visitor: &mut V, stmt: &Stmt) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => visitor.visit_expr(e),
+        Stmt::Let(_, init) | Stmt::Return(init) => {
+            if let Some(e) = init {
+                visitor.visit_expr(e);
+            }
+        }
+        Stmt::Lets(decls) => {
+            for (_, init) in decls {
+                if let Some(e) = init {
+                    visitor.visit_expr(e);
+                }
+            }
+        }
+        Stmt::If(test, then, els) => {
+            visitor.visit_expr(test);
+            visitor.visit_stmts(then);
+            if let Some(els) = els {
+                visitor.visit_stmts(els);
+            }
+        }
+        Stmt::Switch(disc, cases) => {
+            visitor.visit_expr(disc);
+            for case in cases {
+                for test in &case.tests {
+                    visitor.visit_expr(test);
+                }
+                visitor.visit_stmts(&case.body);
+            }
+        }
+        Stmt::Labeled(_, inner) => visitor.visit_stmt(inner),
+        Stmt::LoopForever(_, body) | Stmt::Block(body) => visitor.visit_stmts(body),
+        Stmt::While(test, body) => {
+            visitor.visit_expr(test);
+            visitor.visit_stmts(body);
+        }
+        Stmt::TryCatch { body, handler, .. } => {
+            visitor.visit_stmts(body);
+            visitor.visit_stmts(handler);
+        }
+        Stmt::FunctionDecl { body, .. } => visitor.visit_stmts(body),
+        Stmt::Continue(_)
+        | Stmt::Break(_)
+        | Stmt::Import { .. }
+        | Stmt::Comment(_)
+        | Stmt::Raw(_)
+        | Stmt::Loc(_) => {}
+    }
+}
+
+/// Visits every child of `expr` using `visitor`.
+pub fn walk_expr<V: Visit>(visitor: &mut V, expr: &Expr) {
+    match expr {
+        Expr::Member(obj, _) | Expr::Unary(_, obj) => visitor.visit_expr(obj),
+        Expr::Index(a, b)
+        | Expr::Binary(_, a, b)
+        | Expr::Assign(a, b)
+        | Expr::CompoundAssign(_, a, b) => {
+            visitor.visit_expr(a);
+            visitor.visit_expr(b);
+        }
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            visitor.visit_expr(callee);
+            for arg in args {
+                visitor.visit_expr(arg);
+            }
+        }
+        Expr::Cond(c, t, e) => {
+            visitor.visit_expr(c);
+            visitor.visit_expr(t);
+            visitor.visit_expr(e);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                visitor.visit_expr(v);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for item in items {
+                visitor.visit_expr(item);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(body)) => visitor.visit_expr(body),
+        Expr::Arrow(_, ArrowBody::Block(body)) => visitor.visit_stmts(body),
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Undefined
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::Raw(_) => {}
+    }
+}
+
+/// Mutable AST visitor. Override `visit_stmt_mut` and/or `visit_expr_mut` and call
+/// [`walk_stmt_mut`] / [`walk_expr_mut`] to descend into child nodes.
+pub trait VisitMut: Sized {
+    fn visit_stmts_mut(&mut self, stmts: &mut [Stmt]) {
+        for stmt in stmts {
+            self.visit_stmt_mut(stmt);
+        }
+    }
+
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        walk_stmt_mut(self, stmt);
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        walk_expr_mut(self, expr);
+    }
+}
+
+/// Mutably visits every child of `stmt` using `visitor`.
+pub fn walk_stmt_mut<V: VisitMut>(visitor: &mut V, stmt: &mut Stmt) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => visitor.visit_expr_mut(e),
+        Stmt::Let(_, init) | Stmt::Return(init) => {
+            if let Some(e) = init {
+                visitor.visit_expr_mut(e);
+            }
+        }
+        Stmt::Lets(decls) => {
+            for (_, init) in decls {
+                if let Some(e) = init {
+                    visitor.visit_expr_mut(e);
+                }
+            }
+        }
+        Stmt::If(test, then, els) => {
+            visitor.visit_expr_mut(test);
+            visitor.visit_stmts_mut(then);
+            if let Some(els) = els {
+                visitor.visit_stmts_mut(els);
+            }
+        }
+        Stmt::Switch(disc, cases) => {
+            visitor.visit_expr_mut(disc);
+            for case in cases {
+                for test in &mut case.tests {
+                    visitor.visit_expr_mut(test);
+                }
+                visitor.visit_stmts_mut(&mut case.body);
+            }
+        }
+        Stmt::Labeled(_, inner) => visitor.visit_stmt_mut(inner),
+        Stmt::LoopForever(_, body) | Stmt::Block(body) => visitor.visit_stmts_mut(body),
+        Stmt::While(test, body) => {
+            visitor.visit_expr_mut(test);
+            visitor.visit_stmts_mut(body);
+        }
+        Stmt::TryCatch { body, handler, .. } => {
+            visitor.visit_stmts_mut(body);
+            visitor.visit_stmts_mut(handler);
+        }
+        Stmt::FunctionDecl { body, .. } => visitor.visit_stmts_mut(body),
+        Stmt::Continue(_)
+        | Stmt::Break(_)
+        | Stmt::Import { .. }
+        | Stmt::Comment(_)
+        | Stmt::Raw(_)
+        | Stmt::Loc(_) => {}
+    }
+}
+
+/// Mutably visits every child of `expr` using `visitor`.
+pub fn walk_expr_mut<V: VisitMut>(visitor: &mut V, expr: &mut Expr) {
+    match expr {
+        Expr::Member(obj, _) | Expr::Unary(_, obj) => visitor.visit_expr_mut(obj),
+        Expr::Index(a, b)
+        | Expr::Binary(_, a, b)
+        | Expr::Assign(a, b)
+        | Expr::CompoundAssign(_, a, b) => {
+            visitor.visit_expr_mut(a);
+            visitor.visit_expr_mut(b);
+        }
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            visitor.visit_expr_mut(callee);
+            for arg in args {
+                visitor.visit_expr_mut(arg);
+            }
+        }
+        Expr::Cond(c, t, e) => {
+            visitor.visit_expr_mut(c);
+            visitor.visit_expr_mut(t);
+            visitor.visit_expr_mut(e);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                visitor.visit_expr_mut(v);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for item in items {
+                visitor.visit_expr_mut(item);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(body)) => visitor.visit_expr_mut(body),
+        Expr::Arrow(_, ArrowBody::Block(body)) => visitor.visit_stmts_mut(body),
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Undefined
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::Raw(_) => {}
+    }
+}
+
+/// Visits every `Expr` in `stmts` (pre-order) with `f`.
+pub fn visit_each_expr(stmts: &[Stmt], f: impl FnMut(&Expr)) {
+    struct FnVisitor<F>(F);
+    impl<F: FnMut(&Expr)> Visit for FnVisitor<F> {
+        fn visit_expr(&mut self, expr: &Expr) {
+            (self.0)(expr);
+            walk_expr(self, expr);
+        }
+    }
+    FnVisitor(f).visit_stmts(stmts);
+}
+
+/// Mutably visits every `Expr` in `stmts` (pre-order) with `f`.
+pub fn visit_each_expr_mut(stmts: &mut [Stmt], f: impl FnMut(&mut Expr)) {
+    struct FnVisitor<F>(F);
+    impl<F: FnMut(&mut Expr)> VisitMut for FnVisitor<F> {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            (self.0)(expr);
+            walk_expr_mut(self, expr);
+        }
+    }
+    FnVisitor(f).visit_stmts_mut(stmts);
+}
+
 impl structurizer::Payload for Stmt {
     fn cost(&self) -> i32 {
         1

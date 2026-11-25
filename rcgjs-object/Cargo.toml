@@ -7,11 +7,12 @@ description = "The rustc-free JIR-S schema shared by the rustc_codegen_js produc
 [lib]
 crate-type = ["rlib"]
 
+[features]
+interp = []
+
 [dependencies]
 # The relooper, for the one `Payload` impl that says what a `jsast::Stmt` costs to duplicate.
 structurizer = { path = "../structurizer" }
-# The format 19 object footer: a base64 encoded, postcard serialized item table.
-base64 = "0.23.0"
 # The section codec: deflate for the content-addressed body blobs, the origins, and the interns.
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }

@@ -987,7 +987,6 @@ pub enum CallSemantic {
     GlobalAllocator,
     RawParts,
     Host,
-    ViewAbi,
     RawJavaScript,
     Standard(StandardOperation),
 }
@@ -996,15 +995,11 @@ pub enum CallSemantic {
 /// encode time so the consumer never needs rustc attributes.
 ///
 /// The encoder's convention (W1b): a `#[js_extern]` declaration is `Extern` (the descriptor
-/// bytes after the macro's `PREFIX`); a `js!{}` marker is `Block`; a `rcgjs.tc.*` marker is
-/// `Marker { section: "rcgjs.tc.template", template: Some(..) }` when it is the `template`
-/// marker called with a `&STATIC` (the static pre-decoded as a `ConstTree` at its own type),
-/// `KeyedList` for the versioned keyed-list boundary, and `ViewAbi { marker }` otherwise; a
-/// `rcgjs.map.*` marker is `Map { marker }`; a `rcgjs.host.*` marker is
-/// `Marker { section: "rcgjs.host.<name>", template: None }` (the async markers
-/// `spawn`/`spawnowner`/`futurepromise` included: whether they are intercepted or compiled as the
-/// safe Rust bodies they have is the consumer's mode decision, as in v1). The `callee` of such a
-/// call is still the resolved marker instance.
+/// bytes after the macro's `PREFIX`); a `js!{}` marker is `Block`; a `rcgjs.map.*` marker is
+/// `Map { marker }`; a `rcgjs.host.*` marker is `Marker { section: "rcgjs.host.<name>", .. }`
+/// (the async markers `spawn`/`futurepromise`/`futurenativepromise` included: whether they are
+/// intercepted or compiled as the safe Rust bodies they have is the consumer's mode decision).
+/// The `callee` of such a call is still the resolved marker instance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HostPayload {
     /// Append-only: postcard serializes this enum by index.
@@ -1014,41 +1009,28 @@ pub enum HostPayload {
     Extern(BytesId),
     /// A `js!{}` block: the block section bytes (`js-macro` `Block`, after its `PREFIX`).
     Block(BytesId),
-    /// A `link_section` marker function: `section` is the full section name (`rcgjs.tc.*`,
-    /// `rcgjs.host.*`, `rcgjs.map.*`, ...), `def` the marker's definition, `template` the
-    /// pre-decoded `view!` template static for the `rcgjs.tc.*` markers that take one, and
-    /// `helpers` the marker's sibling instances (see [`HostPayload::helpers`]).
+    /// A `link_section` marker function: `section` is the full section name (`rcgjs.host.*`),
+    /// `def` the marker's definition, and `helpers` the marker's sibling instances (see
+    /// [`HostPayload::helpers`]).
     Marker {
         section: StrId,
-        def: DefinitionId,
-        template: Option<ConstTree>,
-        helpers: Vec<(StrId, DirectItemRef)>,
-    },
-    /// A `view-abi` marker by its short name (the part after `rcgjs.tc.`), its definition, and
-    /// its sibling instances.
-    ViewAbi {
-        marker: StrId,
         def: DefinitionId,
         helpers: Vec<(StrId, DirectItemRef)>,
     },
     /// A `mires-js` collection marker by its short name (the part after `rcgjs.map.`).
     Map { marker: StrId },
-    /// The version-one transactional keyed-list semantic boundary.
-    KeyedList(Box<KeyedListPayload>),
 }
 
 impl HostPayload {
     /// The **sibling instances** a marker's lowering calls, by the helper's Rust name.
     ///
-    /// A marker declares its helpers beside itself in `view-abi`/`mires-js` and the lowering
-    /// resolves one of them at the marker's own generic argument: `rcgjs.tc.{text,pushkeyed}`
-    /// call `view_abi::display_to_str::<T>` for a value whose `Display` has no in-place
-    /// conversion, `rcgjs.host.{spawn,spawnowner}` call `poll_once::<F>` and
-    /// `rcgjs.host.futurepromise` calls `poll_result::<F>`. Only rustc can resolve those (v1
-    /// `abi.rs::sibling_item`, `host.rs::host_future_helper`), so the producer records them.
+    /// A marker declares its helpers beside itself in `mires-js` and the lowering resolves one of
+    /// them at the marker's own generic argument: `rcgjs.host.spawn` calls `poll_once::<F>` and
+    /// `rcgjs.host.futurepromise` calls `poll_result::<F>`. Only rustc can resolve those, so the
+    /// producer records them.
     pub fn helpers(&self) -> &[(StrId, DirectItemRef)] {
         match self {
-            Self::Marker { helpers, .. } | Self::ViewAbi { helpers, .. } => helpers,
+            Self::Marker { helpers, .. } => helpers,
             _ => &[],
         }
     }
@@ -1060,43 +1042,6 @@ impl HostPayload {
             .find(|(key, _)| interns.str(*key) == Some(name))
             .map(|(_, item)| *item)
     }
-}
-
-/// The keyed-list payload format understood by this schema.
-pub const KEYED_LIST_FORMAT_V1: u16 = 1;
-
-/// One closure or function-item value owned by a keyed-list instance.
-///
-/// `ty` describes the callable value and therefore its captured fields. `body` is the exact
-/// monomorphic body when rustc can resolve one, and is `None` for an indirect callable. `cleanup`
-/// records how ownership of that value ends. The consumer validates all three facts before it may
-/// select an executable keyed lane.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct KeyedListCallable {
-    pub ty: TypeId,
-    pub body: Option<DirectItemRef>,
-    pub cleanup: DropGlue,
-    pub source: Option<SourceFactId>,
-}
-
-/// Representation-neutral facts for one `keyed_list_v1` call.
-///
-/// The collection, item, and key types are separate because the final representation planner may
-/// choose a physical carrier for each independently. Callable captures are described by their
-/// [`KeyedListCallable::ty`] descriptors. Body and cleanup references make every rustc-only query
-/// explicit in the object rather than asking the linker to reconstruct it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct KeyedListPayload {
-    pub format: u16,
-    pub site: Option<SourceFactId>,
-    pub def: DefinitionId,
-    pub collection_ty: TypeId,
-    pub item_ty: TypeId,
-    pub key_ty: TypeId,
-    pub row_ty: TypeId,
-    pub collection: KeyedListCallable,
-    pub key: KeyedListCallable,
-    pub row: KeyedListCallable,
 }
 
 /// How a declared host-binding parameter observes its argument.

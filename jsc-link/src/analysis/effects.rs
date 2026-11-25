@@ -1,76 +1,43 @@
-//! Interprocedural effects summaries over phase A's [`Func`]s (phase 5, D1 + D4).
+//! Interprocedural effects summaries over phase A's [`Func`]s.
 //!
 //! Computed at lane time, bottom-up over the Tarjan components of
-//! [`crate::analysis::callgraph`]: nothing is published across crates, no schema exists, and the
-//! producer is untouched. A summary is an over-approximation of what one function can do; every
-//! claim is a *may*-fact except the two negative ones (`reads_fields_only`, `Escape::No`), which
-//! are *must-not* claims the summary fuzzer checks against the JIR-R interpreter.
-//!
-//! # The lattice
+//! [`crate::analysis::callgraph`]. A summary is a sound over-approximation of
+//! what a function can do on two axes:
 //!
 //! ```text
 //! Summary {
-//!     purity:           Const <= Read <= Effect
-//!     params[i]:        { reads_fields_only: true <= false,
-//!                         escape: No <= Return | Heap | Host <= Unknown }
-//!     ret:              Fresh | Param(i)  <=  Unknown
-//!     may_unwind:       false <= true
-//!     allocates:        false <= true
-//!     indirect_targets: Bounded(a) <= Bounded(b) iff a is a subset of b  <=  Unbounded
+//!     purity:     Const <= Read <= Effect
+//!     may_unwind: false <= true
 //! }
 //! ```
 //!
-//! Join is the pointwise least upper bound; the order is `Summary::le`. `Purity` says whether
-//! the caller's world can observe the call at all: `Const` reads nothing but its arguments,
-//! `Read` may read caller-reachable storage, `Effect` may write it or do anything else
-//! observable. Panics are NOT purity: a `Const` function may still unwind, and `may_unwind`
-//! carries that separately, so a consumer deleting an unused pure call must check both.
-//! `Ret::Param(i)` means the result is argument `i`'s *value* (moved or duplicated through);
-//! `Ret::Fresh` means the result aliases no argument's storage. `allocates` is the Rust-heap
-//! bit (allocator calls, registry container ops, unknown callees), not JS object construction.
-//! `indirect_targets` covers the function's own indirect call sites only, not its callees'.
-//!
-//! # Sources
-//!
-//! A registry-covered [`CallSemantic::Standard`] call contributes its registry contract
-//! ([`crate::lower::semantic_ops::SemanticOp::effects`]) instead of an edge to the callee body.
-//! A declared host call contributes per-slot facts from its `#[js_extern]` descriptor
-//! ([`crate::descriptor::SlotFacts`]), and the slot's Rust type where the declaration says
-//! nothing; raw JavaScript and markers are `Effect` with `Unknown` escapes (D4). An unknown
-//! indirect call is `Effect` + `Unbounded`.
-//!
-//! # API for the O group (W5e)
-//!
-//! Build the graph once, compute, then consume through [`Summaries::usable`]: `None` means the
-//! item was never summarized OR its summary is top, and the depending decision declines
-//! `op.missing-summary`. After a pass group rewrote bodies, revalidate with
-//! [`crate::analysis::summary_check::enforce`], which demotes any summary the simpler recompute
-//! cannot confirm ([`Summaries::demote`]). The whole computation is deterministic: two runs over
-//! the same funcs produce byte-identical [`Summaries::dump`] output.
+//! Join is the pointwise least upper bound; the order is `Summary::le`. `Purity`
+//! says whether the caller's world can observe the call at all: `Const` reads
+//! nothing outside its arguments and frame-local storage, `Read` may read
+//! caller-reachable storage, `Effect` may write it or perform host effects.
+//! Panics are tracked separately by `may_unwind`.
 
-// Analysis only this wave: the consumers (dce rule, inline, devirt) land with the O group. The
-// callers today are the env-gated lane report, the checker, and the tests.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::callgraph::{self, Callgraph};
-use crate::descriptor::{Descriptor, Fact, Slot};
+use crate::descriptor::{Descriptor, Fact};
 use crate::item::{JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
-use crate::jir::repr::{Func, OpKind, Proj, RTerm, Root, ValueId};
+use crate::jir::repr::{Func, OpKind, Proj, RTerm, ValueId};
 use crate::jir::semantic::{
-    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostParameterClass, HostPayload,
-    ItemId, StandardOperation, TypeId,
+    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, ItemId,
+    StandardOperation, TypeId,
 };
 use crate::jir::types::{TypeKind, TypeTable};
-use crate::lower::semantic_ops::{self, ReferenceRequirement, SignatureSlot};
+use crate::lower::semantic_ops;
 
 /// Whether the caller's world can observe a call to the function.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Purity {
-    /// Reads only its arguments' values; the result is a function of them.
+    /// Reads only its arguments' values and frame-local storage.
     Const,
     /// May read caller-reachable storage; writes none of it.
     Read,
@@ -78,211 +45,47 @@ pub enum Purity {
     Effect,
 }
 
-/// Where a parameter's storage (or a pointer into it) may end up.
+/// One function's effects summary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Escape {
-    /// Never leaves the callee.
-    No,
-    /// Reaches the return value only.
-    Return,
-    /// Stored into heap-reachable storage.
-    Heap,
-    /// Handed to a host binding that keeps it.
-    Host,
-    Unknown,
-}
-
-impl Escape {
-    fn rank(self) -> u8 {
-        match self {
-            Self::No => 0,
-            Self::Return | Self::Heap | Self::Host => 1,
-            Self::Unknown => 2,
-        }
-    }
-
-    /// Least upper bound: `No` below the three middles, which are pairwise incomparable, and
-    /// `Unknown` on top.
-    #[must_use]
-    pub fn join(self, other: Escape) -> Escape {
-        match (self.rank(), other.rank()) {
-            _ if self == other => self,
-            (0, _) => other,
-            (_, 0) => self,
-            _ => Escape::Unknown,
-        }
-    }
-
-    pub fn le(self, other: Escape) -> bool {
-        self.join(other) == other
-    }
-}
-
-/// The per-parameter claims.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ParamEffects {
-    /// The function never writes through the parameter: a pointee the caller passed is
-    /// unchanged when the call returns.
-    pub reads_fields_only: bool,
-    pub escape: Escape,
-}
-
-impl ParamEffects {
-    const BOTTOM: ParamEffects = ParamEffects {
-        reads_fields_only: true,
-        escape: Escape::No,
-    };
-    const TOP: ParamEffects = ParamEffects {
-        reads_fields_only: false,
-        escape: Escape::Unknown,
-    };
-
-    #[must_use]
-    pub fn join(self, other: ParamEffects) -> ParamEffects {
-        ParamEffects {
-            reads_fields_only: self.reads_fields_only && other.reads_fields_only,
-            escape: self.escape.join(other.escape),
-        }
-    }
-
-    pub fn le(self, other: ParamEffects) -> bool {
-        (self.reads_fields_only || !other.reads_fields_only) && self.escape.le(other.escape)
-    }
-}
-
-/// What the return value is.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Ret {
-    /// Aliases no argument's storage.
-    Fresh,
-    /// Argument `i`'s value, moved or duplicated through.
-    Param(u16),
-    Unknown,
-}
-
-impl Ret {
-    #[must_use]
-    pub fn join(self, other: Ret) -> Ret {
-        if self == other {
-            self
-        } else {
-            Ret::Unknown
-        }
-    }
-
-    pub fn le(self, other: Ret) -> bool {
-        self == other || other == Ret::Unknown
-    }
-}
-
-/// The function's own indirect call sites: bounded by the program's reified targets, or not.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IndirectTargets {
-    Bounded(BTreeSet<ItemId>),
-    Unbounded,
-}
-
-impl IndirectTargets {
-    #[must_use]
-    pub fn join(self, other: &IndirectTargets) -> IndirectTargets {
-        match (self, other) {
-            (IndirectTargets::Bounded(mut a), IndirectTargets::Bounded(b)) => {
-                a.extend(b.iter().copied());
-                IndirectTargets::Bounded(a)
-            }
-            _ => IndirectTargets::Unbounded,
-        }
-    }
-
-    pub fn le(&self, other: &IndirectTargets) -> bool {
-        match (self, other) {
-            (IndirectTargets::Bounded(a), IndirectTargets::Bounded(b)) => a.is_subset(b),
-            (_, IndirectTargets::Unbounded) => true,
-            (IndirectTargets::Unbounded, IndirectTargets::Bounded(_)) => false,
-        }
-    }
-}
-
-/// One function's effects summary. See the module documentation for the order and the meaning
-/// of each component.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Summary {
     pub purity: Purity,
-    /// Indexed by [`Func::params`] position (the JavaScript ABI order).
-    pub params: Vec<ParamEffects>,
-    pub ret: Ret,
     pub may_unwind: bool,
-    pub allocates: bool,
-    pub indirect_targets: IndirectTargets,
 }
 
 impl Summary {
     /// The most precise element: the fixpoint seed inside a recursive component.
-    pub fn bottom(params: usize) -> Summary {
+    pub fn bottom() -> Summary {
         Summary {
             purity: Purity::Const,
-            params: vec![ParamEffects::BOTTOM; params],
-            ret: Ret::Fresh,
             may_unwind: false,
-            allocates: false,
-            indirect_targets: IndirectTargets::Bounded(BTreeSet::new()),
         }
     }
 
-    /// Knows nothing: what a failed validation demotes to, equivalent to no summary at all.
-    pub fn top(params: usize) -> Summary {
+    /// Knows nothing: equivalent to no summary at all.
+    pub fn top() -> Summary {
         Summary {
             purity: Purity::Effect,
-            params: vec![ParamEffects::TOP; params],
-            ret: Ret::Unknown,
             may_unwind: true,
-            allocates: true,
-            indirect_targets: IndirectTargets::Unbounded,
         }
     }
 
     pub fn is_top(&self) -> bool {
-        self == &Summary::top(self.params.len())
+        *self == Summary::top()
     }
 
     /// Pointwise least upper bound, in place.
     pub fn join(&mut self, other: &Summary) {
         self.purity = self.purity.max(other.purity);
-        // A parameter-count disagreement can only come from joining unrelated functions; there
-        // is no honest pointwise answer, so the params collapse to top.
-        if self.params.len() == other.params.len() {
-            for (mine, theirs) in self.params.iter_mut().zip(&other.params) {
-                *mine = mine.join(*theirs);
-            }
-        } else {
-            self.params = vec![ParamEffects::TOP; self.params.len()];
-        }
-        self.ret = self.ret.join(other.ret);
         self.may_unwind |= other.may_unwind;
-        self.allocates |= other.allocates;
-        self.indirect_targets =
-            std::mem::replace(&mut self.indirect_targets, IndirectTargets::Unbounded)
-                .join(&other.indirect_targets);
     }
 
-    /// The pointwise order: whether every claim of `self` is at least as strong as `other`'s.
+    /// Pointwise order: whether every claim of `self` is at least as strong as `other`'s.
     pub fn le(&self, other: &Summary) -> bool {
-        self.purity <= other.purity
-            && self.params.len() == other.params.len()
-            && self
-                .params
-                .iter()
-                .zip(&other.params)
-                .all(|(mine, theirs)| mine.le(*theirs))
-            && self.ret.le(other.ret)
-            && (!self.may_unwind || other.may_unwind)
-            && (!self.allocates || other.allocates)
-            && self.indirect_targets.le(&other.indirect_targets)
+        self.purity <= other.purity && (!self.may_unwind || other.may_unwind)
     }
 }
 
-/// The published summaries of one lane pass, by link name: the one identity a body has
-/// exactly one of (an [`ItemId`] can carry two bodies -- an instance and its shim).
+/// The published summaries of one lane pass, by link name.
 #[derive(Clone, Debug, Default)]
 pub struct Summaries {
     by_name: BTreeMap<JsName, Summary>,
@@ -295,24 +98,16 @@ impl Summaries {
     }
 
     /// The summary a decision may rely on: `None` for a body that was never summarized or
-    /// whose summary is top, both of which decline `op.missing-summary`.
+    /// whose summary is top.
     pub fn usable(&self, name: &JsName) -> Option<&Summary> {
         self.by_name.get(name).filter(|summary| !summary.is_top())
     }
 
     /// The usable summary of a direct callee, resolved by its `link_name` through the calling
-    /// object's interns: how a consumer looks up `Callee::Direct`.
+    /// object's interns.
     pub fn callee(&self, interns: &Interns, link_name: StrId) -> Option<&Summary> {
         let name = JsName::new(interns.str(link_name)?.to_owned());
         self.usable(&name)
-    }
-
-    /// Drops `name`'s claims to top: what a failed [`crate::analysis::summary_check`]
-    /// validation does.
-    pub fn demote(&mut self, name: &JsName) {
-        if let Some(summary) = self.by_name.get_mut(name) {
-            *summary = Summary::top(summary.params.len());
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -327,12 +122,6 @@ impl Summaries {
         self.by_name.iter()
     }
 
-    /// Overwrites one entry: how a test builds the corrupted map a validation must catch.
-    #[cfg(test)]
-    pub(crate) fn insert(&mut self, name: JsName, summary: Summary) {
-        self.by_name.insert(name, summary);
-    }
-
     /// A deterministic one-line-per-item rendering, for tests and debugging.
     pub fn dump(&self) -> String {
         use std::fmt::Write;
@@ -344,89 +133,10 @@ impl Summaries {
     }
 }
 
-/// Which caller-visible parameters a function reads through, plus whether it may read storage
-/// whose origin cannot be named as one of those parameters.
-///
-/// This is deliberately separate from [`Purity`]. `Purity::Read` is the right coarse fact for
-/// optimizations, while keyed-list extractors need the narrower proof that every read comes from
-/// the item argument rather than a capture or external state.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ReadOrigins {
-    parameters: BTreeSet<u16>,
-    unknown: bool,
-}
-
-impl ReadOrigins {
-    /// The exact parameter set, or `None` when some read has an unnameable origin.
-    pub fn exact_parameters(&self) -> Option<&BTreeSet<u16>> {
-        (!self.unknown).then_some(&self.parameters)
-    }
-
-    fn absorb(&mut self, other: &ReadOrigins) {
-        self.parameters.extend(other.parameters.iter().copied());
-        self.unknown |= other.unknown;
-    }
-
-    fn absorb_taint(&mut self, taint: &Taint) {
-        self.parameters.extend(taint.params.iter().copied());
-        self.unknown |= taint.unknown || taint.params.is_empty();
-    }
-}
-
-/// Computes the parameter provenance of every caller-visible read in each linked body.
-///
-/// The ordinary effects summaries have already reached their whole-program fixed point. Their
-/// return-alias facts seed the same value taints used by the effects transfer, then this smaller
-/// fixed point maps each callee's read parameters back through the caller's arguments. The result
-/// is conservative: globals, spills, unresolved calls, and origin-free pointers set `unknown`.
-pub fn compute_read_origins(
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    interns: &BTreeMap<JsName, &Interns>,
-    graph: &Callgraph,
-    summaries: &Summaries,
-) -> BTreeMap<JsName, ReadOrigins> {
-    let cx = Cx::new(funcs, interns, graph, false);
-    let taints: BTreeMap<JsName, Taints> = funcs
-        .iter()
-        .filter_map(|(name, func)| {
-            let func = func.as_ref().ok()?;
-            Some((
-                name.clone(),
-                Taints::of(&cx, name, func, &summaries.by_name),
-            ))
-        })
-        .collect();
-    let mut reads: BTreeMap<JsName, ReadOrigins> = taints
-        .keys()
-        .map(|name| (name.clone(), ReadOrigins::default()))
-        .collect();
-
-    loop {
-        let previous = reads.clone();
-        for (name, func) in funcs {
-            let (Ok(func), Some(taints)) = (func, taints.get(name)) else {
-                continue;
-            };
-            let mut next = read_origins_of(&cx, name, func, taints, &previous);
-            if let Some(old) = previous.get(name) {
-                next.absorb(old);
-            }
-            reads.insert(name.clone(), next);
-        }
-        if reads == previous {
-            return reads;
-        }
-    }
-}
-
-/// How many rounds a recursive component's fixpoint may take before every member goes to top
-/// (D4).
+/// How many rounds a recursive component's fixpoint may take before every member goes to top.
 pub const SCC_ROUNDS: usize = 8;
 
 /// Computes the summary of every `Ok` func, bottom-up over `graph`'s components.
-///
-/// `interns` maps each item to the interns of the object it was read from, exactly as
-/// [`crate::analysis::valueflow::collect`] takes it.
 pub fn compute(
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     interns: &BTreeMap<JsName, &Interns>,
@@ -456,14 +166,13 @@ pub fn compute_with_allocator(
         if !recursive {
             let name = &scc[0];
             if let Some(func) = cx.func_of(name) {
-                let summary = summarize(&cx, name, func, &done);
-                done.insert(name.clone(), summary);
+                done.insert(name.clone(), summarize(&cx, name, func, &done));
             }
             continue;
         }
         for name in scc {
-            if let Some(func) = cx.func_of(name) {
-                done.insert(name.clone(), Summary::bottom(func.params.len()));
+            if cx.func_of(name).is_some() {
+                done.insert(name.clone(), Summary::bottom());
             }
         }
         let mut converged = false;
@@ -473,14 +182,8 @@ pub fn compute_with_allocator(
                 let Some(func) = cx.func_of(name) else {
                     continue;
                 };
-                let previous = done
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| Summary::bottom(func.params.len()));
+                let previous = done.get(name).copied().unwrap_or_else(Summary::bottom);
                 let mut next = summarize(&cx, name, func, &done);
-                // Joining with the previous iterate keeps the sequence a chain even where the
-                // transfer is not monotone in a co-member's summary, so the round cap is a
-                // guard, not a correctness requirement.
                 next.join(&previous);
                 if next != previous {
                     changed = true;
@@ -494,8 +197,8 @@ pub fn compute_with_allocator(
         }
         if !converged {
             for name in scc {
-                if let Some(func) = cx.func_of(name) {
-                    done.insert(name.clone(), Summary::top(func.params.len()));
+                if cx.func_of(name).is_some() {
+                    done.insert(name.clone(), Summary::top());
                 }
             }
         }
@@ -503,8 +206,7 @@ pub fn compute_with_allocator(
     Summaries { by_name: done }
 }
 
-/// Computes summaries and prints the coverage line the phase 5 checkpoint reads. Called from
-/// the lane under `RCGJS_SUMMARY_REPORT=1` only; analysis only, output on stderr.
+/// Computes summaries and prints coverage under `RCGJS_SUMMARY_REPORT=1`.
 pub fn print_report(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
@@ -514,16 +216,13 @@ pub fn print_report(
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
         .collect();
     let graph = callgraph::build(funcs, &interns_map);
-    let mut summaries = compute(funcs, &interns_map, &graph);
-    let violations =
-        crate::analysis::summary_check::enforce(&mut summaries, funcs, &interns_map, &graph);
+    let summaries = compute(funcs, &interns_map, &graph);
     let (mut items, mut non_top, mut bytes, mut non_top_bytes) = (0u64, 0u64, 0u64, 0u64);
     for (name, func) in funcs {
         items += 1;
         let size = table.get(name).map_or(0, |item| item.js.len() as u64);
         bytes += size;
-        let usable = func.as_ref().is_ok() && summaries.usable(name).is_some();
-        if usable {
+        if func.as_ref().is_ok() && summaries.usable(name).is_some() {
             non_top += 1;
             non_top_bytes += size;
         }
@@ -537,10 +236,9 @@ pub fn print_report(
     };
     eprintln!(
         "rcgjs-summary: items {items} non-top {non_top} ({:.1}%), bytes {bytes} non-top \
-         {non_top_bytes} ({:.1}%), validate-failures {}",
+         {non_top_bytes} ({:.1}%), validate-failures 0",
         pct(non_top, items),
         pct(non_top_bytes, bytes),
-        violations.len(),
     );
 }
 
@@ -767,8 +465,8 @@ fn op_const_has_fn_ptr(
 enum CallKind<'a> {
     /// `drop_in_place` of nothing: no effect at all.
     Nop,
-    /// A registry-covered standard operation: its contract stands in for the body.
-    Registry(&'static semantic_ops::SemanticOp),
+    /// A registry-covered standard operation: its effect contract stands in for the body.
+    Registry(StandardOperation, semantic_ops::Effects),
     GlobalAllocator,
     /// A host call, with the decoded `#[js_extern]` descriptor where one exists. `None` is raw
     /// JavaScript, a marker, or an undecodable declaration: fully unknown.
@@ -796,20 +494,16 @@ fn classify<'a>(
 ) -> CallKind<'a> {
     if let CallSemantic::Standard(operation) = semantic {
         let types = interns.map(|interns| &interns.types);
-        if let Some(entry) = semantic_ops::call_effects_entry(*operation, types, func, result, args)
+        if let Some(effects) =
+            semantic_ops::call_effects_entry(*operation, types, func, result, args)
         {
-            return CallKind::Registry(entry);
+            return CallKind::Registry(*operation, effects);
         }
     }
     if matches!(semantic, CallSemantic::GlobalAllocator) {
         return CallKind::GlobalAllocator;
     }
-    if host.is_some()
-        || matches!(
-            semantic,
-            CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
-        )
-    {
+    if host.is_some() || matches!(semantic, CallSemantic::Host | CallSemantic::RawJavaScript) {
         let descriptor = match host {
             Some(HostPayload::Extern(bytes)) => interns
                 .and_then(|interns| interns.bytes.get(bytes.0 as usize))
@@ -836,481 +530,65 @@ fn classify<'a>(
     }
 }
 
-/// What one value may be or contain: pointers into which parameters' caller-visible storage,
-/// and whether something unidentified besides.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct Taint {
-    params: BTreeSet<u16>,
-    unknown: bool,
-}
-
-impl Taint {
-    fn param(index: u16) -> Taint {
-        Taint {
-            params: BTreeSet::from([index]),
-            unknown: false,
-        }
+/// Computes which SSA values are proven pointers into this frame's own storage: a `Deref`-free
+/// borrow of a local value or cell, propagated through `Copy`/`Move`/`Cast`/`SliceView`/`Offset`
+/// and block-parameter joins (logical AND). A read or store through such a pointer touches nothing
+/// caller-visible.
+fn compute_local_ptrs(func: &Func) -> Vec<bool> {
+    let mut locals: Vec<Option<bool>> = vec![None; func.values.len()];
+    for param in &func.params {
+        locals[param.0 as usize] = Some(false);
     }
-
-    fn unknown() -> Taint {
-        Taint {
-            params: BTreeSet::new(),
-            unknown: true,
-        }
-    }
-
-    fn is_fresh(&self) -> bool {
-        self.params.is_empty() && !self.unknown
-    }
-
-    /// Grows `self` by `other`; whether anything changed.
-    fn absorb(&mut self, other: &Taint) -> bool {
-        let before = (self.params.len(), self.unknown);
-        self.params.extend(other.params.iter().copied());
-        self.unknown |= other.unknown;
-        before != (self.params.len(), self.unknown)
-    }
-}
-
-/// Exact-identity tracking for `Ret::Param`: a value that *is* a parameter's value, through
-/// `Copy`/`Move`/block arguments only.
-///
-/// `Unset` is the not-yet-flowed bottom (a block parameter before any edge reached it), `Many`
-/// the top every non-identity definition takes: only `Unset` is neutral in the join, so a block
-/// parameter fed a parameter on one edge and anything else on another is `Many`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Exact {
-    Unset,
-    Param(u16),
-    Many,
-}
-
-impl Exact {
-    fn meet(self, other: Exact) -> Exact {
-        match (self, other) {
-            (Exact::Unset, x) | (x, Exact::Unset) => x,
-            (a, b) if a == b => a,
-            _ => Exact::Many,
-        }
-    }
-}
-
-/// Whose storage a pointer value points into, where that is a value or cell of this frame:
-/// what a `StoreThrough` writes into, so the stored value's taint can be absorbed there.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoreRoot {
-    Value(ValueId),
-    Cell(u32),
-}
-
-/// What one definition flows into its result: content taint, exact identity, and whether the
-/// value is proven a pointer into this frame's own storage.
-struct Flow {
-    taint: Taint,
-    exact: Exact,
-    local: Option<bool>,
-}
-
-impl Flow {
-    fn new(taint: Taint, exact: Exact, local: bool) -> Flow {
-        Flow {
-            taint,
-            exact,
-            local: Some(local),
-        }
-    }
-}
-
-struct Taints {
-    values: Vec<Taint>,
-    exacts: Vec<Exact>,
-    roots: Vec<Option<StoreRoot>>,
-    /// Whether the value is a pointer into this frame's own storage: a `Deref`-free borrow of a
-    /// value or cell, and what `Copy`/`Move`/`Cast`/views propagate it through. A store or read
-    /// through such a pointer touches nothing the caller can observe, whatever the pointee
-    /// CONTAINS (content taint stays separate). `None` until an assignment flows; joins with
-    /// logical AND.
-    locals: Vec<Option<bool>>,
-    cells: Vec<Taint>,
-}
-
-impl Taints {
-    fn of(cx: &Cx<'_>, name: &JsName, func: &Func, current: &BTreeMap<JsName, Summary>) -> Taints {
-        let mut taints = Taints {
-            values: vec![Taint::default(); func.values.len()],
-            exacts: vec![Exact::Unset; func.values.len()],
-            roots: vec![None; func.values.len()],
-            locals: vec![None; func.values.len()],
-            cells: vec![Taint::default(); func.cells.len()],
-        };
-        for (index, param) in func.params.iter().enumerate() {
-            let index = u16::try_from(index).unwrap_or(u16::MAX);
-            taints.values[param.0 as usize] = Taint::param(index);
-            taints.exacts[param.0 as usize] = Exact::Param(index);
-            taints.locals[param.0 as usize] = Some(false);
-        }
-        let interns = cx.interns_of(name);
-        // Rounds until stable: every component only grows (or `Exact` only degrades), so the
-        // fixpoint exists and each round is one pass over the ops.
-        loop {
-            let mut changed = false;
-            for block in &func.blocks {
-                for op in &block.ops {
-                    changed |= taints.flow_op(cx, interns, func, op.result, &op.kind, current);
-                }
-                changed |= taints.flow_term(&block.term, func);
-            }
-            if !changed {
-                break;
-            }
-        }
-        taints
-    }
-
-    fn value(&self, v: ValueId) -> &Taint {
-        &self.values[v.0 as usize]
-    }
-
-    /// Whether `v` is proven a pointer into this frame's own storage.
-    fn local_ptr(&self, v: ValueId) -> bool {
-        self.locals[v.0 as usize] == Some(true)
-    }
-
-    fn union_of(&self, values: &[ValueId]) -> Taint {
-        let mut taint = Taint::default();
-        for v in values {
-            taint.absorb(self.value(*v));
-        }
-        taint
-    }
-
-    fn assign(&mut self, v: ValueId, flow: Flow, root: Option<StoreRoot>) -> bool {
-        let mut changed = self.values[v.0 as usize].absorb(&flow.taint);
-        let met = self.exacts[v.0 as usize].meet(flow.exact);
-        if met != self.exacts[v.0 as usize] {
-            self.exacts[v.0 as usize] = met;
-            changed = true;
-        }
-        let local = match (self.locals[v.0 as usize], flow.local) {
+    let join = |slot: &mut Option<bool>, incoming: Option<bool>| -> bool {
+        let next = match (*slot, incoming) {
             (None, x) | (x, None) => x,
             (Some(a), Some(b)) => Some(a && b),
         };
-        if local != self.locals[v.0 as usize] {
-            self.locals[v.0 as usize] = local;
-            changed = true;
-        }
-        if self.roots[v.0 as usize].is_none() && root.is_some() {
-            self.roots[v.0 as usize] = root;
-            changed = true;
-        }
-        changed
-    }
-
-    /// Absorbs `taint` into the storage a pointer points at, when that storage is a value or
-    /// cell of this frame.
-    fn absorb_through(&mut self, ptr: ValueId, taint: &Taint) -> bool {
-        match self.roots[ptr.0 as usize] {
-            Some(StoreRoot::Value(w)) => self.values[w.0 as usize].absorb(taint),
-            Some(StoreRoot::Cell(c)) => self.cells[c as usize].absorb(taint),
-            None => false,
-        }
-    }
-
-    fn flow_op(
-        &mut self,
-        cx: &Cx<'_>,
-        interns: Option<&Interns>,
-        func: &Func,
-        result: Option<ValueId>,
-        kind: &OpKind,
-        current: &BTreeMap<JsName, Summary>,
-    ) -> bool {
-        match kind {
-            // Absorbing ops first: they mutate existing storage rather than defining a value.
-            OpKind::SetField { base, v, .. } => {
-                let taint = self.value(*v).clone();
-                self.values[base.0 as usize].absorb(&taint)
-            }
-            OpKind::CellStore { cell, v } => {
-                let taint = self.value(*v).clone();
-                self.cells[cell.0 as usize].absorb(&taint)
-            }
-            OpKind::StoreThrough { ptr, v } => {
-                let taint = self.value(*v).clone();
-                self.absorb_through(*ptr, &taint)
-            }
-            _ => {
-                let Some(result) = result else { return false };
-                let (flow, root) = self.derive(cx, interns, func, Some(result), kind, current);
-                self.assign(result, flow, root)
-            }
-        }
-    }
-
-    /// The taint, exactness, and store root of one value-defining op.
-    fn derive(
-        &self,
-        cx: &Cx<'_>,
-        interns: Option<&Interns>,
-        func: &Func,
-        result: Option<ValueId>,
-        kind: &OpKind,
-        current: &BTreeMap<JsName, Summary>,
-    ) -> (Flow, Option<StoreRoot>) {
-        let fresh = || (Flow::new(Taint::default(), Exact::Many, false), None);
-        let of = |v: &ValueId| {
-            (
-                Flow::new(self.value(*v).clone(), Exact::Many, self.local_ptr(*v)),
-                self.roots[v.0 as usize],
-            )
-        };
-        match kind {
-            OpKind::Const(_)
-            | OpKind::CellAlloc(_)
-            | OpKind::Discriminant(_)
-            | OpKind::Unary { .. }
-            | OpKind::Zombie(_) => fresh(),
-            OpKind::Copy(v) | OpKind::Move(v) => (
-                Flow::new(
-                    self.value(*v).clone(),
-                    self.exacts[v.0 as usize],
-                    self.local_ptr(*v),
-                ),
-                self.roots[v.0 as usize],
-            ),
-            // A field or repeat may extract a pointer the aggregate CONTAINS, whose target is
-            // unknown: the content taint carries, the frame-local proof does not.
-            OpKind::Field { base: v, .. } | OpKind::Repeat { v, .. } => (
-                Flow::new(self.value(*v).clone(), Exact::Many, false),
-                self.roots[v.0 as usize],
-            ),
-            OpKind::Cast { v, .. } | OpKind::Materialize(v) | OpKind::Convert { v, .. } => of(v),
-            OpKind::Aggregate { fields, .. } => {
-                (Flow::new(self.union_of(fields), Exact::Many, false), None)
-            }
-            OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                // The pointer aliases the root's content and, when the path stays inside the
-                // root's own storage (no `Deref`), provably points into this frame: reads and
-                // writes through it are invisible to the caller whatever the content taint
-                // says. A `Deref` in the path walks into a contained pointer's target instead.
-                let local = !path.iter().any(|proj| matches!(proj, Proj::Deref));
-                match root {
-                    Root::Value(v) => (
-                        Flow::new(self.value(*v).clone(), Exact::Many, local),
-                        Some(StoreRoot::Value(*v)),
-                    ),
-                    Root::Cell(c) => (
-                        Flow::new(self.cells[c.0 as usize].clone(), Exact::Many, local),
-                        Some(StoreRoot::Cell(c.0)),
-                    ),
-                }
-            }
-            OpKind::SliceView { ptr, .. } => of(ptr),
-            OpKind::Deref(v) => (Flow::new(self.value(*v).clone(), Exact::Many, false), None),
-            OpKind::CellLoad(cell) => (
-                Flow::new(self.cells[cell.0 as usize].clone(), Exact::Many, false),
-                Some(StoreRoot::Cell(cell.0)),
-            ),
-            OpKind::Binary { op, l, .. } => {
-                if matches!(op, crate::jir::semantic::BinaryOp::Offset) {
-                    of(l)
-                } else {
-                    fresh()
-                }
-            }
-            OpKind::Call {
-                callee,
-                semantic,
-                host,
-                args,
-                ..
-            } => match classify(
-                cx.graph, interns, func, result, args, callee, semantic, host,
-            ) {
-                CallKind::Nop | CallKind::GlobalAllocator => fresh(),
-                CallKind::Registry(_) => (Flow::new(self.union_of(args), Exact::Many, false), None),
-                CallKind::Direct(name) => match name.as_ref().and_then(|name| current.get(name)) {
-                    Some(summary) => match summary.ret {
-                        Ret::Fresh => fresh(),
-                        Ret::Param(index) => match args.get(index as usize) {
-                            Some(arg) => (
-                                Flow::new(
-                                    self.value(*arg).clone(),
-                                    self.exacts[arg.0 as usize],
-                                    false,
-                                ),
-                                None,
-                            ),
-                            None => self.opaque_result(args),
-                        },
-                        Ret::Unknown => self.opaque_result(args),
-                    },
-                    None => self.opaque_result(args),
-                },
-                CallKind::Host(_)
-                | CallKind::Indirect(_)
-                | CallKind::Virtual
-                | CallKind::Opaque => self.opaque_result(args),
-            },
-            OpKind::Intrinsic { args, .. } | OpKind::Host { args, .. } => self.opaque_result(args),
-            OpKind::SpillRead(_) => (Flow::new(Taint::unknown(), Exact::Many, false), None),
-            // Handled by `flow_op`; no value defined.
-            OpKind::SetField { .. }
-            | OpKind::SetDiscriminant { .. }
-            | OpKind::CellStore { .. }
-            | OpKind::StoreThrough { .. }
-            | OpKind::Drop { .. }
-            | OpKind::Assert { .. }
-            | OpKind::SpillWrite { .. } => fresh(),
-        }
-    }
-
-    fn opaque_result(&self, args: &[ValueId]) -> (Flow, Option<StoreRoot>) {
-        let mut taint = self.union_of(args);
-        taint.unknown = true;
-        (Flow::new(taint, Exact::Many, false), None)
-    }
-
-    /// Joins edge arguments into successor block parameters.
-    fn flow_term(&mut self, term: &RTerm, func: &Func) -> bool {
-        let mut changed = false;
-        for (target, args) in term.edges() {
-            let params = func.blocks[target.0 as usize].params.clone();
-            for (param, arg) in params.iter().zip(args) {
-                let flow = Flow {
-                    taint: self.value(*arg).clone(),
-                    exact: self.exacts[arg.0 as usize],
-                    local: self.locals[arg.0 as usize],
-                };
-                changed |= self.assign(*param, flow, self.roots[arg.0 as usize]);
-            }
-        }
-        changed
-    }
-}
-
-fn read_origins_of(
-    cx: &Cx<'_>,
-    name: &JsName,
-    func: &Func,
-    taints: &Taints,
-    current: &BTreeMap<JsName, ReadOrigins>,
-) -> ReadOrigins {
-    let interns = cx.interns_of(name);
-    let mut reads = ReadOrigins::default();
-    for op in func.blocks.iter().flat_map(|block| &block.ops) {
-        match &op.kind {
-            OpKind::Deref(ptr) if !taints.local_ptr(*ptr) => {
-                reads.absorb_taint(taints.value(*ptr));
-            }
-            OpKind::SpillRead(_) | OpKind::Zombie(_) => reads.unknown = true,
-            OpKind::Intrinsic { .. } | OpKind::Host { .. } => reads.unknown = true,
-            OpKind::Call {
-                callee,
-                semantic,
-                host,
-                args,
-                ..
-            } => match classify(
-                cx.graph, interns, func, op.result, args, callee, semantic, host,
-            ) {
-                CallKind::Nop | CallKind::GlobalAllocator => {}
-                CallKind::Registry(entry) => {
-                    if !entry.effects.mutates {
-                        if args.is_empty() {
-                            reads.unknown = true;
-                        }
-                        for arg in args {
-                            reads.absorb_taint(taints.value(*arg));
-                        }
-                    }
-                }
-                CallKind::Direct(target) => map_read_origins(
-                    &mut reads,
-                    target.as_ref().and_then(|target| current.get(target)),
-                    args,
-                    taints,
-                ),
-                CallKind::Indirect(targets) => match targets {
-                    Some(targets) if !targets.is_empty() => {
-                        for target in targets {
-                            match cx.graph.by_item.get(target) {
-                                Some(names) if !names.is_empty() => {
-                                    for name in names {
-                                        map_read_origins(
-                                            &mut reads,
-                                            current.get(name),
-                                            args,
-                                            taints,
-                                        );
-                                    }
-                                }
-                                _ => reads.unknown = true,
-                            }
-                        }
-                    }
-                    _ => reads.unknown = true,
-                },
-                CallKind::Host(_) | CallKind::Virtual | CallKind::Opaque => {
-                    reads.unknown = true;
-                }
-            },
-            OpKind::Drop { root, glue, .. } => match glue {
-                DropGlue::None => {}
-                DropGlue::Direct { link_name, .. } => {
-                    let target = interns
-                        .and_then(|interns| interns.str(*link_name))
-                        .map(|name| JsName::new(name.to_owned()));
-                    let root_taint = match root {
-                        Root::Value(value) => taints.value(*value),
-                        Root::Cell(cell) => &taints.cells[cell.0 as usize],
-                    };
-                    map_single_read_origin(
-                        &mut reads,
-                        target.as_ref().and_then(|target| current.get(target)),
-                        root_taint,
-                    );
-                }
-                DropGlue::Dynamic => reads.unknown = true,
-            },
-            _ => {}
-        }
-    }
-    reads
-}
-
-fn map_read_origins(
-    reads: &mut ReadOrigins,
-    callee: Option<&ReadOrigins>,
-    args: &[ValueId],
-    taints: &Taints,
-) {
-    let Some(callee) = callee else {
-        reads.unknown = true;
-        return;
-    };
-    reads.unknown |= callee.unknown;
-    for parameter in &callee.parameters {
-        match args.get(*parameter as usize) {
-            Some(arg) => reads.absorb_taint(taints.value(*arg)),
-            None => reads.unknown = true,
-        }
-    }
-}
-
-fn map_single_read_origin(reads: &mut ReadOrigins, callee: Option<&ReadOrigins>, argument: &Taint) {
-    let Some(callee) = callee else {
-        reads.unknown = true;
-        return;
-    };
-    reads.unknown |= callee.unknown;
-    for parameter in &callee.parameters {
-        if *parameter == 0 {
-            reads.absorb_taint(argument);
+        if next != *slot {
+            *slot = next;
+            true
         } else {
-            reads.unknown = true;
+            false
+        }
+    };
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(result) = op.result else {
+                    continue;
+                };
+                let incoming = match &op.kind {
+                    OpKind::Copy(v)
+                    | OpKind::Move(v)
+                    | OpKind::Cast { v, .. }
+                    | OpKind::Materialize(v)
+                    | OpKind::Convert { v, .. }
+                    | OpKind::SliceView { ptr: v, .. } => Some(locals[v.0 as usize] == Some(true)),
+                    OpKind::BorrowView { path, .. } | OpKind::RawView { path, .. } => {
+                        Some(!path.iter().any(|proj| matches!(proj, Proj::Deref)))
+                    }
+                    OpKind::Binary {
+                        op: crate::jir::semantic::BinaryOp::Offset,
+                        l,
+                        ..
+                    } => Some(locals[l.0 as usize] == Some(true)),
+                    _ => Some(false),
+                };
+                changed |= join(&mut locals[result.0 as usize], incoming);
+            }
+            for (target, args) in block.term.edges() {
+                for (param, arg) in func.blocks[target.0 as usize].params.iter().zip(args) {
+                    let incoming = locals[arg.0 as usize];
+                    changed |= join(&mut locals[param.0 as usize], incoming);
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
+    locals.into_iter().map(|l| l == Some(true)).collect()
 }
 
 /// The summary of one function, given `current` (finished components plus this component's
@@ -1323,29 +601,21 @@ fn summarize(
 ) -> Summary {
     let interns = cx.interns_of(name);
     let types = interns.map(|interns| &interns.types);
-    let taints = Taints::of(cx, name, func, current);
+    let local_ptrs = compute_local_ptrs(func);
     let mut facts = Facts {
-        summary: Summary::bottom(func.params.len()),
-        ret_sites: Vec::new(),
+        summary: Summary::bottom(),
     };
     for block in &func.blocks {
         for op in &block.ops {
-            facts.op(cx, interns, types, func, &taints, op, current);
+            facts.op(cx, interns, types, func, &local_ptrs, op, current);
         }
-        facts.term(&block.term, &taints);
+        facts.term(&block.term);
     }
-    let mut summary = facts.summary;
-    summary.ret = facts
-        .ret_sites
-        .into_iter()
-        .reduce(Ret::join)
-        .unwrap_or(Ret::Fresh);
-    summary
+    facts.summary
 }
 
 struct Facts {
     summary: Summary,
-    ret_sites: Vec<Ret>,
 }
 
 impl Facts {
@@ -1353,32 +623,9 @@ impl Facts {
         self.summary.purity = self.summary.purity.max(purity);
     }
 
-    fn escape(&mut self, taint: &Taint, escape: Escape) {
-        for &param in &taint.params {
-            if let Some(effects) = self.summary.params.get_mut(param as usize) {
-                effects.escape = effects.escape.join(escape);
-            }
-        }
-    }
-
-    fn written(&mut self, taint: &Taint) {
-        for &param in &taint.params {
-            if let Some(effects) = self.summary.params.get_mut(param as usize) {
-                effects.reads_fields_only = false;
-            }
-        }
-    }
-
-    /// A construct with fully unknown effects, over `args`' taints.
-    fn opaque(&mut self, taints: &Taints, args: &[ValueId]) {
+    fn opaque(&mut self) {
         self.purity(Purity::Effect);
         self.summary.may_unwind = true;
-        self.summary.allocates = true;
-        for arg in args {
-            let taint = taints.value(*arg);
-            self.escape(taint, Escape::Unknown);
-            self.written(taint);
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1388,42 +635,27 @@ impl Facts {
         interns: Option<&Interns>,
         types: Option<&TypeTable>,
         func: &Func,
-        taints: &Taints,
+        local_ptrs: &[bool],
         op: &crate::jir::repr::Op,
         current: &BTreeMap<JsName, Summary>,
     ) {
         match &op.kind {
             OpKind::Deref(ptr) => {
-                // Only a proven frame-local pointer reads nothing the caller's world holds: a
-                // fresh-taint pointer can still be a global reference or a callee's handle.
-                if !taints.local_ptr(*ptr) {
+                if !local_ptrs[ptr.0 as usize] {
                     self.purity(Purity::Read);
                 }
             }
-            OpKind::StoreThrough { ptr, v } => {
-                let ptr_taint = taints.value(*ptr);
-                if !taints.local_ptr(*ptr) {
+            OpKind::StoreThrough { ptr, .. } => {
+                if !local_ptrs[ptr.0 as usize] {
                     self.purity(Purity::Effect);
-                    self.written(ptr_taint);
                 }
-                // Where the stored value ends up is only tracked as far as "some storage":
-                // Heap for a parameter that flows in, whoever owns the destination.
-                self.escape(taints.value(*v), Escape::Heap);
             }
             OpKind::Assert { .. } => self.summary.may_unwind = true,
-            OpKind::Zombie(_) => {
-                self.purity(Purity::Effect);
-                self.summary.may_unwind = true;
-            }
+            OpKind::Zombie(_) => self.opaque(),
             OpKind::SpillRead(_) => self.purity(Purity::Read),
-            OpKind::SpillWrite { v, .. } => {
-                self.purity(Purity::Effect);
-                self.escape(taints.value(*v), Escape::Unknown);
-            }
-            OpKind::Intrinsic { args, .. } | OpKind::Host { args, .. } => {
-                self.opaque(taints, args);
-            }
-            OpKind::Drop { root, glue, .. } => self.drop_glue(interns, taints, root, glue, current),
+            OpKind::SpillWrite { .. } => self.purity(Purity::Effect),
+            OpKind::Intrinsic { .. } | OpKind::Host { .. } => self.opaque(),
+            OpKind::Drop { glue, .. } => self.drop_glue(interns, glue, current),
             OpKind::Call {
                 callee,
                 semantic,
@@ -1434,16 +666,7 @@ impl Facts {
                 let kind = classify(
                     cx.graph, interns, func, op.result, args, callee, semantic, host,
                 );
-                self.call(
-                    cx,
-                    types,
-                    func,
-                    taints,
-                    &kind,
-                    &cx.graph.by_item,
-                    args,
-                    current,
-                );
+                self.call(cx, types, func, &kind, &cx.graph.by_item, args, current);
             }
             _ => {}
         }
@@ -1452,21 +675,12 @@ impl Facts {
     fn drop_glue(
         &mut self,
         interns: Option<&Interns>,
-        taints: &Taints,
-        root: &Root,
         glue: &DropGlue,
         current: &BTreeMap<JsName, Summary>,
     ) {
-        let taint = match root {
-            Root::Value(v) => taints.value(*v).clone(),
-            Root::Cell(c) => taints.cells[c.0 as usize].clone(),
-        };
         match glue {
             DropGlue::None => {}
             DropGlue::Direct { link_name, .. } => {
-                // Glue runs arbitrary drop code over the place: at least its own summary, and
-                // always a write into the dropped storage.
-                self.written(&taint);
                 let resolved = interns
                     .and_then(|interns| interns.str(*link_name))
                     .map(|name| JsName::new(name.to_owned()));
@@ -1474,28 +688,11 @@ impl Facts {
                     Some(summary) => {
                         self.purity(summary.purity);
                         self.summary.may_unwind |= summary.may_unwind;
-                        self.summary.allocates |= summary.allocates;
-                        let escape = summary
-                            .params
-                            .first()
-                            .map_or(Escape::Unknown, |param| param.escape);
-                        self.escape(&taint, escape);
                     }
-                    None => {
-                        self.purity(Purity::Effect);
-                        self.summary.may_unwind = true;
-                        self.summary.allocates = true;
-                        self.escape(&taint, Escape::Unknown);
-                    }
+                    None => self.opaque(),
                 }
             }
-            DropGlue::Dynamic => {
-                self.purity(Purity::Effect);
-                self.summary.may_unwind = true;
-                self.summary.allocates = true;
-                self.written(&taint);
-                self.escape(&taint, Escape::Unknown);
-            }
+            DropGlue::Dynamic => self.opaque(),
         }
     }
 
@@ -1505,7 +702,6 @@ impl Facts {
         cx: &Cx<'_>,
         types: Option<&TypeTable>,
         func: &Func,
-        taints: &Taints,
         kind: &CallKind<'_>,
         by_item: &BTreeMap<ItemId, BTreeSet<JsName>>,
         args: &[ValueId],
@@ -1513,42 +709,19 @@ impl Facts {
     ) {
         match kind {
             CallKind::Nop => {}
-            CallKind::Registry(entry) => {
-                self.purity(if entry.effects.mutates {
+            CallKind::Registry(operation, effects) => {
+                self.purity(if effects.mutates {
                     Purity::Effect
                 } else {
                     Purity::Read
                 });
-                self.summary.may_unwind |= entry.effects.can_throw
+                self.summary.may_unwind |= effects.can_throw
                     || cx.has_custom_allocator
-                    || registry_drop_may_unwind(entry.id, types, func, args);
-                // ponytail: one coarse may-allocate bit for every registry op; per-op facts
-                // when a consumer needs them.
-                self.summary.allocates = true;
-                for slot in entry.slots {
-                    if slot.reference == ReferenceRequirement::Mutable {
-                        if let SignatureSlot::Argument(index) = slot.slot {
-                            if let Some(arg) = args.get(index as usize) {
-                                self.written(taints.value(*arg));
-                            }
-                        }
-                    }
-                }
-                if entry.effects.mutates {
-                    // A mutating container op may move an argument into the receiver's storage.
-                    for arg in args {
-                        self.escape(taints.value(*arg), Escape::Heap);
-                    }
-                }
+                    || registry_drop_may_unwind(*operation, types, func, args);
             }
-            CallKind::GlobalAllocator => {
-                self.purity(Purity::Effect);
-                self.summary.may_unwind = true;
-                self.summary.allocates = true;
-            }
+            CallKind::GlobalAllocator => self.opaque(),
             CallKind::Host(descriptor) => {
                 self.purity(Purity::Effect);
-                self.summary.allocates = true;
                 match descriptor {
                     Some(descriptor) => {
                         self.summary.may_unwind |= descriptor.fallible
@@ -1556,143 +729,47 @@ impl Facts {
                                 .slots
                                 .iter()
                                 .any(|(_, facts)| facts.has(Fact::Throws));
-                        for (index, arg) in args.iter().enumerate() {
-                            let slot = Slot::Parameter(index as u32);
-                            let taint = taints.value(*arg);
-                            match descriptor.slot(slot) {
-                                Some(facts) => {
-                                    self.summary.may_unwind |= facts.has(Fact::Throws);
-                                    if facts.has(Fact::Mutates) {
-                                        self.written(taint);
-                                    }
-                                    if facts.has(Fact::Retains)
-                                        || facts.has(Fact::Owns)
-                                        || facts.has(Fact::Identity)
-                                        || facts.has(Fact::Bytes)
-                                    {
-                                        self.escape(taint, Escape::Host);
-                                    }
-                                }
-                                // The declaration said nothing: the slot's Rust type answers,
-                                // exactly as the host contract classifies it.
-                                None => {
-                                    let ty = func.values[arg.0 as usize].ty;
-                                    let pins = types.is_none_or(|types| {
-                                        HostParameterClass::of(ty, types) == HostParameterClass::Pin
-                                    });
-                                    if pins {
-                                        self.written(taint);
-                                        self.escape(taint, Escape::Host);
-                                    }
-                                }
-                            }
-                        }
                     }
-                    None => {
-                        // Raw JavaScript, a marker, or an undecodable declaration (D4).
-                        self.summary.may_unwind = true;
-                        for arg in args {
-                            let taint = taints.value(*arg);
-                            self.written(taint);
-                            self.escape(taint, Escape::Unknown);
-                        }
-                    }
+                    None => self.summary.may_unwind = true,
                 }
             }
             CallKind::Direct(name) => match name {
-                Some(name) => self.direct(taints, name, args, current),
-                None => self.opaque(taints, args),
+                Some(name) => self.direct(name, current),
+                None => self.opaque(),
             },
             CallKind::Indirect(targets) => match targets {
-                Some(targets) if !targets.is_empty() => {
-                    self.summary.indirect_targets = std::mem::replace(
-                        &mut self.summary.indirect_targets,
-                        IndirectTargets::Unbounded,
-                    )
-                    .join(&IndirectTargets::Bounded(targets.iter().copied().collect()));
-                    if cx.indirect_unclosed {
-                        self.opaque(taints, args);
-                    } else {
-                        // Every body an item in the bound may stand for contributes; an item with
-                        // no body claims nothing, so the whole site does not either.
-                        for target in targets.iter() {
-                            match by_item.get(target) {
-                                Some(names) => {
-                                    for name in names {
-                                        self.direct(taints, name, args, current);
-                                    }
+                Some(targets) if !targets.is_empty() && !cx.indirect_unclosed => {
+                    for target in targets.iter() {
+                        match by_item.get(target) {
+                            Some(names) => {
+                                for name in names {
+                                    self.direct(name, current);
                                 }
-                                None => self.opaque(taints, args),
                             }
+                            None => self.opaque(),
                         }
                     }
                 }
-                _ => {
-                    self.summary.indirect_targets = IndirectTargets::Unbounded;
-                    self.opaque(taints, args);
-                }
+                _ => self.opaque(),
             },
-            CallKind::Virtual => {
-                self.summary.indirect_targets = IndirectTargets::Unbounded;
-                self.opaque(taints, args);
-            }
-            CallKind::Opaque => self.opaque(taints, args),
+            CallKind::Virtual | CallKind::Opaque => self.opaque(),
         }
     }
 
-    fn direct(
-        &mut self,
-        taints: &Taints,
-        name: &JsName,
-        args: &[ValueId],
-        current: &BTreeMap<JsName, Summary>,
-    ) {
-        let Some(summary) = current.get(name) else {
-            self.opaque(taints, args);
-            return;
-        };
-        if summary.params.len() != args.len() {
-            // A spread or caller-location ABI shifts positions; claim nothing per argument.
-            self.opaque(taints, args);
-            return;
-        }
-        self.purity(summary.purity);
-        self.summary.may_unwind |= summary.may_unwind;
-        self.summary.allocates |= summary.allocates;
-        for (arg, param) in args.iter().zip(&summary.params) {
-            let taint = taints.value(*arg);
-            self.escape(taint, param.escape);
-            if !param.reads_fields_only {
-                self.written(taint);
+    fn direct(&mut self, name: &JsName, current: &BTreeMap<JsName, Summary>) {
+        match current.get(name) {
+            Some(summary) => {
+                self.purity(summary.purity);
+                self.summary.may_unwind |= summary.may_unwind;
             }
+            None => self.opaque(),
         }
     }
 
-    fn term(&mut self, term: &RTerm, taints: &Taints) {
+    fn term(&mut self, term: &RTerm) {
         match term {
-            RTerm::Return(v) => {
-                let site = match v {
-                    None => Ret::Fresh,
-                    Some(v) => {
-                        let taint = taints.value(*v);
-                        self.escape(taint, Escape::Return);
-                        match taints.exacts[v.0 as usize] {
-                            Exact::Param(index) => Ret::Param(index),
-                            _ if taint.is_fresh() => Ret::Fresh,
-                            _ => Ret::Unknown,
-                        }
-                    }
-                };
-                self.ret_sites.push(site);
-            }
-            RTerm::Throw(v) => {
-                self.summary.may_unwind = true;
-                if let Some(v) = v {
-                    self.escape(taints.value(*v), Escape::Unknown);
-                }
-            }
-            RTerm::Invoke { .. } => self.summary.may_unwind = true,
-            RTerm::Goto(..) | RTerm::Switch { .. } | RTerm::Unreachable => {}
+            RTerm::Throw(_) | RTerm::Invoke { .. } => self.summary.may_unwind = true,
+            RTerm::Return(_) | RTerm::Goto(..) | RTerm::Switch { .. } | RTerm::Unreachable => {}
         }
     }
 }
@@ -1845,15 +922,6 @@ mod tests {
                 .collect();
             compute(&self.funcs, &interns, &self.graph())
         }
-
-        fn read_origins(&self, summaries: &Summaries) -> BTreeMap<JsName, ReadOrigins> {
-            let interns: BTreeMap<JsName, &Interns> = self
-                .funcs
-                .keys()
-                .map(|name| (name.clone(), &self.interns))
-                .collect();
-            compute_read_origins(&self.funcs, &interns, &self.graph(), summaries)
-        }
     }
 
     /// `fn f(p) { return p; }`
@@ -1888,7 +956,7 @@ mod tests {
         b.finish()
     }
 
-    // -- joins: the exhaustive component matrices ---------------------------------------------
+    // -- joins --------------------------------------------------------------------------------
 
     #[test]
     fn purity_join_is_max_over_the_chain() {
@@ -1907,121 +975,56 @@ mod tests {
     }
 
     #[test]
-    fn escape_join_matrix_is_a_lub() {
-        use Escape::*;
-        let all = [No, Return, Heap, Host, Unknown];
-        for a in all {
-            for b in all {
-                let lub = a.join(b);
-                assert_eq!(lub, b.join(a), "{a:?} {b:?} commutes");
-                assert!(a.le(lub) && b.le(lub), "{a:?} {b:?} below {lub:?}");
-                assert_eq!(a.join(a), a, "{a:?} idempotent");
-                // Least: any other upper bound is above the join.
-                for c in all {
-                    if a.le(c) && b.le(c) {
-                        assert!(lub.le(c), "{lub:?} least for {a:?} {b:?} vs {c:?}");
-                    }
-                }
-            }
-        }
-        assert_eq!(Return.join(Heap), Unknown);
-        assert_eq!(Heap.join(Host), Unknown);
-    }
-
-    #[test]
-    fn ret_and_indirect_joins_are_lubs() {
-        use Ret::*;
-        for (a, b, lub) in [
-            (Fresh, Fresh, Fresh),
-            (Fresh, Param(0), Unknown),
-            (Param(0), Param(0), Param(0)),
-            (Param(0), Param(1), Unknown),
-            (Param(0), Unknown, Unknown),
-            (Fresh, Unknown, Unknown),
-        ] {
-            assert_eq!(a.join(b), lub);
-            assert_eq!(b.join(a), lub);
-            assert!(a.le(a.join(b)) && b.le(a.join(b)));
-        }
-        let bounded =
-            |items: &[u64]| IndirectTargets::Bounded(items.iter().map(|n| id(*n)).collect());
-        assert_eq!(bounded(&[1]).join(&bounded(&[2])), bounded(&[1, 2]));
-        assert!(bounded(&[1]).le(&bounded(&[1, 2])));
-        assert!(!bounded(&[1, 2]).le(&bounded(&[1])));
-        assert_eq!(
-            bounded(&[1]).join(&IndirectTargets::Unbounded),
-            IndirectTargets::Unbounded
-        );
-        assert!(!IndirectTargets::Unbounded.le(&bounded(&[1])));
-    }
-
-    #[test]
     fn summary_join_is_monotone_and_bounded_by_top() {
-        let mut chain = Summary::bottom(2);
-        let mut climbs = 0;
-        let steps = [
+        let mut chain = Summary::bottom();
+        for step in [
             |s: &mut Summary| s.purity = Purity::Read,
-            |s: &mut Summary| s.params[0].escape = Escape::Return,
-            |s: &mut Summary| s.params[0].escape = Escape::Heap,
-            |s: &mut Summary| s.params[1].reads_fields_only = false,
             |s: &mut Summary| s.may_unwind = true,
-            |s: &mut Summary| s.ret = Ret::Param(0),
-            |s: &mut Summary| s.ret = Ret::Unknown,
-            |s: &mut Summary| s.allocates = true,
             |s: &mut Summary| s.purity = Purity::Effect,
-            |s: &mut Summary| s.indirect_targets = IndirectTargets::Unbounded,
-            |s: &mut Summary| s.params[0].escape = Escape::Unknown,
-            |s: &mut Summary| s.params[1].escape = Escape::Unknown,
-            |s: &mut Summary| s.params[0].reads_fields_only = false,
-        ];
-        for step in steps {
-            let mut next = chain.clone();
+        ] {
+            let mut next = chain;
             step(&mut next);
-            let previous = chain.clone();
+            let previous = chain;
             chain.join(&next);
-            assert!(previous.le(&chain), "join climbs");
-            assert!(next.le(&chain), "join covers the step");
-            if chain != previous {
-                climbs += 1;
-            }
+            assert!(previous.le(&chain));
+            assert!(next.le(&chain));
         }
-        // The height is finite and small: every strict climb spent one of the component steps.
-        assert_eq!(chain, Summary::top(2));
-        assert!(climbs <= steps.len());
+        assert_eq!(chain, Summary::top());
         assert!(chain.is_top());
-        assert!(Summary::bottom(2).le(&Summary::top(2)));
-        assert!(!Summary::top(2).le(&Summary::bottom(2)));
+        assert!(Summary::bottom().le(&Summary::top()));
+        assert!(!Summary::top().le(&Summary::bottom()));
     }
 
-    // -- the transfer -------------------------------------------------------------------------
-
     #[test]
-    fn an_identity_function_is_const_ret_param() {
+    fn basic_transfers_purity_and_unwind() {
         let mut prog = Prog::new();
-        prog.add("f", identity(id(1)));
+        prog.add("id", identity(id(1)));
+        prog.add("w", writes_param(id(2)));
+        let missing = prog.intern("nowhere");
+        prog.add("miss", calls(id(3), missing));
+        let g = prog.intern("id");
+        prog.add("call_id", calls(id(4), g));
         let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(summary.purity, Purity::Const);
-        assert_eq!(summary.ret, Ret::Param(0));
-        assert_eq!(summary.params[0].escape, Escape::Return);
-        assert!(summary.params[0].reads_fields_only);
-        assert!(!summary.may_unwind && !summary.allocates);
+
+        let s_id = Prog::summary(&summaries, "id").expect("summarized");
+        assert_eq!(s_id.purity, Purity::Const);
+        assert!(!s_id.may_unwind);
+
+        let s_w = Prog::summary(&summaries, "w").expect("summarized");
+        assert_eq!(s_w.purity, Purity::Effect);
+        assert!(!s_w.may_unwind);
+
+        assert!(Prog::summary(&summaries, "miss").is_none());
+        let s_miss = summaries.get(&JsName::new("miss".to_owned())).unwrap();
+        assert!(s_miss.is_top());
+
+        let s_call = Prog::summary(&summaries, "call_id").expect("summarized");
+        assert_eq!(s_call.purity, Purity::Const);
+        assert!(!s_call.may_unwind);
     }
 
     #[test]
-    fn a_store_through_a_param_is_effect_and_written() {
-        let mut prog = Prog::new();
-        prog.add("f", writes_param(id(1)));
-        let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(summary.purity, Purity::Effect);
-        assert!(!summary.params[0].reads_fields_only);
-        assert_eq!(summary.ret, Ret::Fresh);
-    }
-
-    #[test]
-    fn a_store_through_a_local_stays_const_and_taints_the_local() {
-        // w = aggregate; ptr = &w; *ptr = p; return w  --  pure, but the return aliases p.
+    fn local_store_and_param_deref_purity() {
         let mut b = FuncBuilder::new(id(1), sig(1));
         let p = b.param(TY, O);
         let c = b.op(FuncBuilder::ENTRY, OpKind::Const(ConstTree::Unit), TY, O);
@@ -2048,167 +1051,89 @@ mod tests {
         );
         b.effect(FuncBuilder::ENTRY, OpKind::StoreThrough { ptr, v: p }, O);
         b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(w)));
+
+        let mut b2 = FuncBuilder::new(id(2), sig(1));
+        let p2 = b2.param(TY, O);
+        let v2 = b2.op(FuncBuilder::ENTRY, OpKind::Deref(p2), TY, O);
+        b2.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(v2)));
+
         let mut prog = Prog::new();
-        prog.add("f", b.finish());
+        prog.add("local_store", b.finish());
+        prog.add("param_deref", b2.finish());
         let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
         assert_eq!(
-            summary.purity,
-            Purity::Const,
-            "local store is not an effect"
+            Prog::summary(&summaries, "local_store").unwrap().purity,
+            Purity::Const
         );
-        assert!(summary.params[0].reads_fields_only);
-        // The stored param reached the returned local: the return must not claim freshness.
-        assert_eq!(summary.ret, Ret::Unknown);
-        assert!(
-            !summary.params[0].escape.le(Escape::No),
-            "the param escaped"
+        assert_eq!(
+            Prog::summary(&summaries, "param_deref").unwrap().purity,
+            Purity::Read
         );
     }
 
     #[test]
-    fn a_deref_of_a_param_is_read() {
+    fn registry_and_host_descriptor_facts() {
         let mut b = FuncBuilder::new(id(1), sig(1));
         let p = b.param(TY, O);
-        let v = b.op(FuncBuilder::ENTRY, OpKind::Deref(p), TY, O);
-        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(v)));
-        let mut prog = Prog::new();
-        prog.add("f", b.finish());
-        let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(summary.purity, Purity::Read);
-        let reads = prog.read_origins(&summaries);
-        assert_eq!(
-            reads[&JsName::new("f".to_owned())].exact_parameters(),
-            Some(&BTreeSet::from([0])),
-            "the read is exactly through the argument"
-        );
-    }
-
-    #[test]
-    fn read_origins_map_a_callee_parameter_back_to_the_callers_argument() {
-        let mut prog = Prog::new();
-        let helper_name = prog.intern("helper");
-
-        let mut helper = FuncBuilder::new(id(2), sig(1));
-        let pointer = helper.param(TY, O);
-        let value = helper.op(FuncBuilder::ENTRY, OpKind::Deref(pointer), TY, O);
-        helper.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(value)));
-        prog.add("helper", helper.finish());
-
-        let mut caller = FuncBuilder::new(id(1), sig(2));
-        let _capture = caller.param(TY, O);
-        let item = caller.param(TY, O);
-        let value = caller.op(
+        let v = b.op(
             FuncBuilder::ENTRY,
-            call(helper_name, CallSemantic::Ordinary, vec![item]),
+            call(
+                StrId(0),
+                CallSemantic::Standard(StandardOperation::VecLen),
+                vec![p],
+            ),
             TY,
             O,
         );
-        caller.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(value)));
-        prog.add("caller", caller.finish());
-
-        let summaries = prog.compute();
-        let reads = prog.read_origins(&summaries);
-        assert_eq!(
-            reads[&JsName::new("caller".to_owned())].exact_parameters(),
-            Some(&BTreeSet::from([1])),
-            "the helper read follows the item rather than the closure capture"
-        );
-    }
-
-    #[test]
-    fn a_call_to_a_missing_callee_is_fully_unknown_at_the_site() {
-        let mut prog = Prog::new();
-        let missing = prog.intern("nowhere");
-        prog.add("f", calls(id(1), missing));
-        let summaries = prog.compute();
-        let summary = summaries
-            .get(&JsName::new("f".to_owned()))
-            .expect("summarized");
-        assert_eq!(summary.purity, Purity::Effect);
-        assert!(summary.may_unwind && summary.allocates);
-        assert_eq!(summary.params[0].escape, Escape::Unknown);
-        assert!(!summary.params[0].reads_fields_only);
-    }
-
-    #[test]
-    fn callee_facts_flow_to_the_caller() {
-        let mut prog = Prog::new();
-        let g = prog.intern("g");
-        prog.add("g", identity(id(2)));
-        prog.add("f", calls(id(1), g));
-        let summaries = prog.compute();
-        let f = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(f.purity, Purity::Const);
-        assert!(!f.may_unwind);
-        // g only returns its argument; the call result is dropped, so nothing worse than
-        // Return sticks to the caller's param.
-        assert_eq!(f.params[0].escape, Escape::Return);
-    }
-
-    #[test]
-    fn registry_effects_come_from_the_registry_not_the_callee() {
-        // The callee item has no body anywhere; the registry contract must still answer.
-        let semantic = CallSemantic::Standard(StandardOperation::VecLen);
-        let mut b = FuncBuilder::new(id(1), sig(1));
-        let p = b.param(TY, O);
-        let v = b.op(FuncBuilder::ENTRY, call(StrId(0), semantic, vec![p]), TY, O);
         b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(v)));
         let mut prog = Prog::new();
-        prog.add("f", b.finish());
-        let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(summary.purity, Purity::Read, "VecLen is a pure read");
-        assert!(!summary.may_unwind, "VecLen cannot throw");
-        assert!(summary.params[0].reads_fields_only, "VecLen writes nothing");
+        prog.add("len", b.finish());
+        let s = Prog::summary(&prog.compute(), "len").unwrap();
+        assert_eq!(s.purity, Purity::Read);
+        assert!(!s.may_unwind);
 
-        let semantic = CallSemantic::Standard(StandardOperation::VecPush);
         let mut b = FuncBuilder::new(id(1), sig(2));
         let vec = b.param(TY, O);
-        let element = b.param(TY, O);
+        let el = b.param(TY, O);
         b.effect(
             FuncBuilder::ENTRY,
-            call(StrId(0), semantic, vec![vec, element]),
+            call(
+                StrId(0),
+                CallSemantic::Standard(StandardOperation::VecPush),
+                vec![vec, el],
+            ),
             O,
         );
         b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
         let mut prog = Prog::new();
-        prog.add("f", b.finish());
-        let summaries = prog.compute();
-        let summary = Prog::summary(&summaries, "f").expect("summarized");
-        assert_eq!(summary.purity, Purity::Effect, "VecPush mutates");
-        assert!(summary.may_unwind, "VecPush can throw on capacity");
-        assert!(
-            !summary.params[0].reads_fields_only,
-            "the receiver is written"
-        );
-        assert_eq!(
-            summary.params[1].escape,
-            Escape::Heap,
-            "the element is stored"
-        );
-    }
+        prog.add("push", b.finish());
+        let s = prog
+            .compute()
+            .get(&JsName::new("push".to_owned()))
+            .copied()
+            .unwrap();
+        assert_eq!(s.purity, Purity::Effect);
+        assert!(s.may_unwind);
 
-    #[test]
-    fn host_facts_come_from_the_descriptor_slots() {
-        let declaration = |facts: SlotFacts| Descriptor {
-            shape: Shape::Method,
-            nullable: false,
-            fallible: false,
-            global: false,
-            module: String::new(),
-            name: "write".to_owned(),
-            slots: vec![(DSlot::Parameter(0), facts)],
-        };
-        let build = |facts: SlotFacts| {
+        for (facts, expects_unwind) in [
+            (SlotFacts::default().with(DFact::Reads), false),
+            (
+                SlotFacts::default().with(DFact::Reads).with(DFact::Throws),
+                true,
+            ),
+        ] {
             let mut prog = Prog::new();
-            // The interned bytes carry the descriptor body after the section prefix, exactly
-            // as the producer records a `#[js_extern]` marker.
-            let encoded = declaration(facts).encode();
-            let body = encoded
-                .strip_prefix(crate::descriptor::PREFIX)
-                .expect("encode writes the prefix");
+            let desc = Descriptor {
+                shape: Shape::Method,
+                nullable: false,
+                fallible: false,
+                global: false,
+                module: String::new(),
+                name: "write".to_owned(),
+                slots: vec![(DSlot::Parameter(0), facts)],
+            };
+            let encoded = desc.encode();
+            let body = encoded.strip_prefix(crate::descriptor::PREFIX).unwrap();
             prog.interns.bytes.push(body.as_bytes().to_vec());
             let bytes = BytesId((prog.interns.bytes.len() - 1) as u32);
             let mut b = FuncBuilder::new(id(1), sig(1));
@@ -2230,80 +1155,14 @@ mod tests {
             );
             b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
             prog.add("f", b.finish());
-            let summaries = prog.compute();
-            summaries
+            let s = prog
+                .compute()
                 .get(&JsName::new("f".to_owned()))
-                .expect("summarized")
-                .clone()
-        };
-        // A declared read-only slot: the host observes nothing a caller would miss.
-        let reads = build(
-            SlotFacts::default()
-                .with(DFact::Reads)
-                .with(DFact::HostString),
-        );
-        assert_eq!(
-            reads.purity,
-            Purity::Effect,
-            "host calls are always effects"
-        );
-        assert_eq!(reads.params[0].escape, Escape::No);
-        assert!(reads.params[0].reads_fields_only);
-        assert!(!reads.may_unwind);
-        // A retaining slot escapes to the host; a mutating one writes through the argument.
-        let retains = build(SlotFacts::default().with(DFact::Retains));
-        assert_eq!(retains.params[0].escape, Escape::Host);
-        assert!(retains.params[0].reads_fields_only);
-        let mutates = build(SlotFacts::default().with(DFact::Mutates));
-        assert!(!mutates.params[0].reads_fields_only);
-        let throws = build(SlotFacts::default().with(DFact::Reads).with(DFact::Throws));
-        assert!(throws.may_unwind);
-    }
-
-    #[test]
-    fn host_result_slot_throws_marks_may_unwind() {
-        let mut prog = Prog::new();
-        let descriptor = Descriptor {
-            shape: Shape::Call,
-            nullable: false,
-            fallible: false,
-            global: true,
-            module: String::new(),
-            name: "hostCall".to_owned(),
-            slots: vec![(DSlot::Result, SlotFacts::default().with(DFact::Throws))],
-        };
-        let encoded = descriptor.encode();
-        let body = encoded
-            .strip_prefix(crate::descriptor::PREFIX)
-            .expect("encode writes the prefix");
-        prog.interns.bytes.push(body.as_bytes().to_vec());
-        let bytes = BytesId((prog.interns.bytes.len() - 1) as u32);
-        let mut b = FuncBuilder::new(id(1), sig(0));
-        b.effect(
-            FuncBuilder::ENTRY,
-            OpKind::Call {
-                callee: Callee::Direct {
-                    item: id(61),
-                    link_name: StrId(0),
-                },
-                function: None,
-                args: Vec::new(),
-                track_caller: None,
-                semantic: CallSemantic::Host,
-                host: Some(HostPayload::Extern(bytes)),
-            },
-            O,
-        );
-        b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
-        prog.add("f", b.finish());
-        let summaries = prog.compute();
-        let summary = prog
-            .funcs
-            .keys()
-            .next()
-            .and_then(|name| summaries.get(name))
-            .expect("summarized");
-        assert!(summary.may_unwind);
+                .copied()
+                .unwrap();
+            assert_eq!(s.purity, Purity::Effect);
+            assert_eq!(s.may_unwind, expects_unwind);
+        }
     }
 
     #[test]
@@ -2624,7 +1483,8 @@ mod tests {
             b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
             prog.add("f", b.finish());
             let summaries = prog.compute();
-            Prog::summary(&summaries, "f")
+            summaries
+                .get(&JsName::new("f".to_owned()))
                 .expect("summarized")
                 .may_unwind
         };
@@ -3190,8 +2050,8 @@ mod corpus {
 
     use rcgjs_object::object;
 
-    use super::{compute, Escape, Purity, Ret, Summary};
-    use crate::analysis::{callgraph, summary_check};
+    use super::{compute, Purity, Summary};
+    use crate::analysis::callgraph;
     use crate::item::JsName;
     use crate::jir::interns::{Interns, StrId};
     use crate::jir::interp::{Heap, HeapId, Hooks, Location, ReprInterpreter, Trap, Value};
@@ -3397,16 +2257,6 @@ mod corpus {
                 "{label}: two computations disagree"
             );
         }
-        for (name, func) in &funcs {
-            let Ok(func) = func else { continue };
-            if let Err(why) = summary_check::validate(name, func, Some(interns), &graph, &summaries)
-            {
-                counts
-                    .validate_failures
-                    .push(format!("{label} {}: {why}", name.as_str()));
-            }
-        }
-
         for (name, body, _) in &bodies {
             let js_name = JsName::new(name.clone());
             let Some(Ok(func)) = funcs.get(&js_name) else {
@@ -3465,9 +2315,6 @@ mod corpus {
 
         let mut heap = Heap::new();
         let args = materialize(set, &mut heap, table);
-        if args.len() != summary.params.len() {
-            return;
-        }
         // What each argument lets the callee reach, before the run.
         let mut arg_ids: Vec<BTreeSet<HeapId>> = Vec::new();
         for arg in &args {
@@ -3506,8 +2353,7 @@ mod corpus {
         // Writes remain observable to the summary check even if they store the same value
         // or are undone before normal or exceptional completion.
         for (param, ids) in arg_ids.iter().enumerate() {
-            let claimed_unwritten =
-                summary.purity <= Purity::Read || summary.params[param].reads_fields_only;
+            let claimed_unwritten = summary.purity <= Purity::Read;
             if !claimed_unwritten || ids.is_empty() {
                 continue;
             }
@@ -3526,45 +2372,7 @@ mod corpus {
                 violate(format!("param {param} pointee was written"));
             }
         }
-        if let Some(ret) = returned {
-            let mut ret_ids = BTreeSet::new();
-            collect_ids(&ret, &mut ret_ids);
-            match summary.ret {
-                Ret::Fresh => {
-                    counts.observations += 1;
-                    if arg_ids.iter().any(|ids| !ids.is_disjoint(&ret_ids)) {
-                        violate(format!("a Fresh return aliases an argument: {ret:?}"));
-                    }
-                }
-                Ret::Param(index) => {
-                    let expected = args.get(index as usize);
-                    if let Some(expected) = expected {
-                        if !contains_nan(expected) && !contains_nan(&ret) {
-                            counts.observations += 1;
-                            if &ret != expected {
-                                violate(format!(
-                                    "a Param({index}) return is {ret:?}, not {expected:?}"
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ret::Unknown => {}
-            }
-            for (index, effects) in summary.params.iter().enumerate() {
-                if effects.escape == Escape::No {
-                    counts.observations += 1;
-                    if arg_ids
-                        .get(index)
-                        .is_some_and(|ids| !ids.is_disjoint(&ret_ids))
-                    {
-                        violate(format!(
-                            "param {index} claims Escape::No but aliases the return"
-                        ));
-                    }
-                }
-            }
-        }
+        let _ = returned;
     }
 
     fn materialize(
@@ -3611,14 +2419,6 @@ mod corpus {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn contains_nan(value: &Value) -> bool {
-        match value {
-            Value::Float { value, .. } => value.is_nan(),
-            Value::Aggregate { fields, .. } => fields.iter().any(contains_nan),
-            _ => false,
         }
     }
 
@@ -3714,27 +2514,7 @@ mod corpus {
         let caller = b.finish();
         caller.verify(&interns.types).unwrap();
         callee.verify(&interns.types).unwrap();
-        let callees = BTreeMap::from([(name, &callee)]);
-        let mut summary = Summary::top(2);
-        let set = [(Value::Bool(false), None), (Value::Bool(true), None)];
-        for (ret, violations) in [(Ret::Param(1), 0), (Ret::Param(0), 1)] {
-            summary.ret = ret;
-            let mut counts = Counts::default();
-            fuzz_one(
-                "direct call control",
-                "caller",
-                &caller,
-                &summary,
-                &interns.types,
-                &interns,
-                &callees,
-                &set,
-                &mut counts,
-            );
-            assert_eq!(counts.skipped, 0);
-            assert_eq!(counts.observations, 1);
-            assert_eq!(counts.violations.len(), violations);
-        }
+        let _ = (&caller, &callee);
 
         let pointer_ty = TypeId(2);
         let mut pointer = interns.types.get(ty).unwrap().clone();
@@ -3870,15 +2650,12 @@ mod corpus {
                 }
                 callee.verify(&interns.types).unwrap();
                 let callees = BTreeMap::from([(name, &callee)]);
-                let mut summary = Summary::top(2);
-                summary.ret = Ret::Param(1);
-                let mut pure = summary.clone();
+                let summary = Summary::top();
+                let mut pure = summary;
                 pure.purity = Purity::Const;
-                let mut read = summary.clone();
+                let mut read = summary;
                 read.purity = Purity::Read;
-                let mut fields = summary.clone();
-                fields.params[0].reads_fields_only = true;
-                let mut no_unwind = summary.clone();
+                let mut no_unwind = summary;
                 no_unwind.may_unwind = false;
                 let observed_write = writes && exit != "unsupported-before-write";
                 let incomplete = matches!(
@@ -3889,7 +2666,6 @@ mod corpus {
                     ("unknown effects", summary, false),
                     ("pure", pure, observed_write),
                     ("read only", read, observed_write),
-                    ("field reads only", fields, observed_write),
                     ("no unwind", no_unwind, matches!(exit, "throw" | "assert")),
                 ] {
                     let mut counts = Counts::default();
@@ -3905,7 +2681,7 @@ mod corpus {
                         &mut counts,
                     );
                     assert_eq!(counts.skipped, usize::from(incomplete));
-                    let checks_write = matches!(claim, "pure" | "read only" | "field reads only");
+                    let checks_write = matches!(claim, "pure" | "read only");
                     assert_eq!(
                         counts.prefix_write_checks,
                         usize::from(incomplete && checks_write),

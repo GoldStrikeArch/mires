@@ -176,10 +176,6 @@ pub(crate) fn augment_plan(
     let mut probe_opts = opts.clone();
     probe_opts.optimizer = OptimizerMode::On;
     let mut probed: BTreeMap<JsName, ProbedFunc> = BTreeMap::new();
-    let mut inlined_vecs: BTreeMap<
-        JsName,
-        crate::lower::semantic_ops::string::InlinedStringVecAnalysis,
-    > = BTreeMap::new();
     for (name, res) in funcs {
         let Ok(func) = res else { continue };
         let Some(&interns) = interns_map.get(name) else {
@@ -259,21 +255,6 @@ pub(crate) fn augment_plan(
             }
             let _ = crate::opt::slice_iter::run(&mut scratch, &interns.types);
         }
-        if let Some(analysis) = crate::lower::semantic_ops::string::analyze_inlined_string_vec(
-            &scratch,
-            &interns.types,
-            interns,
-            |item_id, _| {
-                crate::lower::semantic_ops::string::is_raw_vec_reserve_in_table(
-                    table,
-                    &interns_map,
-                    &item_to_name,
-                    item_id,
-                )
-            },
-        ) {
-            inlined_vecs.insert(name.clone(), analysis);
-        }
         let probe_plan =
             crate::lower::fuse::plan(&scratch, None, &interns.types, interns, &probe_opts);
         probed.insert(
@@ -334,7 +315,6 @@ pub(crate) fn augment_plan(
                     cand_plan,
                     &cand.interns.types,
                     cand.interns,
-                    inlined_vecs.get(&cand.name),
                     &sub_seeds,
                     false,
                     &accepts,
@@ -360,7 +340,6 @@ pub(crate) fn augment_plan(
                     cand_plan,
                     &cand.interns.types,
                     cand.interns,
-                    inlined_vecs.get(&cand.name),
                     &full_seeds,
                     false,
                     &accepts,
@@ -425,7 +404,6 @@ pub(crate) fn augment_plan(
                 Some(&probed_caller.probe_plan),
                 &caller_interns.types,
                 caller_interns,
-                inlined_vecs.get(caller_name),
                 &caller_seeds,
                 false,
                 &accepts_safe,
@@ -575,7 +553,6 @@ pub(crate) fn augment_plan(
                 Some(&cand_probed.probe_plan),
                 &cand.interns.types,
                 cand.interns,
-                inlined_vecs.get(&cand.name),
                 &seeds,
                 false,
                 &accepts_sel,
@@ -627,7 +604,6 @@ pub(crate) fn augment_plan(
                 Some(&probed_caller.probe_plan),
                 &caller_interns.types,
                 caller_interns,
-                inlined_vecs.get(caller_name),
                 &[],
                 false,
                 &accepts_sel,
@@ -689,7 +665,6 @@ pub(crate) fn augment_plan(
                     Some(&probed_caller.probe_plan),
                     &caller_interns.types,
                     caller_interns,
-                    inlined_vecs.get(caller_name),
                     &seeds,
                     false,
                     &accepts_sel,

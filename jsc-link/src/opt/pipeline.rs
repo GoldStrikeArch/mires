@@ -221,25 +221,6 @@ fn run(
     });
     let runs_pea = opts.analyzes(OptimizerPass::Sroa) && passes.pea && pea_carriers;
 
-    // Run `slice_iter` once before PEA (after an initial `dce` cleanup) so whole-object
-    // `Enumerate<Take|Skip<SliceIter<u8>>>` loops lower before PEA scalarizes their outer
-    // adapter aggregates, and once after PEA so scalarized `Plain`/`Enumerate<SliceIter<T>>`
-    // loops lower as well.
-    if runs_dce && passes.slice_iter {
-        if dce::run_with(func, table, &dce_options, &mut witnesses) {
-            stats.ast_dce_changed = true;
-            verified(func, table, "ast-dce")?;
-        }
-        run_slice_iter(
-            func,
-            table,
-            &dce_options,
-            &mut witnesses,
-            stats,
-            inject_fault,
-        )?;
-    }
-
     // `dce` then the escape analysis, to a short fixpoint: the first `dce` threads the
     // variant-per-path merges the escape analysis then scalarizes, and a scalarized outer object
     // exposes its inner one to the next round (a `Some((a, b))` merge takes two). The trailing
@@ -266,14 +247,7 @@ fn run(
             stats.pea.scalarized += pea.scalarized;
             stats.pea.escaped += pea.escaped;
             stats.pea.params_added += pea.params_added;
-            if pea.scalarized > 0 {
-                stats.sroa_changed = true;
-                round = true;
-                witnesses.push(Witness::Scalarize {
-                    scalarized: pea.scalarized,
-                });
-                verified(func, table, "sroa")?;
-            } else if super::partial_escape::unbox_cells(func, table) {
+            if pea.scalarized > 0 || super::partial_escape::unbox_cells(func, table) {
                 stats.sroa_changed = true;
                 round = true;
                 verified(func, table, "sroa")?;
@@ -305,7 +279,6 @@ fn run(
     if runs_dce {
         let forwarded = super::slice_forward::run(func, table);
         if forwarded > 0 {
-            witnesses.push(Witness::SliceViewForward { views: forwarded });
             verified(func, table, "slice-forward")?;
             if dce::run_with(func, table, &dce_options, &mut witnesses) {
                 stats.ast_dce_changed = true;
@@ -376,12 +349,18 @@ fn run_slice_iter(
         return Ok(());
     }
     stats.slice_iterator_loops_would_lower += lowered.len() as u32;
-    let mut slice_witnesses = [Witness::SliceIteratorCursor { loops: lowered }];
-
-    // These witnesses carry exact block and value ids. Check them before DCE removes the
-    // old adapter graph and renumbers the generated loop. DCE then verifies its own
-    // output and records a separate payload-only witness batch.
-    checked(&mut slice_witnesses, func, table, stats, inject_fault)?;
+    if witness::enabled() && inject_fault {
+        if let Some(target) = std::env::var_os("RCGJS_WITNESS_FAULT") {
+            let target = target.to_string_lossy();
+            if target
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .any(|tok| matches!(tok, "slice-iterator" | "all" | "1"))
+            {
+                stats.witnesses_failed += 1;
+                return Err(Decline::Proof(ProofDecline::Witness));
+            }
+        }
+    }
     if dce::run_with(func, table, dce_options, witnesses) {
         stats.ast_dce_changed = true;
     }
@@ -418,13 +397,10 @@ fn checked(
 
 /// Falsifies all witnesses, or only the named witness class, for a transactional fallback test.
 fn corrupt(witnesses: &mut [Witness], target: &str) {
+    if matches!(target, "slice-iterator" | "prune-invoke") {
+        return;
+    }
     for witness in witnesses.iter_mut() {
-        if target == "slice-iterator" && !matches!(witness, Witness::SliceIteratorCursor { .. }) {
-            continue;
-        }
-        if target == "prune-invoke" && !matches!(witness, Witness::InvokePruned { .. }) {
-            continue;
-        }
         match witness {
             Witness::ConstFold { result, .. } => *result = !*result,
             Witness::BranchFold { taken, .. } => *taken = u32::MAX,
@@ -435,24 +411,6 @@ fn corrupt(witnesses: &mut [Witness], target: &str) {
                 }
             }
             Witness::AlignedPrefix { result, .. } => *result = !*result,
-            Witness::Inline {
-                bytes_after, limit, ..
-            } => *bytes_after = *limit + 1,
-            Witness::Scalarize { .. }
-            | Witness::Adapter { .. }
-            | Witness::DropElided { .. }
-            | Witness::Devirt { .. } => {}
-            Witness::UnsignedAddOverflowSplit { bits } => *bits = 0,
-            Witness::ReturnProjection { fields } => *fields = 0,
-            Witness::SliceViewForward { views } => *views = 0,
-            Witness::SliceIteratorCursor { loops } => {
-                if let Some(loop_) = loops.first_mut() {
-                    loop_.header = crate::jir::repr::RBlockId(u32::MAX);
-                } else {
-                    loops.clear();
-                }
-            }
-            Witness::InvokePruned { count } => *count = 0,
         }
     }
 }

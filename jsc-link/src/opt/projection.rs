@@ -17,7 +17,6 @@ use crate::jir::semantic::{CallSemantic, Callee, TypeId};
 use crate::lower::fuse::{op_purity, Purity};
 
 use super::candidates;
-use super::witness::{self, Witness};
 
 /// What the pass changed and proved.
 #[derive(Clone, Debug, Default)]
@@ -65,14 +64,11 @@ pub fn run(
         if fields == 0 {
             continue;
         }
-        let witness = Witness::ReturnProjection { fields };
         stats.witnesses_recorded += 1;
         let verified = rewritten
             .verify_carriers(&table.types, super::observed_carriers(&rewritten))
             .is_ok();
-        let checked = !witness::enabled() || witness.check(&rewritten, &table.types).is_ok();
-        if !verified || !checked {
-            stats.witnesses_failed += u32::from(verified);
+        if !verified {
             continue;
         }
         stats.items.insert(name.clone());

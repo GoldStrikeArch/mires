@@ -50,13 +50,12 @@ use std::path::Path;
 use crate::diag::Sink;
 use crate::item::{item_map, prologue, write_program, JsItem, JsName, LinkItem};
 use crate::jir::decline::{Decline, LowerDecline, OpClass};
-use crate::jir::repr::{Func, OpKind, RTerm, ValueId};
-use crate::jir::semantic::{BinaryOp, BodySemantic, CallSemantic, Callee, HostPayload, ItemId};
+use crate::jir::repr::Func;
+use crate::jir::semantic::BodySemantic;
 use crate::jir::summary::ItemClass;
-use crate::jir::types::TypeKind;
 use crate::jsast;
 use crate::lane_report::{push_string, ItemLane};
-use crate::lower::js::host::{DropGlueIndex, ItemEntry, ItemIndex, KeyedPurity, KeyedRowCapture};
+use crate::lower::js::host::{DropGlueIndex, ItemEntry, ItemIndex};
 use crate::lower::js::unsize::VtableIndex;
 use crate::lower::{lower_item, LowerInput, LoweredItem};
 use crate::opt::OptStats;
@@ -100,9 +99,6 @@ use crate::plan::abi_flat::AbiPlan;
 /// 15 -> 16: each item reports fixed host argument-pack opportunities, retention, and declines.
 /// 16 -> 17: inlining reports cross-object sites and semantic, metadata, and cost declines.
 const LANE_SIDECAR_SCHEMA: u32 = 17;
-
-/// The names that never take the JIR lane, whatever their class. See the file's own header.
-const ALLOWLIST: &str = include_str!("../../../examples/jir-allowlist.txt");
 
 /// What the driver did with one item it offered to the lowerer.
 #[derive(Clone, Debug)]
@@ -571,13 +567,6 @@ pub(crate) fn sidecar_path(path: &Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-/// `<out>.jir.js` for an output path: where the shadow lane's second program goes.
-pub(crate) fn shadow_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".jir.js");
-    path.with_file_name(name)
-}
-
 /// Lowers every promoted reachable item in `table` from its JIR-S body, in place.
 ///
 /// Called once per lane pass, immediately after the bodies are decoded and before anything
@@ -603,18 +592,10 @@ pub(crate) fn run(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
     reachable: &[JsName],
-    coroutine_sources: &crate::plan::async_graph::SourceCaptures,
 ) -> LaneRun {
     let opts = crate::opts::get();
     let fault = abi_fault();
-    run_with_opts(
-        dcx,
-        table,
-        reachable,
-        coroutine_sources,
-        opts,
-        fault.as_deref(),
-    )
+    run_with_opts(dcx, table, reachable, opts, fault.as_deref())
 }
 
 fn merge_o_stats(dst: &mut OGroup, src: OGroup) {
@@ -640,7 +621,6 @@ fn run_with_opts(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
     reachable: &[JsName],
-    coroutine_sources: &crate::plan::async_graph::SourceCaptures,
     opts: &crate::opts::Opts,
     fault: Option<&str>,
 ) -> LaneRun {
@@ -653,7 +633,7 @@ fn run_with_opts(
     let mut live: BTreeSet<JsName> = reachable.iter().cloned().collect();
     // Every item of the program by its semantic identity: what the host lowering resolves a
     // closure body's name and arity through (`lower/js/host.rs`).
-    let (mut items, drop_glue) = item_index(table);
+    let (items, drop_glue) = item_index(table);
     let vtables = vtable_index(table);
     let original_names = offered(table, reachable, opts);
     let mut names = original_names.clone();
@@ -764,7 +744,6 @@ fn run_with_opts(
             &enum_plan.smi_u32_fields,
         )
     };
-    record_keyed_purity(table, &pristine_funcs, &mut items);
     let mut ctx = Ctx {
         opts,
         items: &items,
@@ -841,9 +820,8 @@ fn run_with_opts(
     let pre_repr_native_string = ctx.heap.native_string_enabled;
     let pre_repr_native_vec = ctx.heap.native_vec_enabled;
 
-    // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
-    // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
-    // post-O program in both modes and return identical decisions.
+    // Phase B1: whole-type native container lowering (`Box<T, Global>` drop-glue elision and
+    // order-unobserved `BTreeMap<K, V, Global>` -> JS `Map`).
     let repr_ran = opts.analyzes(OptimizerPass::NativeRepresentations);
     let planned_repr = if repr_ran {
         let repr_live = crate::analysis::heap::filter_live_for_repr(
@@ -853,62 +831,36 @@ fn run_with_opts(
             opts,
             &ctx.heap,
         );
-        let repr_cx = crate::plan::representation::ReprCx {
+        let repr_cx = crate::plan::native_types::ReprCx {
             opts,
-            items: &items,
             drop_glue: &drop_glue,
-            vtables: &vtables,
-            byte_views,
             heap: &ctx.heap,
-            nonthrowing_glues: &o_stats.nonthrowing_items,
         };
-        crate::profile::time("lane.B1.representation", || {
-            crate::plan::representation::plan_and_commit(
-                table,
-                &mut planned_funcs,
-                &repr_live,
-                &repr_cx,
-                true,
-            )
+        crate::profile::time("lane.B1.native_types", || {
+            crate::plan::native_types::plan_and_commit(table, &planned_funcs, &repr_live, &repr_cx)
         })
     } else {
-        crate::plan::representation::ReprOutcome::default()
+        crate::plan::native_types::ReprOutcome::default()
     };
-    let planned_clones = planned_repr.clones.clone();
     let planned_body_names: Vec<JsName> = planned_repr.bodies.keys().cloned().collect();
-    let planned_nested_clone = planned_repr.nested_clone.clone();
+    let planned_has_native_map = planned_repr.has_native_map;
     let mut planning_table = table.clone();
-    for (clone, source) in &planned_clones {
-        let Some(source) = planning_table.get(source).cloned() else {
-            continue;
-        };
-        planning_table.insert(
-            clone.clone(),
-            crate::plan::representation::clone_link_item(source, clone),
-        );
-    }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
     if opts.analyzes(OptimizerPass::AstDce) {
         prune_noop_heap_drop_glues(&planning_table, &mut planned_funcs, &ctx.heap);
         let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
-        for name in planned_repr
-            .bodies
-            .keys()
-            .chain(planned_repr.nested_clone.keys())
-        {
+        for name in planned_repr.bodies.keys() {
             if let Some(entry) = planned_funcs.remove(name) {
                 excluded.insert(name.clone(), entry);
             }
         }
-        let mut post_live = live.clone();
-        post_live.extend(planned_clones.keys().cloned());
         let post_o = o_group_with_mode(
             &mut planning_table,
             &mut planned_funcs,
             &ctx,
-            &post_live,
+            &live,
             true,
-            Some(&planned_repr.call_retargets),
+            None,
         );
         prune_noop_heap_drop_glues(&planning_table, &mut planned_funcs, &ctx.heap);
         planned_funcs.extend(excluded);
@@ -925,16 +877,7 @@ fn run_with_opts(
         planned_repr.unapplied()
     };
 
-    // Only an applying run offers private versions to phase C. Report mode still priced and
-    // planned them above, but its emitted table and item list remain byte-identical to `off`.
     let mut work_table = if emitting_plans {
-        for clone in repr.clones.keys() {
-            names.push(clone.clone());
-            defined.insert(clone.clone());
-            live.insert(clone.clone());
-        }
-        names.sort();
-        names.dedup();
         planning_table.clone()
     } else {
         table.clone()
@@ -974,10 +917,7 @@ fn run_with_opts(
     // `ctx.heap.native_string_enabled` is finalized after post-repr inlining and before `abi_flat`
     // and Phase C, so helper functions containing `format!`/`write!` remain baseline during
     // inlining and every proven site lowers inline to `{ s, cap }` / `out.s += ...`.
-    if emitting_plans
-        && ctx.heap.native_string_enabled
-        && opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
-    {
+    if emitting_plans && ctx.heap.native_string_enabled {
         let skip_bodies: BTreeSet<JsName> = repr.bodies.keys().cloned().collect();
         let fmt_touched =
             crate::lower::semantic_ops::fmt_kernel::commit_universal_native_string_sites(
@@ -997,13 +937,9 @@ fn run_with_opts(
 
     // B2 plans against the same post-O, post-representation map D9 measured. Report mode records
     // that plan and empties it before emission.
-    let mut abi_funcs = planned_funcs.clone();
-    for clone in planned_clones.keys() {
-        abi_funcs.remove(clone);
-    }
-    let abi_excluded: BTreeSet<crate::jir::semantic::ItemId> = planned_clones
-        .values()
-        .chain(planned_body_names.iter())
+    let abi_funcs = planned_funcs.clone();
+    let abi_excluded: BTreeSet<crate::jir::semantic::ItemId> = planned_body_names
+        .iter()
         .filter_map(|source| {
             pristine_funcs
                 .get(source)?
@@ -1032,7 +968,7 @@ fn run_with_opts(
                     &planned_funcs,
                     candidate,
                     &ctx,
-                    &planned_nested_clone,
+                    planned_has_native_map,
                     &mut reuse,
                 )
             },
@@ -1041,16 +977,7 @@ fn run_with_opts(
         economics = Some(evaluation);
     }
     let abi_clones = plan.clones().clone();
-    let mut physical_table = planning_table.clone();
-    let mut physical_funcs = planned_funcs.clone();
-    plan.install_clones(&mut physical_table, &mut physical_funcs);
-    let planned_physical = crate::plan::physical::PhysicalPlan::of(
-        &physical_table,
-        &physical_funcs,
-        &plan,
-        opts.typed_storage && opts.optimizer == crate::opts::OptimizerMode::On,
-    )
-    .with_economics(economics.clone());
+    let _ = economics;
     if emitting_plans {
         plan.install_clones(&mut work_table, &mut funcs);
         for clone in abi_clones.keys() {
@@ -1130,29 +1057,10 @@ fn run_with_opts(
     };
     let mut plan_retries = 0;
     let mut enum_retries = 0u32;
-    let mut ready_allowed = true;
     let mut soa_allowed = true;
     let mut active_soa_helpers: Vec<JsName> = Vec::new();
-    let mut physical = planned_physical;
-    let (mut lowered, async_plan, final_soa_plan) = loop {
+    let (mut lowered, final_soa_plan) = loop {
         let rewrite_scope = crate::profile::scope("lane.rewrite");
-        if abi_applied {
-            physical = crate::plan::physical::PhysicalPlan::of(
-                &work_table,
-                &funcs,
-                &plan,
-                opts.typed_storage && opts.optimizer == crate::opts::OptimizerMode::On,
-            )
-            .with_economics(economics.clone());
-        }
-        let mut async_plan =
-            crate::plan::async_graph::AsyncPlan::of(&work_table, &funcs, coroutine_sources, opts);
-        if !ready_allowed {
-            async_plan.ready.disable();
-        }
-        physical
-            .ready_futures
-            .clone_from(&async_plan.ready.selected);
         // Phase B2.
         plan.rewrite(&mut funcs, &work_table);
         drop(rewrite_scope);
@@ -1191,7 +1099,6 @@ fn run_with_opts(
                 report_probe,
                 &plan,
                 &repr,
-                &physical,
                 &soa_plan,
                 &defined,
                 &live,
@@ -1228,14 +1135,9 @@ fn run_with_opts(
             Vec::new()
         };
         if !enum_conflict_items.is_empty()
-            || (retry
-                && (!plan.is_empty()
-                    || !repr.touched.is_empty()
-                    || !physical.ready_futures.is_empty()
-                    || !soa_plan.is_empty()))
+            || (retry && (!plan.is_empty() || !repr.touched.is_empty() || !soa_plan.is_empty()))
         {
             let _scope = crate::profile::scope("lane.retry");
-            ready_allowed = false;
             if !soa_plan.is_empty() {
                 soa_allowed = false;
             }
@@ -1250,10 +1152,6 @@ fn run_with_opts(
             repr = repr.emptied();
             economics = economics.as_ref().map(|economics| economics.after_retry());
             plan_retries += 1;
-            for clone in planned_clones.keys() {
-                defined.remove(clone);
-                live.remove(clone);
-            }
             for clone in abi_clones.keys() {
                 defined.remove(clone);
                 live.remove(clone);
@@ -1327,16 +1225,14 @@ fn run_with_opts(
             ctx.heap = heap;
             continue;
         }
-        break (lowered, async_plan, soa_plan);
+        break (lowered, soa_plan);
     };
 
     // The spill registers the plan needs are items like any other, and they have to be in the
     // table and reachable before a lowering that names them is checked against either.
     let spills = plan.spill_items();
-    let mut added_items = !spills.is_empty()
-        || enum_plan.sentinel_none.is_some()
-        || !repr.clones.is_empty()
-        || !abi_clones.is_empty();
+    let mut added_items =
+        !spills.is_empty() || enum_plan.sentinel_none.is_some() || !abi_clones.is_empty();
     if opts.optimizer == crate::opts::OptimizerMode::On {
         added_items |= super::hoist_consts::run(table, &mut lowered, &mut defined, &mut live);
         if let Some(names) = &bigint_names {
@@ -1434,10 +1330,7 @@ fn run_with_opts(
             )
             .to_json()
         });
-        if !table.contains_key(&name)
-            && result.is_ok()
-            && (repr.clones.contains_key(&name) || abi_clones.contains_key(&name))
-        {
+        if !table.contains_key(&name) && result.is_ok() && abi_clones.contains_key(&name) {
             if let Some(clone) = work_table.get(&name).cloned() {
                 table.insert(name.clone(), clone);
             }
@@ -1521,17 +1414,17 @@ fn run_with_opts(
         outcomes.push(outcome);
     }
 
-    // `js-str=bytes` is a JIR-lane representation: an item that keeps the baseline's text holds
-    // its `str` values as UTF-16 text, and the program would mix the two. Refused, never mixed.
-    if crate::lower::bstr::enabled() {
-        for outcome in outcomes.iter().filter(|o| o.lane == ItemLane::Fallback) {
-            dcx.err(format!(
-                "rustc_codegen_js: `js-str=bytes` needs every item on the JIR lane, but `{}` fell \
-                 back to the baseline text ({:?})",
-                outcome.name.as_str(),
-                outcome.decline
-            ));
+    // JIR is the only lowering lane: any offered item that fails to lower is a hard link error.
+    for outcome in outcomes.iter().filter(|o| o.lane == ItemLane::Fallback) {
+        let mut diag = dcx.struct_err(format!(
+            "rustc_codegen_js: JIR lowering of `{}` failed ({:?})",
+            outcome.name.as_str(),
+            outcome.decline
+        ));
+        if let Some(item) = table.get(&outcome.name) {
+            diag.note(format!("in `{}`", item.debug_path));
         }
+        diag.emit();
     }
 
     let referenced: BTreeSet<JsName> = table
@@ -1562,8 +1455,8 @@ fn run_with_opts(
         } else {
             reported
         },
-        physical_json: Some(physical.json()),
-        async_json: Some(async_plan.json()),
+        physical_json: None,
+        async_json: None,
         // The representation plan's accounting (Phase 4, D12): present whenever its analysis
         // ran, filled by the solver in report and on alike.
         repr: repr_ran.then(|| repr.block.clone()),
@@ -2190,7 +2083,6 @@ fn offered(
     reachable: &[JsName],
     opts: &crate::opts::Opts,
 ) -> Vec<JsName> {
-    let allowed = allowlist();
     let only: BTreeSet<&str> = opts.lane_only.iter().map(String::as_str).collect();
     let mut names: Vec<JsName> = reachable
         .iter()
@@ -2208,7 +2100,6 @@ fn offered(
                 return false;
             };
             opts.lane_classes.contains(summary.class)
-                && !allowed.contains(name.as_str())
                 && (only.is_empty() || only.contains(name.as_str()))
         })
         .cloned()
@@ -2258,7 +2149,7 @@ fn lower_input_with_retargets<'a>(
         vtables: ctx.vtables,
         spills,
         abi: None,
-        physical: None,
+        final_lowering: false,
         call_retargets,
         bigints: None,
         byte_views: ctx.byte_views,
@@ -2277,7 +2168,7 @@ fn physical_program_metrics(
     source_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     abi: &AbiPlan,
     ctx: &Ctx<'_>,
-    nested_clone: &BTreeMap<JsName, crate::lower::NestedClone>,
+    has_native_map: bool,
     reuse: &mut crate::plan::lowering_reuse::Reuse,
 ) -> Option<crate::plan::physical_cost::ProgramMetrics> {
     crate::profile::bump(crate::profile::Counter::TrialPhysical);
@@ -2323,11 +2214,7 @@ fn physical_program_metrics(
         // ABI, just as the final phase-C pass does, or those candidates price as byte-identical
         // to the baseline and can never be selected.
         input.abi = Some(abi);
-        input.nested_clone = nested_clone
-            .get(name)
-            .or_else(|| abi.clones().get(name).and_then(|s| nested_clone.get(s)))
-            .copied()
-            .unwrap_or_default();
+        input.nested_clone.map = has_native_map;
         match reuse.lower_physical(abi, name, &input, func) {
             Ok(lowering) => {
                 allocation_terms.insert(name.clone(), lowering.alloc);
@@ -2359,7 +2246,7 @@ fn physical_program_metrics(
         }
     }
 
-    let mut reachable = crate::plan::representation::measurement_reach(&table, &opts.roots);
+    let mut reachable = crate::plan::native_types::measurement_reach(&table, &opts.roots);
     if opts.analyzes(OptimizerPass::LinkDedup)
         && crate::link_dedup::merge_duplicates_for_measurement(
             &mut table,
@@ -2367,7 +2254,7 @@ fn physical_program_metrics(
             opts.source_map,
         )
     {
-        reachable = crate::plan::representation::measurement_reach(&table, &opts.roots);
+        reachable = crate::plan::native_types::measurement_reach(&table, &opts.roots);
     }
     let stubs = crate::link::stub_missing(&table, &reachable);
     let mut items = crate::link::order(&table, &reachable);
@@ -2495,7 +2382,7 @@ fn o_group_with_mode(
     allow_std_post_repr: bool,
     call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
 ) -> OGroup {
-    use crate::analysis::{callgraph, effects, summary_check};
+    use crate::analysis::{callgraph, effects};
     let mut group = OGroup::default();
     let run_inline = crate::opt::o_pass_enabled("inline");
     let run_devirt = crate::opt::o_pass_enabled("devirt");
@@ -2793,12 +2680,10 @@ fn o_group_with_mode(
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
         .collect();
-    // D1: revalidate against the rewritten bodies; a claim the recompute cannot confirm demotes
-    // to top, and everything that then reads the map sees `op.missing-summary`-shaped absence.
-    let violations = summary_check::enforce(&mut summaries, funcs, &interns_map, &graph);
-    group.summaries_validated = group
-        .summaries_items
-        .saturating_sub(violations.len() as u32);
+    // Recompute summaries directly after inline/devirt rewrites.
+    let graph = callgraph::build(funcs, &interns_map);
+    let summaries = effects::compute(funcs, &interns_map, &graph);
+    group.summaries_validated = summaries.len() as u32;
     group.summaries_top = summaries.iter().filter(|(_, s)| s.is_top()).count() as u32;
 
     if run_dce {
@@ -2856,13 +2741,6 @@ fn o_group_with_mode(
             group.dce_items.insert(name.clone());
             funcs.insert(name, Ok(rewritten));
         }
-        // Deletions can stale a summary too; the group ends validated (D1: enforce after every
-        // pass group). Nothing downstream consumes the map — this keeps the sidecar honest.
-        let violations = summary_check::enforce(&mut summaries, funcs, &interns_map, &graph);
-        group.summaries_validated = group
-            .summaries_validated
-            .saturating_sub(violations.len() as u32);
-        group.summaries_top = summaries.iter().filter(|(_, s)| s.is_top()).count() as u32;
     }
     group.nonthrowing_items = summaries
         .iter()
@@ -2900,6 +2778,7 @@ fn prepare_opt_func(
     report_probe: Option<ReportProbe<'_>>,
 ) -> Result<(OptStats, Option<String>), Decline> {
     let mut stats = OptStats::default();
+    let saved = (report_probe.is_none() && crate::opt::witness::enabled()).then(|| func.clone());
     let probe = if let Some((probe_table, probe_funcs)) = report_probe {
         if let (Some(probe_item), Some(Ok(probe_func))) =
             (probe_table.get(name), probe_funcs.get(name))
@@ -2924,6 +2803,18 @@ fn prepare_opt_func(
         crate::opt::optimize(func, table_types, interns, opts, &mut stats)
     };
     match probe {
+        Err(Decline::Proof(_)) if saved.is_some() => {
+            *func = saved.expect("checked above");
+            let recorded = stats.witnesses_recorded;
+            let failed = stats.witnesses_failed.max(1);
+            stats = OptStats {
+                witnesses_recorded: recorded,
+                witnesses_failed: failed,
+                ..OptStats::default()
+            };
+            let alloc = crate::analysis::alloc_sites::AllocSites::of(func, interns).to_json();
+            Ok((stats, Some(alloc)))
+        }
         Err(decline) => {
             if std::env::var("RCGJS_OPT_DEBUG_FUNC")
                 .is_ok_and(|filter| name.as_str().contains(&filter))
@@ -2957,8 +2848,7 @@ fn lower_all(
     mut funcs: BTreeMap<JsName, Result<Func, Decline>>,
     report_probe: Option<ReportProbe<'_>>,
     plan: &AbiPlan,
-    repr: &crate::plan::representation::ReprOutcome,
-    physical: &crate::plan::physical::PhysicalPlan,
+    repr: &crate::plan::native_types::ReprOutcome,
     soa: &crate::plan::soa_vec::SoaPlan,
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
@@ -3034,47 +2924,16 @@ fn lower_all(
         let Some(item) = table.get(name) else {
             continue;
         };
-        let repr_retargets = repr
-            .call_retargets
-            .get(name)
-            .or_else(|| {
-                plan.clones()
-                    .get(name)
-                    .and_then(|s| repr.call_retargets.get(s))
-            })
-            .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
-        let abi_retargets = plan.call_retargets(name);
-        let mut merged_retargets = crate::lower::CallRetargets::new();
-        let retargets = if repr_retargets.is_empty() {
-            abi_retargets
-        } else if abi_retargets.is_empty() {
-            repr_retargets
-        } else {
-            merged_retargets.clone_from(repr_retargets);
-            for (item, target) in abi_retargets {
-                let previous = merged_retargets.insert(*item, target.clone());
-                debug_assert!(previous.is_none() || previous.as_ref() == Some(target));
-            }
-            &merged_retargets
-        };
+        let retargets = plan.call_retargets(name);
         let Some(mut input) =
             lower_input_with_retargets(name, item, ctx, plan.spill_names(), retargets)
         else {
             continue;
         };
         input.abi = Some(plan);
-        input.physical = Some(physical);
+        input.final_lowering = true;
         input.bigints = bigints;
-        input.nested_clone = repr
-            .nested_clone
-            .get(name)
-            .or_else(|| {
-                plan.clones()
-                    .get(name)
-                    .and_then(|s| repr.nested_clone.get(s))
-            })
-            .copied()
-            .unwrap_or_default();
+        input.nested_clone.map = repr.has_native_map;
         crate::profile::bump(crate::profile::Counter::LowerFinal);
         let mut stats = OptStats::default();
         let mut alloc = None;
@@ -3130,26 +2989,19 @@ fn lower_all(
             }
         }
         let touched = plan.touches(name) || repr.touched.contains(name);
-        if (touched || !physical.ready_futures.is_empty())
-            && fault.is_some_and(|item| name.as_str().contains(item))
-        {
+        if touched && fault.is_some_and(|item| name.as_str().contains(item)) {
             result = Err(Decline::Lower(LowerDecline::Other {
                 op: OpClass::Region,
                 detail: "JSC_JIR_ABI_FAULT".to_owned(),
             }));
         }
-        // An item the plan changed that then declines would leave its callers calling it in the
-        // shape the plan chose, which no longer exists. A lowering the driver is going to *refuse*
-        // is a decline like any other, so it is asked here — before the table has been touched —
-        // rather than left to the diagnostic that `apply` reports: "every caller or none" is a
-        // property of the program, not of whether the link step goes on to fail.
         if touched && std::env::var("RCGJS_REPR_DEBUG_SOLVE").is_ok() {
             if let Err(decline) = &result {
                 eprintln!("lane-retry: `{}` declined: {decline:?}", name.as_str());
             }
         }
         let soa_touched = !soa.is_empty() && soa.item_may_touch_soa(item);
-        retry |= (touched || soa_touched || !physical.ready_futures.is_empty())
+        retry |= (touched || soa_touched)
             && match &result {
                 Err(_) => true,
                 Ok(lowering) => refusal(
@@ -3172,7 +3024,7 @@ fn lower_all(
 /// identifiers).
 fn native_body_item(
     name: &JsName,
-    body: &crate::plan::representation::NativeBody,
+    body: &crate::plan::native_types::NativeBody,
     bigint_names: Option<&crate::lower::bigint::BigIntNames>,
 ) -> crate::lower::LoweredItem {
     let mut decl = jsast::function(
@@ -3261,16 +3113,10 @@ fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) 
                 caller_location: abi.caller_location,
                 caller_location_def,
                 is_core: core_crate_ids.contains(&id.definition.crate_id),
-                used_params: BTreeSet::new(),
                 standard: match item.jir.body.as_ref().map(|body| body.semantic) {
                     Some(BodySemantic::Standard(operation)) => Some(operation),
                     _ => None,
                 },
-                keyed_purity: None,
-                keyed_read_params: None,
-                keyed_may_unwind: None,
-                keyed_row_capture: None,
-                keyed_proxy_safe_params: None,
             },
         );
         // A body that says it IS a type's drop glue is how a host lowering names the glue of a
@@ -3280,582 +3126,6 @@ fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) 
         }
     }
     (index, drop_glue)
-}
-
-/// Records the validated effect class of direct callables used as keyed-list extractors.
-fn record_keyed_purity(
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    items: &mut ItemIndex,
-) {
-    let has_keyed_list = funcs
-        .values()
-        .filter_map(|func| func.as_ref().ok())
-        .any(|func| {
-            func.blocks.iter().flat_map(|block| &block.ops).any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        host: Some(HostPayload::KeyedList(_)),
-                        ..
-                    }
-                )
-            })
-        });
-    if !has_keyed_list {
-        return;
-    }
-    let interns: BTreeMap<JsName, &crate::jir::Interns> = table
-        .iter()
-        .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
-        .collect();
-    let graph = crate::analysis::callgraph::build(funcs, &interns);
-    let summaries = crate::analysis::effects::compute(funcs, &interns, &graph);
-    let reads = crate::analysis::effects::compute_read_origins(funcs, &interns, &graph, &summaries);
-    for entry in items.values_mut() {
-        let name = JsName::new(entry.name.clone());
-        entry.used_params = funcs
-            .get(&name)
-            .and_then(|func| func.as_ref().ok())
-            .map(used_parameters)
-            .unwrap_or_default();
-        if let Some(summary) = summaries.usable(&name) {
-            entry.keyed_purity = Some(match summary.purity {
-                crate::analysis::effects::Purity::Const => KeyedPurity::Const,
-                crate::analysis::effects::Purity::Read => KeyedPurity::Read,
-                crate::analysis::effects::Purity::Effect => KeyedPurity::Effect,
-            });
-            entry.keyed_read_params = reads
-                .get(&name)
-                .and_then(crate::analysis::effects::ReadOrigins::exact_parameters)
-                .cloned();
-            entry.keyed_may_unwind = Some(summary.may_unwind);
-        }
-    }
-    record_keyed_row_capture(funcs, &interns, items);
-    record_keyed_proxy_safety(funcs, &interns, items);
-}
-
-fn used_parameters(func: &Func) -> BTreeSet<u16> {
-    let uses: BTreeSet<_> = func
-        .blocks
-        .iter()
-        .flat_map(|block| {
-            block
-                .ops
-                .iter()
-                .flat_map(|op| op.kind.uses())
-                .chain(block.term.uses())
-        })
-        .collect();
-    func.params
-        .iter()
-        .enumerate()
-        .filter(|(_, parameter)| uses.contains(parameter))
-        .filter_map(|(index, _)| u16::try_from(index).ok())
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowCaptureProof {
-    Static,
-    Live,
-    Unknown,
-}
-
-impl RowCaptureProof {
-    fn combine(self, other: RowCaptureProof) -> RowCaptureProof {
-        match (self, other) {
-            (RowCaptureProof::Live, _) | (_, RowCaptureProof::Live) => RowCaptureProof::Live,
-            (RowCaptureProof::Unknown, _) | (_, RowCaptureProof::Unknown) => {
-                RowCaptureProof::Unknown
-            }
-            _ => RowCaptureProof::Static,
-        }
-    }
-}
-
-/// Proves the first executable row lane reaches only creation-time view operations.
-fn record_keyed_row_capture(
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    interns: &BTreeMap<JsName, &crate::jir::Interns>,
-    items: &mut ItemIndex,
-) {
-    let mut local = BTreeMap::new();
-    let mut edges: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
-    for (name, func) in funcs {
-        let Ok(func) = func else {
-            continue;
-        };
-        let Some(item_interns) = interns.get(name).copied() else {
-            local.insert(name.clone(), RowCaptureProof::Unknown);
-            continue;
-        };
-        let mut proof = RowCaptureProof::Static;
-        let callees = edges.entry(name.clone()).or_default();
-        for op in func.blocks.iter().flat_map(|block| &block.ops) {
-            let OpKind::Call {
-                callee,
-                host,
-                semantic,
-                args,
-                ..
-            } = &op.kind
-            else {
-                if matches!(&op.kind, OpKind::Host { .. }) {
-                    proof = proof.combine(RowCaptureProof::Live);
-                }
-                continue;
-            };
-            if let Some(host) = host {
-                proof = proof.combine(keyed_host_capture(host, item_interns));
-                continue;
-            }
-            if matches!(
-                semantic,
-                CallSemantic::Standard(operation)
-                    if crate::lower::semantic_ops::call_effects_entry(
-                        *operation,
-                        Some(&item_interns.types),
-                        func,
-                        op.result,
-                        args,
-                    )
-                    .is_some()
-            ) {
-                continue;
-            }
-            match callee {
-                Callee::Direct { link_name, .. } => match item_interns.str(*link_name) {
-                    Some(target) => {
-                        callees.insert(JsName::new(target.to_owned()));
-                    }
-                    None => proof = proof.combine(RowCaptureProof::Unknown),
-                },
-                _ => proof = proof.combine(RowCaptureProof::Unknown),
-            }
-        }
-        local.insert(name.clone(), proof);
-    }
-
-    let mut proof = local.clone();
-    loop {
-        let before = proof.clone();
-        for (name, own) in &local {
-            let mut next = *own;
-            for callee in edges.get(name).into_iter().flatten() {
-                next = next.combine(
-                    before
-                        .get(callee)
-                        .copied()
-                        .unwrap_or(RowCaptureProof::Unknown),
-                );
-            }
-            proof.insert(name.clone(), next);
-        }
-        if proof == before {
-            break;
-        }
-    }
-
-    for entry in items.values_mut() {
-        entry.keyed_row_capture = match proof.get(&JsName::new(entry.name.clone())) {
-            Some(RowCaptureProof::Static) => Some(KeyedRowCapture::Static),
-            Some(RowCaptureProof::Live) => Some(KeyedRowCapture::Live),
-            Some(RowCaptureProof::Unknown) | None => None,
-        };
-    }
-}
-
-fn keyed_host_capture(host: &HostPayload, interns: &crate::jir::Interns) -> RowCaptureProof {
-    let marker = match host {
-        HostPayload::ViewAbi { marker, .. } => interns.str(*marker),
-        HostPayload::Marker { section, .. } => interns
-            .str(*section)
-            .and_then(|section| section.strip_prefix("rcgjs.tc.")),
-        HostPayload::KeyedList(_) => return RowCaptureProof::Live,
-        HostPayload::Extern(_) | HostPayload::Block(_) | HostPayload::Map { .. } => {
-            return RowCaptureProof::Live
-        }
-    };
-    match marker {
-        Some("template" | "hole" | "content" | "text" | "list" | "push" | "hostval") => {
-            RowCaptureProof::Static
-        }
-        Some(_) => RowCaptureProof::Live,
-        None => RowCaptureProof::Unknown,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProxySafety {
-    Visiting,
-    Safe,
-    Unsafe,
-}
-
-type ProxyPaths = BTreeSet<Vec<u32>>;
-type ProxyCache = BTreeMap<(JsName, u16, ProxyPaths), ProxySafety>;
-
-struct ProxyProgram<'a, 'i> {
-    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
-    interns: &'a BTreeMap<JsName, &'i crate::jir::Interns>,
-    items: &'a ItemIndex,
-}
-
-/// Proves the narrow callable-proxy ABI used for a live row parameter.
-///
-/// The proxy is sound while it is transported into a marker-owned closure and then consumed by
-/// an operation that coerces it to a primitive. JavaScript strict equality and `switch` do not
-/// coerce objects, and returning or storing the proxy would expose the representation. Those
-/// shapes remain exact declines until the lowerer has a first-class live-value carrier.
-fn record_keyed_proxy_safety(
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    interns: &BTreeMap<JsName, &crate::jir::Interns>,
-    items: &mut ItemIndex,
-) {
-    let mut candidates: BTreeMap<ItemId, BTreeSet<u16>> = BTreeMap::new();
-    for (name, func) in funcs {
-        let Ok(func) = func else {
-            continue;
-        };
-        let Some(item_interns) = interns.get(name).copied() else {
-            continue;
-        };
-        for payload in func
-            .blocks
-            .iter()
-            .flat_map(|block| &block.ops)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    host: Some(HostPayload::KeyedList(payload)),
-                    ..
-                } => Some(payload),
-                _ => None,
-            })
-        {
-            let Some(body) = payload.row.body else {
-                continue;
-            };
-            let first = match item_interns
-                .types
-                .get(item_interns.types.peeled(payload.row.ty))
-                .map(|descriptor| &descriptor.kind)
-            {
-                Some(TypeKind::Closure { .. }) => 1,
-                Some(TypeKind::FnDef { .. }) => 0,
-                _ => continue,
-            };
-            candidates
-                .entry(body.item)
-                .or_default()
-                .extend([first, first + 1]);
-        }
-    }
-    let proven = {
-        let program = ProxyProgram {
-            funcs,
-            interns,
-            items,
-        };
-        let mut cache = BTreeMap::new();
-        let mut proven = BTreeMap::new();
-        for (item, parameters) in candidates {
-            let mut safe = BTreeSet::new();
-            let Some(entry) = program.items.get(&item) else {
-                continue;
-            };
-            let name = JsName::new(entry.name.clone());
-            for parameter in parameters {
-                if proxy_parameter_safe(&name, parameter, root_proxy_paths(), &program, &mut cache)
-                {
-                    safe.insert(parameter);
-                }
-            }
-            proven.insert(item, safe);
-        }
-        proven
-    };
-    for (item, safe) in proven {
-        if let Some(entry) = items.get_mut(&item) {
-            entry.keyed_proxy_safe_params = Some(safe);
-        }
-    }
-}
-
-fn proxy_parameter_safe(
-    name: &JsName,
-    parameter: u16,
-    seed: ProxyPaths,
-    program: &ProxyProgram<'_, '_>,
-    cache: &mut ProxyCache,
-) -> bool {
-    let key = (name.clone(), parameter, seed.clone());
-    match cache.get(&key) {
-        Some(ProxySafety::Safe) => return true,
-        Some(ProxySafety::Visiting | ProxySafety::Unsafe) => return false,
-        None => {}
-    }
-    cache.insert(key.clone(), ProxySafety::Visiting);
-    let safe = program
-        .funcs
-        .get(name)
-        .and_then(|func| func.as_ref().ok())
-        .zip(program.interns.get(name).copied())
-        .is_some_and(|(func, item_interns)| {
-            proxy_body_safe(func, parameter, seed, item_interns, program, cache)
-        });
-    cache.insert(
-        key,
-        if safe {
-            ProxySafety::Safe
-        } else {
-            ProxySafety::Unsafe
-        },
-    );
-    safe
-}
-
-fn proxy_body_safe(
-    func: &Func,
-    parameter: u16,
-    seed: ProxyPaths,
-    item_interns: &crate::jir::Interns,
-    program: &ProxyProgram<'_, '_>,
-    cache: &mut ProxyCache,
-) -> bool {
-    let Some(initial) = func.params.get(usize::from(parameter)).copied() else {
-        return false;
-    };
-    let mut tainted = BTreeMap::from([(initial, seed)]);
-    let mut tainted_cells = BTreeMap::new();
-
-    loop {
-        let before_values = tainted.clone();
-        let before_cells = tainted_cells.clone();
-        for block in &func.blocks {
-            for op in &block.ops {
-                match &op.kind {
-                    OpKind::CellStore { cell, v } => {
-                        merge_proxy_paths(&mut tainted_cells, *cell, proxy_paths(&tainted, *v));
-                    }
-                    OpKind::SetField { base, field, v, .. } => {
-                        let paths = prefixed_proxy_paths(proxy_paths(&tainted, *v), *field);
-                        merge_proxy_paths(&mut tainted, *base, paths);
-                    }
-                    _ => {}
-                }
-                let paths = match &op.kind {
-                    OpKind::Copy(value)
-                    | OpKind::Move(value)
-                    | OpKind::Deref(value)
-                    | OpKind::Materialize(value)
-                    | OpKind::Convert { v: value, .. } => proxy_paths(&tainted, *value),
-                    OpKind::Aggregate { fields, .. } => fields
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(field, value)| {
-                            prefixed_proxy_paths(
-                                proxy_paths(&tainted, *value),
-                                u32::try_from(field).unwrap_or(u32::MAX),
-                            )
-                        })
-                        .collect(),
-                    OpKind::Field { base, field, .. } => {
-                        projected_proxy_paths(proxy_paths(&tainted, *base), *field)
-                    }
-                    OpKind::CellLoad(cell) => tainted_cells.get(cell).cloned().unwrap_or_default(),
-                    _ => ProxyPaths::new(),
-                };
-                if let Some(result) = op.result {
-                    merge_proxy_paths(&mut tainted, result, paths);
-                }
-            }
-            for (successor, arguments) in block.term.edges() {
-                let Some(target) = func.blocks.get(successor.0 as usize) else {
-                    return false;
-                };
-                for (target, argument) in target.params.iter().zip(arguments) {
-                    let paths = proxy_paths(&tainted, *argument);
-                    merge_proxy_paths(&mut tainted, *target, paths);
-                }
-            }
-        }
-        if tainted == before_values && tainted_cells == before_cells {
-            break;
-        }
-    }
-
-    for block in &func.blocks {
-        for op in &block.ops {
-            let uses_proxy = op
-                .kind
-                .uses()
-                .iter()
-                .any(|value| !proxy_paths(&tainted, *value).is_empty());
-            if !uses_proxy {
-                continue;
-            }
-            match &op.kind {
-                OpKind::Copy(_)
-                | OpKind::Move(_)
-                | OpKind::Aggregate { .. }
-                | OpKind::Field { .. }
-                | OpKind::CellLoad(_)
-                | OpKind::CellStore { .. }
-                | OpKind::Deref(_)
-                | OpKind::Materialize(_)
-                | OpKind::Convert { .. } => {}
-                OpKind::SetField { base, .. }
-                    if !proxy_paths(&tainted, *base).contains(&Vec::new()) => {}
-                OpKind::Unary { v, .. } if proxy_paths(&tainted, *v).iter().all(Vec::is_empty) => {}
-                OpKind::Binary { op: binary, .. }
-                    if !matches!(binary, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Cmp)
-                        && op
-                            .kind
-                            .uses()
-                            .iter()
-                            .flat_map(|value| proxy_paths(&tainted, *value))
-                            .all(|path| path.is_empty()) => {}
-                OpKind::Call {
-                    function,
-                    args,
-                    host: Some(host),
-                    ..
-                } if function.is_none() && proxy_callable_host(host, item_interns) => {
-                    for argument in args {
-                        let paths = proxy_paths(&tainted, *argument);
-                        if paths.is_empty() {
-                            continue;
-                        }
-                        if !proxy_closure_safe(func, *argument, paths, item_interns, program, cache)
-                        {
-                            return false;
-                        }
-                    }
-                }
-                OpKind::Call {
-                    callee: Callee::Direct { item, .. },
-                    function: None,
-                    args,
-                    host: None,
-                    ..
-                } => {
-                    let Some(entry) = program.items.get(item) else {
-                        return false;
-                    };
-                    let target = JsName::new(entry.name.clone());
-                    for (parameter, argument) in args.iter().enumerate() {
-                        let paths = proxy_paths(&tainted, *argument);
-                        if paths.is_empty() {
-                            continue;
-                        }
-                        let Ok(parameter) = u16::try_from(parameter) else {
-                            return false;
-                        };
-                        if !proxy_parameter_safe(&target, parameter, paths, program, cache) {
-                            return false;
-                        }
-                    }
-                }
-                _ => return false,
-            }
-        }
-        match &block.term {
-            RTerm::Invoke { .. } => return false,
-            RTerm::Goto(..) | RTerm::Unreachable => {}
-            RTerm::Switch { scrut, .. } if !proxy_paths(&tainted, *scrut).is_empty() => {
-                return false;
-            }
-            RTerm::Return(Some(value)) | RTerm::Throw(Some(value))
-                if !proxy_paths(&tainted, *value).is_empty() =>
-            {
-                return false;
-            }
-            RTerm::Switch { .. } | RTerm::Return(_) | RTerm::Throw(_) => {}
-        }
-    }
-    true
-}
-
-fn root_proxy_paths() -> ProxyPaths {
-    BTreeSet::from([Vec::new()])
-}
-
-fn proxy_paths<K: Ord>(values: &BTreeMap<K, ProxyPaths>, value: K) -> ProxyPaths {
-    values.get(&value).cloned().unwrap_or_default()
-}
-
-fn merge_proxy_paths<K: Ord>(values: &mut BTreeMap<K, ProxyPaths>, value: K, paths: ProxyPaths) {
-    if paths.is_empty() {
-        return;
-    }
-    values.entry(value).or_default().extend(paths);
-}
-
-fn prefixed_proxy_paths(paths: ProxyPaths, field: u32) -> ProxyPaths {
-    paths
-        .into_iter()
-        .map(|mut path| {
-            path.insert(0, field);
-            path
-        })
-        .collect()
-}
-
-fn projected_proxy_paths(paths: ProxyPaths, field: u32) -> ProxyPaths {
-    paths
-        .into_iter()
-        .filter_map(|mut path| {
-            (path.first() == Some(&field)).then(|| {
-                path.remove(0);
-                path
-            })
-        })
-        .collect()
-}
-
-fn proxy_callable_host(host: &HostPayload, interns: &crate::jir::Interns) -> bool {
-    if matches!(host, HostPayload::KeyedList(_)) {
-        return true;
-    }
-    let marker = match host {
-        HostPayload::ViewAbi { marker, .. } => interns.str(*marker),
-        HostPayload::Marker { section, .. } => interns
-            .str(*section)
-            .and_then(|section| section.strip_prefix("rcgjs.tc.")),
-        _ => None,
-    };
-    matches!(marker, Some("handler" | "effect" | "component" | "cond"))
-}
-
-fn proxy_closure_safe(
-    func: &Func,
-    closure: ValueId,
-    paths: ProxyPaths,
-    item_interns: &crate::jir::Interns,
-    program: &ProxyProgram<'_, '_>,
-    cache: &mut ProxyCache,
-) -> bool {
-    let Some(value) = func.values.get(closure.0 as usize) else {
-        return false;
-    };
-    let peeled = item_interns.types.peeled(value.ty);
-    let Some(TypeKind::Closure { def, .. }) = item_interns
-        .types
-        .get(peeled)
-        .map(|descriptor| &descriptor.kind)
-    else {
-        return false;
-    };
-    let item = ItemId {
-        definition: *def,
-        instantiation: peeled.0,
-    };
-    let Some(entry) = program.items.get(&item) else {
-        return false;
-    };
-    proxy_parameter_safe(&JsName::new(entry.name.clone()), 0, paths, program, cache)
 }
 
 /// Every vtable item of the program by the `(concrete type, principal trait)` pair it is the
@@ -3934,8 +3204,7 @@ fn apply(
         names: lowered.names,
         dts: lowered.dts,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: None,
         jir_decline: None,
         jir_item: None,
@@ -4077,59 +3346,17 @@ pub(super) fn refs_of(decl: &jsast::Stmt, name: &JsName) -> BTreeSet<JsName> {
     refs
 }
 
-/// The compiled-in allow list, comments and blank lines removed.
-fn allowlist() -> BTreeSet<&'static str> {
-    ALLOWLIST
-        .lines()
-        .map(|line| line.split('#').next().unwrap_or("").trim())
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::item::{ItemKind, ItemMap, Linkage};
+    use crate::jir::ItemId;
 
     #[test]
     fn a_transitively_hot_callee_charges_every_site_at_loop_depth_one() {
         assert_eq!(propagated_alloc_term(3, 72, true, 24), 288);
         assert_eq!(propagated_alloc_term(3, 1_200, true, 24), 1_200);
         assert_eq!(propagated_alloc_term(3, 72, false, 24), 72);
-    }
-
-    #[test]
-    fn keyed_row_capture_keeps_only_creation_time_view_markers() {
-        let mut interns = crate::jir::Interns::default();
-        let definition = crate::jir::semantic::DefinitionId {
-            crate_id: 0,
-            local_hash: 1,
-        };
-        let marker = |name: &str, interns: &mut crate::jir::Interns| HostPayload::ViewAbi {
-            marker: interns.intern_str(name),
-            def: definition,
-            helpers: Vec::new(),
-        };
-        assert_eq!(
-            keyed_host_capture(&marker("hole", &mut interns), &interns),
-            RowCaptureProof::Static
-        );
-        assert_eq!(
-            keyed_host_capture(&marker("effect", &mut interns), &interns),
-            RowCaptureProof::Live
-        );
-        assert_eq!(
-            keyed_host_capture(&marker("handler", &mut interns), &interns),
-            RowCaptureProof::Live
-        );
-        assert_eq!(
-            RowCaptureProof::Static.combine(RowCaptureProof::Unknown),
-            RowCaptureProof::Unknown
-        );
-        assert_eq!(
-            RowCaptureProof::Unknown.combine(RowCaptureProof::Live),
-            RowCaptureProof::Live
-        );
     }
 
     fn item(name: &str, refs: &[&str]) -> LinkItem {
@@ -4149,8 +3376,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         }
     }
@@ -4186,7 +3412,7 @@ mod tests {
         let one = item("one$h1", &[]);
         table.insert(one.name.clone(), one);
         let reachable = vec![JsName::new("one$h1".to_owned())];
-        let run = run(&dcx, &mut table, &reachable, &Default::default());
+        let run = run(&dcx, &mut table, &reachable);
         assert_eq!(run.fallback_count(), 0);
         assert!(run.outcome(&JsName::new("one$h1".to_owned())).is_none());
         assert_eq!(dcx.errors(), 0);
@@ -4520,8 +3746,8 @@ mod tests {
         };
         assert_eq!(run.fallback_count(), 1);
         assert_eq!(
-            run.render(Lane::Shadow),
-            "{\"schema\":17,\"lane\":\"shadow\",\"fallback_count\":1,\
+            run.render(Lane::Jir),
+            "{\"schema\":17,\"lane\":\"jir\",\"fallback_count\":1,\
              \"passes\":{\"would_apply\":{\"sroa\":1,\"ast_dce\":2,\"inline\":1,\"devirt\":0},\
              \"applied\":{\"sroa\":1,\"ast_dce\":2,\"inline\":1,\"devirt\":0}},\
              \"summaries\":{\"items\":0,\"validated\":0,\"top\":0},\
@@ -4640,19 +3866,9 @@ mod tests {
     }
 
     #[test]
-    fn the_allow_list_is_comments_only_today() {
-        assert!(
-            allowlist().is_empty(),
-            "adding a name to examples/jir-allowlist.txt stops the exit gate watching it; say \
-             who is watching it instead, and update this test with the reason"
-        );
-    }
-
-    #[test]
-    fn the_sidecar_and_shadow_paths_sit_beside_the_program() {
+    fn the_sidecar_path_sits_beside_the_program() {
         let path = Path::new("/build/program.js");
         assert_eq!(sidecar_path(path), Path::new("/build/program.js.lane.json"));
-        assert_eq!(shadow_path(path), Path::new("/build/program.js.jir.js"));
     }
 
     #[test]
@@ -5220,7 +4436,6 @@ mod tests {
             JsName::new("flat_callee$h2".to_owned()),
             JsName::new("vec_push$h3".to_owned()),
         ];
-        let sources = Default::default();
         let dcx = Sink::default();
 
         let opts_on = Opts {
@@ -5234,7 +4449,6 @@ mod tests {
             &dcx,
             &mut fault_table,
             &reachable,
-            &sources,
             &opts_on,
             Some("flat_callee"),
         );
@@ -5246,14 +4460,7 @@ mod tests {
             ..Opts::default()
         };
         let mut off_table = pristine_table;
-        let off_run = run_with_opts(
-            &dcx,
-            &mut off_table,
-            &reachable,
-            &sources,
-            &opts_flat_off,
-            None,
-        );
+        let off_run = run_with_opts(&dcx, &mut off_table, &reachable, &opts_flat_off, None);
 
         assert_eq!(
             fault_run.plan_retries, 1,
@@ -5490,7 +4697,6 @@ mod tests {
                                 crate_id: 0,
                                 local_hash: 4,
                             },
-                            template: None,
                             helpers: Vec::new(),
                         }),
                     }),

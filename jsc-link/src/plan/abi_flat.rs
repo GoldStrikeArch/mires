@@ -262,20 +262,6 @@ impl ProductNode {
             }
         }
     }
-
-    pub(crate) fn lane_components(&self, out: &mut Vec<(TypeId, LaneComponent)>) {
-        match self {
-            ProductNode::Zst { .. } => {}
-            ProductNode::Leaf { ty, components } => {
-                out.extend(components.iter().map(|component| (*ty, *component)));
-            }
-            ProductNode::Product { fields, .. } => {
-                for field in fields {
-                    field.lane_components(out);
-                }
-            }
-        }
-    }
 }
 
 /// A fixed product whose nested fields cross a private direct edge as physical leaves.
@@ -450,22 +436,6 @@ pub struct CrossCrateEvidence {
 }
 
 impl FlatSig {
-    /// Positions of semantic slice parameters before aggregate parameters expand in JIR-R.
-    /// Analyses that run before [`AbiPlan::rewrite`] use these positions to recognize a call
-    /// whose slice object will be consumed as `buf, off, len` lanes.
-    pub(crate) fn slice_param_positions(&self) -> Vec<usize> {
-        self.params
-            .iter()
-            .enumerate()
-            .filter_map(|(position, param)| {
-                param
-                    .as_ref()
-                    .is_some_and(|param| param.slice)
-                    .then_some(position)
-            })
-            .collect()
-    }
-
     /// Positions of 3-lane `(buf, off, len)` slice values after aggregate parameters have already
     /// expanded in JIR-R. Phase C uses these positions to expand only canonical 3-lane slices;
     /// zero-offset 2-lane slices (`is_off_zero_slice`) expand through [`Self::off_zero_slice_jir_positions`]
@@ -1025,11 +995,6 @@ impl AbiPlan {
                 .is_some_and(|target| a_callers.is_some_and(|callers| callers.contains(target)))
     }
 
-    /// Aggregate-bearing items considered by the physical ABI planner.
-    pub(crate) fn decisions(&self) -> impl Iterator<Item = &AbiDecision> {
-        self.decisions.values()
-    }
-
     fn consider(&mut self, name: &JsName, reason: impl Into<String>) {
         self.decisions.entry(name.clone()).or_insert(AbiDecision {
             item: name.clone(),
@@ -1144,11 +1109,6 @@ impl AbiPlan {
         self
     }
 
-    /// Whether `name` is a private flat body behind a canonical wrapper.
-    pub(crate) fn has_canonical_wrapper(&self, name: &JsName) -> bool {
-        self.clones.contains_key(name)
-    }
-
     /// Direct-call retargets selected for `caller`.
     pub(crate) fn call_retargets(&self, caller: &JsName) -> &crate::lower::CallRetargets {
         self.call_retargets
@@ -1171,7 +1131,7 @@ impl AbiPlan {
             let Some(item) = table.get(source).cloned() else {
                 continue;
             };
-            let mut cloned_item = crate::plan::representation::clone_link_item(item, clone);
+            let mut cloned_item = crate::plan::native_types::clone_link_item(item, clone);
             if let Some(&synth_id) = self.synthetic_items.get(clone) {
                 if let Some(body) = cloned_item.jir.body.as_mut() {
                     body.item = synth_id;
@@ -1212,8 +1172,7 @@ impl AbiPlan {
                     map: ItemMap::default(),
                     dts: None,
                     optimization: Default::default(),
-                    late_ir: Default::default(),
-                    baseline_shadow: Default::default(),
+                    allocator_provider: Default::default(),
                     jir: Default::default(),
                 }
             })
@@ -1232,8 +1191,7 @@ impl AbiPlan {
                 map: ItemMap::default(),
                 dts: None,
                 optimization: Default::default(),
-                late_ir: Default::default(),
-                baseline_shadow: Default::default(),
+                allocator_provider: Default::default(),
                 jir: Default::default(),
             });
         }
@@ -1586,8 +1544,8 @@ pub fn plan_excluding(
     let graph = crate::analysis::callgraph::build(funcs, &interns);
     let has_custom_allocator = table.values().any(|item| {
         matches!(
-            item.late_ir.artifact_allocator_provider(),
-            crate::late_ir::AllocatorProvider::Custom | crate::late_ir::AllocatorProvider::Conflict
+            item.allocator_provider,
+            crate::item::AllocatorProvider::Custom | crate::item::AllocatorProvider::Conflict
         )
     });
     let effects = crate::analysis::effects::compute_with_allocator(
@@ -6316,7 +6274,6 @@ mod tests {
             spill: 0,
             returns_out_field: false,
         };
-        assert_eq!(sig.slice_param_positions(), vec![1]);
         assert_eq!(sig.slice_jir_positions(), vec![2]);
     }
 
@@ -6419,8 +6376,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         }
     }
@@ -6626,8 +6582,8 @@ mod tests {
                 args: Vec::new(),
                 track_caller: None,
                 semantic: crate::jir::semantic::CallSemantic::Ordinary,
-                host: Some(HostPayload::ViewAbi {
-                    marker: StrId(0),
+                host: Some(HostPayload::Marker {
+                    section: StrId(0),
                     def: DefinitionId {
                         crate_id: 0,
                         local_hash: 0,

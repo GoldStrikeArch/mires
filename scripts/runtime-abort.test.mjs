@@ -6,8 +6,7 @@ import { parse } from 'acorn';
 import { minimalShim } from './minimal-shim.mjs';
 
 const source = readFileSync(new URL('../runtime/shim.js', import.meta.url), 'utf8');
-const direct = ['js_abort', 'abort_error', 'is_abort', 'prefix', 'native_str_truncate',
-  'native_vec_set_capacity', 'native_vec_set_len', 'keyed_key_type'];
+const direct = ['js_abort', 'abort_error', 'is_abort', 'prefix'];
 const extracted = minimalShim([], source, { direct });
 const errorOf = (f) => {
   try { f(); } catch (error) { return error; }
@@ -52,13 +51,9 @@ function verify(rt) {
     assert.equal(wrapped.message, String(prim));
     assert.equal(rt.is_abort(wrapped), true);
   }
-  for (const run of [() => rt.prefix(null, 0, 0),
-    () => rt.native_str_truncate({text: '\u03b1'}, 1),
-    () => rt.native_vec_set_capacity({len: 2}, 1),
-    () => rt.native_vec_set_len({cap: 1}, 2)]) {
+  for (const run of [() => rt.prefix(null, 0, 0)]) {
     assert.equal(rt.is_abort(errorOf(run)), true);
   }
-  assert.equal(rt.is_abort(errorOf(() => rt.keyed_key_type({}))), false);
   return abort;
 }
 

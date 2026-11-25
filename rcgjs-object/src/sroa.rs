@@ -23,36 +23,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::jsast::{self, ArrowBody, BinOp, Expr, Stmt, SwitchCase};
+use crate::jsast::{
+    self, walk_expr, walk_expr_mut, walk_stmt, walk_stmt_mut, ArrowBody, BinOp, Expr, Stmt, Visit,
+    VisitMut,
+};
 use crate::opts::{OptimizerMode, OptimizerPass};
 
 pub struct Analysis {
     pub decl: Stmt,
     pub changed: bool,
-}
-/// Replaces the aggregates of `decl` that are consumed where they are built.
-pub fn analyze(decl: Stmt, mode: OptimizerMode) -> Analysis {
-    if mode == OptimizerMode::Off
-        || !crate::opts::get()
-            .optimizer_passes
-            .contains(OptimizerPass::Sroa)
-    {
-        return Analysis {
-            decl,
-            changed: false,
-        };
-    }
-
-    let rewritten = split_locals(rewrite_stmt(decl.clone()), false);
-    let changed = rewritten != decl;
-    Analysis {
-        decl: if mode == OptimizerMode::On {
-            rewritten
-        } else {
-            decl
-        },
-        changed,
-    }
 }
 
 /// Runs the finished-AST rewrite for a JIR-lowered declaration.
@@ -146,263 +125,79 @@ impl FreshAllocations {
             depth: 0,
             in_loop: 0,
         };
-        allocations.stmt(stmt);
+        allocations.visit_stmt(stmt);
         allocations
     }
 
     fn record(&mut self) {
         self.in_loop += u64::from(self.depth > 0);
     }
+}
 
-    fn stmts(&mut self, stmts: &[Stmt]) {
-        for stmt in stmts {
-            self.stmt(stmt);
-        }
-    }
-
-    fn stmt(&mut self, stmt: &Stmt) {
+impl Visit for FreshAllocations {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::ExprStmt(expr) | Stmt::Throw(expr) => self.expr(expr),
-            Stmt::Let(_, init) => {
-                if let Some(init) = init {
-                    self.expr(init);
-                }
+            Stmt::LoopForever(_, body) => {
+                self.depth += 1;
+                self.visit_stmts(body);
+                self.depth -= 1;
             }
-            Stmt::Lets(declarations) => {
-                for (_, init) in declarations {
-                    if let Some(init) = init {
-                        self.expr(init);
-                    }
-                }
+            Stmt::While(test, body) => {
+                self.depth += 1;
+                self.visit_expr(test);
+                self.visit_stmts(body);
+                self.depth -= 1;
             }
-            Stmt::Const(_, init) => self.expr(init),
-            Stmt::Return(value) => {
-                if let Some(value) = value {
-                    self.expr(value);
-                }
-            }
-            Stmt::If(test, then, otherwise) => {
-                self.expr(test);
-                self.stmts(then);
-                if let Some(otherwise) = otherwise {
-                    self.stmts(otherwise);
-                }
-            }
-            Stmt::Switch(discriminant, cases) => {
-                self.expr(discriminant);
-                for case in cases {
-                    for test in &case.tests {
-                        self.expr(test);
-                    }
-                    self.stmts(&case.body);
-                }
-            }
-            Stmt::Labeled(_, inner) => self.stmt(inner),
-            Stmt::LoopForever(_, body) => self.loop_body(None, body),
-            Stmt::While(test, body) => self.loop_body(Some(test), body),
             Stmt::FunctionDecl { body, .. } => {
                 let depth = self.depth;
                 self.depth = 0;
-                self.stmts(body);
+                self.visit_stmts(body);
                 self.depth = depth;
             }
-            Stmt::TryCatch { body, handler, .. } => {
-                self.stmts(body);
-                self.stmts(handler);
-            }
-            Stmt::Block(body) => self.stmts(body),
-            Stmt::Import { .. }
-            | Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
+            _ => walk_stmt(self, stmt),
         }
     }
 
-    fn loop_body(&mut self, test: Option<&Expr>, body: &[Stmt]) {
-        self.depth += 1;
-        if let Some(test) = test {
-            self.expr(test);
-        }
-        self.stmts(body);
-        self.depth -= 1;
-    }
-
-    fn expr(&mut self, expr: &Expr) {
+    fn visit_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Member(object, _) | Expr::Unary(_, object) => self.expr(object),
-            Expr::Index(object, index)
-            | Expr::Binary(_, object, index)
-            | Expr::Assign(object, index)
-            | Expr::CompoundAssign(_, object, index) => {
-                self.expr(object);
-                self.expr(index);
-            }
-            Expr::Call(callee, arguments) => {
-                self.expr(callee);
-                for argument in arguments {
-                    self.expr(argument);
-                }
-            }
-            Expr::New(callee, arguments) => {
+            Expr::New(..) | Expr::Object(_) | Expr::Array(_) => {
                 self.record();
-                self.expr(callee);
-                for argument in arguments {
-                    self.expr(argument);
-                }
-            }
-            Expr::Cond(test, consequent, alternate) => {
-                self.expr(test);
-                self.expr(consequent);
-                self.expr(alternate);
-            }
-            Expr::Object(entries) => {
-                self.record();
-                for (_, value) in entries {
-                    self.expr(value);
-                }
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                if matches!(expr, Expr::Array(_)) {
-                    self.record();
-                }
-                for item in items {
-                    self.expr(item);
-                }
+                walk_expr(self, expr);
             }
             Expr::Arrow(_, body) => {
                 self.record();
                 let depth = self.depth;
                 self.depth = 0;
                 match body {
-                    ArrowBody::Expr(body) => self.expr(body),
-                    ArrowBody::Block(body) => self.stmts(body),
+                    ArrowBody::Expr(body) => self.visit_expr(body),
+                    ArrowBody::Block(body) => self.visit_stmts(body),
                 }
                 self.depth = depth;
             }
-            Expr::Num(_)
-            | Expr::RawNum(_)
-            | Expr::BigInt(_)
-            | Expr::Str(_)
-            | Expr::Bool(_)
-            | Expr::Undefined
-            | Expr::Null
-            | Expr::Ident(_)
-            | Expr::Raw(_) => {}
+            _ => walk_expr(self, expr),
         }
     }
 }
 
-fn rewrite_stmt(stmt: Stmt) -> Stmt {
-    match stmt {
-        Stmt::ExprStmt(expr) => Stmt::ExprStmt(rewrite_expr(expr)),
-        Stmt::Throw(expr) => Stmt::Throw(rewrite_expr(expr)),
-        Stmt::Let(name, init) => Stmt::Let(name, init.map(rewrite_expr)),
-        Stmt::Lets(declarations) => Stmt::Lets(
-            declarations
-                .into_iter()
-                .map(|(name, init)| (name, init.map(rewrite_expr)))
-                .collect(),
-        ),
-        Stmt::Const(name, init) => Stmt::Const(name, rewrite_expr(init)),
-        Stmt::Return(value) => Stmt::Return(value.map(rewrite_expr)),
-        Stmt::If(test, then, otherwise) => Stmt::If(
-            rewrite_expr(test),
-            rewrite_stmts(then),
-            otherwise.map(rewrite_stmts),
-        ),
-        Stmt::Switch(disc, cases) => Stmt::Switch(
-            rewrite_expr(disc),
-            cases
-                .into_iter()
-                .map(|case| SwitchCase {
-                    tests: case.tests.into_iter().map(rewrite_expr).collect(),
-                    body: rewrite_stmts(case.body),
-                })
-                .collect(),
-        ),
-        Stmt::Labeled(label, body) => Stmt::Labeled(label, Box::new(rewrite_stmt(*body))),
-        Stmt::LoopForever(label, body) => Stmt::LoopForever(label, rewrite_stmts(body)),
-        Stmt::While(test, body) => Stmt::While(rewrite_expr(test), rewrite_stmts(body)),
-        Stmt::FunctionDecl { name, params, body } => Stmt::FunctionDecl {
-            name,
-            params,
-            body: rewrite_stmts(body),
-        },
-        Stmt::TryCatch {
-            body,
-            binding,
-            handler,
-        } => Stmt::TryCatch {
-            body: rewrite_stmts(body),
-            binding,
-            handler: rewrite_stmts(handler),
-        },
-        Stmt::Block(body) => Stmt::Block(rewrite_stmts(body)),
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Raw(_)
-        | Stmt::Loc(_) => stmt,
+struct RewriteLiterals;
+
+impl VisitMut for RewriteLiterals {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        walk_expr_mut(self, expr);
+        let cur = std::mem::replace(expr, Expr::Undefined);
+        *expr = forward_elements(drop_literal_copy(cur));
     }
 }
 
-fn rewrite_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
-    stmts.into_iter().map(rewrite_stmt).collect()
+fn rewrite_stmt(mut stmt: Stmt) -> Stmt {
+    RewriteLiterals.visit_stmt_mut(&mut stmt);
+    stmt
 }
 
-fn rewrite_expr(expr: Expr) -> Expr {
-    let expr = match expr {
-        Expr::Member(obj, name) => Expr::Member(Box::new(rewrite_expr(*obj)), name),
-        Expr::Index(obj, index) => {
-            Expr::Index(Box::new(rewrite_expr(*obj)), Box::new(rewrite_expr(*index)))
-        }
-        Expr::Call(callee, args) => Expr::Call(
-            Box::new(rewrite_expr(*callee)),
-            args.into_iter().map(rewrite_expr).collect(),
-        ),
-        Expr::New(callee, args) => Expr::New(
-            Box::new(rewrite_expr(*callee)),
-            args.into_iter().map(rewrite_expr).collect(),
-        ),
-        Expr::Unary(op, operand) => Expr::Unary(op, Box::new(rewrite_expr(*operand))),
-        Expr::Binary(op, lhs, rhs) => Expr::Binary(
-            op,
-            Box::new(rewrite_expr(*lhs)),
-            Box::new(rewrite_expr(*rhs)),
-        ),
-        Expr::Assign(lhs, rhs) => {
-            Expr::Assign(Box::new(rewrite_expr(*lhs)), Box::new(rewrite_expr(*rhs)))
-        }
-        Expr::CompoundAssign(op, lhs, rhs) => Expr::CompoundAssign(
-            op,
-            Box::new(rewrite_expr(*lhs)),
-            Box::new(rewrite_expr(*rhs)),
-        ),
-        Expr::Cond(test, consequent, alternate) => Expr::Cond(
-            Box::new(rewrite_expr(*test)),
-            Box::new(rewrite_expr(*consequent)),
-            Box::new(rewrite_expr(*alternate)),
-        ),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, rewrite_expr(value)))
-                .collect(),
-        ),
-        Expr::Array(items) => Expr::Array(items.into_iter().map(rewrite_expr).collect()),
-        Expr::Arrow(params, ArrowBody::Expr(body)) => {
-            Expr::Arrow(params, ArrowBody::Expr(Box::new(rewrite_expr(*body))))
-        }
-        Expr::Arrow(params, ArrowBody::Block(body)) => {
-            Expr::Arrow(params, ArrowBody::Block(rewrite_stmts(body)))
-        }
-        Expr::Seq(items) => Expr::Seq(items.into_iter().map(rewrite_expr).collect()),
-        other => other,
-    };
-    forward_elements(drop_literal_copy(expr))
+#[cfg(test)]
+fn rewrite_expr(mut expr: Expr) -> Expr {
+    RewriteLiterals.visit_expr_mut(&mut expr);
+    expr
 }
 
 /// `[a, b].slice()` is `[a, b]`: a copy of a value nothing else holds.
@@ -816,76 +611,71 @@ fn fixed_path(expr: &Expr) -> Option<FixedPath> {
     }
 }
 
-fn collect_alias_stmts(stmts: &[Stmt], facts: &mut AliasFacts) {
-    for stmt in stmts {
-        collect_alias_stmt(stmt, facts);
+impl Visit for AliasFacts {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let(name, Some(init)) => {
+                note_binding(name, init, self);
+                self.visit_expr(init);
+            }
+            Stmt::Lets(declarations) => {
+                for (name, init) in declarations {
+                    if let Some(init) = init {
+                        note_binding(name, init, self);
+                        self.visit_expr(init);
+                    }
+                }
+            }
+            Stmt::Const(name, init) => {
+                note_binding(name, init, self);
+                self.visit_expr(init);
+            }
+            Stmt::FunctionDecl { name, params, body } => {
+                self.shadowed.insert(name.clone());
+                self.shadowed.extend(params.iter().cloned());
+                self.visit_stmts(body);
+            }
+            // A throw can expose a prefix of the assignments, and the catch binding can shadow
+            // an outer alias. The straight-line alias proof does not cover either obligation.
+            Stmt::Raw(_) | Stmt::TryCatch { .. } => self.opaque = true,
+            _ => walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Assign(target, value) => {
+                if let Some(path) = fixed_path(target) {
+                    if let Some(field) = path.fields.last() {
+                        self.member_writes.insert(field.clone());
+                    } else {
+                        note_binding(&path.root, value, self);
+                    }
+                }
+                walk_expr(self, expr);
+            }
+            Expr::CompoundAssign(_, target, _) => {
+                if let Some(path) = fixed_path(target) {
+                    if let Some(field) = path.fields.last() {
+                        self.member_writes.insert(field.clone());
+                    } else {
+                        *self.whole_writes.entry(path.root).or_default() += 1;
+                    }
+                }
+                walk_expr(self, expr);
+            }
+            Expr::Arrow(params, _) => {
+                self.shadowed.extend(params.iter().cloned());
+                walk_expr(self, expr);
+            }
+            Expr::Raw(_) => self.opaque = true,
+            _ => walk_expr(self, expr),
+        }
     }
 }
 
-fn collect_alias_stmt(stmt: &Stmt, facts: &mut AliasFacts) {
-    match stmt {
-        Stmt::ExprStmt(expr) | Stmt::Throw(expr) => collect_alias_expr(expr, facts),
-        Stmt::Let(name, init) => {
-            if let Some(init) = init {
-                note_binding(name, init, facts);
-                collect_alias_expr(init, facts);
-            }
-        }
-        Stmt::Lets(declarations) => {
-            for (name, init) in declarations {
-                if let Some(init) = init {
-                    note_binding(name, init, facts);
-                    collect_alias_expr(init, facts);
-                }
-            }
-        }
-        Stmt::Const(name, init) => {
-            note_binding(name, init, facts);
-            collect_alias_expr(init, facts);
-        }
-        Stmt::Return(value) => {
-            if let Some(value) = value {
-                collect_alias_expr(value, facts);
-            }
-        }
-        Stmt::If(test, then, otherwise) => {
-            collect_alias_expr(test, facts);
-            collect_alias_stmts(then, facts);
-            if let Some(otherwise) = otherwise {
-                collect_alias_stmts(otherwise, facts);
-            }
-        }
-        Stmt::Switch(disc, cases) => {
-            collect_alias_expr(disc, facts);
-            for case in cases {
-                for test in &case.tests {
-                    collect_alias_expr(test, facts);
-                }
-                collect_alias_stmts(&case.body, facts);
-            }
-        }
-        Stmt::Labeled(_, body) => collect_alias_stmt(body, facts),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) => collect_alias_stmts(body, facts),
-        Stmt::While(test, body) => {
-            collect_alias_expr(test, facts);
-            collect_alias_stmts(body, facts);
-        }
-        Stmt::FunctionDecl {
-            name, params, body, ..
-        } => {
-            facts.shadowed.insert(name.clone());
-            facts.shadowed.extend(params.iter().cloned());
-            collect_alias_stmts(body, facts);
-        }
-        // A throw can expose a prefix of the assignments, and the catch binding can shadow
-        // an outer alias. The straight-line alias proof does not cover either obligation.
-        Stmt::Raw(_) | Stmt::TryCatch { .. } => facts.opaque = true,
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => {}
-    }
+fn collect_alias_stmts(stmts: &[Stmt], facts: &mut AliasFacts) {
+    facts.visit_stmts(stmts);
 }
 
 fn note_binding(name: &str, value: &Expr, facts: &mut AliasFacts) {
@@ -902,75 +692,6 @@ fn note_binding(name: &str, value: &Expr, facts: &mut AliasFacts) {
     }
 }
 
-fn collect_alias_expr(expr: &Expr, facts: &mut AliasFacts) {
-    match expr {
-        Expr::Assign(target, value) => {
-            if let Some(path) = fixed_path(target) {
-                if let Some(field) = path.fields.last() {
-                    facts.member_writes.insert(field.clone());
-                } else {
-                    note_binding(&path.root, value, facts);
-                }
-            }
-            collect_alias_expr(target, facts);
-            collect_alias_expr(value, facts);
-        }
-        Expr::CompoundAssign(_, target, value) => {
-            if let Some(path) = fixed_path(target) {
-                if let Some(field) = path.fields.last() {
-                    facts.member_writes.insert(field.clone());
-                } else {
-                    *facts.whole_writes.entry(path.root).or_default() += 1;
-                }
-            }
-            collect_alias_expr(target, facts);
-            collect_alias_expr(value, facts);
-        }
-        Expr::Member(object, _) | Expr::Unary(_, object) => collect_alias_expr(object, facts),
-        Expr::Index(object, index) | Expr::Binary(_, object, index) => {
-            collect_alias_expr(object, facts);
-            collect_alias_expr(index, facts);
-        }
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            collect_alias_expr(callee, facts);
-            for arg in args {
-                collect_alias_expr(arg, facts);
-            }
-        }
-        Expr::Cond(test, consequent, alternate) => {
-            collect_alias_expr(test, facts);
-            collect_alias_expr(consequent, facts);
-            collect_alias_expr(alternate, facts);
-        }
-        Expr::Object(entries) => {
-            for (_, value) in entries {
-                collect_alias_expr(value, facts);
-            }
-        }
-        Expr::Array(items) | Expr::Seq(items) => {
-            for item in items {
-                collect_alias_expr(item, facts);
-            }
-        }
-        Expr::Arrow(params, body) => {
-            facts.shadowed.extend(params.iter().cloned());
-            match body {
-                ArrowBody::Expr(body) => collect_alias_expr(body, facts),
-                ArrowBody::Block(body) => collect_alias_stmts(body, facts),
-            }
-        }
-        Expr::Raw(_) => facts.opaque = true,
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Ident(_) => {}
-    }
-}
-
 fn path_expr(path: &FixedPath) -> Expr {
     path.fields
         .iter()
@@ -979,165 +700,77 @@ fn path_expr(path: &FixedPath) -> Expr {
         })
 }
 
-fn rewrite_alias_stmts(stmts: Vec<Stmt>, aliases: &BTreeMap<String, FixedPath>) -> Vec<Stmt> {
+struct AliasRewriter<'a>(&'a BTreeMap<String, FixedPath>);
+
+impl AliasRewriter<'_> {
+    fn rewrite_block(&mut self, stmts: &mut Vec<Stmt>) {
+        self.visit_stmts_mut(stmts);
+        stmts.retain(|stmt| !matches!(stmt, Stmt::ExprStmt(Expr::Undefined)));
+    }
+}
+
+impl VisitMut for AliasRewriter<'_> {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::TryCatch { .. } => {}
+            Stmt::If(test, then, otherwise) => {
+                self.visit_expr_mut(test);
+                self.rewrite_block(then);
+                if let Some(body) = otherwise {
+                    self.rewrite_block(body);
+                }
+            }
+            Stmt::Switch(disc, cases) => {
+                self.visit_expr_mut(disc);
+                for case in cases {
+                    for test in &mut case.tests {
+                        self.visit_expr_mut(test);
+                    }
+                    self.rewrite_block(&mut case.body);
+                }
+            }
+            Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
+                self.rewrite_block(body);
+            }
+            Stmt::While(test, body) => {
+                self.visit_expr_mut(test);
+                self.rewrite_block(body);
+            }
+            _ => walk_stmt_mut(self, stmt),
+        }
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Ident(name) => {
+                if let Some(path) = self.0.get(name) {
+                    *expr = path_expr(path);
+                }
+            }
+            Expr::Assign(target, _) if matches!(target.as_ref(), Expr::Ident(name) if self.0.contains_key(name)) =>
+            {
+                *expr = Expr::Undefined;
+            }
+            Expr::Arrow(_, ArrowBody::Block(body)) => self.rewrite_block(body),
+            Expr::Seq(items) => {
+                for item in items.iter_mut() {
+                    self.visit_expr_mut(item);
+                }
+                items.retain(|item| !matches!(item, Expr::Undefined));
+                match items.len() {
+                    0 => *expr = Expr::Undefined,
+                    1 => *expr = items.pop().expect("the sequence has one item"),
+                    _ => {}
+                }
+            }
+            _ => walk_expr_mut(self, expr),
+        }
+    }
+}
+
+fn rewrite_alias_stmts(mut stmts: Vec<Stmt>, aliases: &BTreeMap<String, FixedPath>) -> Vec<Stmt> {
+    AliasRewriter(aliases).rewrite_block(&mut stmts);
     stmts
-        .into_iter()
-        .map(|stmt| rewrite_alias_stmt(stmt, aliases))
-        .filter(|stmt| !matches!(stmt, Stmt::ExprStmt(Expr::Undefined)))
-        .collect()
-}
-
-fn rewrite_alias_stmt(stmt: Stmt, aliases: &BTreeMap<String, FixedPath>) -> Stmt {
-    match stmt {
-        Stmt::ExprStmt(expr) => Stmt::ExprStmt(rewrite_alias_expr(expr, aliases)),
-        Stmt::Throw(expr) => Stmt::Throw(rewrite_alias_expr(expr, aliases)),
-        Stmt::Let(name, init) => {
-            Stmt::Let(name, init.map(|value| rewrite_alias_expr(value, aliases)))
-        }
-        Stmt::Lets(declarations) => Stmt::Lets(
-            declarations
-                .into_iter()
-                .map(|(name, init)| (name, init.map(|value| rewrite_alias_expr(value, aliases))))
-                .collect(),
-        ),
-        Stmt::Const(name, value) => Stmt::Const(name, rewrite_alias_expr(value, aliases)),
-        Stmt::Return(value) => Stmt::Return(value.map(|value| rewrite_alias_expr(value, aliases))),
-        Stmt::If(test, then, otherwise) => Stmt::If(
-            rewrite_alias_expr(test, aliases),
-            rewrite_alias_stmts(then, aliases),
-            otherwise.map(|body| rewrite_alias_stmts(body, aliases)),
-        ),
-        Stmt::Switch(disc, cases) => Stmt::Switch(
-            rewrite_alias_expr(disc, aliases),
-            cases
-                .into_iter()
-                .map(|case| SwitchCase {
-                    tests: case
-                        .tests
-                        .into_iter()
-                        .map(|test| rewrite_alias_expr(test, aliases))
-                        .collect(),
-                    body: rewrite_alias_stmts(case.body, aliases),
-                })
-                .collect(),
-        ),
-        Stmt::Labeled(label, body) => {
-            Stmt::Labeled(label, Box::new(rewrite_alias_stmt(*body, aliases)))
-        }
-        Stmt::LoopForever(label, body) => {
-            Stmt::LoopForever(label, rewrite_alias_stmts(body, aliases))
-        }
-        Stmt::While(test, body) => Stmt::While(
-            rewrite_alias_expr(test, aliases),
-            rewrite_alias_stmts(body, aliases),
-        ),
-        Stmt::FunctionDecl { name, params, body } => Stmt::FunctionDecl {
-            name,
-            params,
-            body: rewrite_alias_stmts(body, aliases),
-        },
-        Stmt::TryCatch { .. } => stmt,
-        Stmt::Block(body) => Stmt::Block(rewrite_alias_stmts(body, aliases)),
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Raw(_)
-        | Stmt::Loc(_) => stmt,
-    }
-}
-
-fn rewrite_alias_expr(expr: Expr, aliases: &BTreeMap<String, FixedPath>) -> Expr {
-    match expr {
-        Expr::Ident(name) => aliases
-            .get(&name)
-            .map(path_expr)
-            .unwrap_or(Expr::Ident(name)),
-        Expr::Member(object, field) => jsast::member(rewrite_alias_expr(*object, aliases), field),
-        Expr::Index(object, index) => Expr::Index(
-            Box::new(rewrite_alias_expr(*object, aliases)),
-            Box::new(rewrite_alias_expr(*index, aliases)),
-        ),
-        Expr::Call(callee, args) => Expr::Call(
-            Box::new(rewrite_alias_expr(*callee, aliases)),
-            args.into_iter()
-                .map(|arg| rewrite_alias_expr(arg, aliases))
-                .collect(),
-        ),
-        Expr::New(callee, args) => Expr::New(
-            Box::new(rewrite_alias_expr(*callee, aliases)),
-            args.into_iter()
-                .map(|arg| rewrite_alias_expr(arg, aliases))
-                .collect(),
-        ),
-        Expr::Unary(op, operand) => {
-            Expr::Unary(op, Box::new(rewrite_alias_expr(*operand, aliases)))
-        }
-        Expr::Binary(op, left, right) => Expr::Binary(
-            op,
-            Box::new(rewrite_alias_expr(*left, aliases)),
-            Box::new(rewrite_alias_expr(*right, aliases)),
-        ),
-        Expr::Assign(target, value) => {
-            if matches!(target.as_ref(), Expr::Ident(name) if aliases.contains_key(name)) {
-                Expr::Undefined
-            } else {
-                Expr::Assign(
-                    Box::new(rewrite_alias_expr(*target, aliases)),
-                    Box::new(rewrite_alias_expr(*value, aliases)),
-                )
-            }
-        }
-        Expr::CompoundAssign(op, target, value) => Expr::CompoundAssign(
-            op,
-            Box::new(rewrite_alias_expr(*target, aliases)),
-            Box::new(rewrite_alias_expr(*value, aliases)),
-        ),
-        Expr::Cond(test, consequent, alternate) => Expr::Cond(
-            Box::new(rewrite_alias_expr(*test, aliases)),
-            Box::new(rewrite_alias_expr(*consequent, aliases)),
-            Box::new(rewrite_alias_expr(*alternate, aliases)),
-        ),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, rewrite_alias_expr(value, aliases)))
-                .collect(),
-        ),
-        Expr::Array(items) => Expr::Array(
-            items
-                .into_iter()
-                .map(|item| rewrite_alias_expr(item, aliases))
-                .collect(),
-        ),
-        Expr::Arrow(params, ArrowBody::Expr(body)) => Expr::Arrow(
-            params,
-            ArrowBody::Expr(Box::new(rewrite_alias_expr(*body, aliases))),
-        ),
-        Expr::Arrow(params, ArrowBody::Block(body)) => {
-            Expr::Arrow(params, ArrowBody::Block(rewrite_alias_stmts(body, aliases)))
-        }
-        Expr::Seq(items) => {
-            let mut items: Vec<Expr> = items
-                .into_iter()
-                .map(|item| rewrite_alias_expr(item, aliases))
-                .filter(|item| !matches!(item, Expr::Undefined))
-                .collect();
-            match items.len() {
-                0 => Expr::Undefined,
-                1 => items.pop().expect("the sequence has one item"),
-                _ => Expr::Seq(items),
-            }
-        }
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Raw(_) => expr,
-    }
 }
 
 /// What one function-scoped local is used for, as far as splitting it is concerned.
@@ -1414,177 +1047,93 @@ fn identifiers(body: &[Stmt]) -> BTreeSet<String> {
     names
 }
 
-fn collect_stmt(stmt: &Stmt, uses: &mut BTreeMap<String, LocalUse>) {
-    match stmt {
-        // A whole-value assignment standing on its own is the one shape a split rewrites;
-        // `collect_expr` recognizes it, nested or not.
-        Stmt::ExprStmt(expr) | Stmt::Throw(expr) => collect_expr(expr, uses),
-        Stmt::Let(_, init) => {
-            if let Some(init) = init {
-                collect_expr(init, uses);
-            }
-        }
-        Stmt::Lets(declarations) => {
-            for (_, init) in declarations {
-                if let Some(init) = init {
-                    collect_expr(init, uses);
-                }
-            }
-        }
-        Stmt::Const(_, init) => collect_expr(init, uses),
-        Stmt::Return(value) => {
-            if let Some(value) = value {
-                collect_expr(value, uses);
-            }
-        }
-        Stmt::If(test, then, otherwise) => {
-            collect_expr(test, uses);
-            collect_stmts(then, uses);
-            if let Some(otherwise) = otherwise {
-                collect_stmts(otherwise, uses);
-            }
-        }
-        Stmt::Switch(disc, cases) => {
-            collect_expr(disc, uses);
-            for case in cases {
-                for test in &case.tests {
-                    collect_expr(test, uses);
-                }
-                collect_stmts(&case.body, uses);
-            }
-        }
-        Stmt::Labeled(_, body) => collect_stmt(body, uses),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
-            collect_stmts(body, uses);
-        }
-        Stmt::While(test, body) => {
-            collect_expr(test, uses);
-            collect_stmts(body, uses);
-        }
+struct UseCollector<'a>(&'a mut BTreeMap<String, LocalUse>);
+
+impl Visit for UseCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         // Verbatim JavaScript may name anything, so nothing in this function can be split.
-        Stmt::Raw(_) | Stmt::TryCatch { .. } => {
-            for use_ in uses.values_mut() {
+        if matches!(stmt, Stmt::Raw(_) | Stmt::TryCatch { .. }) {
+            for use_ in self.0.values_mut() {
                 use_.opaque = true;
             }
+            return;
         }
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => {}
+        walk_stmt(self, stmt);
     }
-}
 
-fn collect_stmts(stmts: &[Stmt], uses: &mut BTreeMap<String, LocalUse>) {
-    for stmt in stmts {
-        collect_stmt(stmt, uses);
-    }
-}
-
-fn collect_expr(expr: &Expr, uses: &mut BTreeMap<String, LocalUse>) {
-    match expr {
-        Expr::Ident(name) => {
-            if let Some(use_) = uses.get_mut(name) {
-                use_.opaque = true;
-            }
-        }
-        // One named field of the local, which a split turns into one local of its own.
-        Expr::Member(obj, key) => {
-            if let Expr::Ident(name) = obj.as_ref() {
-                if let Some(use_) = uses.get_mut(name) {
-                    use_.fields.insert(key.clone());
-                    return;
-                }
-            }
-            collect_expr(obj, uses);
-        }
-        Expr::Index(obj, index) => {
-            collect_expr(obj, uses);
-            collect_expr(index, uses);
-        }
-        Expr::Call(callee, args) if pointer_eq_args(callee, args).is_some() => {
-            let (left, right) = pointer_eq_args(callee, args).expect("matched above");
-            if uses.contains_key(left) && uses.contains_key(right) {
-                for (name, peer) in [(left, right), (right, left)] {
-                    let use_ = uses.get_mut(name).expect("checked above");
-                    use_.fields
-                        .extend(["buf", "off", "sc"].into_iter().map(str::to_owned));
-                    use_.pointer_eq.insert(peer.to_owned());
-                }
-            } else {
-                collect_expr(callee, uses);
-                for arg in args {
-                    collect_expr(arg, uses);
-                }
-            }
-        }
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            collect_expr(callee, uses);
-            for arg in args {
-                collect_expr(arg, uses);
-            }
-        }
-        Expr::Unary(_, operand) => collect_expr(operand, uses),
-        // A previous split spells the field writes as a comma expression. Recognize a nested
-        // whole-local assignment too, so a JIR-only bounded retry can peel the next product layer
-        // without changing the one-round policy used while building the sysroot.
-        Expr::Assign(target, value) => {
-            if collect_whole_assignment(target, value, uses) {
-                return;
-            }
-            note_field_store(target, uses);
-            collect_expr(target, uses);
-            collect_expr(value, uses);
-        }
-        Expr::CompoundAssign(_, target, value) => {
-            note_field_store(target, uses);
-            collect_expr(target, uses);
-            collect_expr(value, uses);
-        }
-        Expr::Binary(_, lhs, rhs) => {
-            collect_expr(lhs, uses);
-            collect_expr(rhs, uses);
-        }
-        Expr::Cond(test, consequent, alternate) => {
-            collect_expr(test, uses);
-            collect_expr(consequent, uses);
-            collect_expr(alternate, uses);
-        }
-        Expr::Object(entries) => {
-            for (_, value) in entries {
-                collect_expr(value, uses);
-            }
-        }
-        Expr::Array(items) | Expr::Seq(items) => {
-            for item in items {
-                collect_expr(item, uses);
-            }
-        }
-        Expr::Arrow(params, body) => {
-            // A parameter of the same name shadows the local, so the body says nothing about it.
-            for param in params {
-                if let Some(use_) = uses.get_mut(param) {
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Ident(name) => {
+                if let Some(use_) = self.0.get_mut(name) {
                     use_.opaque = true;
                 }
             }
-            match body {
-                ArrowBody::Expr(body) => collect_expr(body, uses),
-                ArrowBody::Block(body) => collect_stmts(body, uses),
+            // One named field of the local, which a split turns into one local of its own.
+            Expr::Member(obj, key) => {
+                if let Expr::Ident(name) = obj.as_ref() {
+                    if let Some(use_) = self.0.get_mut(name) {
+                        use_.fields.insert(key.clone());
+                        return;
+                    }
+                }
+                self.visit_expr(obj);
             }
-        }
-        Expr::Raw(_) => {
-            for use_ in uses.values_mut() {
-                use_.opaque = true;
+            Expr::Call(callee, args) if pointer_eq_args(callee, args).is_some() => {
+                let (left, right) = pointer_eq_args(callee, args).expect("matched above");
+                if self.0.contains_key(left) && self.0.contains_key(right) {
+                    for (name, peer) in [(left, right), (right, left)] {
+                        let use_ = self.0.get_mut(name).expect("checked above");
+                        use_.fields
+                            .extend(["buf", "off", "sc"].into_iter().map(str::to_owned));
+                        use_.pointer_eq.insert(peer.to_owned());
+                    }
+                } else {
+                    walk_expr(self, expr);
+                }
             }
+            // A previous split spells the field writes as a comma expression. Recognize a nested
+            // whole-local assignment too, so a JIR-only bounded retry can peel the next product
+            // layer without changing the one-round policy used while building the sysroot.
+            Expr::Assign(target, value) => {
+                if collect_whole_assignment(target, value, self.0) {
+                    return;
+                }
+                note_field_store(target, self.0);
+                walk_expr(self, expr);
+            }
+            Expr::CompoundAssign(_, target, _) => {
+                note_field_store(target, self.0);
+                walk_expr(self, expr);
+            }
+            Expr::Arrow(params, _) => {
+                // A parameter of the same name shadows the local, so the body says nothing about it.
+                for param in params {
+                    if let Some(use_) = self.0.get_mut(param) {
+                        use_.opaque = true;
+                    }
+                }
+                walk_expr(self, expr);
+            }
+            Expr::Raw(_) => {
+                for use_ in self.0.values_mut() {
+                    use_.opaque = true;
+                }
+            }
+            _ => walk_expr(self, expr),
         }
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => {}
     }
+}
+
+fn collect_stmt(stmt: &Stmt, uses: &mut BTreeMap<String, LocalUse>) {
+    UseCollector(uses).visit_stmt(stmt);
+}
+
+fn collect_stmts(stmts: &[Stmt], uses: &mut BTreeMap<String, LocalUse>) {
+    UseCollector(uses).visit_stmts(stmts);
+}
+
+fn collect_expr(expr: &Expr, uses: &mut BTreeMap<String, LocalUse>) {
+    UseCollector(uses).visit_expr(expr);
 }
 
 /// Records that `target`, the left-hand side of an assignment, changes one field of a local in
@@ -1649,45 +1198,43 @@ fn collect_whole_assignment(
 /// each right-hand side reads only the lane it is about to replace. Cross-field reads, delayed
 /// closure reads, and assignments remain conservative refusals.
 fn reads_only_own_field(expr: &Expr, name: &str, field: &str) -> bool {
-    match expr {
-        Expr::Ident(candidate) => candidate != name,
-        Expr::Member(object, key) if matches!(object.as_ref(), Expr::Ident(candidate) if candidate == name) => {
-            key == field
-        }
-        Expr::Member(object, _) | Expr::Unary(_, object) => {
-            reads_only_own_field(object, name, field)
-        }
-        Expr::Index(object, index) | Expr::Binary(_, object, index) => {
-            reads_only_own_field(object, name, field) && reads_only_own_field(index, name, field)
-        }
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            reads_only_own_field(callee, name, field)
-                && args
-                    .iter()
-                    .all(|arg| reads_only_own_field(arg, name, field))
-        }
-        Expr::Cond(test, consequent, alternate) => {
-            reads_only_own_field(test, name, field)
-                && reads_only_own_field(consequent, name, field)
-                && reads_only_own_field(alternate, name, field)
-        }
-        Expr::Object(entries) => entries
-            .iter()
-            .all(|(_, value)| reads_only_own_field(value, name, field)),
-        Expr::Array(items) | Expr::Seq(items) => items
-            .iter()
-            .all(|item| reads_only_own_field(item, name, field)),
-        Expr::Assign(..) | Expr::CompoundAssign(..) | Expr::Arrow(..) | Expr::Raw(_) => {
-            !mentions(expr, name)
-        }
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => true,
+    struct Check<'a> {
+        name: &'a str,
+        field: &'a str,
+        ok: bool,
     }
+    impl Visit for Check<'_> {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if !self.ok {
+                return;
+            }
+            match expr {
+                Expr::Ident(candidate) => {
+                    if candidate == self.name {
+                        self.ok = false;
+                    }
+                }
+                Expr::Member(object, key) if matches!(object.as_ref(), Expr::Ident(candidate) if candidate == self.name) => {
+                    if key != self.field {
+                        self.ok = false;
+                    }
+                }
+                Expr::Assign(..) | Expr::CompoundAssign(..) | Expr::Arrow(..) | Expr::Raw(_) => {
+                    if mentions(expr, self.name) {
+                        self.ok = false;
+                    }
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut c = Check {
+        name,
+        field,
+        ok: true,
+    };
+    c.visit_expr(expr);
+    c.ok
 }
 
 /// The two local operands of a runtime pointer equality call.
@@ -1714,183 +1261,102 @@ fn mentions(expr: &Expr, name: &str) -> bool {
 
 type Split = BTreeMap<String, Vec<(String, String)>>;
 
-fn apply_stmt(stmt: Stmt, split: &Split) -> Stmt {
-    match stmt {
-        Stmt::ExprStmt(Expr::Assign(target, value)) => {
-            if let Some(writes) = split_assignment(&target, &value, split) {
-                return Stmt::ExprStmt(writes);
+struct SplitApplier<'a>(&'a Split);
+
+impl VisitMut for SplitApplier<'_> {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::TryCatch { .. } => {}
+            Stmt::Let(name, _) => {
+                if let Some(fields) = self.0.get(name) {
+                    *stmt = Stmt::Lets(
+                        fields
+                            .iter()
+                            .map(|(_, scalar)| (scalar.clone(), None))
+                            .collect(),
+                    );
+                } else {
+                    walk_stmt_mut(self, stmt);
+                }
             }
-            Stmt::ExprStmt(Expr::Assign(
-                Box::new(apply_expr(*target, split)),
-                Box::new(apply_expr(*value, split)),
-            ))
+            Stmt::Lets(declarations) => {
+                let expanded = std::mem::take(declarations)
+                    .into_iter()
+                    .flat_map(|(name, init)| match self.0.get(&name) {
+                        Some(fields) => fields
+                            .iter()
+                            .map(|(_, scalar)| (scalar.clone(), None))
+                            .collect(),
+                        None => {
+                            let init = init.map(|mut init| {
+                                self.visit_expr_mut(&mut init);
+                                init
+                            });
+                            vec![(name, init)]
+                        }
+                    })
+                    .collect();
+                *declarations = expanded;
+            }
+            _ => walk_stmt_mut(self, stmt),
         }
-        Stmt::ExprStmt(expr) => Stmt::ExprStmt(apply_expr(expr, split)),
-        Stmt::Throw(expr) => Stmt::Throw(apply_expr(expr, split)),
-        Stmt::Let(name, init) => match split.get(&name) {
-            Some(fields) => Stmt::Lets(
-                fields
-                    .iter()
-                    .map(|(_, scalar)| (scalar.clone(), None))
-                    .collect(),
-            ),
-            None => Stmt::Let(name, init.map(|init| apply_expr(init, split))),
-        },
-        Stmt::Lets(declarations) => Stmt::Lets(
-            declarations
-                .into_iter()
-                .flat_map(|(name, init)| match split.get(&name) {
-                    Some(fields) => fields
-                        .iter()
-                        .map(|(_, scalar)| (scalar.clone(), None))
-                        .collect(),
-                    None => vec![(name, init.map(|init| apply_expr(init, split)))],
-                })
-                .collect(),
-        ),
-        Stmt::Const(name, init) => Stmt::Const(name, apply_expr(init, split)),
-        Stmt::Return(value) => Stmt::Return(value.map(|value| apply_expr(value, split))),
-        Stmt::If(test, then, otherwise) => Stmt::If(
-            apply_expr(test, split),
-            apply_stmts(then, split),
-            otherwise.map(|otherwise| apply_stmts(otherwise, split)),
-        ),
-        Stmt::Switch(disc, cases) => Stmt::Switch(
-            apply_expr(disc, split),
-            cases
-                .into_iter()
-                .map(|case| SwitchCase {
-                    tests: case
-                        .tests
-                        .into_iter()
-                        .map(|test| apply_expr(test, split))
-                        .collect(),
-                    body: apply_stmts(case.body, split),
-                })
-                .collect(),
-        ),
-        Stmt::Labeled(label, body) => Stmt::Labeled(label, Box::new(apply_stmt(*body, split))),
-        Stmt::LoopForever(label, body) => Stmt::LoopForever(label, apply_stmts(body, split)),
-        Stmt::While(test, body) => Stmt::While(apply_expr(test, split), apply_stmts(body, split)),
-        Stmt::FunctionDecl { name, params, body } => Stmt::FunctionDecl {
-            name,
-            params,
-            body: apply_stmts(body, split),
-        },
-        Stmt::TryCatch { .. } => stmt,
-        Stmt::Block(body) => Stmt::Block(apply_stmts(body, split)),
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Raw(_)
-        | Stmt::Loc(_) => stmt,
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Member(obj, key) => {
+                if let Expr::Ident(name) = obj.as_ref() {
+                    if let Some(fields) = self.0.get(name) {
+                        let scalar = fields
+                            .iter()
+                            .find(|(field, _)| *field == *key)
+                            .map(|(_, scalar)| scalar.clone())
+                            .expect("every field read was included in the split shape");
+                        *expr = jsast::id(scalar);
+                        return;
+                    }
+                }
+                self.visit_expr_mut(obj);
+            }
+            Expr::Call(callee, args) => {
+                if let Some((left, right)) = pointer_eq_args(callee, args) {
+                    if self.0.contains_key(left) && self.0.contains_key(right) {
+                        *expr = ["buf", "off", "sc"]
+                            .into_iter()
+                            .map(|field| {
+                                jsast::binary(
+                                    BinOp::StrictEq,
+                                    split_field_expr(left, field, self.0),
+                                    split_field_expr(right, field, self.0),
+                                )
+                            })
+                            .reduce(|left, right| jsast::binary(BinOp::And, left, right))
+                            .expect("pointer equality has fields");
+                        return;
+                    }
+                }
+                walk_expr_mut(self, expr);
+            }
+            Expr::Assign(target, value) => {
+                if let Some(writes) = split_assignment(target, value, self.0) {
+                    *expr = writes;
+                    return;
+                }
+                walk_expr_mut(self, expr);
+            }
+            _ => walk_expr_mut(self, expr),
+        }
     }
 }
 
-fn apply_stmts(stmts: Vec<Stmt>, split: &Split) -> Vec<Stmt> {
-    stmts
-        .into_iter()
-        .map(|stmt| apply_stmt(stmt, split))
-        .collect()
+fn apply_stmt(mut stmt: Stmt, split: &Split) -> Stmt {
+    SplitApplier(split).visit_stmt_mut(&mut stmt);
+    stmt
 }
 
-fn apply_expr(expr: Expr, split: &Split) -> Expr {
-    match expr {
-        Expr::Member(obj, key) => {
-            if let Expr::Ident(name) = obj.as_ref() {
-                if let Some(fields) = split.get(name) {
-                    let scalar = fields
-                        .iter()
-                        .find(|(field, _)| *field == key)
-                        .map(|(_, scalar)| scalar.clone())
-                        .expect("every field read was included in the split shape");
-                    return jsast::id(scalar);
-                }
-            }
-            Expr::Member(Box::new(apply_expr(*obj, split)), key)
-        }
-        Expr::Index(obj, index) => Expr::Index(
-            Box::new(apply_expr(*obj, split)),
-            Box::new(apply_expr(*index, split)),
-        ),
-        Expr::Call(callee, args) => {
-            if let Some((left, right)) = pointer_eq_args(&callee, &args) {
-                if split.contains_key(left) && split.contains_key(right) {
-                    let equal = ["buf", "off", "sc"]
-                        .into_iter()
-                        .map(|field| {
-                            jsast::binary(
-                                BinOp::StrictEq,
-                                split_field_expr(left, field, split),
-                                split_field_expr(right, field, split),
-                            )
-                        })
-                        .reduce(|left, right| jsast::binary(BinOp::And, left, right))
-                        .expect("pointer equality has fields");
-                    return equal;
-                }
-            }
-            Expr::Call(
-                Box::new(apply_expr(*callee, split)),
-                args.into_iter().map(|arg| apply_expr(arg, split)).collect(),
-            )
-        }
-        Expr::New(callee, args) => Expr::New(
-            Box::new(apply_expr(*callee, split)),
-            args.into_iter().map(|arg| apply_expr(arg, split)).collect(),
-        ),
-        Expr::Unary(op, operand) => Expr::Unary(op, Box::new(apply_expr(*operand, split))),
-        Expr::Binary(op, lhs, rhs) => Expr::Binary(
-            op,
-            Box::new(apply_expr(*lhs, split)),
-            Box::new(apply_expr(*rhs, split)),
-        ),
-        Expr::Assign(target, value) => {
-            if let Some(writes) = split_assignment(&target, &value, split) {
-                return writes;
-            }
-            Expr::Assign(
-                Box::new(apply_expr(*target, split)),
-                Box::new(apply_expr(*value, split)),
-            )
-        }
-        Expr::CompoundAssign(op, lhs, rhs) => Expr::CompoundAssign(
-            op,
-            Box::new(apply_expr(*lhs, split)),
-            Box::new(apply_expr(*rhs, split)),
-        ),
-        Expr::Cond(test, consequent, alternate) => Expr::Cond(
-            Box::new(apply_expr(*test, split)),
-            Box::new(apply_expr(*consequent, split)),
-            Box::new(apply_expr(*alternate, split)),
-        ),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, apply_expr(value, split)))
-                .collect(),
-        ),
-        Expr::Array(items) => Expr::Array(
-            items
-                .into_iter()
-                .map(|item| apply_expr(item, split))
-                .collect(),
-        ),
-        Expr::Arrow(params, ArrowBody::Expr(body)) => {
-            Expr::Arrow(params, ArrowBody::Expr(Box::new(apply_expr(*body, split))))
-        }
-        Expr::Arrow(params, ArrowBody::Block(body)) => {
-            Expr::Arrow(params, ArrowBody::Block(apply_stmts(body, split)))
-        }
-        Expr::Seq(items) => Expr::Seq(
-            items
-                .into_iter()
-                .map(|item| apply_expr(item, split))
-                .collect(),
-        ),
-        other => other,
-    }
+fn apply_expr(mut expr: Expr, split: &Split) -> Expr {
+    SplitApplier(split).visit_expr_mut(&mut expr);
+    expr
 }
 
 /// One field lane of a split local.

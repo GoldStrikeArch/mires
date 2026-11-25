@@ -46,7 +46,6 @@
 //! a schema bump (postcard has no field names to skip by).
 
 pub mod artifact;
-pub mod baseline_shadow;
 pub mod dts;
 pub mod evaluation;
 pub mod host;
@@ -54,7 +53,6 @@ pub mod item;
 pub mod jir;
 pub mod jsast;
 pub mod lane_report;
-pub mod late_ir;
 pub mod manifest;
 pub mod minify;
 pub mod object;

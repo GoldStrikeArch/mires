@@ -341,24 +341,9 @@ impl Remap<'_> {
                 *id = self.bytes(*id)?;
             }
             HostPayload::Marker {
-                section,
-                template,
-                helpers,
-                ..
+                section, helpers, ..
             } => {
                 *section = self.string(*section)?;
-                if let Some(tree) = template {
-                    self.constant(tree)?;
-                }
-                for (name, direct) in helpers {
-                    *name = self.string(*name)?;
-                    self.direct(direct)?;
-                }
-            }
-            HostPayload::ViewAbi {
-                marker, helpers, ..
-            } => {
-                *marker = self.string(*marker)?;
                 for (name, direct) in helpers {
                     *name = self.string(*name)?;
                     self.direct(direct)?;
@@ -367,7 +352,6 @@ impl Remap<'_> {
             HostPayload::Map { marker } => {
                 *marker = self.string(*marker)?;
             }
-            HostPayload::KeyedList(_) => return Err("inline.host-boundary"),
         }
         Ok(())
     }

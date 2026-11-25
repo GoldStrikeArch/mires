@@ -11,10 +11,11 @@
 //! constant that cannot be decoded exactly) declines the whole item with a reason naming the
 //! statement or terminator, and the printed JavaScript stays the executable fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_abi::Size;
 use rustc_hir::def_id::DefId;
+use rustc_hir::LangItem;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::ty::print::with_no_trimmed_paths;
@@ -32,25 +33,38 @@ use rcgjs_object::jir::semantic::{
     AbiSignature, AggregateKind, AssertMessage, BasicBlock, BinaryOp, BlockId, Body, BodyKind,
     BodySemantic, BorrowKind, Call, CallSemantic, Callee, CastKind, ConstTree, Constant,
     CoroutineDesugaring, CoroutineKind, CoroutineSource, DefinitionId, DirectItemRef, DropGlue,
-    GlobalReference, HostPayload, ItemId, KeyedListCallable, KeyedListPayload, Local, LocalId,
-    LocalRole, Operand, OperandKind, Place, Projection, RawPointerKind, Rvalue, Signature,
-    SpreadArgument, StandardOperation, Statement, StatementKind, StaticStep, TerminateReason,
-    Terminator, TypeId, UnaryOp, Unwind, VtableEntry, KEYED_LIST_FORMAT_V1,
+    GlobalReference, HostPayload, ItemId, Local, LocalId, LocalRole, Operand, OperandKind, Place,
+    Projection, RawPointerKind, Rvalue, Signature, SpreadArgument, StandardOperation, Statement,
+    StatementKind, StaticStep, TerminateReason, Terminator, TypeId, UnaryOp, Unwind, VtableEntry,
 };
+use rcgjs_object::jsast::{self, Loc};
 
 use super::types::{definition_id, type_name, TypeCx};
 use super::JirItem;
 use crate::cgu::CguCx;
+use crate::descriptor::{Descriptor, Root, PREFIX as EXTERN_PREFIX};
+use crate::item::{ItemKind, JsItem, JsName, Linkage};
 use crate::value::typing_env;
+
+const BLOCK_PREFIX: &str = "rcgjs.js.";
+const HOST_PREFIX: &str = "rcgjs.host.";
+const MAP_PREFIX: &str = "rcgjs.map.";
+
+/// The encoded JIR item together with any auxiliary link-level item references (vtables,
+/// `#[js_extern]` imports, panic lang items, reified function items, host closure callbacks)
+/// discovered while walking MIR.
+pub(crate) struct EncodedJir {
+    pub(crate) item: JirItem,
+    pub(crate) extra_refs: BTreeSet<JsName>,
+}
+
+type PendingVtable<'tcx> = (Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>);
 
 /// The largest anonymous constant allocation decoded into an owned constant tree.
 const MAX_CONST_MEMORY_BYTES: u64 = 65536;
 
 /// The deepest pointer chain followed while decoding constant memory.
 const MAX_CONST_TREE_DEPTH: u32 = 64;
-
-/// The `link_section` prefix every `view-abi` marker carries (`abi.rs`).
-const VIEW_ABI_PREFIX: &str = "rcgjs.tc.";
 
 /// Whether the debug-only self checks (postcard round trip of every body) run.
 pub(crate) fn self_check() -> bool {
@@ -63,22 +77,34 @@ pub(crate) fn function<'tcx>(
     cgu: &CguCx<'tcx>,
     instance: Instance<'tcx>,
     mir: &mir::Body<'tcx>,
-) -> Result<JirItem, EncodeDecline> {
-    let mut interns = cgu.interns_mut();
-    let mut encoder = Encoder::new(cgu, &mut interns, Some((instance, mir)));
-    let result = encoder.function_body();
-    encoder.finish(result)
+) -> Result<EncodedJir, EncodeDecline> {
+    let (result, pending_vtables) = {
+        let mut interns = cgu.interns_mut();
+        let mut encoder = Encoder::new(cgu, &mut interns, Some((instance, mir)));
+        let body = encoder.function_body();
+        encoder.finish_encoded(body)
+    };
+    for (ty, principal) in pending_vtables {
+        let _ = crate::vtable::vtable_expr(cgu, ty, principal);
+    }
+    result
 }
 
 /// Encodes a `static`: its identity, type, and decoded initializer.
 pub(crate) fn static_item<'tcx>(
     cgu: &CguCx<'tcx>,
     def_id: DefId,
-) -> Result<JirItem, EncodeDecline> {
-    let mut interns = cgu.interns_mut();
-    let mut encoder = Encoder::new(cgu, &mut interns, None);
-    let result = encoder.static_body(def_id);
-    encoder.finish(result)
+) -> Result<EncodedJir, EncodeDecline> {
+    let (result, pending_vtables) = {
+        let mut interns = cgu.interns_mut();
+        let mut encoder = Encoder::new(cgu, &mut interns, None);
+        let body = encoder.static_body(def_id);
+        encoder.finish_encoded(body)
+    };
+    for (ty, principal) in pending_vtables {
+        let _ = crate::vtable::vtable_expr(cgu, ty, principal);
+    }
+    result
 }
 
 /// Encodes the vtable of `ty as dyn trait_ref` (`vtable.rs` builds the JavaScript array).
@@ -99,6 +125,11 @@ struct Encoder<'a, 'tcx> {
     /// The function being encoded and its MIR; `None` for a static or vtable, whose types need
     /// no generic context.
     function: Option<(Instance<'tcx>, &'a mir::Body<'tcx>)>,
+    /// Extra item references discovered during MIR encoding (panic lang items, runtime `Unsize`
+    /// vtables, `#[js_extern]` imports, reified function items, host closure bodies).
+    extra_refs: BTreeSet<JsName>,
+    /// Vtables to intern into `cgu` after releasing `cgu.interns_mut()`.
+    pending_vtables: Vec<PendingVtable<'tcx>>,
     // Origins.
     origins: Vec<Origin>,
     origin_index: BTreeMap<OriginKey, OriginId>,
@@ -130,6 +161,8 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             cgu,
             types: TypeCx::new(cgu, interns),
             function,
+            extra_refs: BTreeSet::new(),
+            pending_vtables: Vec::new(),
             origins: Vec::new(),
             origin_index: BTreeMap::new(),
             statement_origins: Vec::new(),
@@ -151,6 +184,18 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
 
     fn instance(&self) -> Instance<'tcx> {
         self.function.expect("a function encoder has an instance").0
+    }
+
+    fn finish_encoded(
+        mut self,
+        result: Result<Body, EncodeDecline>,
+    ) -> (Result<EncodedJir, EncodeDecline>, Vec<PendingVtable<'tcx>>) {
+        let extra_refs = std::mem::take(&mut self.extra_refs);
+        let pending_vtables = std::mem::take(&mut self.pending_vtables);
+        match self.finish(result) {
+            Ok(item) => (Ok(EncodedJir { item, extra_refs }), pending_vtables),
+            Err(decline) => (Err(decline), Vec::new()),
+        }
     }
 
     /// Verifies the body and its origins, rolls the type table back on failure, and runs the
@@ -205,7 +250,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             .source_fact(mir.span)
             .or_else(|| self.source_fact(tcx.def_span(self.instance().def_id())));
 
-        let host_body = crate::js_extern::extern_section(tcx, self.instance().def_id());
+        let host_body = extern_section(tcx, self.instance().def_id());
         let local_count = if host_body.is_some() {
             mir.arg_count + 1
         } else {
@@ -271,6 +316,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     /// A binding used as a function value executes its host operation, just like a direct call.
     /// Its Rust placeholder contributes no locals or panic edges to the host body.
     fn host_function_body(&mut self, descriptor: &str) -> Result<Vec<BasicBlock>, EncodeDecline> {
+        self.intern_extern_import(descriptor);
         let instance = self.instance();
         let function_ty = Ty::new_fn_def(
             self.tcx(),
@@ -391,12 +437,11 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         ) {
             return Ok(BodySemantic::PanicImpl);
         }
-        Ok(crate::late_ir::standard_operation(
+        Ok(crate::jir::classify::standard_operation(
             self.tcx(),
             self.instance().def_id(),
             self.instance().args,
         )
-        .map(standard_operation_v2)
         .or_else(|| jir_standard_operation(self.tcx(), self.instance().def_id()))
         .map_or(BodySemantic::Ordinary, BodySemantic::Standard))
     }
@@ -503,11 +548,32 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 kind: raw_pointer_kind(*kind),
                 place: self.place(*place)?,
             },
-            mir::Rvalue::Cast(kind, value, result) => Rvalue::Cast {
-                kind: cast_kind(*kind),
-                value: self.operand(value)?,
-                result: self.type_id(*result)?,
-            },
+            mir::Rvalue::Cast(kind, value, result) => {
+                self.record_cast_refs(*kind, value, *result);
+                if matches!(kind, mir::CastKind::PtrToPtr | mir::CastKind::Transmute) {
+                    let from_ty = crate::value::peel_pattern(crate::value::peel_transparent(
+                        tcx,
+                        self.monomorphize(value.ty(&self.mir().local_decls, tcx)),
+                    ));
+                    let to_ty = crate::value::peel_pattern(crate::value::peel_transparent(
+                        tcx,
+                        self.monomorphize(*result),
+                    ));
+                    if let (Some(fp), Some(tp)) =
+                        (from_ty.builtin_deref(true), to_ty.builtin_deref(true))
+                    {
+                        if fp != tp {
+                            self.types.record_type_name(fp)?;
+                            self.types.record_type_name(tp)?;
+                        }
+                    }
+                }
+                Rvalue::Cast {
+                    kind: cast_kind(*kind),
+                    value: self.operand(value)?,
+                    result: self.type_id(*result)?,
+                }
+            }
             mir::Rvalue::BinaryOp(op, operands) => Rvalue::Binary {
                 op: binary_op(*op),
                 left: self.operand(&operands.0)?,
@@ -633,7 +699,8 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 // The Location type is otherwise absent from a producer rlib whose only bounds
                 // checks live in that producer, so preserve its descriptor with the assertion.
                 self.describe_caller_location_type()?;
-                let track_caller = crate::intrinsics::resolve_caller_location_span(
+                self.record_assert_panic(msg);
+                let track_caller = resolve_caller_location_span(
                     self.tcx(),
                     self.mir(),
                     self.instance(),
@@ -737,6 +804,24 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let function_ty = self.monomorphize(func.ty(&self.mir().local_decls, tcx));
         let function = self.operand(func)?;
         let (callee, tracks_caller) = self.callee(function_ty)?;
+        if let Callee::Intrinsic { name, .. } = &callee {
+            if self.types.interns.str(*name) == Some("const_eval_select") {
+                if let Some(arg) = args.get(2) {
+                    let runtime_ty = crate::value::peel_pattern(crate::value::peel_transparent(
+                        tcx,
+                        self.monomorphize(arg.node.ty(&self.mir().local_decls, tcx)),
+                    ));
+                    if let ty::FnDef(def, fn_args) = *runtime_ty.kind() {
+                        if let Some(Ok(Some(inst))) = fn_args
+                            .no_bound_vars()
+                            .map(|a| Instance::try_resolve(tcx, typing_env(), def, a))
+                        {
+                            self.extra_refs.insert(self.cgu.namer.fn_name(inst));
+                        }
+                    }
+                }
+            }
+        }
         let semantic = self.call_semantic(function_ty);
         let host = self.host_payload(function_ty, args, source_info.span)?;
         let arguments = self.call_arguments(function_ty, args)?;
@@ -745,14 +830,9 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         // concrete call site (including when a non-`#[track_caller]` helper was MIR-inlined into
         // a `#[track_caller]` body).
         let track_caller = if tracks_caller {
-            crate::intrinsics::resolve_caller_location_span(
-                tcx,
-                self.mir(),
-                self.instance(),
-                source_info,
-            )
-            .map(|span| self.caller_location_fact(span))
-            .transpose()?
+            resolve_caller_location_span(tcx, self.mir(), self.instance(), source_info)
+                .map(|span| self.caller_location_fact(span))
+                .transpose()?
         } else {
             None
         };
@@ -840,7 +920,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 // there exactly as an in-memory pack is.
                 OperandKind::Constant(Constant::Scalar { bits, bytes }) => {
                     let scratch = ScalarInt::try_from_uint(bits, Size::from_bytes(bytes))
-                        .and_then(|int| crate::constant::raw::scratch_alloc(tcx, int, pack_ty))
+                        .and_then(|int| crate::const_raw::scratch_alloc(tcx, int, pack_ty))
                         .ok_or_else(|| EncodeDecline::ConstantNoLayout {
                             ty: type_name(pack_ty),
                         })?;
@@ -992,7 +1072,6 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     }
 
     fn direct_item(&mut self, instance: Instance<'tcx>) -> DirectItemRef {
-        self.cgu.require_function(instance);
         DirectItemRef {
             item: item_id(self.cgu, instance),
             link_name: self.types.str(self.cgu.namer.fn_name(instance).as_str()),
@@ -1011,9 +1090,9 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         if let Ok(Some(instance)) = Instance::try_resolve(tcx, typing_env(), definition, arguments)
         {
             if let Some(operation) =
-                crate::late_ir::standard_operation(tcx, instance.def_id(), instance.args)
+                crate::jir::classify::standard_operation(tcx, instance.def_id(), instance.args)
             {
-                return call_semantic_for_operation(standard_operation_v2(operation));
+                return call_semantic_for_operation(operation);
             }
             if let Some(operation) = jir_standard_operation(tcx, instance.def_id()) {
                 return CallSemantic::Standard(operation);
@@ -1024,20 +1103,19 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 }
             }
         }
-        if let Some(operation) = crate::late_ir::standard_operation(tcx, definition, arguments) {
-            return call_semantic_for_operation(standard_operation_v2(operation));
+        if let Some(operation) =
+            crate::jir::classify::standard_operation(tcx, definition, arguments)
+        {
+            return call_semantic_for_operation(operation);
         }
         if let Some(operation) = jir_standard_operation(tcx, definition) {
             return CallSemantic::Standard(operation);
         }
-        if crate::js_extern::extern_section(tcx, definition).is_some() {
+        if extern_section(tcx, definition).is_some() {
             return CallSemantic::Host;
         }
-        if crate::js_block::block_section(tcx, definition).is_some() {
+        if block_section(tcx, definition).is_some() {
             return CallSemantic::RawJavaScript;
-        }
-        if view_abi_marker(tcx, definition).is_some() {
-            return CallSemantic::ViewAbi;
         }
         if tcx.is_foreign_item(definition) {
             let symbol = tcx.symbol_name(Instance::mono(tcx, definition));
@@ -1069,163 +1147,42 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         &mut self,
         function_ty: Ty<'tcx>,
         args: &[rustc_span::Spanned<mir::Operand<'tcx>>],
-        fn_span: Span,
+        _fn_span: Span,
     ) -> Result<Option<HostPayload>, EncodeDecline> {
         let tcx = self.tcx();
-        let ty::FnDef(definition, arguments) = *function_ty.kind() else {
+        let ty::FnDef(definition, _arguments) = *function_ty.kind() else {
             return Ok(None);
         };
-        if let Some(descriptor) = crate::js_extern::extern_section(tcx, definition) {
+        if let Some(descriptor) = extern_section(tcx, definition) {
+            self.intern_extern_import(&descriptor);
             return Ok(Some(HostPayload::Extern(
                 self.types.interns.intern_bytes(descriptor.as_bytes()),
             )));
         }
-        if let Some(block) = crate::js_block::block_section(tcx, definition) {
+        if let Some(block) = block_section(tcx, definition) {
             return Ok(Some(HostPayload::Block(
                 self.types.interns.intern_bytes(block.as_bytes()),
             )));
         }
-        if let Some(marker) = view_abi_marker(tcx, definition) {
-            if marker == "keyedlist.v1" {
-                let Some(arguments) = arguments.no_bound_vars() else {
-                    return Err(EncodeDecline::Invalid {
-                        message: "keyed.marker-bound-type: `rcgjs.tc.keyedlist.v1` has a bound type argument"
-                            .to_owned(),
-                    });
-                };
-                let row_ty = function_ty.fn_sig(tcx).skip_binder().output();
-                return self
-                    .keyed_list_payload(definition, arguments, row_ty, args, fn_span)
-                    .map(|payload| Some(HostPayload::KeyedList(Box::new(payload))));
-            }
-            let helpers = self.marker_helpers(definition, &marker, args);
-            if marker == "template" {
-                if let Some(static_id) = self.static_argument(args.first()) {
-                    let template = self.static_initializer(static_id)?;
-                    return Ok(Some(HostPayload::Marker {
-                        section: self.types.str(&format!("{VIEW_ABI_PREFIX}{marker}")),
-                        def: definition_id(tcx, definition),
-                        template: Some(template),
-                        helpers,
-                    }));
-                }
-            }
-            return Ok(Some(HostPayload::ViewAbi {
-                marker: self.types.str(&marker),
-                def: definition_id(tcx, definition),
-                helpers,
-            }));
-        }
-        if let Some(marker) = crate::map::map_section(tcx, definition) {
+        if let Some(marker) = map_section(tcx, definition) {
             return Ok(Some(HostPayload::Map {
                 marker: self.types.str(&marker),
             }));
         }
-        if let Some(marker) = crate::host::host_section(tcx, definition) {
+        if let Some(marker) = host_section(tcx, definition) {
+            self.record_host_marker_refs(args);
             let helpers = self.marker_helpers(definition, &marker, args);
             return Ok(Some(HostPayload::Marker {
-                section: self
-                    .types
-                    .str(&format!("{}{marker}", crate::host::HOST_PREFIX)),
+                section: self.types.str(&format!("{HOST_PREFIX}{marker}")),
                 def: definition_id(tcx, definition),
-                template: None,
                 helpers,
             }));
         }
         Ok(None)
     }
 
-    /// The rustc-only facts behind the version-one keyed-list semantic boundary.
-    fn keyed_list_payload(
-        &mut self,
-        definition: DefId,
-        arguments: ty::GenericArgsRef<'tcx>,
-        row_ty: Ty<'tcx>,
-        args: &[rustc_span::Spanned<mir::Operand<'tcx>>],
-        fn_span: Span,
-    ) -> Result<KeyedListPayload, EncodeDecline> {
-        let type_arguments: Vec<Ty<'tcx>> = arguments
-            .iter()
-            .filter_map(|argument| argument.as_type())
-            .collect();
-        let [collection_ty, item_ty, key_ty, _, _, _] = type_arguments.as_slice() else {
-            return Err(EncodeDecline::Invalid {
-                message: format!(
-                    "keyed.marker-type-arity: `rcgjs.tc.keyedlist.v1` records six type arguments, found {}",
-                    type_arguments.len()
-                ),
-            });
-        };
-        let [collection, key, row] = args else {
-            return Err(EncodeDecline::Invalid {
-                message: format!(
-                    "keyed.marker-arity: `rcgjs.tc.keyedlist.v1` takes three callables, found {}",
-                    args.len()
-                ),
-            });
-        };
-        let tcx = self.tcx();
-        // A marker nested inside a proc-macro expansion may give rustc the
-        // outer attribute as `fn_span`. The keyed macro deliberately spans the
-        // row callable at the written `for`, so it is the more precise site;
-        // a direct handwritten call falls back to the callee span.
-        let site = self
-            .source_fact(row.span)
-            .or_else(|| self.source_fact(fn_span));
-        Ok(KeyedListPayload {
-            format: KEYED_LIST_FORMAT_V1,
-            site,
-            def: definition_id(tcx, definition),
-            collection_ty: self.type_id(*collection_ty)?,
-            item_ty: self.type_id(*item_ty)?,
-            key_ty: self.type_id(*key_ty)?,
-            row_ty: self.type_id(row_ty)?,
-            collection: self.keyed_list_callable(collection)?,
-            key: self.keyed_list_callable(key)?,
-            row: self.keyed_list_callable(row)?,
-        })
-    }
-
-    /// One callable value and the body and cleanup instances rustc resolves for it.
-    fn keyed_list_callable(
-        &mut self,
-        argument: &rustc_span::Spanned<mir::Operand<'tcx>>,
-    ) -> Result<KeyedListCallable, EncodeDecline> {
-        let tcx = self.tcx();
-        let ty = self.monomorphize(argument.node.ty(&self.mir().local_decls, tcx));
-        Ok(KeyedListCallable {
-            ty: self.type_id(ty)?,
-            body: self.callable_body(ty),
-            cleanup: self.drop_glue_for_ty(ty),
-            source: self.source_fact(argument.span),
-        })
-    }
-
-    /// Resolves a closure or function-item value to the monomorphic body it calls.
-    fn callable_body(&mut self, ty: Ty<'tcx>) -> Option<DirectItemRef> {
-        let tcx = self.tcx();
-        let instance = match *ty.kind() {
-            ty::Closure(definition, arguments) => {
-                Instance::resolve_closure(tcx, definition, arguments, ty::ClosureKind::Fn)
-            }
-            ty::FnDef(definition, arguments) => {
-                let arguments = arguments.no_bound_vars()?;
-                Instance::try_resolve(tcx, typing_env(), definition, arguments)
-                    .ok()
-                    .flatten()?
-            }
-            _ => return None,
-        };
-        Some(self.direct_item(instance))
-    }
-
     /// The sibling instances a marker's lowering calls, resolved at the marker's own generic
-    /// argument (v1 `abi.rs::sibling_item`, `host.rs::host_future_helper`).
-    ///
-    /// Every one of these is a `tcx` query the consumer cannot run: `display_to_str::<T>`,
-    /// `poll_once::<F>` and `poll_result::<F>` are declared beside their marker in `view-abi`
-    /// and `mires-js`, and which instance a call needs is decided by the type of one of the
-    /// call's own arguments.
+    /// argument (`host.rs::host_future_helper`).
     fn marker_helpers(
         &mut self,
         marker: DefId,
@@ -1233,11 +1190,8 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         args: &[rustc_span::Spanned<mir::Operand<'tcx>>],
     ) -> Vec<(StrId, DirectItemRef)> {
         let (helper, argument) = match marker_name {
-            "spawn" | "spawnowner" | "spawnowner.v2" => ("poll_once", 0),
+            "spawn" => ("poll_once", 0),
             "futurepromise" | "futurenativepromise" => ("poll_result", 0),
-            "text" => ("display_to_str", 0),
-            // `push_keyed(list, key, row)`: the key is the `Display` value.
-            "pushkeyed" => ("display_to_str", 1),
             _ => return Vec::new(),
         };
         let Some(argument) = args.get(argument) else {
@@ -1271,50 +1225,6 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             .ok()
             .flatten()?;
         Some(self.direct_item(instance))
-    }
-
-    /// The `static` a `&STATIC` argument names (`abi.rs::static_argument`).
-    ///
-    /// The reference is a pointer constant and the allocation its provenance names is the static.
-    /// Nothing else is accepted: a template payload built at run time is not a payload the
-    /// producer can read at compile time.
-    fn static_argument(
-        &self,
-        argument: Option<&rustc_span::Spanned<mir::Operand<'tcx>>>,
-    ) -> Option<DefId> {
-        let tcx = self.tcx();
-        let value = self.constant_value(&argument?.node)?;
-        let mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) = value else {
-            return None;
-        };
-        let (provenance, _) = pointer.prov_and_relative_offset();
-        match tcx.global_alloc(provenance.alloc_id()) {
-            GlobalAlloc::Static(def_id) => Some(def_id),
-            _ => None,
-        }
-    }
-
-    /// The value of a marker argument that is a constant, however MIR chose to spell it
-    /// (`abi.rs::constant_value`).
-    ///
-    /// A literal argument does not have to reach the call as an `Operand::Constant`: MIR
-    /// routinely assigns it to a temporary first and passes that (`_2 = const {alloc}` then
-    /// `template(move _2)`). Both spellings mean the same constant, so the temporary is followed
-    /// back to the assignment that filled it.
-    fn constant_value(&self, operand: &mir::Operand<'tcx>) -> Option<mir::ConstValue> {
-        /// How many assignments to follow, as v1 bounds the same walk.
-        const MAX_STEPS: usize = 8;
-
-        let tcx = self.tcx();
-        let mut operand = operand.clone();
-        for _ in 0..MAX_STEPS {
-            if let Some(constant) = operand.constant() {
-                let konst = self.monomorphize(constant.const_);
-                return konst.eval(tcx, typing_env(), constant.span).ok();
-            }
-            operand = assigned_operand(self.mir(), operand.place()?.as_local()?)?;
-        }
-        None
     }
 
     /// The caller `Location` a `#[track_caller]` callee receives from this call site, as the
@@ -1439,8 +1349,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         match value {
             mir::ConstValue::ZeroSized => Ok(Constant::ZeroSized),
             mir::ConstValue::Scalar(Scalar::Int(value))
-                if crate::constant::raw::is_primitive(ty)
-                    || crate::constant::raw::is_pointer(ty) =>
+                if crate::const_raw::is_primitive(ty) || crate::const_raw::is_pointer(ty) =>
             {
                 Ok(Constant::Scalar {
                     bits: value.to_uint(value.size()),
@@ -1453,7 +1362,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             // one register. Decode it through a scratch allocation laid out for `ty`, matching
             // v1 `constant.rs::scalar_to_expr` and `ConstValue::Indirect` (MIRES-006).
             mir::ConstValue::Scalar(Scalar::Int(value)) => {
-                let scratch = crate::constant::raw::scratch_alloc(tcx, value, ty)
+                let scratch = crate::const_raw::scratch_alloc(tcx, value, ty)
                     .ok_or_else(|| EncodeDecline::ConstantNoLayout { ty: type_name(ty) })?;
                 Ok(Constant::Memory(self.const_tree(
                     &scratch,
@@ -1466,9 +1375,9 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             // `Option<NonNull<T>>`, `Option<fn()>`) decodes from a scratch allocation holding it,
             // provenance included, as that type stored in memory does.
             mir::ConstValue::Scalar(pointer @ Scalar::Ptr(..))
-                if !crate::constant::raw::is_pointer(ty) =>
+                if !crate::const_raw::is_pointer(ty) =>
             {
-                let scratch = crate::constant::raw::scratch_pointer_alloc(tcx, pointer, ty)
+                let scratch = crate::const_raw::scratch_pointer_alloc(tcx, pointer, ty)
                     .ok_or_else(|| EncodeDecline::ConstantNoLayout { ty: type_name(ty) })?;
                 Ok(Constant::Memory(self.const_tree(
                     &scratch,
@@ -1521,7 +1430,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else {
                     return Err(EncodeDecline::StringConstantNoMemory);
                 };
-                let text = crate::constant::raw::read_str(allocation.inner(), Size::ZERO, meta)
+                let text = crate::const_raw::read_str(allocation.inner(), Size::ZERO, meta)
                     .map_err(|_| EncodeDecline::StringConstantInvalid)?;
                 Ok(Constant::String(self.types.str(text)))
             }
@@ -1554,7 +1463,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                     )));
                 }
                 if peeled.is_str() {
-                    let text = crate::constant::raw::read_str(allocation, offset, meta)
+                    let text = crate::const_raw::read_str(allocation, offset, meta)
                         .map_err(|_| EncodeDecline::StringConstantInvalid)?;
                     return Ok(Constant::Memory(ConstTree::Str(self.types.str(text))));
                 }
@@ -1591,7 +1500,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     ) -> Result<ConstTree, EncodeDecline> {
         if pointee.is_str() {
             let length = meta.ok_or(EncodeDecline::StrConstantNoLength)?;
-            let text = crate::constant::raw::read_str(allocation, offset, length)
+            let text = crate::const_raw::read_str(allocation, offset, length)
                 .map_err(|_| EncodeDecline::StringConstantInvalid)?;
             return Ok(ConstTree::Str(self.types.str(text)));
         }
@@ -1663,7 +1572,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             let tree = if Some(index.as_usize()) == last && !field_ty.is_sized(tcx, typing_env()) {
                 match field_ty.kind() {
                     ty::Str => {
-                        let text = crate::constant::raw::read_str(allocation, field_offset, length)
+                        let text = crate::const_raw::read_str(allocation, field_offset, length)
                             .map_err(|_| EncodeDecline::StringConstantInvalid)?;
                         ConstTree::Str(self.types.str(text))
                     }
@@ -1706,7 +1615,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let stride = layout.size.bytes();
         let length =
             usize::try_from(length).map_err(|_| EncodeDecline::SliceConstantLengthOverflow)?;
-        if !crate::constant::raw::slice_fits(allocation, offset, stride, length) {
+        if !crate::const_raw::slice_fits(allocation, offset, stride, length) {
             return Err(EncodeDecline::SliceConstantOverrun {
                 element: type_name(element),
             });
@@ -1752,7 +1661,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
 
         match ty.kind() {
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
-                let int = crate::constant::raw::read_scalar(tcx, allocation, offset, layout.size)
+                let int = crate::const_raw::read_scalar(tcx, allocation, offset, layout.size)
                     .ok_or_else(|| EncodeDecline::ConstantUnreadable { ty: type_name(ty) })?;
                 Ok(ConstTree::Scalar {
                     bits: int.to_uint(int.size()),
@@ -1762,7 +1671,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             ty::Pat(base, _) => self.const_tree(allocation, offset, *base, depth),
             ty::Adt(def, args) if def.is_enum() => {
                 let variant_index =
-                    crate::constant::raw::variant_index(tcx, allocation, offset, layout, *def)
+                    crate::const_raw::variant_index(tcx, allocation, offset, layout, *def)
                         .map_err(|_| EncodeDecline::ConstantVariantUnreadable {
                             ty: type_name(ty),
                         })?;
@@ -1883,9 +1792,8 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     ) -> Result<ConstTree, EncodeDecline> {
         let tcx = self.tcx();
         let pointee = ty.builtin_deref(true);
-        let wide =
-            pointee.is_some_and(|pointee| crate::constant::raw::is_wide_pointee(tcx, pointee));
-        let pointer = crate::constant::raw::read_pointer(tcx, allocation, offset, wide);
+        let wide = pointee.is_some_and(|pointee| crate::const_raw::is_wide_pointee(tcx, pointee));
+        let pointer = crate::const_raw::read_pointer(tcx, allocation, offset, wide);
         if let Some(pointee) = pointee {
             let peeled_pointee =
                 crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee));
@@ -1966,16 +1874,17 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     /// constant memory (`constant.rs::read_dyn_pointer`).
     fn const_dyn_pointer_field(
         &mut self,
-        pointer: &crate::constant::raw::Pointer,
+        pointer: &crate::const_raw::Pointer,
         ty: Ty<'tcx>,
         depth: u32,
     ) -> Result<ConstTree, EncodeDecline> {
         let tcx = self.tcx();
-        let Some((concrete_ty, principal)) = crate::constant::raw::read_vtable(tcx, pointer) else {
+        let Some((concrete_ty, principal)) = crate::const_raw::read_vtable(tcx, pointer) else {
             return Err(EncodeDecline::VtablePointerConstant);
         };
-        let _ = crate::vtable::vtable_expr(self.cgu, concrete_ty, principal);
+        self.pending_vtables.push((concrete_ty, principal));
         let vtable_name = self.cgu.namer.vtable_name(concrete_ty, principal);
+        self.extra_refs.insert(vtable_name.clone());
         let vtable = self.types.str(vtable_name.as_str());
         let concrete = self.type_id(concrete_ty)?;
         let data = match pointer.alloc_id() {
@@ -2027,7 +1936,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         outer_ty: Ty<'tcx>,
     ) -> Result<ConstTree, EncodeDecline> {
         let tcx = self.tcx();
-        let Some(steps) = crate::constant::raw::resolve_static_path(tcx, def_id, offset, pointee)
+        let Some(steps) = crate::const_raw::resolve_static_path(tcx, def_id, offset, pointee)
         else {
             return Err(EncodeDecline::StaticSubPointerConstant {
                 ty: type_name(outer_ty),
@@ -2040,10 +1949,10 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             let path = steps
                 .into_iter()
                 .map(|step| match step {
-                    crate::constant::raw::StaticPathStep::Field(name) => {
+                    crate::const_raw::StaticPathStep::Field(name) => {
                         StaticStep::Field(self.types.str(&name))
                     }
-                    crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+                    crate::const_raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
                 })
                 .collect();
             Ok(ConstTree::StaticField { target, path })
@@ -2061,7 +1970,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     ) -> Result<ConstTree, EncodeDecline> {
         let tcx = self.tcx();
         let Some((steps, start)) =
-            crate::constant::raw::resolve_static_slice(tcx, def_id, offset, element_ty, length)
+            crate::const_raw::resolve_static_slice(tcx, def_id, offset, element_ty, length)
         else {
             return Err(EncodeDecline::StaticSubPointerConstant {
                 ty: type_name(outer_ty),
@@ -2071,10 +1980,10 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let path = steps
             .into_iter()
             .map(|step| match step {
-                crate::constant::raw::StaticPathStep::Field(name) => {
+                crate::const_raw::StaticPathStep::Field(name) => {
                     StaticStep::Field(self.types.str(&name))
                 }
-                crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+                crate::const_raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
             })
             .collect();
         Ok(ConstTree::StaticSlice {
@@ -2098,15 +2007,12 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                     link_name: item.link_name,
                 }
             }
-            GlobalAlloc::Static(definition) => {
-                self.cgu.require_static(definition);
-                GlobalReference::Static {
-                    definition: definition_id(tcx, definition),
-                    link_name: self
-                        .types
-                        .str(self.cgu.namer.static_name(definition).as_str()),
-                }
-            }
+            GlobalAlloc::Static(definition) => GlobalReference::Static {
+                definition: definition_id(tcx, definition),
+                link_name: self
+                    .types
+                    .str(self.cgu.namer.static_name(definition).as_str()),
+            },
             GlobalAlloc::TypeId { ty } => GlobalReference::Type(self.type_id(ty)?),
             GlobalAlloc::Memory(_) => return Err(EncodeDecline::AnonymousPointerConstant),
             GlobalAlloc::VTable(..) => return Err(EncodeDecline::VtablePointerConstantYet),
@@ -2254,13 +2160,194 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let span = self.function.map_or(span, |(_, mir)| {
             rustc_span::hygiene::walk_chain_collapsed(span, mir.span)
         });
-        let location = crate::names::location_of(self.tcx(), span)?;
+        let location = location_of(self.tcx(), span)?;
         let file = self.types.str(&location.file);
         Some(self.types.interns.intern_source_fact(SourceFact {
             file,
             line: location.line,
             col: location.col,
         }))
+    }
+
+    /// Interns an `ItemKind::Import` item for a `#[js_extern(module = "...")]` descriptor and
+    /// records the binding in `extra_refs` so link-time reachability keeps the import alive.
+    fn intern_extern_import(&mut self, raw: &str) {
+        let Ok(descriptor) = Descriptor::decode(raw) else {
+            return;
+        };
+        if descriptor.root() != Root::Module {
+            return;
+        }
+        let head = descriptor
+            .segments()
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .to_owned();
+        let local = crate::naming::extern_import(&descriptor.module, &head);
+        let js_name = JsName::new(local.clone());
+        let source = descriptor.module.clone();
+        self.cgu.intern(js_name.clone(), || {
+            JsItem::new(
+                js_name.clone(),
+                ItemKind::Import,
+                jsast::import_named(vec![(head.clone(), local.clone())], source.clone()),
+                Vec::new(),
+                Linkage {
+                    fixed_name: Some(local.clone()),
+                    root: false,
+                    exported: false,
+                },
+                source.clone(),
+            )
+        });
+        self.extra_refs.insert(js_name);
+    }
+
+    /// Records the panic lang item referenced by a MIR `Assert` terminator so JIR lowering
+    /// (`emit.rs::assert_failure`) and link reachability find it in `summary.deps`.
+    fn record_assert_panic(&mut self, msg: &mir::AssertMessage<'tcx>) {
+        let tcx = self.tcx();
+        let lang_item = match msg {
+            mir::AssertKind::BoundsCheck { .. } => LangItem::PanicBoundsCheck,
+            mir::AssertKind::MisalignedPointerDereference { .. } => {
+                LangItem::PanicMisalignedPointerDereference
+            }
+            mir::AssertKind::InvalidEnumConstruction(_) => LangItem::PanicInvalidEnumConstruction,
+            other => other.panic_function(),
+        };
+        if let Some(def_id) = tcx
+            .lang_items()
+            .get(lang_item)
+            .filter(|def_id| tcx.generics_of(*def_id).count() == 0)
+        {
+            let panic = Instance::mono(tcx, def_id);
+            self.extra_refs.insert(self.cgu.namer.fn_name(panic));
+        }
+    }
+
+    /// Records auxiliary link-level references implied by pointer coercions (`Unsize` vtables,
+    /// `ReifyFnPointer` target items, `ClosureFnPointer` `call_once` shims).
+    fn record_cast_refs(
+        &mut self,
+        kind: mir::CastKind,
+        value: &mir::Operand<'tcx>,
+        result: Ty<'tcx>,
+    ) {
+        use rustc_middle::ty::adjustment::PointerCoercion;
+
+        let mir::CastKind::PointerCoercion(coercion, _) = kind else {
+            return;
+        };
+        let tcx = self.tcx();
+        let from_ty = self.monomorphize(value.ty(&self.mir().local_decls, tcx));
+        let to_ty = self.monomorphize(result);
+        match coercion {
+            PointerCoercion::Unsize => self.record_unsize_vtables(from_ty, to_ty),
+            PointerCoercion::ReifyFnPointer(_) => {
+                if let ty::FnDef(def, args) = *crate::value::peel_pattern(from_ty).kind() {
+                    if let Some(Ok(Some(inst))) = args
+                        .no_bound_vars()
+                        .map(|a| Instance::try_resolve(tcx, typing_env(), def, a))
+                    {
+                        self.extra_refs.insert(self.cgu.namer.fn_name(inst));
+                    }
+                }
+            }
+            PointerCoercion::ClosureFnPointer(_) => {
+                if let ty::Closure(def, args) = *crate::value::peel_pattern(from_ty).kind() {
+                    let shim = Instance::resolve_closure(tcx, def, args, ty::ClosureKind::FnOnce);
+                    self.extra_refs.insert(self.cgu.namer.fn_name(shim));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks an `Unsize` coercion pair to queue any concrete-to-`dyn` vtable for interning and
+    /// record its link name in `extra_refs`.
+    fn record_unsize_vtables(&mut self, from_ty: Ty<'tcx>, to_ty: Ty<'tcx>) {
+        let tcx = self.tcx();
+        let from_ty = crate::value::peel_pattern(from_ty);
+        let to_ty = crate::value::peel_pattern(to_ty);
+        match (from_ty.kind(), to_ty.kind()) {
+            (
+                ty::Ref(_, source, _) | ty::RawPtr(source, _),
+                ty::Ref(_, target, _) | ty::RawPtr(target, _),
+            ) => {
+                if crate::value::unsized_tail(tcx, *target).is_some() {
+                    return;
+                }
+                let (source, target) =
+                    tcx.struct_lockstep_tails_for_codegen(*source, *target, typing_env());
+                if !matches!(source.kind(), ty::Dynamic(..)) {
+                    if let ty::Dynamic(data, ..) = target.kind() {
+                        let principal = data
+                            .principal()
+                            .map(|p| tcx.instantiate_bound_regions_with_erased(p));
+                        self.pending_vtables.push((source, principal));
+                        let name = self.cgu.namer.vtable_name(source, principal);
+                        self.extra_refs.insert(name);
+                    }
+                }
+            }
+            (ty::Adt(..), ty::Adt(..))
+                if crate::value::transparent_field(tcx, from_ty).is_some()
+                    && crate::value::transparent_field(tcx, to_ty).is_some() =>
+            {
+                let from_field = crate::value::transparent_field(tcx, from_ty).unwrap();
+                let to_field = crate::value::transparent_field(tcx, to_ty).unwrap();
+                self.record_unsize_vtables(from_field, to_field);
+            }
+            (ty::Adt(def_a, args_a), ty::Adt(def_b, args_b)) if def_a == def_b => {
+                let variant = def_a.non_enum_variant();
+                for field in &variant.fields {
+                    let field_from =
+                        tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_a));
+                    let field_to =
+                        tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_b));
+                    if field_from != field_to && !crate::value::is_zst(tcx, field_from) {
+                        self.record_unsize_vtables(field_from, field_to);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Records closure/fn bodies and drop glue referenced by `rcgjs.host.*` markers (`callback*`,
+    /// `try`, `spawn`, `futurepromise`, `futurenativepromise`, `promise`, `microtask`, `task`,
+    /// `settled`, `localwaker`).
+    fn record_host_marker_refs(&mut self, args: &[rustc_span::Spanned<mir::Operand<'tcx>>]) {
+        let tcx = self.tcx();
+        for arg in args {
+            let arg_ty = self.monomorphize(arg.node.ty(&self.mir().local_decls, tcx));
+            if arg_ty.needs_drop(tcx, typing_env()) {
+                let glue = Instance::resolve_drop_glue(tcx, arg_ty);
+                if !matches!(
+                    glue.def,
+                    ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None))
+                ) {
+                    self.extra_refs.insert(self.cgu.namer.fn_name(glue));
+                }
+            }
+            let peeled = crate::value::peel_pattern(crate::value::peel_transparent(tcx, arg_ty));
+            match *peeled.kind() {
+                ty::Closure(def, cl_args) => {
+                    let inst = Instance::new_raw(def, cl_args);
+                    self.extra_refs.insert(self.cgu.namer.fn_name(inst));
+                }
+                ty::FnDef(def, fn_args) => {
+                    if let Some(Ok(Some(inst))) = fn_args
+                        .no_bound_vars()
+                        .map(|a| Instance::try_resolve(tcx, typing_env(), def, a))
+                    {
+                        self.extra_refs.insert(self.cgu.namer.fn_name(inst));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// The origin of one element: its kind, its span's fact, and the inline stack of its scope.
@@ -2394,15 +2481,6 @@ fn local_names(mir: &mir::Body<'_>) -> Vec<Option<String>> {
     names
 }
 
-/// The `view-abi` marker `def_id` is, by the `link_section` it carries (`abi.rs`).
-fn view_abi_marker(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
-    let section = tcx.codegen_fn_attrs(def_id).link_section?;
-    section
-        .as_str()
-        .strip_prefix(VIEW_ABI_PREFIX)
-        .map(str::to_owned)
-}
-
 fn check_const_memory(allocation: &mir::interpret::Allocation) -> Result<(), EncodeDecline> {
     if allocation.mutability != rustc_middle::mir::Mutability::Not {
         return Err(EncodeDecline::MutableConstantMemory);
@@ -2426,27 +2504,6 @@ fn round_trip(body: &Body, origins: &OriginTable) -> Result<(), String> {
         return Err("late-IR origin table does not survive a postcard round trip".to_owned());
     }
     Ok(())
-}
-
-/// The operand `local`'s one assignment reads, when that assignment is a plain move or copy
-/// (`abi.rs::assigned_operand`).
-fn assigned_operand<'tcx>(mir: &mir::Body<'tcx>, local: mir::Local) -> Option<mir::Operand<'tcx>> {
-    for block in mir.basic_blocks.iter() {
-        for statement in &block.statements {
-            let mir::StatementKind::Assign(assignment) = &statement.kind else {
-                continue;
-            };
-            let (place, rvalue) = &**assignment;
-            if place.as_local() != Some(local) {
-                continue;
-            }
-            let mir::Rvalue::Use(operand, _) = rvalue else {
-                return None;
-            };
-            return Some(operand.clone());
-        }
-    }
-    None
 }
 
 pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> ItemId {
@@ -2752,84 +2809,6 @@ fn call_semantic_for_operation(operation: StandardOperation) -> CallSemantic {
     }
 }
 
-/// v1's operation enum, variant for variant (both are append-only in the same order).
-fn standard_operation_v2(operation: crate::late_ir::StandardOperation) -> StandardOperation {
-    use crate::late_ir::StandardOperation as V1;
-    match operation {
-        V1::VecNew => StandardOperation::VecNew,
-        V1::VecWithCapacity => StandardOperation::VecWithCapacity,
-        V1::VecLen => StandardOperation::VecLen,
-        V1::VecCapacity => StandardOperation::VecCapacity,
-        V1::VecPush => StandardOperation::VecPush,
-        V1::VecClear => StandardOperation::VecClear,
-        V1::VecReserve => StandardOperation::VecReserve,
-        V1::VecAsSlice => StandardOperation::VecAsSlice,
-        V1::VecAsMutSlice => StandardOperation::VecAsMutSlice,
-        V1::VecPop => StandardOperation::VecPop,
-        V1::VecIsEmpty => StandardOperation::VecIsEmpty,
-        V1::VecExtend => StandardOperation::VecExtend,
-        V1::VecRemove => StandardOperation::VecRemove,
-        V1::VecSwap => StandardOperation::VecSwap,
-        V1::VecIndex => StandardOperation::VecIndex,
-        V1::VecIndexMut => StandardOperation::VecIndexMut,
-        V1::VecDrop => StandardOperation::VecDrop,
-        V1::StringNew => StandardOperation::StringNew,
-        V1::StringWithCapacity => StandardOperation::StringWithCapacity,
-        V1::StringLen => StandardOperation::StringLen,
-        V1::StringCapacity => StandardOperation::StringCapacity,
-        V1::StringPush => StandardOperation::StringPush,
-        V1::StringPushStr => StandardOperation::StringPushStr,
-        V1::StringClear => StandardOperation::StringClear,
-        V1::StringAsStr => StandardOperation::StringAsStr,
-        V1::StringDrop => StandardOperation::StringDrop,
-        V1::SliceSwap => StandardOperation::SliceSwap,
-        V1::StringFmtWriteStr => StandardOperation::StringFmtWriteStr,
-        V1::StringFmtWriteChar => StandardOperation::StringFmtWriteChar,
-        V1::StringFmtWriteFmt => StandardOperation::StringFmtWriteFmt,
-        V1::StringFmtSpecWriteFmt => StandardOperation::StringFmtSpecWriteFmt,
-        V1::F64SpecToString => StandardOperation::F64SpecToString,
-        V1::IntToString => StandardOperation::IntToString,
-        V1::BoolToString => StandardOperation::BoolToString,
-        V1::CharToString => StandardOperation::CharToString,
-        V1::FormatArgumentNewDisplay => StandardOperation::FormatArgumentNewDisplay,
-        V1::FormatArgsNew => StandardOperation::FormatArgsNew,
-        V1::FormatArgsToString => StandardOperation::FormatArgsToString,
-        V1::FormatArgumentNewLowerHex => StandardOperation::FormatArgumentNewLowerHex,
-        V1::FormatArgumentNewUpperHex => StandardOperation::FormatArgumentNewUpperHex,
-        V1::F64FromStr => StandardOperation::F64FromStr,
-        V1::F32FromStr => StandardOperation::F32FromStr,
-        V1::VecPushMut => StandardOperation::VecPushMut,
-        V1::VecReserveExact => StandardOperation::VecReserveExact,
-        V1::VecShrinkToFit => StandardOperation::VecShrinkToFit,
-        V1::VecTruncate => StandardOperation::VecTruncate,
-        V1::VecResize => StandardOperation::VecResize,
-        V1::VecSwapRemove => StandardOperation::VecSwapRemove,
-        V1::VecFromElem => StandardOperation::VecFromElem,
-        V1::VecExtendFromSlice => StandardOperation::VecExtendFromSlice,
-        V1::VecClone => StandardOperation::VecClone,
-        V1::SliceToVec => StandardOperation::SliceToVec,
-        V1::VecRangeIndex => StandardOperation::VecRangeIndex,
-        V1::VecRangeIndexMut => StandardOperation::VecRangeIndexMut,
-        V1::VecFromBoxArray => StandardOperation::VecFromBoxArray,
-        V1::VecIter => StandardOperation::VecIter,
-        V1::VecIterMut => StandardOperation::VecIterMut,
-        V1::VecReplace => StandardOperation::VecReplace,
-        V1::VecMemSwap => StandardOperation::VecMemSwap,
-        V1::VecInsert => StandardOperation::VecInsert,
-        V1::VecInsertMut => StandardOperation::VecInsertMut,
-        V1::BTreeMapNew => StandardOperation::BTreeMapNew,
-        V1::BTreeMapLen => StandardOperation::BTreeMapLen,
-        V1::BTreeMapIsEmpty => StandardOperation::BTreeMapIsEmpty,
-        V1::BTreeMapClear => StandardOperation::BTreeMapClear,
-        V1::BTreeMapContainsKey => StandardOperation::BTreeMapContainsKey,
-        V1::BTreeMapGet => StandardOperation::BTreeMapGet,
-        V1::BTreeMapGetMut => StandardOperation::BTreeMapGetMut,
-        V1::BTreeMapInsert => StandardOperation::BTreeMapInsert,
-        V1::BTreeMapRemove => StandardOperation::BTreeMapRemove,
-        V1::BTreeMapDrop => StandardOperation::BTreeMapDrop,
-    }
-}
-
 fn block_id(block: mir::BasicBlock) -> BlockId {
     BlockId(block.as_usize() as u32)
 }
@@ -2948,4 +2927,122 @@ fn terminate_reason(reason: mir::UnwindTerminateReason) -> TerminateReason {
         mir::UnwindTerminateReason::Abi => TerminateReason::Abi,
         mir::UnwindTerminateReason::InCleanup => TerminateReason::InCleanup,
     }
+}
+
+fn extern_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let section = tcx.codegen_fn_attrs(def_id).link_section?;
+    section
+        .as_str()
+        .strip_prefix(EXTERN_PREFIX)
+        .map(str::to_owned)
+}
+
+fn block_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let section = tcx.codegen_fn_attrs(def_id).link_section?;
+    section
+        .as_str()
+        .strip_prefix(BLOCK_PREFIX)
+        .map(str::to_owned)
+}
+
+fn host_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let section = tcx.codegen_fn_attrs(def_id).link_section?;
+    section
+        .as_str()
+        .strip_prefix(HOST_PREFIX)
+        .map(str::to_owned)
+}
+
+fn map_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let section = tcx.codegen_fn_attrs(def_id).link_section?;
+    section.as_str().strip_prefix(MAP_PREFIX).map(str::to_owned)
+}
+
+/// Resolves the `#[track_caller]` location for `source_info` inside `mir`.
+fn resolve_caller_location_span<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir: &mir::Body<'tcx>,
+    outer_instance: Instance<'tcx>,
+    source_info: mir::SourceInfo,
+) -> Option<Span> {
+    let mut span = source_info.span;
+    let mut scope = source_info.scope;
+    for _ in 0..mir.source_scopes.len() {
+        let data = &mir.source_scopes[scope];
+        if let Some((inlined_instance, call_span)) = data.inlined {
+            if !inlined_instance.def.requires_caller_location(tcx) {
+                return Some(span);
+            }
+            span = call_span;
+            match data.inlined_parent_scope {
+                Some(parent) => scope = parent,
+                None => break,
+            }
+        } else {
+            match data.parent_scope {
+                Some(parent) => scope = parent,
+                None => break,
+            }
+        }
+    }
+    if outer_instance.def.requires_caller_location(tcx) {
+        None
+    } else {
+        Some(span)
+    }
+}
+
+/// Where a span starts, spelled as rustc would spell it in a diagnostic.
+pub(crate) fn location_of(tcx: TyCtxt<'_>, span: Span) -> Option<Loc> {
+    if span.is_dummy() {
+        return None;
+    }
+    let position = tcx.sess.source_map().lookup_char_pos(span.lo());
+    let file = position
+        .file
+        .name
+        .prefer_remapped_unconditionally()
+        .to_string();
+    if file.is_empty() {
+        return None;
+    }
+    Some(Loc {
+        file,
+        line: position.line as u32,
+        col: position.col.0 as u32,
+    })
+}
+
+/// Emitted parameter names of `instance` for `.d.ts` signature synthesis.
+pub(crate) fn dts_params<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &mir::Body<'tcx>,
+) -> Vec<String> {
+    let debug = local_names(mir);
+    let mut params = Vec::new();
+    for local in mir.args_iter() {
+        if mir.spread_arg == Some(local) {
+            let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                typing_env(),
+                ty::EarlyBinder::bind(tcx, mir.local_decls[local].ty),
+            );
+            if let ty::Tuple(tys) = ty.kind() {
+                for i in 0..tys.len() {
+                    params.push(format!("_{}$e{i}", local.as_usize()));
+                }
+                continue;
+            }
+        }
+        let name = debug
+            .get(local.as_usize())
+            .and_then(|n| n.clone())
+            .unwrap_or_else(|| format!("_{}", local.as_usize()));
+        params.push(name);
+    }
+    if instance.def.requires_caller_location(tcx) {
+        params.push("$loc".to_owned());
+    }
+    params
 }

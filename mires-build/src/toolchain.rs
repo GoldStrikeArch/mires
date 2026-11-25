@@ -2,10 +2,9 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::SystemTime,
 };
 
-use crate::{collect_inputs, BuildError, Fix, Pinned, Result, RustOptLevel, Step, Unmet};
+use crate::{BuildError, Fix, Pinned, Result, RustOptLevel, Step, Unmet};
 
 /// Environment variable overriding the spike checkout root.
 pub const SPIKE_ROOT_ENV: &str = "MIRES_ROOT";
@@ -73,9 +72,6 @@ impl PanicMode {
         }
     }
 }
-
-/// Cargo target directory for the feature-gated keyed view macros.
-const KEYED_VIEW_MACRO_TARGET: &str = "keyed-view-macros";
 
 /// The spike checkout a client crate is compiled with: the codegen backend
 /// dylib, the `jsc-link` binary it execs, the `core` sysroot built against
@@ -246,139 +242,6 @@ impl Toolchain {
         self.root.join("runtime").join("shim.js")
     }
 
-    /// The template ABI a client crate's `view!` expansions are written
-    /// against. Compiled by the backend into an rlib before the crate that
-    /// names it.
-    pub fn view_abi(&self) -> PathBuf {
-        self.root.join("view-abi").join("src").join("lib.rs")
-    }
-
-    /// The crate directories the view macros are built from, in dependency
-    /// order.
-    ///
-    /// Editing any of them changes what a `view!` or a `#[js_extern]` expands
-    /// to, so they decide whether the built macros are still current. Which
-    /// dylib each one belongs to is [`view_macro_sources`] and
-    /// [`extern_macro_sources`]; this is the union, which is what a build
-    /// script watches.
-    ///
-    /// [`view_macro_sources`]: Self::view_macro_sources
-    /// [`extern_macro_sources`]: Self::extern_macro_sources
-    pub fn view_sources(&self) -> [PathBuf; 4] {
-        [
-            self.root.join("view-abi"),
-            self.root.join("view-dom"),
-            self.root.join("view-dom-macro"),
-            self.root.join("js-extern-macro"),
-        ]
-    }
-
-    /// The crate directories `view-dom-macro` is built from.
-    pub fn view_macro_sources(&self) -> [PathBuf; 3] {
-        [
-            self.root.join("view-abi"),
-            self.root.join("view-dom"),
-            self.root.join("view-dom-macro"),
-        ]
-    }
-
-    /// The crate directories `js-extern-macro` is built from.
-    ///
-    /// A standalone proc macro: it depends on none of the view crates, so
-    /// editing one of those does not make it stale and cargo would not rebuild
-    /// it if it did.
-    pub fn extern_macro_sources(&self) -> [PathBuf; 1] {
-        [self.root.join("js-extern-macro")]
-    }
-
-    /// The proc-macro crate holding the view macros, built for the host.
-    ///
-    /// A proc macro runs inside rustc, so this one is an ordinary cargo build
-    /// for the machine doing the compiling rather than anything the backend
-    /// touches.
-    pub fn view_macros(&self) -> PathBuf {
-        self.view_macros_with_keyed(false)
-    }
-
-    pub(crate) fn view_macros_with_keyed(&self, keyed: bool) -> PathBuf {
-        self.view_macro_artifact_dir(keyed).join(macro_dylib_name())
-    }
-
-    fn view_macro_artifact_dir(&self, keyed: bool) -> PathBuf {
-        if keyed {
-            return self
-                .root
-                .join("build")
-                .join(KEYED_VIEW_MACRO_TARGET)
-                .join("release");
-        }
-        self.root.join("target").join("release")
-    }
-
-    /// The proc-macro crate holding `#[js_extern]`, built for the host.
-    ///
-    /// It rides the [`ViewMacros`](Step::ViewMacros) step with the view macros:
-    /// a client crate that uses either needs the expansion pass, and one step
-    /// keeps "the macros are current" a single answer.
-    pub fn js_extern_macro(&self) -> PathBuf {
-        self.js_extern_macro_with_keyed(false)
-    }
-
-    pub(crate) fn js_extern_macro_with_keyed(&self, keyed: bool) -> PathBuf {
-        self.view_macro_artifact_dir(keyed)
-            .join(extern_macro_dylib_name())
-    }
-
-    /// The proc macro used by the framework's `#[procedure]` attribute.
-    pub fn procedure_macro(&self) -> PathBuf {
-        self.root
-            .join("target")
-            .join("release")
-            .join(procedure_macro_dylib_name())
-    }
-
-    /// The `js!` proc macro used while building the client `topcoat-dom` seam.
-    pub fn js_macro(&self) -> PathBuf {
-        self.root
-            .join("target")
-            .join("release")
-            .join(js_macro_dylib_name())
-    }
-
-    /// The client async executor compiled through this backend.
-    pub fn view_async(&self) -> PathBuf {
-        self.root.join("view-async").join("src").join("lib.rs")
-    }
-
-    /// The client half of the procedure transport compiled through this backend.
-    pub fn topcoat_dom(&self) -> PathBuf {
-        self.root.join("topcoat-dom").join("src").join("lib.rs")
-    }
-
-    /// Inputs that determine procedure expansion and target support.
-    pub fn procedure_sources(&self) -> Vec<PathBuf> {
-        let archived = self.root.join("procedure-support").join("source");
-        if archived.is_dir() {
-            return vec![
-                self.root.join("js-macro"),
-                self.root.join("topcoat-dom"),
-                self.root.join("view-async"),
-                archived,
-            ];
-        }
-        vec![
-            self.root.join("js-macro"),
-            self.root.join("topcoat-dom"),
-            self.root.join("view-async"),
-            self.root
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(&self.root)
-                .join("crates")
-                .join("topcoat-runtime"),
-        ]
-    }
-
     /// The toolchain the checkout pins, which every child process that
     /// compiles a client crate asks for by name.
     pub fn pinned(&self) -> Pinned {
@@ -392,28 +255,18 @@ impl Toolchain {
 
     /// Every setup step missing before a client crate compiled with
     /// `emit_args` can be built, in the order they have to be performed.
-    ///
-    /// `views` asks for the view macros as well, which only a crate that uses
-    /// them needs. An empty list means the checkout is ready.
-    ///
-    /// This is the one definition of ready: [`check`](Self::check) reports the
-    /// first entry as an error, [`apply`](Self::apply) performs one, and
-    /// anything driving the setup from outside a build script works off the
-    /// same list.
-    pub fn preconditions(&self, emit_args: &str, views: bool) -> Vec<Unmet> {
-        self.preconditions_with_opt_level(emit_args, views, None)
+    pub fn preconditions(&self, emit_args: &str) -> Vec<Unmet> {
+        self.preconditions_with_opt_level(emit_args, None)
     }
 
     /// Every setup step missing for the requested backend and rustc optimization settings.
     pub fn preconditions_with_opt_level(
         &self,
         emit_args: &str,
-        views: bool,
         opt_level: Option<RustOptLevel>,
     ) -> Vec<Unmet> {
         Step::ALL
             .into_iter()
-            .filter(|step| views || *step != Step::ViewMacros)
             .filter_map(|step| match step {
                 Step::Sysroot => self.unmet_sysroot_with_opt_level(emit_args, opt_level),
                 _ => self.unmet(step, emit_args),
@@ -427,14 +280,10 @@ impl Toolchain {
             Step::Toolchain => self.unmet_toolchain(),
             Step::Backend => self.unmet_backend(),
             Step::Sysroot => self.unmet_sysroot(emit_args),
-            Step::ViewMacros => self.unmet_view_macros(),
         }
     }
 
     /// The command that performs `step`, whether or not it is already done.
-    ///
-    /// [`preconditions`](Self::preconditions) reports the steps that are
-    /// missing; this is how a caller asks for one anyway, to redo it.
     pub fn fix(&self, step: Step, emit_args: &str) -> Fix {
         self.fix_with_opt_level(step, emit_args, None)
     }
@@ -457,30 +306,7 @@ impl Toolchain {
                 .maybe_env(RUST_OPT_LEVEL_ENV, opt_level.map(RustOptLevel::as_str))
                 .maybe_env(PANIC_ENV, self.panic.env_value())
                 .dir(&self.root),
-            Step::ViewMacros => self.view_macro_fix(false),
         }
-    }
-
-    fn view_macro_fix(&self, keyed: bool) -> Fix {
-        let fix = Fix::new(Step::ViewMacros, "cargo").args([
-            "build",
-            "--release",
-            "-p",
-            "view-dom-macro",
-            "-p",
-            "js-extern-macro",
-        ]);
-        let fix = if keyed {
-            fix.args([
-                "--features".to_owned(),
-                "view-dom-macro/keyed-v2".to_owned(),
-                "--target-dir".to_owned(),
-                path_arg(&self.root.join("build").join(KEYED_VIEW_MACRO_TARGET)),
-            ])
-        } else {
-            fix
-        };
-        fix.dir(&self.root)
     }
 
     /// The pinned nightly, when `rustup` does not have it.
@@ -564,64 +390,6 @@ impl Toolchain {
         ))
     }
 
-    /// The view macros, when they are not built for the host or were built
-    /// before the sources they come from were last edited.
-    ///
-    /// Existence alone is not enough. A proc macro that is merely present runs
-    /// happily and expands a `view!` the way it did whenever it was built, so
-    /// an edit to the lowering shows up as compiled output that quietly
-    /// disagrees with the source it was supposedly produced from. That is
-    /// harder to notice than a missing dylib, not easier, because everything
-    /// succeeds.
-    fn unmet_view_macros(&self) -> Option<Unmet> {
-        self.unmet_view_macros_with_keyed(false)
-    }
-
-    fn unmet_view_macros_with_keyed(&self, keyed: bool) -> Option<Unmet> {
-        // Each dylib is asked about the sources IT is built from, and not about
-        // the other one's. The two crates share a step but not a dependency
-        // graph: `js-extern-macro` is a standalone proc macro, so an edit to
-        // `view-dom` does not rebuild it and its timestamp stays where it was.
-        // Comparing the oldest dylib against the newest source anywhere would
-        // then report a staleness the fix cannot clear -- cargo has nothing to
-        // redo for that crate -- and the build would refuse for good.
-        let built = [
-            (
-                self.view_macros_with_keyed(keyed),
-                &self.view_macro_sources()[..],
-            ),
-            (
-                self.js_extern_macro_with_keyed(keyed),
-                &self.extern_macro_sources()[..],
-            ),
-        ];
-        if let Some((missing, _)) = built.iter().find(|(dylib, _)| !dylib.is_file()) {
-            let reason = format!("the view macros are not built at {}", missing.display());
-            return Some(Unmet::new(reason, self.view_macro_fix(keyed)));
-        }
-
-        for (dylib, sources) in built {
-            // A time that cannot be read is not evidence of staleness. Saying
-            // nothing leaves the build to the compile, which reports what it
-            // actually hit; claiming a rebuild is needed on no evidence would
-            // send everyone down the wrong path.
-            let (Some(built), Some((source, edited))) = (modified(&dylib), newest_input(sources))
-            else {
-                continue;
-            };
-            if edited <= built {
-                continue;
-            }
-            let reason = format!(
-                "the view macros are older than {source}, so a `view!` or `#[js_extern]` \
-                 would expand through a macro as it was built rather than as it is written",
-                source = source.display()
-            );
-            return Some(Unmet::new(reason, self.view_macro_fix(keyed)));
-        }
-        None
-    }
-
     /// Check the backend and a sysroot built with `emit_args` are in place.
     ///
     /// # Errors
@@ -629,54 +397,16 @@ impl Toolchain {
     /// Returns `Err` naming the first unmet precondition and the command that
     /// satisfies it.
     pub fn check(&self, emit_args: &str) -> Result {
-        self.report(self.preconditions(emit_args, false).into_iter().next())
+        self.report(self.preconditions(emit_args).into_iter().next())
     }
 
     /// Check the backend and sysroot against both backend and rustc optimization settings.
     pub fn check_with_opt_level(&self, emit_args: &str, opt_level: Option<RustOptLevel>) -> Result {
         self.report(
-            self.preconditions_with_opt_level(emit_args, false, opt_level)
+            self.preconditions_with_opt_level(emit_args, opt_level)
                 .into_iter()
                 .next(),
         )
-    }
-
-    /// Check the view macros are built for the host.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the proc-macro dylib is missing, with the cargo command
-    /// that builds it.
-    pub fn check_view_macros(&self) -> Result {
-        self.report(self.unmet_view_macros())
-    }
-
-    pub(crate) fn check_view_macros_with_keyed(&self, keyed: bool) -> Result {
-        self.report(self.unmet_view_macros_with_keyed(keyed))
-    }
-
-    /// Check the framework procedure macro and its client support macro are present and current.
-    pub fn check_procedure_support(&self) -> Result {
-        let built = [self.procedure_macro(), self.js_macro()];
-        if let Some(path) = built.iter().find(|path| !path.is_file()) {
-            return Err(BuildError::ProcedureSupportMissing {
-                path: path.clone(),
-                script: self.script("build-procedure-support.sh"),
-            });
-        }
-        let sources = self.procedure_sources();
-        if let (Some(oldest), Some((source, edited))) = (
-            built.iter().filter_map(|path| modified(path)).min(),
-            newest_input(&sources),
-        ) {
-            if edited > oldest {
-                return Err(BuildError::ProcedureSupportStale {
-                    input: source,
-                    script: self.script("build-procedure-support.sh"),
-                });
-            }
-        }
-        Ok(())
     }
 
     /// Turn an unmet precondition into the error that reports it.
@@ -739,7 +469,7 @@ impl Toolchain {
     /// Returns `Err` if a step cannot be started, exits non-zero, or leaves
     /// its precondition unmet.
     pub fn bootstrap(&self, emit_args: &str) -> Result {
-        for unmet in self.preconditions(emit_args, false) {
+        for unmet in self.preconditions(emit_args) {
             self.apply(unmet.fix())?;
         }
         self.check(emit_args)
@@ -751,124 +481,10 @@ impl Toolchain {
         emit_args: &str,
         opt_level: Option<RustOptLevel>,
     ) -> Result {
-        for unmet in self.preconditions_with_opt_level(emit_args, false, opt_level) {
+        for unmet in self.preconditions_with_opt_level(emit_args, opt_level) {
             self.apply(unmet.fix())?;
         }
         self.check_with_opt_level(emit_args, opt_level)
-    }
-
-    /// Expand `src` into a single Rust file at `out`, running its macros and
-    /// resolving `cfgs`.
-    ///
-    /// This is an explicit expansion utility. [`BuildConfig`](crate::BuildConfig)
-    /// compiles proc-macro clients in one pass so rustc retains their original
-    /// spans for diagnostics and source maps.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if rustc cannot be started, rejects the crate, or the
-    /// expansion cannot be written.
-    pub fn expand(
-        &self,
-        src: &Path,
-        out: &Path,
-        cfgs: &[String],
-        externs: &[(String, PathBuf)],
-    ) -> Result {
-        self.expand_against(src, out, cfgs, externs, &[], &self.sysroot())
-    }
-
-    /// Expand against the immutable sysroot selected by the compiler settings.
-    pub fn expand_with_opt_level(
-        &self,
-        src: &Path,
-        out: &Path,
-        cfgs: &[String],
-        externs: &[(String, PathBuf)],
-        emit_args: &str,
-        opt_level: Option<RustOptLevel>,
-    ) -> Result {
-        let sysroot = self.sysroot_for(emit_args, opt_level)?;
-        self.expand_against(src, out, cfgs, externs, &[], &sysroot)
-    }
-
-    fn expand_against(
-        &self,
-        src: &Path,
-        out: &Path,
-        cfgs: &[String],
-        externs: &[(String, PathBuf)],
-        search_paths: &[PathBuf],
-        sysroot: &Path,
-    ) -> Result {
-        let mut command = Command::new("rustc");
-        command
-            .arg(format!("+{}", self.pinned().channel()))
-            .args(["--edition", "2021"]);
-        match self.panic {
-            PanicMode::Abort => {
-                command.args(["--target", "wasm32-unknown-unknown"]);
-            }
-            PanicMode::Unwind => {
-                command
-                    .arg("--target")
-                    .arg(self.unwind_target_spec())
-                    .args(["-Zunstable-options", "-Cpanic=unwind"]);
-            }
-        }
-        command
-            .arg("--sysroot")
-            .arg(sysroot)
-            .args(["--crate-type", "cdylib"])
-            .arg("-Zunpretty=expanded")
-            .args(
-                EXPANSION_GATES
-                    .iter()
-                    .map(|gate| format!("-Zcrate-attr={gate}")),
-            )
-            .arg("--remap-path-prefix")
-            .arg(format!("{}/=", self.root.display()));
-        for cfg in cfgs {
-            command.args(["--cfg", cfg]);
-        }
-        for (name, path) in externs {
-            command
-                .arg("--extern")
-                .arg(format!("{name}={}", path.display()));
-        }
-        for path in search_paths {
-            command.arg("-L").arg(path);
-        }
-        command
-            .arg(src)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        scrub(&mut command);
-        procedure_identity_env(&mut command);
-
-        let output = command.output().map_err(|source| BuildError::Io {
-            path: PathBuf::from("rustc"),
-            source,
-        })?;
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !output.status.success() {
-            eprint!("{stderr}");
-            println!(
-                "cargo::error=mires-build: rustc failed expanding {}",
-                src.display()
-            );
-            return Err(BuildError::Expand {
-                status: output.status,
-                stderr,
-            });
-        }
-
-        let expanded = String::from_utf8_lossy(&output.stdout);
-        let expanded = allow_prelude_import(&strip_data_sections(&expanded));
-        fs::write(out, expanded).map_err(|source| BuildError::Io {
-            path: out.to_path_buf(),
-            source,
-        })
     }
 
     /// Compile `client_root` to `out`, passing `extra_args` to the backend and
@@ -957,7 +573,6 @@ impl Toolchain {
             command.env(RUST_MIR_INLINE_ENV, "off");
         }
         scrub(&mut command);
-        procedure_identity_env(&mut command);
 
         if env::var_os("JSC_REMAP_ROOT").is_none() {
             if let Some(root) = env::var_os("CARGO_MANIFEST_DIR") {
@@ -1056,107 +671,6 @@ fn path_arg(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// The attribute rustc refuses on `wasm32`, which the view macros put on the
-/// payload static.
-const DATA_SECTION: &str = r#"link_section = "rcgjs.tc.data""#;
-
-/// Drops the lines carrying [`DATA_SECTION`] from an expansion.
-///
-/// The crate attributes the explicit expansion utility needs, injected here
-/// rather than written in the crate root.
-///
-/// A crate that uses the view macros is macro expanded first and the EXPANDED
-/// TEXT is what gets compiled, so anything a macro lowers to has to be spelled
-/// in a source file rather than only understood by the compiler that wrote it.
-/// Three of the library's own lowerings are internal, and writing them down is
-/// what needs a gate:
-///
-/// * `panic_internals` for the `core::panicking::panic_fmt` an `unreachable!` becomes, which every
-///   `#[js_extern]` declaration carries in the marker body the backend replaces;
-/// * `trivial_clone` and `derive_clone_copy_internals` for the assertions `#[derive(Clone, Copy)]`
-///   emits.
-///
-/// None of this is about the crate: the same code compiled in ONE pass needs no
-/// gate at all, because a macro may use what a source file may not. It is a
-/// property of compiling expanded text as source, not of the author's crate,
-/// so the gates belong to the opt-in utility. [`crate::BuildConfig`] avoids
-/// them by compiling proc-macro consumers in one pass.
-///
-/// `internal_features` is allowed for the same reason: naming an internal
-/// feature warns, and the expansion names one of its own (`prelude_import`)
-/// before any source line is reached, so the allow covers the STEP rather than
-/// only what is asked for here.
-const EXPANSION_GATES: &[&str] = &[
-    "allow(internal_features)",
-    "feature(panic_internals, trivial_clone, derive_clone_copy_internals)",
-];
-
-/// `-Zunpretty=expanded` stops before the check that rejects the attribute, so
-/// removing it here is what lets the expansion be compiled again.
-fn strip_data_sections(expanded: &str) -> String {
-    if !expanded.contains(DATA_SECTION) {
-        return expanded.to_owned();
-    }
-    let mut out = String::with_capacity(expanded.len());
-    for line in expanded.lines() {
-        if line.trim_start().starts_with("#[") && line.contains(DATA_SECTION) {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-/// Silences the one warning the expansion itself introduces.
-///
-/// `-Zunpretty=expanded` writes the compiler's injected prelude import out as
-/// ordinary source. A `no_std` crate that imports what it uses explicitly has
-/// no use for the line, so recompiling the file reports it unused, which is a
-/// warning no author can act on. Only the first occurrence is the injected
-/// one, at the head of the crate.
-fn allow_prelude_import(expanded: &str) -> String {
-    expanded.replacen(
-        "use core::prelude::rust_2021::*;",
-        "#[allow(unused_imports)]\nuse core::prelude::rust_2021::*;",
-        1,
-    )
-}
-
-/// The view macro crate's dylib file name on this platform.
-fn macro_dylib_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "libview_dom_macro.dylib"
-    } else {
-        "libview_dom_macro.so"
-    }
-}
-
-/// The `#[js_extern]` macro crate's dylib file name on this platform.
-fn extern_macro_dylib_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "libjs_extern_macro.dylib"
-    } else {
-        "libjs_extern_macro.so"
-    }
-}
-
-fn js_macro_dylib_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "libjs_macro.dylib"
-    } else {
-        "libjs_macro.so"
-    }
-}
-
-fn procedure_macro_dylib_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "libtopcoat_runtime_macro.dylib"
-    } else {
-        "libtopcoat_runtime_macro.so"
-    }
-}
-
 /// The codegen backend dylib's file name on this platform.
 ///
 /// # Errors
@@ -1173,43 +687,6 @@ fn dylib_name() -> Result<&'static str> {
     } else {
         Ok("librustc_codegen_mires.so")
     }
-}
-
-/// When `path` was last written, or `None` if that cannot be read.
-fn modified(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).and_then(|meta| meta.modified()).ok()
-}
-
-/// The most recently edited input under `dirs`, and when it was edited.
-///
-/// Modification times rather than a content stamp, deliberately. A stamp only
-/// works when whatever performs the rebuild writes it, which is true of the
-/// sysroot because one script builds it and true of nothing else here: the
-/// command reported for the view macros is an ordinary `cargo build` that
-/// anyone can run by hand, and a stamp it did not update would assert freshness
-/// that is not there. A stale stamp is worse than no check at all. Times need
-/// no cooperation, and they are what cargo itself decides freshness by, so this
-/// agrees with the tool that does the rebuild.
-///
-/// It errs toward reporting a rebuild: touching a file without changing it
-/// counts as an edit. The cost of that is one cargo build that finds nothing to
-/// do, against silently compiling through a macro that no longer matches its
-/// source.
-fn newest_input(dirs: &[PathBuf]) -> Option<(PathBuf, SystemTime)> {
-    let mut inputs = Vec::new();
-    for dir in dirs {
-        collect_inputs(dir, &mut inputs);
-    }
-    inputs
-        .into_iter()
-        .filter_map(|path| modified(&path).map(|time| (path, time)))
-        .max_by(|(left_path, left), (right_path, right)| {
-            // Ties are broken by path so the file named in the message is the
-            // same one on every run. Whole directories share a timestamp after
-            // a checkout, and a message that names a different file each time
-            // reads as a different problem each time.
-            left.cmp(right).then_with(|| right_path.cmp(left_path))
-        })
 }
 
 /// Whether two whitespace-delimited backend option sets are equivalent.
@@ -1277,19 +754,6 @@ fn optional_env(command: &mut Command, key: &str, value: Option<&str>) {
         }
         None => {
             command.env_remove(key);
-        }
-    }
-}
-
-/// Passes package identity to procedure macros without restoring Cargo's build environment.
-fn procedure_identity_env(command: &mut Command) {
-    for (target, source) in [
-        ("TOPCOAT_PROCEDURE_MANIFEST_DIR", "CARGO_MANIFEST_DIR"),
-        ("TOPCOAT_PROCEDURE_PKG_NAME", "CARGO_PKG_NAME"),
-    ] {
-        command.env_remove(target);
-        if let Some(value) = env::var_os(source) {
-            command.env(target, value);
         }
     }
 }
@@ -1385,43 +849,6 @@ mod tests {
 
         let unmet = toolchain.unmet_backend().unwrap();
         assert!(unmet.reason().contains("jsc-link"), "{unmet}");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn the_view_stack_hangs_off_the_checkout_root() {
-        let toolchain = Toolchain::new("/spike").unwrap();
-        assert_eq!(
-            toolchain.view_abi(),
-            Path::new("/spike/view-abi/src/lib.rs")
-        );
-        assert_eq!(
-            toolchain.view_macros(),
-            Path::new("/spike/target/release").join(macro_dylib_name())
-        );
-        assert_eq!(
-            toolchain.view_macros_with_keyed(true),
-            Path::new("/spike/build/keyed-view-macros/release").join(macro_dylib_name())
-        );
-    }
-
-    #[test]
-    fn an_expansion_without_the_attribute_is_left_alone() {
-        let expanded = "fn main() {}\n";
-        assert_eq!(strip_data_sections(expanded), expanded);
-    }
-
-    #[test]
-    fn the_attribute_rustc_refuses_on_wasm_is_dropped() {
-        let expanded = concat!(
-            "static A: u8 = 0;\n",
-            "    #[link_section = \"rcgjs.tc.data\"]\n",
-            "static B: u8 = 1;\n",
-        );
-        assert_eq!(
-            strip_data_sections(expanded),
-            "static A: u8 = 0;\nstatic B: u8 = 1;\n"
-        );
     }
 
     #[test]
@@ -1623,9 +1050,9 @@ mod tests {
     /// nightly is installed is a property of the machine running the tests, not
     /// of the checkout they describe.
     #[cfg(not(target_os = "windows"))]
-    fn checkout_steps(toolchain: &Toolchain, emit_args: &str, views: bool) -> Vec<Unmet> {
+    fn checkout_steps(toolchain: &Toolchain, emit_args: &str) -> Vec<Unmet> {
         toolchain
-            .preconditions(emit_args, views)
+            .preconditions(emit_args)
             .into_iter()
             .filter(|unmet| unmet.step() != Step::Toolchain)
             .collect()
@@ -1636,20 +1063,7 @@ mod tests {
     fn a_checkout_with_nothing_built_needs_every_step() {
         let toolchain = Toolchain::new("/spike").unwrap();
 
-        let steps: Vec<Step> = checkout_steps(&toolchain, "", true)
-            .iter()
-            .map(Unmet::step)
-            .collect();
-
-        assert_eq!(steps, [Step::Backend, Step::Sysroot, Step::ViewMacros]);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn the_view_macros_are_only_asked_for_by_a_crate_that_uses_them() {
-        let toolchain = Toolchain::new("/spike").unwrap();
-
-        let steps: Vec<Step> = checkout_steps(&toolchain, "", false)
+        let steps: Vec<Step> = checkout_steps(&toolchain, "")
             .iter()
             .map(Unmet::step)
             .collect();
@@ -1665,7 +1079,7 @@ mod tests {
             .unwrap()
             .with_panic_mode(PanicMode::Unwind);
 
-        let fixes: Vec<String> = checkout_steps(&toolchain, "js-minify=on", true)
+        let fixes: Vec<String> = checkout_steps(&toolchain, "js-minify=on")
             .iter()
             .map(|unmet| unmet.fix().to_string())
             .collect();
@@ -1675,7 +1089,6 @@ mod tests {
             [
                 "cd /spike && bash scripts/build.sh",
                 "cd /spike && JS_EXTRA_ARGS='js-minify=on' bash scripts/build_sysroot.sh",
-                "cd /spike && cargo build --release -p view-dom-macro -p js-extern-macro",
             ]
         );
     }
@@ -1721,231 +1134,5 @@ mod tests {
             panic!("expected an unmet precondition, got {error}");
         };
         assert!(error.to_string().contains(&unmet.fix().to_string()));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn checking_the_view_macros_reports_the_cargo_build_that_makes_them() {
-        let toolchain = Toolchain::new("/spike").unwrap();
-
-        let error = toolchain.check_view_macros().unwrap_err();
-
-        let BuildError::Unmet(unmet) = &error else {
-            panic!("expected an unmet precondition, got {error}");
-        };
-        assert_eq!(unmet.step(), Step::ViewMacros);
-        assert_eq!(
-            unmet.fix().to_string(),
-            "cd /spike && cargo build --release -p view-dom-macro -p js-extern-macro"
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn keyed_view_macros_have_an_isolated_feature_build() {
-        let toolchain = Toolchain::new("/spike").unwrap();
-
-        let error = toolchain.check_view_macros_with_keyed(true).unwrap_err();
-
-        let BuildError::Unmet(unmet) = &error else {
-            panic!("expected an unmet precondition, got {error}");
-        };
-        assert_eq!(
-            unmet.fix().to_string(),
-            concat!(
-                "cd /spike && cargo build --release -p view-dom-macro -p js-extern-macro ",
-                "--features view-dom-macro/keyed-v2 --target-dir build/keyed-view-macros",
-            )
-        );
-    }
-
-    /// A checkout holding a built view macro dylib and one source it is built
-    /// from, so the two can be given modification times a test controls.
-    #[cfg(not(target_os = "windows"))]
-    fn view_checkout(label: &str) -> (TempDir, Toolchain) {
-        let dir = TempDir::new(label);
-        fs::create_dir_all(dir.path().join("target").join("release")).unwrap();
-        fs::create_dir_all(dir.path().join("view-dom").join("src")).unwrap();
-        fs::write(dir.path().join("view-dom").join("src").join("lower.rs"), "").unwrap();
-        fs::write(dir.path().join("view-dom").join("Cargo.toml"), "").unwrap();
-        for dylib in [macro_dylib_name(), extern_macro_dylib_name()] {
-            fs::write(dir.path().join("target").join("release").join(dylib), "").unwrap();
-        }
-
-        let toolchain = Toolchain::new(dir.path()).unwrap();
-        (dir, toolchain)
-    }
-
-    /// A fixed instant, plus `offset` seconds. Real clocks are not used: the
-    /// question is only which of two files is newer.
-    #[cfg(not(target_os = "windows"))]
-    fn at(offset: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + offset)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn touch(path: &Path, time: SystemTime) {
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(time)
-            .unwrap();
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn the_view_sources_are_the_four_crates_the_macros_are_built_from() {
-        let toolchain = Toolchain::new("/spike").unwrap();
-
-        assert_eq!(
-            toolchain.view_sources(),
-            [
-                PathBuf::from("/spike/view-abi"),
-                PathBuf::from("/spike/view-dom"),
-                PathBuf::from("/spike/view-dom-macro"),
-                PathBuf::from("/spike/js-extern-macro"),
-            ]
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn view_macros_built_after_their_sources_are_current() {
-        let (dir, toolchain) = view_checkout("views-current");
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(0));
-        touch(&toolchain.view_macros(), at(60));
-
-        assert_eq!(toolchain.unmet_view_macros(), None);
-        assert!(toolchain.check_view_macros().is_ok());
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn view_macros_built_at_the_same_instant_are_current() {
-        let (dir, toolchain) = view_checkout("views-tie");
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(0));
-        touch(&toolchain.view_macros(), at(0));
-
-        assert_eq!(toolchain.unmet_view_macros(), None);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn a_source_edited_after_the_build_makes_the_view_macros_stale() {
-        let (dir, toolchain) = view_checkout("views-stale");
-        touch(&toolchain.view_macros(), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(0));
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(60));
-
-        let unmet = toolchain.unmet_view_macros().unwrap();
-
-        assert_eq!(unmet.step(), Step::ViewMacros);
-        assert!(unmet.reason().contains("view-dom/src/lower.rs"), "{unmet}");
-        assert!(unmet.reason().contains("older than"), "{unmet}");
-        assert_eq!(
-            unmet.fix().to_string(),
-            format!(
-                "cd {} && cargo build --release -p view-dom-macro -p js-extern-macro",
-                dir.path().display()
-            )
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn a_dylib_is_only_asked_about_the_sources_it_is_built_from() {
-        // `js-extern-macro` depends on none of the view crates, so an edit to
-        // `view-dom` leaves its dylib alone and cargo has nothing to redo for
-        // it. Asking the oldest dylib about the newest source anywhere would
-        // report a staleness the fix can never clear, and the build would
-        // refuse for good.
-        let (dir, toolchain) = view_checkout("views-independent");
-        touch(&toolchain.js_extern_macro(), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(0));
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(60));
-        touch(&toolchain.view_macros(), at(120));
-
-        assert_eq!(toolchain.unmet_view_macros(), None);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn an_edited_manifest_makes_the_view_macros_stale_too() {
-        let (dir, toolchain) = view_checkout("views-manifest");
-        touch(&toolchain.view_macros(), at(0));
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(60));
-
-        let unmet = toolchain.unmet_view_macros().unwrap();
-
-        assert!(unmet.reason().contains("view-dom/Cargo.toml"), "{unmet}");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn a_stale_build_is_reported_alongside_the_other_steps() {
-        let (dir, toolchain) = view_checkout("views-precondition");
-        touch(&toolchain.view_macros(), at(0));
-        touch(&dir.path().join("view-dom/Cargo.toml"), at(0));
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(60));
-
-        let steps: Vec<Step> = toolchain
-            .preconditions("", true)
-            .iter()
-            .map(Unmet::step)
-            .filter(|step| *step != Step::Toolchain)
-            .collect();
-
-        assert!(steps.contains(&Step::ViewMacros), "{steps:?}");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn a_missing_dylib_is_reported_as_missing_and_not_as_stale() {
-        let (dir, toolchain) = view_checkout("views-missing");
-        fs::remove_file(toolchain.view_macros()).unwrap();
-        touch(&dir.path().join("view-dom/src/lower.rs"), at(60));
-
-        let unmet = toolchain.unmet_view_macros().unwrap();
-
-        assert!(unmet.reason().contains("are not built at"), "{unmet}");
-        assert!(!unmet.reason().contains("older than"), "{unmet}");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn a_checkout_with_no_view_sources_at_all_is_not_called_stale() {
-        let dir = TempDir::new("views-sourceless");
-        fs::create_dir_all(dir.path().join("target").join("release")).unwrap();
-        for dylib in [macro_dylib_name(), extern_macro_dylib_name()] {
-            fs::write(dir.path().join("target").join("release").join(dylib), "").unwrap();
-        }
-
-        let toolchain = Toolchain::new(dir.path()).unwrap();
-
-        assert_eq!(newest_input(&toolchain.view_sources()), None);
-        assert_eq!(toolchain.unmet_view_macros(), None);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn the_newest_input_is_named_and_ties_break_by_path() {
-        let dir = TempDir::new("views-newest");
-        fs::create_dir_all(dir.path().join("view-dom").join("src")).unwrap();
-        for name in ["b.rs", "a.rs"] {
-            fs::write(dir.path().join("view-dom").join("src").join(name), "").unwrap();
-            touch(&dir.path().join("view-dom").join("src").join(name), at(60));
-        }
-        fs::write(dir.path().join("view-dom").join("src").join("old.rs"), "").unwrap();
-        touch(&dir.path().join("view-dom/src/old.rs"), at(0));
-
-        let toolchain = Toolchain::new(dir.path()).unwrap();
-        let (path, time) = newest_input(&toolchain.view_sources()).unwrap();
-
-        assert_eq!(time, at(60));
-        assert_eq!(path, dir.path().join("view-dom/src/a.rs"));
     }
 }

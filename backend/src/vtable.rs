@@ -93,6 +93,11 @@ fn build<'tcx>(
         None => format!("<{ty}> vtable"),
     });
 
+    let (jir, jir_decline) = match crate::jir::encode::vtable(cgu, ty, trait_ref) {
+        Ok(item) => (Some(item), None),
+        Err(decline) => (None, Some(rcgjs_object::jir::Decline::Encode(decline))),
+    };
+
     JsItem::new(
         name.clone(),
         ItemKind::Vtable,
@@ -101,7 +106,7 @@ fn build<'tcx>(
         Linkage::internal(),
         debug_path,
     )
-    .with_late_ir(crate::late_ir::vtable(cgu, ty, trait_ref))
+    .with_jir(jir, jir_decline)
 }
 
 /// Slot 0: the drop glue of the concrete type, or `null` when it has none.

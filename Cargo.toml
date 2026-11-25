@@ -2,15 +2,12 @@
 resolver = "2"
 exclude = ["experiments", "experiments-pro", "recovery", "legacy"]
 members = [
-    "rustc-cleanup",
     "backend",
     "rcgjs-object",
     "jsc-link",
     "mires-build",
     "structurizer",
     "mires-js",
-    "view-abi",
-    "view-async",
     "js-extern-macro",
     "js-macro",
     "test-node",

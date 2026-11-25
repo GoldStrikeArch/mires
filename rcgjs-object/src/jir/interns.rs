@@ -48,9 +48,6 @@ pub struct Interns {
     pub source_facts: Vec<SourceFact>,
     /// Keyed by [`TypeId`], sorted.
     pub types: TypeTable,
-    /// Generic source suspension facts, keyed by stable coroutine definition identity.
-    pub coroutine_sources:
-        BTreeMap<super::semantic::DefinitionId, super::coroutine::CoroutineSource>,
     #[serde(skip)]
     string_index: BTreeMap<String, StrId>,
     #[serde(skip)]

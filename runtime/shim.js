@@ -1129,18 +1129,6 @@ globalThis.__rt._put = (buf, off, value, heap) => {
   }
 };
 
-// _put_plain(buf, off, value): element store for aggregate types proven never to be
-// looked up in `_boxes` (never boxed, never unsized to `dyn Trait`, never passed as
-// a bare reference to pointer identity ops). Skips `_blk_get` and `_boxes` entirely.
-globalThis.__rt._put_plain = (buf, off, value) => {
-  const old = buf[off];
-  if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
-    globalThis.__rt.overwrite(old, value);
-    return;
-  }
-  buf[off] = value;
-};
-
 // _put_tracked(buf, off, value): element store for aggregate types that DO participate
 // in `_boxes` lookup, registering `{ buf, off }` directly without a `_blk_get` WeakMap lookup.
 globalThis.__rt._put_tracked = (buf, off, value) => {
@@ -3850,113 +3838,6 @@ globalThis.__rt.bstr_trim = (s) => {
   return s.slice(start, _bstr_ws_end(s, start));
 };
 
-// bstr_push(value, point): `native_str_push` over a byte-string builder
-// `{ text, cap, len }`, whose `len` is always `text.length`.
-globalThis.__rt.bstr_push = (value, point) => {
-  value.text += globalThis.__rt.bstr_char(point);
-  value.len = value.text.length;
-};
-
-// bstr_pop(value): `native_str_pop` over a byte-string builder: -1 for `None`,
-// otherwise the last scalar, decoded from its UTF-8 bytes. Capacity is kept.
-globalThis.__rt.bstr_pop = (value) => {
-  const text = value.text;
-  if (text.length === 0) return -1;
-  let at = text.length - 1;
-  while (at > 0 && (text.charCodeAt(at) & 0xc0) === 0x80) at -= 1;
-  const b0 = text.charCodeAt(at);
-  const n = text.length - at;
-  let point = n === 1 ? b0 : n === 2 ? b0 & 0x1f : n === 3 ? b0 & 0x0f : b0 & 0x07;
-  for (let i = at + 1; i < text.length; i++) point = (point << 6) | (text.charCodeAt(i) & 0x3f);
-  value.text = text.slice(0, at);
-  value.len = at;
-  return point;
-};
-
-// bstr_truncate(value, byteIndex): `native_str_truncate` over a byte-string
-// builder: a no-op at or past the length, a refusal off a char boundary.
-globalThis.__rt.bstr_truncate = (value, byteIndex) => {
-  if (byteIndex >= value.len) return;
-  if (!globalThis.__rt.bstr_boundary(value.text, byteIndex)) {
-    throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
-  }
-  value.text = value.text.slice(0, byteIndex);
-  value.len = byteIndex;
-};
-
-// bstr_host_sb(s): `convert_host_sb` for a byte string: an exact-fit builder.
-globalThis.__rt.bstr_host_sb = (s) => ({ text: s, cap: s.length, len: s.length });
-
-// bstr_block(s): `convert_str_block` for a byte string: its bytes as a fresh,
-// registered, exact-fit `{ buf, off, len, cap }` baseline block.
-globalThis.__rt.bstr_block = (s) => {
-  const n = s.length;
-  const copy = new Array(n);
-  for (let i = 0; i < n; i++) copy[i] = s.charCodeAt(i);
-  const p = globalThis.__rt._register(copy, n, false);
-  globalThis.__rt._blk_get(copy).fresh = false;
-  return { buf: p.buf, off: 0, len: n, cap: n };
-};
-
-// bstr_sb_block(sb): `convert_sb_block` for a byte-string builder: a fresh
-// registered block of capacity `max(cap, len)`, `[0, len)` initialized.
-globalThis.__rt.bstr_sb_block = (sb) => {
-  const text = sb.text;
-  const n = text.length;
-  const cap = Math.max(sb.cap, n);
-  const copy = new Array(n);
-  for (let i = 0; i < n; i++) copy[i] = text.charCodeAt(i);
-  copy.length = cap;
-  const p = globalThis.__rt._register(copy, cap, false);
-  globalThis.__rt._blk_get(copy).fresh = false;
-  return { buf: p.buf, off: 0, len: n, cap };
-};
-
-// Tier A typed-heap variants of `bstr_block` / `bstr_sb_block`: allocate a
-// `Uint8Array` directly without `_register` / `_blocks`.
-globalThis.__rt.bstr_block_typed = (s) => {
-  const n = s.length;
-  const copy = new Uint8Array(n);
-  for (let i = 0; i < n; i++) copy[i] = s.charCodeAt(i);
-  return { buf: copy, off: 0, len: n, cap: n };
-};
-
-globalThis.__rt.bstr_sb_block_typed = (sb) => {
-  const text = sb.text;
-  const n = text.length;
-  const cap = Math.max(sb.cap, n);
-  const copy = new Uint8Array(cap);
-  for (let i = 0; i < n; i++) copy[i] = text.charCodeAt(i);
-  return { buf: copy, off: 0, len: n, cap };
-};
-
-// bstr_sb_check(value): `_sb_check` (`RCGJS_SB_VERIFY=1`) for a byte-string
-// builder: `len` is `text.length`, `cap` at least that, and the text is a
-// byte string holding well-formed UTF-8.
-globalThis.__rt.bstr_sb_check = (value) => {
-  const text = value.text;
-  const bytes = new Uint8Array(text.length);
-  let valid = true;
-  for (let i = 0; i < text.length; i++) {
-    const unit = text.charCodeAt(i);
-    if (unit > 0xff) valid = false;
-    bytes[i] = unit;
-  }
-  if (valid && typeof TextDecoder === "function") {
-    try {
-      new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch (_) {
-      valid = false;
-    }
-  }
-  if (value.len !== text.length || !(value.cap >= text.length) || !valid) {
-    const detail = "len " + value.len + ", cap " + value.cap + ", text measures " + text.length +
-      (valid ? "" : ", text is not a UTF-8 byte string");
-    throw __rt.abort_error(new RangeError("native String length drift: " + detail));
-  }
-  return value;
-};
-
 globalThis.__rt._bstr_out_ref = new WeakMap();
 globalThis.__rt._bstr_in_ref = new WeakMap();
 globalThis.__rt._bstr_unwrap_rust = new WeakMap();
@@ -4464,73 +4345,6 @@ globalThis.__rt.bstr_ref_in = (value, spec) => globalThis.__rt._bstr_wrap(value,
 // lifetime. These helpers implement only the operations JavaScript cannot
 // spell inline without duplicating exact UTF-8 or slot-clearing logic. Rust
 // still computes capacity growth and runs element drops before shrinking.
-
-globalThis.__rt._utf8_width = (point) => {
-  if (point <= 0x7f) return 1;
-  if (point <= 0x7ff) return 2;
-  if (point <= 0xffff) return 3;
-  return 4;
-};
-
-// native_str_wf(s): the text a `&str` is once Rust holds it as bytes. A lone
-// surrogate (only a host can hand Rust one) is the U+FFFD that `str_bytes`
-// encodes for it, so this is exactly what a baseline `Vec<u8>` String decodes
-// back after the same append. A native String's text is only ever built from
-// such text: it stays well formed, its UTF-8 length is the sum of its pieces'
-// (`str_len`), and two appended halves can never pair into one scalar the
-// baseline never saw. A well-formed string -- every string Rust itself makes --
-// is returned as is, without allocating.
-globalThis.__rt.native_str_wf = (s) => {
-  let out = null;
-  let from = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if ((c & 0xf800) !== 0xd800) continue;
-    if (c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
-      i++;
-      continue;
-    }
-    out = (out === null ? "" : out) + s.slice(from, i) + String.fromCharCode(0xfffd);
-    from = i + 1;
-  }
-  return out === null ? s : out + s.slice(from);
-};
-
-// Maps a UTF-8 byte boundary to the corresponding JavaScript UTF-16 index.
-// A byte inside a code point, a negative/non-integral index, or an index past
-// the end has no equivalent and returns -1.
-globalThis.__rt.native_str_utf16_index = (text, byteIndex) => {
-  if (!Number.isInteger(byteIndex) || byteIndex < 0) return -1;
-  let bytes = 0;
-  for (let utf16 = 0; utf16 < text.length;) {
-    if (bytes === byteIndex) return utf16;
-    const point = text.codePointAt(utf16);
-    const next = bytes + globalThis.__rt._utf8_width(point);
-    if (byteIndex < next) return -1;
-    bytes = next;
-    utf16 += point > 0xffff ? 2 : 1;
-  }
-  return bytes === byteIndex ? text.length : -1;
-};
-
-// The inverse map. An index between the two code units of a surrogate pair is
-// not a Rust char boundary and returns -1.
-globalThis.__rt.native_str_byte_index = (text, utf16Index) => {
-  if (!Number.isInteger(utf16Index) || utf16Index < 0) return -1;
-  let bytes = 0;
-  for (let utf16 = 0; utf16 < text.length;) {
-    if (utf16 === utf16Index) return bytes;
-    const point = text.codePointAt(utf16);
-    const units = point > 0xffff ? 2 : 1;
-    if (utf16Index < utf16 + units) return -1;
-    bytes += globalThis.__rt._utf8_width(point);
-    utf16 += units;
-  }
-  return utf16Index === text.length ? bytes : -1;
-};
-
-globalThis.__rt.native_str_is_char_boundary = (text, byteIndex) =>
-  globalThis.__rt.native_str_utf16_index(text, byteIndex) !== -1;
 
 globalThis.__rt._num_dv = new DataView(new ArrayBuffer(8));
 
@@ -5132,133 +4946,9 @@ globalThis.__rt.parse_f32 = (s) => {
   return neg ? -adj : adj;
 };
 
-// A mutable native String is `{ text, cap, len }`: well-formed text (see
-// native_str_wf), its Rust-visible capacity and its exact UTF-8 byte length,
-// both in bytes. Every operation keeps `len` in step with the text, so nothing
-// rescans the text to learn its length -- which is what would make building a
-// string quadratic. The compiled reserve path has already established enough
-// capacity, so pushing a Rust `char` appends it and advances the length by its
-// width.
-globalThis.__rt.native_str_push = (value, point) => {
-  value.text += String.fromCodePoint(point);
-  value.len += globalThis.__rt._utf8_width(point);
-};
-
-// Returns -1 for `None`; every Rust `char` is otherwise a non-negative Unicode
-// scalar value. Capacity is retained, as it is by `String::pop`; the length
-// drops by the popped scalar's width.
-globalThis.__rt.native_str_pop = (value) => {
-  const text = value.text;
-  if (text.length === 0) return -1;
-  let at = text.length - 1;
-  const tail = text.charCodeAt(at);
-  if (tail >= 0xdc00 && tail <= 0xdfff && at > 0) {
-    const lead = text.charCodeAt(at - 1);
-    if (lead >= 0xd800 && lead <= 0xdbff) at -= 1;
-  }
-  const point = text.codePointAt(at);
-  value.text = text.slice(0, at);
-  value.len -= globalThis.__rt._utf8_width(point);
-  return point;
-};
-
-// Rust makes an index at or past the current byte length a no-op and rejects an
-// in-range index that is not a char boundary. Capacity is retained; the length
-// becomes the index.
-globalThis.__rt.native_str_truncate = (value, byteIndex) => {
-  if (byteIndex >= value.len) return;
-  const text = value.text;
-  const utf16 = globalThis.__rt.native_str_utf16_index(text, byteIndex);
-  if (utf16 < 0) {
-    throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
-  }
-  value.text = text.slice(0, utf16);
-  value.len = byteIndex;
-};
-
-// _sb_check(value): the `RCGJS_SB_VERIFY=1` drift check the compiler emits after
-// every mutation of a native String and around every read of its length. The
-// text must be well formed (a lone surrogate would decode differently from the
-// baseline's bytes), the cached `len` must be its UTF-8 byte length and `cap`
-// at least that; anything else is a compiler bug, reported before the length is
-// used. Returns the value, so a checked length read is
-// `__rt._sb_check(value).len`.
-globalThis.__rt._sb_check = (value) => {
-  const measured = globalThis.__rt.str_len(value.text);
-  const wellFormed = globalThis.__rt.native_str_wf(value.text) === value.text;
-  if (value.len !== measured || !(value.cap >= measured) || !wellFormed) {
-    const detail = "len " + value.len + ", cap " + value.cap + ", text measures " + measured +
-      (wellFormed ? "" : ", text has a lone surrogate");
-    throw __rt.abort_error(new RangeError("native String length drift: " + detail));
-  }
-  return value;
-};
-
-globalThis.__rt.native_vec_new = (capacity) => ({
-  buf: new Array(capacity),
-  len: 0,
-  cap: capacity,
-});
-
-// Phase 12D's exact numeric backing store has already allocated the proven maximum length.
-// Growth therefore changes only Rust's logical capacity before writing the next POD element.
-globalThis.__rt.typed_vec_push = (value, element) => {
-  const length = value.len;
-  if (length === value.cap) value.cap = length + 1;
-  value.buf[length] = element;
-  value.len = length + 1;
-};
-
-// The compiled Rust reserve/shrink path computes `capacity`; this helper only
-// applies it without changing buffer identity. Reducing `length` releases all
-// unused slots beyond the new capacity.
-globalThis.__rt.native_vec_set_capacity = (value, capacity) => {
-  if (capacity < value.len) {
-    throw __rt.abort_error(new RangeError("native Vec capacity cannot be smaller than its length"));
-  }
-  value.buf.length = capacity;
-  value.cap = capacity;
-};
-
-// Drops run in compiled Rust before this call. Filling the removed range with
-// `undefined` releases its host references while retaining the allocation and
-// its explicit capacity.
-globalThis.__rt.native_vec_set_len = (value, length) => {
-  if (length > value.cap) {
-    throw __rt.abort_error(new RangeError("native Vec length cannot exceed its capacity"));
-  }
-  if (length < value.len) value.buf.fill(undefined, length, value.len);
-  value.len = length;
-};
-
-// Compact unified NativeVec helpers (shared by both growable ES2018 TypedArrays
-// and plain JS Arrays). Kind tags 0..=7 index _tv_ctors: u8, i8, u16, i16, u32,
-// i32, f32, f64. Hot paths (nv_push, nv_push_mut, nv_idx, nv_clone) avoid any
-// ArrayBuffer.isView check; growth/shrink/remove branch once on isView.
-// Bounds and capacity failures route through `_nv_fail`, invoking the program's
-// `#[panic_handler]` (with caller location when available) and always raising a
-// registered Rust abort (`__rt.is_abort`).
+// TypedArray constructor table indexed by element kind tags 0..=7:
+// u8, i8, u16, i16, u32, i32, f32, f64.
 globalThis.__rt._tv_ctors = [Uint8Array,Int8Array,Uint16Array,Int16Array,Uint32Array,Int32Array,Float32Array,Float64Array];
-globalThis.__rt._nv_fail = (m, p, l) => { if (p) p(m, l); throw __rt.abort_error(new RangeError(m)); };
-globalThis.__rt._nv_pinfo = (m, p, l) => { const b = []; for (let i = 0; i < m.length; i++) b.push(m.charCodeAt(i)); p({ message: { template: { buf: b, off: 0 }, args: ((b.length << 1) | 1) >>> 0 }, location: l || { filename: { buf: [], off: 0, len: 0 }, line: 0, col: 0 }, can_unwind: true, force_no_backtrace: false }); };
-globalThis.__rt.tv_new = (k) => ({buf:new __rt._tv_ctors[k](0),len:0,cap:0});
-globalThis.__rt.nv_cap = (c, m, k, p) => { if (c > m) throw __rt._nv_fail("cap", p); return {buf:k!==void 0?new __rt._tv_ctors[k](c):new Array(c),len:0,cap:c}; };
-globalThis.__rt._nv_grow = (v, r, m, e, s, p) => { if (r > m) throw __rt._nv_fail("cap", p); const b = v.buf, t = ArrayBuffer.isView(b), mc = s || (t && b.BYTES_PER_ELEMENT === 1 ? 8 : 4); let n = e ? r : Math.max(mc, v.cap * 2, r); if (n > m) n = m; if (t) { const c = new b.constructor(n), vl = v.len; if (vl) { if (vl <= 16) { for (let i = 0; i < vl; i++) c[i] = b[i]; } else c.set(vl === b.length ? b : b.subarray(0, vl)); } v.buf = c; } else b.length = n; v.cap = n; };
-globalThis.__rt.nv_push = (v, x, m, s, p) => { const l = v.len; if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); v.buf[l] = x; v.len = l + 1; };
-globalThis.__rt.nv_insert = (v, i, x, m, s, p, loc) => { const l = v.len; if (i > l) throw __rt._nv_fail("oob", p, loc); if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); const b = v.buf; if (i < l) b.copyWithin(i + 1, i, l); b[i] = x; v.len = l + 1; };
-globalThis.__rt.nv_reserve = (v, a, m, e, s, p) => { const r = v.len + a; if (r > v.cap) __rt._nv_grow(v, r, m, e, s, p); };
-globalThis.__rt.nv_shrink = (v) => { const l = v.len; if (v.cap > l) { const b = v.buf; if (ArrayBuffer.isView(b)) { const c = new b.constructor(l); if (l) c.set(b.subarray(0, l)); v.buf = c; } else b.length = l; v.cap = l; } };
-globalThis.__rt.nv_from_elem = (x, n, m, k, p) => { if (n > m) throw __rt._nv_fail("cap", p); const b = k !== void 0 ? new __rt._tv_ctors[k](n) : new Array(n); if (k === void 0 || x !== 0 || 1 / x < 0) b.fill(x); return {buf:b,len:n,cap:n}; };
-globalThis.__rt.nv_resize = (v, n, x, m, s, p) => { const l = v.len; if (n > l) { if (n > v.cap) __rt._nv_grow(v, n, m, 0, s, p); v.buf.fill(x, l, n); } else if (n < l && !ArrayBuffer.isView(v.buf)) v.buf.fill(void 0, n, l); v.len = n; };
-globalThis.__rt.nv_extend = (v, s, m, mc, p) => { const tl = v.len, sl = s.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); s.len = 0; const db = v.buf, sb = s.buf; if (ArrayBuffer.isView(db)) { if (sl) db.set(sb.subarray(0, sl), tl); s.buf = new sb.constructor(0); } else { for (let i = 0; i < sl; i++) { db[tl + i] = sb[i]; sb[i] = void 0; } sb.length = 0; } v.len = r; s.cap = 0; };
-globalThis.__rt.nv_extend_slice = (v, s, m, mc, p) => { const sl = s.len; if (!sl) return; const tl = v.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); const db = v.buf, sb = s.buf, so = s.off; if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) db.set(sb.subarray(so, so + sl), tl); else for (let i = 0; i < sl; i++) db[tl + i] = sb[so + i]; v.len = r; };
-globalThis.__rt.nv_clone = (v) => ({buf:v.buf.slice(0,v.len),len:v.len,cap:v.len});
-globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; if (l && ArrayBuffer.isView(sb) && sb.constructor === C) { b = sb.slice(so, so + l); } else { b = new C(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
-globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) || ArrayBuffer.isView(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
-globalThis.__rt.nv_remove = (v, i, p, loc) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p, loc); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
-globalThis.__rt.nv_swap_remove = (v, i, p) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };
-globalThis.__rt.nv_idx = (v, i, d, p, loc) => { if (i >= v.len) throw __rt._nv_fail("oob", p, loc); return d ? v.buf[i] : {buf:v.buf,off:i}; };
-globalThis.__rt.nv_range = (v, a, b, p, loc) => { if (a > b || b > v.len) throw __rt._nv_fail("oob", p, loc); return {buf:v.buf,off:a,len:b-a}; };
 
 // ---------------------------------------------------------------------------
 // The heap
@@ -5831,34 +5521,6 @@ globalThis.__rt.sb_take = (h) => {
 // BigInt, a boolean or a string. The backend refuses anything else at the call
 // site, so nothing here validates.
 
-// map_new() -> Map: the map IS the value; nothing frees it but the collector.
-globalThis.__rt.map_new = () => new Map();
-
-// map_len(m) -> number
-globalThis.__rt.map_len = (m) => m.size;
-
-// map_clear(m)
-globalThis.__rt.map_clear = (m) => {
-  m.clear();
-};
-
-// map_has(m, k) -> boolean
-globalThis.__rt.map_has = (m, k) => m.has(k);
-
-// map_set(m, k, v)
-globalThis.__rt.map_set = (m, k, v) => {
-  m.set(k, v);
-};
-
-// map_get(m, k) -> the stored `Option<V>` object. Only ever called for a key the
-// caller has already tested with `map_has`.
-globalThis.__rt.map_get = (m, k) => m.get(k);
-
-// map_del(m, k)
-globalThis.__rt.map_del = (m, k) => {
-  m.delete(k);
-};
-
 // map_keys(m) -> `&[K]`: a snapshot of the keys, as a fat slice over a fresh
 // array. Fresh because it is a snapshot: the map may change afterwards and the
 // array must not notice.
@@ -5873,1141 +5535,6 @@ globalThis.__rt.map_keys = (m) => {
 globalThis.__rt.map_values = (m) => {
   const vals = Array.from(m.values());
   return { buf: vals, off: 0, len: vals.length };
-};
-
-// ---------------------------------------------------------------------------
-// Transactional keyed lists (K1-K5)
-// ---------------------------------------------------------------------------
-//
-// The legacy eager cache below remains byte-for-byte in charge of existing
-// `push_keyed` output. These helpers are the separate lane for the replacement:
-// one instance-scoped state, a validate-before-create transaction, and one owner
-// per row. The versioned keyed-list marker selects this lane in JIR output.
-
-globalThis.__rt._keyed_metrics = {
-  collectionScans: 0,
-  createdRows: 0,
-  disposals: 0,
-  domMoves: 0,
-  effects: 0,
-  handlers: 0,
-  hydrationFallbacks: 0,
-  hydratedRows: 0,
-  liveRowRecords: 0,
-  owners: 0,
-  removedRows: 0,
-  rangeReplacements: 0,
-  retainedRows: 0,
-  rowFactories: 0,
-  selectionEffects: 0,
-  transactionStates: 0,
-};
-
-// keyed_metric(name, amount): the benchmark-only hook for operations whose
-// creation happens in the DOM/reactive runtime rather than in this shim.
-globalThis.__rt.keyed_metric = (name, amount = 1) => {
-  const metrics = globalThis.__rt._keyed_metrics;
-  if (!Object.prototype.hasOwnProperty.call(metrics, name)) {
-    throw new Error(`unknown keyed metric: ${name}`);
-  }
-  if (!Number.isSafeInteger(amount) || amount < 0) {
-    throw new Error(`invalid keyed metric increment: ${amount}`);
-  }
-  metrics[name] += amount;
-};
-
-globalThis.__rt.keyed_metrics_snapshot = () => ({
-  ...globalThis.__rt._keyed_metrics,
-});
-
-globalThis.__rt._keyed_states = new Set();
-globalThis.__rt._keyed_dom_values = new WeakMap();
-
-// Reset event counters without lying about rows that are already live.
-globalThis.__rt.keyed_metrics_reset = () => {
-  const metrics = globalThis.__rt._keyed_metrics;
-  for (const name of Object.keys(metrics)) metrics[name] = 0;
-  if (globalThis.__rt._keyed instanceof Map) {
-    for (const rows of globalThis.__rt._keyed.values()) {
-      metrics.liveRowRecords += rows.size;
-    }
-  }
-  for (const state of globalThis.__rt._keyed_states) {
-    if (!state.disposed) {
-      metrics.liveRowRecords += state.rows.size;
-      metrics.transactionStates += 1;
-    }
-  }
-};
-
-// keyed_state(hooks) -> one list-instance owner. Optional hooks are the host
-// reactive runtime's batch, createRoot, createSignal, and onCleanup equivalents.
-globalThis.__rt.keyed_state = (hooks) => {
-  if (hooks !== undefined && (hooks === null || typeof hooks !== "object")) {
-    throw new TypeError("keyed runtime hooks must be an object");
-  }
-  for (const name of ["batch", "cleanup", "root", "signal", "untrack"]) {
-    if (hooks && hooks[name] !== undefined && typeof hooks[name] !== "function") {
-      throw new TypeError(`keyed runtime hook ${name} must be a function`);
-    }
-  }
-  const state = {
-    batch: hooks && hooks.batch,
-    disposePending: false,
-    disposed: false,
-    hooks,
-    keyType: null,
-    order: [],
-    pending: null,
-    rows: new Map(),
-    running: false,
-  };
-  globalThis.__rt._keyed_states.add(state);
-  globalThis.__rt.keyed_metric("transactionStates");
-  if (hooks && hooks.cleanup !== undefined) {
-    try {
-      hooks.cleanup(() => {
-        if (state.disposed) return;
-        if (state.dom) globalThis.__rt.keyed_dom_dispose(state);
-        else globalThis.__rt.keyed_dispose(state);
-      });
-    } catch (error) {
-      if (globalThis.__rt._keyed_states.delete(state)) {
-        globalThis.__rt._keyed_metrics.transactionStates -= 1;
-      }
-      throw error;
-    }
-  }
-  return state;
-};
-
-const keyedSlot = (value, hooks) => {
-  if (!hooks || hooks.signal === undefined) return { value };
-  const signal = hooks.signal(value);
-  if (!Array.isArray(signal) || typeof signal[0] !== "function" || typeof signal[1] !== "function") {
-    throw new TypeError("a keyed signal hook must return a getter/setter pair");
-  }
-  return {
-    get value() {
-      return signal[0]();
-    },
-    set value(next) {
-      signal[1](next);
-    },
-  };
-};
-
-// A stable callable proxy over a row signal. Calling it returns the live value,
-// property reads forward to that value, and primitive coercion reads it too.
-// Reference-typed Rust row arguments therefore keep their ordinary emitted
-// field/deref spelling, while nested effects and handlers retain this proxy
-// instead of the first item's value.
-const keyedLive = (slot) => {
-  const read = () => slot.value;
-  const primitive = (hint) => {
-    const value = read();
-    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-      return value;
-    }
-    const convert = value[Symbol.toPrimitive];
-    if (typeof convert === "function") return convert.call(value, hint);
-    const converted = hint === "string" ? String(value) : value.valueOf();
-    return converted !== value ? converted : String(value);
-  };
-  return new Proxy(read, {
-    get(target, property, receiver) {
-      if (property === Symbol.toPrimitive) return primitive;
-      if (property === "valueOf") return () => primitive("number");
-      if (property === "toString") return () => String(primitive("string"));
-      const value = read();
-      if (value !== null && value !== undefined && property in Object(value)) {
-        const member = value[property];
-        return typeof member === "function" ? member.bind(value) : member;
-      }
-      return Reflect.get(target, property, receiver);
-    },
-  });
-};
-
-// keyed_owner(factory, item, index, key) -> a row record with live item/index
-// slots and an exact, idempotent disposal boundary. `effect` and `handler` are
-// instrumentation hooks: the DOM integration registers their actual cleanup
-// functions here when it creates them.
-globalThis.__rt.keyed_owner = (factory, item, index, key, hooks) => {
-  const cleanups = [];
-  const itemSlot = keyedSlot(item, hooks);
-  const indexSlot = keyedSlot(index, hooks);
-  let disposed = false;
-  const owner = {
-    effect: (cleanup) => {
-      globalThis.__rt.keyed_metric("effects");
-      if (typeof cleanup === "function") cleanups.push(cleanup);
-    },
-    get index() {
-      return indexSlot.value;
-    },
-    get item() {
-      return itemSlot.value;
-    },
-    liveIndex: keyedLive(indexSlot),
-    liveItem: keyedLive(itemSlot),
-    handler: (cleanup) => {
-      globalThis.__rt.keyed_metric("handlers");
-      if (typeof cleanup === "function") cleanups.push(cleanup);
-    },
-    key,
-    onCleanup: (cleanup) => {
-      if (typeof cleanup !== "function") {
-        throw new TypeError("a keyed row cleanup must be a function");
-      }
-      cleanups.push(cleanup);
-    },
-  };
-  globalThis.__rt.keyed_metric("owners");
-
-  const dispose = () => {
-    if (disposed) return;
-    disposed = true;
-    globalThis.__rt.keyed_metric("disposals");
-    let firstError = null;
-    for (let at = cleanups.length - 1; at >= 0; --at) {
-      try {
-        cleanups[at]();
-      } catch (error) {
-        if (firstError === null) firstError = { error };
-      }
-    }
-    if (firstError !== null) throw firstError.error;
-  };
-
-  try {
-    const build = () => factory(owner);
-    const run = hooks && hooks.untrack !== undefined
-      ? () => hooks.untrack(build)
-      : build;
-    let value;
-    if (hooks && hooks.root !== undefined) {
-      value = hooks.root(rootDispose => {
-        if (typeof rootDispose !== "function") {
-          throw new TypeError("a keyed root hook must provide a disposer");
-        }
-        cleanups.push(rootDispose);
-        return run();
-      });
-    } else {
-      value = run();
-    }
-    return {
-      dispose,
-      index: indexSlot,
-      item: itemSlot,
-      key,
-      liveIndex: owner.liveIndex,
-      liveItem: owner.liveItem,
-      value,
-    };
-  } catch (error) {
-    try {
-      dispose();
-    } catch (_error) {
-      // The factory error is the operation that failed; cleanup still ran.
-    }
-    throw error;
-  }
-};
-
-globalThis.__rt.keyed_key_type = (key) => {
-  const type = typeof key;
-  if (type === "number") {
-    if (!Number.isSafeInteger(key)) {
-      throw new TypeError("a keyed-list number key must be a safe integer");
-    }
-    return type;
-  }
-  if (type === "string" || type === "bigint" || type === "boolean") return type;
-  throw new TypeError(`unsupported keyed-list key type: ${type}`);
-};
-
-// One materialization for the initial array/slice source lane. A Rust slice is
-// the backend's `{ buf, off, len }` view; native arrays and iterables use the
-// ordinary Array.from path.
-globalThis.__rt.keyed_values = (values) => {
-  if (values !== null && typeof values === "object"
-      && "buf" in values && "off" in values && "len" in values) {
-    const { buf, off, len } = values;
-    if (!buf || !Number.isSafeInteger(buf.length) || !Number.isSafeInteger(off)
-        || !Number.isSafeInteger(len) || off < 0 || len < 0 || off + len > buf.length) {
-      throw new TypeError("invalid keyed-list slice source");
-    }
-    return Array.prototype.slice.call(buf, off, off + len);
-  }
-  return Array.from(values);
-};
-
-// The shared array/slice lane implements Rust's `IntoIterator for &[T]`: each
-// item is a reference to one source slot, not the value copied out of that slot.
-globalThis.__rt.keyed_references = (values) => {
-  let buf;
-  let off;
-  let len;
-  if (Array.isArray(values)) {
-    buf = values;
-    off = 0;
-    len = values.length;
-  } else if (values !== null && typeof values === "object"
-      && "buf" in values && "off" in values && "len" in values) {
-    ({ buf, off, len } = values);
-  }
-  if (!buf || !Number.isSafeInteger(buf.length) || !Number.isSafeInteger(off)
-      || !Number.isSafeInteger(len) || off < 0 || len < 0 || off + len > buf.length) {
-    throw new TypeError("invalid keyed-list borrowed source");
-  }
-  return Array.from({ length: len }, (_unused, index) => ({ buf, off: off + index }));
-};
-
-// One compiler-known keyed selection. `slotOf` is shared by every row and
-// returns the row's boolean signal slot, so changing selection touches only the
-// previous and current keys and creates no per-row selection closures.
-globalThis.__rt.keyed_selector = (state, key, slotOf) => {
-  if (!state || !(state.rows instanceof Map) || typeof slotOf !== "function") {
-    throw new TypeError("a keyed selector needs a list state and row slot accessor");
-  }
-  return {
-    disposed: false,
-    is: candidate => candidate === key,
-    get key() {
-      return key;
-    },
-    select: next => {
-      if (state.disposed) throw new Error("cannot select in a disposed keyed list");
-      if (next !== null) {
-        const type = globalThis.__rt.keyed_key_type(next);
-        if (state.keyType !== null && type !== state.keyType) {
-          throw new TypeError(`keyed selection type changed from ${state.keyType} to ${type}`);
-        }
-      }
-      if (next === key) return;
-      const before = key;
-      const previousRow = state.rows.get(before);
-      const nextRow = state.rows.get(next);
-      const changes = [];
-      for (const [row, value] of [[previousRow, false], [nextRow, true]]) {
-        if (row === undefined) continue;
-        const slot = slotOf(row);
-        if (!slot || typeof slot !== "object" || !("value" in slot)) {
-          throw new TypeError("a keyed selector row has no boolean slot");
-        }
-        if (slot.value !== value) changes.push([slot, slot.value, value]);
-      }
-      let ran = false;
-      const publish = () => {
-        if (ran) throw new Error("a keyed batch ran selection more than once");
-        ran = true;
-        for (const [slot, _old, value] of changes) slot.value = value;
-        key = next;
-      };
-      try {
-        if (state.batch === undefined) publish();
-        else state.batch(publish);
-        if (!ran) throw new Error("a keyed batch did not run selection synchronously");
-      } catch (error) {
-        key = before;
-        for (let at = changes.length - 1; at >= 0; --at) {
-          try {
-            changes[at][0].value = changes[at][1];
-          } catch (_error) {
-            // Preserve the selection error after attempting every slot rollback.
-          }
-        }
-        throw error;
-      }
-      globalThis.__rt.keyed_metric("selectionEffects", changes.length);
-    },
-  };
-};
-
-globalThis.__rt.keyed_dispose_row = (row) => {
-  if (typeof row.dispose === "function") row.dispose();
-};
-
-// A static keyed row persists as one Node or a nonempty Node array. DocumentFragment
-// is deliberately not a carrier: inserting it would empty the value that owns identity.
-globalThis.__rt.keyed_dom_owner = (factory, item, index, key, hooks) => {
-  const row = globalThis.__rt.keyed_owner(factory, item, index, key, hooks);
-  let nodes;
-  const seen = new Set();
-  try {
-    nodes = Array.isArray(row.value) ? row.value.slice() : [row.value];
-    if (nodes.length === 0) throw new TypeError("a keyed DOM row must contain at least one node");
-    for (const node of nodes) {
-      if (!node || !Number.isSafeInteger(node.nodeType) || node.nodeType === 11 || seen.has(node)) {
-        throw new TypeError("a keyed DOM row must contain distinct DOM nodes");
-      }
-      seen.add(node);
-    }
-  } catch (error) {
-    try {
-      row.dispose();
-    } catch (_error) {
-      // Preserve the invalid-carrier error after attempting owner cleanup.
-    }
-    throw error;
-  }
-  const disposeOwner = row.dispose;
-  row.nodes = nodes;
-  row.dispose = () => {
-    let firstError = null;
-    for (const node of nodes) {
-      try {
-        if (node.parentNode !== null) node.parentNode.removeChild(node);
-      } catch (error) {
-        if (firstError === null) firstError = { error };
-      }
-    }
-    try {
-      disposeOwner();
-    } catch (error) {
-      if (firstError === null) firstError = { error };
-    }
-    if (firstError !== null) throw firstError.error;
-  };
-  return row;
-};
-
-// One DOM list instance and its permanent end boundary.
-globalThis.__rt.keyed_dom_state = (parent, end, hooks) => {
-  if (!parent || typeof parent.insertBefore !== "function" || typeof parent.removeChild !== "function") {
-    throw new TypeError("a keyed DOM list needs a parent node");
-  }
-  if (end === undefined) {
-    const document = parent.ownerDocument;
-    if (!document || typeof document.createComment !== "function") {
-      throw new TypeError("a keyed DOM list needs an explicit end boundary");
-    }
-    end = document.createComment("");
-  }
-  if (!end || !Number.isSafeInteger(end.nodeType)) {
-    throw new TypeError("a keyed DOM list end boundary must be a node");
-  }
-  if (end.parentNode === null) parent.insertBefore(end, null);
-  if (end.parentNode !== parent) {
-    throw new Error("a keyed DOM list end boundary belongs to another parent");
-  }
-  const state = globalThis.__rt.keyed_state(hooks);
-  state.dom = { end, hydrated: false, ownsEnd: true, parent };
-  return state;
-};
-
-// Adopt a server-rendered row range after ordinary template hydration has
-// resolved every row root through `data-hk`. The closing Solid marker is a
-// boundary the surrounding view owns, so the keyed list borrows rather than
-// removes it. An explicit `tc:k` marker is accepted for server emitters that do
-// not otherwise need a dynamic-child marker pair.
-const keyedDomAdopt = (state, nodes) => {
-  if (nodes.length === 0 || nodes.every(node => node.parentNode === null)) return false;
-  const parent = nodes[0].parentNode;
-  if (parent === null || nodes.some(node => node.parentNode !== parent)) {
-    return false;
-  }
-  for (let at = 1; at < nodes.length; ++at) {
-    if (nodes[at - 1].nextSibling !== nodes[at]) {
-      return false;
-    }
-  }
-  const end = nodes[nodes.length - 1].nextSibling;
-  const marker = end && (end.data === null || end.data === undefined ? end.nodeValue : end.data);
-  if (!end || end.nodeType !== 8 || (marker !== "/" && marker !== "tc:k")) {
-    return false;
-  }
-  state.dom = { end, hydrated: true, ownsEnd: false, parent };
-  globalThis.__rt.keyed_metric("hydratedRows", state.order.length);
-  return true;
-};
-
-const keyedDomContains = (row, target) => {
-  if (target === null || target === undefined) return false;
-  return row.nodes.some(node => node === target
-    || (typeof node.contains === "function" && node.contains(target)));
-};
-
-const keyedDomContiguousBefore = (row, parent, reference) => {
-  const nodes = row.nodes;
-  if (nodes[nodes.length - 1].nextSibling !== reference) return false;
-  for (let at = 0; at < nodes.length; ++at) {
-    if (nodes[at].parentNode !== parent) return false;
-    if (at + 1 < nodes.length && nodes[at].nextSibling !== nodes[at + 1]) return false;
-  }
-  return true;
-};
-
-const keyedDomMoveRow = (parent, row, reference, atomic) => {
-  if (keyedDomContiguousBefore(row, parent, reference)) return false;
-  for (const node of row.nodes) {
-    if (atomic && node.parentNode === parent) parent.moveBefore(node, reference);
-    else parent.insertBefore(node, reference);
-  }
-  return true;
-};
-
-// The no-focus path is the same two-ended reconciliation used by the existing
-// DOM runtime. Running it over the row nodes makes a distant two-row swap two
-// moves instead of walking every row between them backwards.
-const keyedDomOrderNodes = (parent, end, before, next, atomic) => {
-  let nextLength = next.length;
-  let beforeEnd = before.length;
-  let nextEnd = nextLength;
-  let beforeStart = 0;
-  let nextStart = 0;
-  let map = null;
-  let moves = 0;
-  const move = (node, reference) => {
-    if (atomic && node.parentNode === parent) parent.moveBefore(node, reference);
-    else parent.insertBefore(node, reference);
-    moves += 1;
-  };
-  const remove = node => {
-    if (node.parentNode === parent) parent.removeChild(node);
-  };
-  const replace = (node, replaced) => {
-    if (typeof parent.replaceChild === "function") parent.replaceChild(node, replaced);
-    else {
-      parent.insertBefore(node, replaced);
-      parent.removeChild(replaced);
-    }
-    moves += 1;
-  };
-
-  while (beforeStart < beforeEnd || nextStart < nextEnd) {
-    if (before[beforeStart] === next[nextStart]) {
-      beforeStart += 1;
-      nextStart += 1;
-      continue;
-    }
-    while (before[beforeEnd - 1] === next[nextEnd - 1]) {
-      beforeEnd -= 1;
-      nextEnd -= 1;
-    }
-    if (beforeEnd === beforeStart) {
-      const reference = nextEnd < nextLength
-        ? (nextStart ? next[nextStart - 1].nextSibling : next[nextEnd - nextStart])
-        : end;
-      while (nextStart < nextEnd) move(next[nextStart++], reference);
-    } else if (nextEnd === nextStart) {
-      while (beforeStart < beforeEnd) {
-        if (!map || !map.has(before[beforeStart])) remove(before[beforeStart]);
-        beforeStart += 1;
-      }
-    } else if (before[beforeStart] === next[nextEnd - 1]
-        && next[nextStart] === before[beforeEnd - 1]) {
-      const reference = before[--beforeEnd].nextSibling;
-      move(next[nextStart++], before[beforeStart++].nextSibling);
-      move(next[--nextEnd], reference);
-      before[beforeEnd] = next[nextEnd];
-    } else {
-      if (!map) {
-        map = new Map();
-        let at = nextStart;
-        while (at < nextEnd) map.set(next[at], at++);
-      }
-      const index = map.get(before[beforeStart]);
-      if (index !== undefined) {
-        if (nextStart < index && index < nextEnd) {
-          let at = beforeStart;
-          let sequence = 1;
-          let mapped;
-          while (++at < beforeEnd && at < nextEnd) {
-            mapped = map.get(before[at]);
-            if (mapped === undefined || mapped !== index + sequence) break;
-            sequence += 1;
-          }
-          if (sequence > index - nextStart) {
-            const reference = before[beforeStart];
-            while (nextStart < index) move(next[nextStart++], reference);
-          } else replace(next[nextStart++], before[beforeStart++]);
-        } else beforeStart += 1;
-      } else {
-        remove(before[beforeStart++]);
-      }
-    }
-  }
-  return moves;
-};
-
-// Orders rows around the retained active row. The common insertBefore path never
-// touches that row, so focus and selection survive without observable blur/focus.
-const keyedDomOrder = (parent, end, rows) => {
-  const atomic = typeof parent.moveBefore === "function";
-  const document = parent.ownerDocument;
-  const active = document ? document.activeElement : null;
-  const anchor = atomic ? -1 : rows.findIndex(row => keyedDomContains(row, active));
-  let moves = 0;
-  if (anchor >= 0) {
-    let reference = rows[anchor].nodes[0];
-    for (let at = anchor - 1; at >= 0; --at) {
-      if (keyedDomMoveRow(parent, rows[at], reference, false)) moves += 1;
-      reference = rows[at].nodes[0];
-    }
-    reference = end;
-    for (let at = rows.length - 1; at > anchor; --at) {
-      if (keyedDomMoveRow(parent, rows[at], reference, false)) moves += 1;
-      reference = rows[at].nodes[0];
-    }
-    return moves;
-  }
-  const next = rows.flatMap(row => row.nodes);
-  const wanted = new Set(next);
-  const children = parent.childNodes === undefined ? parent.children : parent.childNodes;
-  const before = Array.from(children).filter(node => wanted.has(node));
-  return keyedDomOrderNodes(parent, end, before, next, atomic);
-};
-
-// `insert` is the one place that knows the exact hydration range: the parent,
-// its closing marker (or the end of a sole-child parent), and the server nodes
-// between them. The DOM bundle calls this hook only while `hydrate` is running.
-// A matching range is merely associated with the keyed state. A mismatch is
-// reconciled inside that range before the ordinary insert observes it, so no
-// sibling outside the list can be replaced.
-globalThis.__rt.keyed_dom_insert = (value, parent, end, current) => {
-  const state = globalThis.__rt._keyed_dom_values.get(value);
-  if (state === undefined) return false;
-  if (state.disposed) throw new Error("cannot hydrate a disposed keyed list");
-  if (!parent || typeof parent.insertBefore !== "function"
-      || typeof parent.removeChild !== "function") {
-    throw new TypeError("a keyed hydration range needs a parent node");
-  }
-
-  let boundary = end === undefined ? null : end;
-  const expected = state.order.flatMap(row => row.nodes);
-  const expectedSet = new Set(expected);
-  if (current !== undefined && !Array.isArray(current)) {
-    throw new TypeError("a keyed hydration range must be an array of server nodes");
-  }
-  let server = current === undefined ? Array.from(parent.childNodes) : current.slice();
-  let boundaryMismatch = false;
-
-  // `getNextMarker` returns a null boundary and every following sibling when
-  // the expected closing comment was damaged. Recover only when an unexpected
-  // comment still provides an exact stop point; otherwise there is no safe way
-  // to distinguish stale list rows from static siblings outside the list.
-  if (boundary === null && current !== undefined) {
-    const at = server.findIndex(node => node.nodeType === 8 && !expectedSet.has(node));
-    if (at < 0) throw new Error("keyed hydration boundary is unavailable");
-    boundary = server[at];
-    server = server.slice(0, at);
-    boundaryMismatch = true;
-  }
-  if (boundary !== null
-      && (!Number.isSafeInteger(boundary.nodeType) || boundary.parentNode !== parent)) {
-    throw new Error("keyed hydration boundary does not belong to its parent");
-  }
-  let reference = boundary;
-  for (let at = server.length - 1; at >= 0; --at) {
-    const node = server[at];
-    if (!node || node.parentNode !== parent || node.nextSibling !== reference) {
-      throw new Error("keyed hydration server range is not contiguous");
-    }
-    reference = node;
-  }
-
-  const serverSet = new Set(server);
-  for (const node of expected) {
-    if (node.parentNode !== null
-        && (node.parentNode !== parent || !serverSet.has(node))) {
-      throw new Error("a keyed hydration row escaped its declared list range");
-    }
-  }
-  const matching = !boundaryMismatch && expected.length === server.length
-    && expected.every((node, index) => node === server[index]);
-  const wasHydrated = state.dom && state.dom.hydrated === true;
-  state.dom = {
-    end: boundary,
-    hydrated: matching,
-    ownsEnd: false,
-    parent,
-  };
-  if (matching) {
-    if (!wasHydrated) globalThis.__rt.keyed_metric("hydratedRows", state.order.length);
-    return true;
-  }
-
-  if (boundaryMismatch && boundary.data !== "/") boundary.data = "/";
-  for (const node of server) {
-    if (!expectedSet.has(node) && node.parentNode === parent) parent.removeChild(node);
-  }
-  const moves = keyedDomOrder(parent, boundary, state.order);
-  globalThis.__rt.keyed_metric("domMoves", moves);
-  globalThis.__rt.keyed_metric("hydrationFallbacks");
-  globalThis.__rt.keyed_metric("rangeReplacements");
-  return true;
-};
-
-const keyedDomValidate = (state, rows) => {
-  if (!state.dom || !state.dom.parent
-      || (state.dom.end !== null && state.dom.end.parentNode !== state.dom.parent)) {
-    throw new Error("invalid keyed DOM list boundary");
-  }
-  const parent = state.dom.parent;
-  const seen = new Set();
-  for (const row of rows) {
-    if (!row || !Array.isArray(row.nodes) || row.nodes.length === 0) {
-      throw new Error("invalid keyed DOM row range");
-    }
-    const attached = row.nodes[0].parentNode;
-    for (let at = 0; at < row.nodes.length; ++at) {
-      const node = row.nodes[at];
-      if (seen.has(node) || (node.parentNode !== null && node.parentNode !== parent)) {
-        throw new Error("invalid keyed DOM row range");
-      }
-      seen.add(node);
-      if (node.parentNode !== attached) throw new Error("invalid keyed DOM row range");
-      if (attached === parent && at > 0 && row.nodes[at - 1].nextSibling !== node) {
-        throw new Error("invalid keyed DOM row range");
-      }
-    }
-  }
-};
-
-const keyedDomCommit = (state, rows, journal) => {
-  keyedDomValidate(state, rows);
-  const { end, parent } = state.dom;
-  const before = state.order.slice();
-  const beforeSet = new Set(before);
-  const nextSet = new Set(rows);
-  journal(() => {
-    for (const row of rows) {
-      if (beforeSet.has(row)) continue;
-      for (const node of row.nodes) {
-        if (node.parentNode === parent) parent.removeChild(node);
-      }
-    }
-    keyedDomOrder(parent, end, before);
-  });
-  for (const row of before) {
-    if (nextSet.has(row)) continue;
-    for (const node of row.nodes) {
-      if (node.parentNode === parent) parent.removeChild(node);
-    }
-  }
-  return keyedDomOrder(parent, end, rows);
-};
-
-globalThis.__rt.keyed_dom_reconcile = (state, values, keyOf, factory) => {
-  if (!state.dom) throw new TypeError("keyed DOM reconciliation needs a DOM state");
-  return globalThis.__rt.keyed_reconcile(
-    state,
-    values,
-    keyOf,
-    (item, index, key) => globalThis.__rt.keyed_dom_owner(
-      owner => factory(owner, item, index, key),
-      item,
-      index,
-      key,
-      state.hooks,
-    ),
-    (_values, rows, journal) => keyedDomCommit(state, rows, journal),
-  );
-};
-
-globalThis.__rt.keyed_dom_dispose = (state) => {
-  if (state.running) {
-    globalThis.__rt.keyed_dispose(state);
-    return;
-  }
-  const dom = state.dom;
-  const parent = dom && (dom.parent || (dom.end && dom.end.parentNode));
-  let failure = null;
-  try {
-    globalThis.__rt.keyed_dispose(state);
-  } catch (error) {
-    failure = { error };
-  }
-  if (parent && dom.end && dom.ownsEnd !== false && dom.end.parentNode === parent) {
-    try {
-      parent.removeChild(dom.end);
-    } catch (error) {
-      if (failure === null) failure = { error };
-    }
-  }
-  if (failure !== null) throw failure.error;
-};
-
-// The compiler-facing static-row adapter. Its first run builds detached row
-// carriers and returns them with a permanent end boundary for `insert`. Later
-// collection-effect runs find that boundary's parent and commit ranges directly.
-globalThis.__rt.keyed_dom_view = (collection, keyOf, factory, hooks) => {
-  if (typeof collection !== "function" || typeof keyOf !== "function"
-      || typeof factory !== "function") {
-    throw new TypeError("a keyed DOM view needs collection, key, and row callables");
-  }
-  for (const name of ["batch", "cleanup", "effect", "root", "signal", "untrack"]) {
-    if (!hooks || typeof hooks[name] !== "function") {
-      throw new TypeError(`a keyed DOM view needs a ${name} hook`);
-    }
-  }
-  const document = globalThis.document;
-  if (!document || typeof document.createComment !== "function") {
-    throw new TypeError("a keyed DOM view needs a document");
-  }
-
-  let end = document.createComment("");
-  const state = globalThis.__rt.keyed_state(hooks);
-  state.dom = { end, hydrated: false, ownsEnd: true, parent: null };
-  let initial = null;
-  let first = true;
-  const buildRow = (owner, item, index) => factory(
-    hooks.live ? owner.liveItem : item,
-    hooks.liveIndex ? owner.liveIndex : index,
-  );
-  const createRow = (item, index, key) => globalThis.__rt.keyed_dom_owner(
-    owner => buildRow(owner, item, index, key),
-    item,
-    index,
-    key,
-    hooks,
-  );
-  const detached = values => {
-    globalThis.__rt.keyed_reconcile(state, values, keyOf, createRow);
-    const nodes = state.order.flatMap(row => row.nodes);
-    if (initial === null && keyedDomAdopt(state, nodes)) end = state.dom.end;
-    if (initial === null) {
-      initial = [...nodes, end];
-      globalThis.__rt._keyed_dom_values.set(initial, state);
-    }
-    else initial.splice(0, initial.length, ...nodes, end);
-    return initial;
-  };
-  const update = () => {
-    const collectionValue = collection();
-    const values = hooks.items === "shared-slot"
-      ? globalThis.__rt.keyed_references(collectionValue)
-      : collectionValue;
-    return hooks.untrack(() => {
-      if (first) {
-        first = false;
-        return detached(values);
-      }
-      const dom = state.dom;
-      const parent = dom.parent || (dom.end && dom.end.parentNode);
-      if (parent === null) return detached(values);
-      if (dom.parent === null) dom.parent = parent;
-      if (dom.parent !== parent) {
-        throw new Error("a keyed DOM view boundary moved to another parent");
-      }
-      // The insertion carrier is needed only until mounting. Keeping it in
-      // this effect would retain the first rows even after the list is cleared.
-      initial = null;
-      return globalThis.__rt.keyed_dom_reconcile(state, values, keyOf, buildRow);
-    });
-  };
-
-  try {
-    let initialRuns = 0;
-    hooks.effect(() => {
-      initialRuns += 1;
-      return update();
-    });
-    if (initialRuns !== 1 || initial === null) {
-      throw new Error("a keyed DOM effect must run exactly once synchronously when created");
-    }
-    return initial;
-  } catch (error) {
-    try {
-      globalThis.__rt.keyed_dom_dispose(state);
-    } catch (_error) {
-      // Preserve the construction failure after attempting every row cleanup.
-    }
-    throw error;
-  }
-};
-
-// Run one already-materialized keyed transaction. The public wrapper below
-// serializes reentrant requests and keeps only the newest pending request.
-const keyedReconcileOnce = (state, source, keyOf, createRow, commit) => {
-  const plan = [];
-  const keys = new Map();
-  let keyType = state.keyType;
-  for (let index = 0; index < source.length; ++index) {
-    globalThis.__rt.keyed_metric("collectionScans");
-    const item = source[index];
-    const key = keyOf(item, index);
-    const currentType = globalThis.__rt.keyed_key_type(key);
-    if (keyType === null) keyType = currentType;
-    if (currentType !== keyType) {
-      throw new TypeError(`keyed-list key type changed from ${keyType} to ${currentType}`);
-    }
-    if (keys.has(key)) throw new Error(`duplicate keyed-list key: ${String(key)}`);
-    keys.set(key, true);
-    plan.push({ index, item, key, row: state.rows.get(key) });
-  }
-
-  const created = [];
-  try {
-    for (const entry of plan) {
-      if (entry.row !== undefined) continue;
-      globalThis.__rt.keyed_metric("rowFactories");
-      entry.row = createRow(entry.item, entry.index, entry.key);
-      if (!entry.row || typeof entry.row !== "object") {
-        throw new TypeError("a keyed row factory must return a row record");
-      }
-      created.push(entry.row);
-    }
-  } catch (error) {
-    for (let at = created.length - 1; at >= 0; --at) {
-      try {
-        globalThis.__rt.keyed_dispose_row(created[at]);
-      } catch (_error) {
-        // Preserve the factory failure after attempting every temporary cleanup.
-      }
-    }
-    throw error;
-  }
-
-  const ordered = plan.map(entry => entry.row);
-  const previousKeyType = state.keyType;
-  const previousOrder = state.order;
-  const previousRows = state.rows;
-  const nextRows = new Map();
-  let retained = 0;
-  for (const entry of plan) {
-    if (previousRows.has(entry.key)) retained += 1;
-    nextRows.set(entry.key, entry.row);
-  }
-  const removed = [...previousRows.entries()]
-    .filter(([key]) => !nextRows.has(key))
-    .map(([, row]) => row);
-  const rollbacks = [];
-  const journal = rollback => {
-    if (typeof rollback !== "function") {
-      throw new TypeError("a keyed commit rollback must be a function");
-    }
-    rollbacks.push(rollback);
-  };
-  let moves = 0;
-  let published = false;
-  try {
-    const publish = () => {
-      if (published) throw new Error("a keyed batch ran its transaction more than once");
-      published = true;
-      journal(() => {
-        state.keyType = previousKeyType;
-        state.order = previousOrder;
-        state.rows = previousRows;
-      });
-      for (const entry of plan) {
-        const row = entry.row;
-        if (row.item && typeof row.item === "object" && row.item.value !== entry.item) {
-          const before = row.item.value;
-          journal(() => {
-            row.item.value = before;
-          });
-          row.item.value = entry.item;
-        }
-        if (row.index && typeof row.index === "object" && row.index.value !== entry.index) {
-          const before = row.index.value;
-          journal(() => {
-            row.index.value = before;
-          });
-          row.index.value = entry.index;
-        }
-      }
-      moves = commit === undefined
-        ? 0
-        : commit(ordered.map(row => row.value), ordered, journal);
-      if (!Number.isSafeInteger(moves) || moves < 0) {
-        throw new TypeError("a keyed commit must return a non-negative DOM-move count");
-      }
-      state.keyType = keyType;
-      state.order = ordered;
-      state.rows = nextRows;
-    };
-    if (state.batch === undefined) publish();
-    else state.batch(publish);
-    if (!published) throw new Error("a keyed batch did not run its transaction synchronously");
-  } catch (error) {
-    const rollbackErrors = [];
-    for (let at = rollbacks.length - 1; at >= 0; --at) {
-      try {
-        rollbacks[at]();
-      } catch (rollbackError) {
-        rollbackErrors.push(rollbackError);
-      }
-    }
-    for (let at = created.length - 1; at >= 0; --at) {
-      try {
-        globalThis.__rt.keyed_dispose_row(created[at]);
-      } catch (_error) {
-        // Preserve the commit failure after attempting every temporary cleanup.
-      }
-    }
-    if (rollbackErrors.length > 0 && error !== null && typeof error === "object") {
-      try {
-        error.keyedRollbackErrors = rollbackErrors;
-      } catch (_error) {
-        // A frozen or host-owned exception still remains the operation's error.
-      }
-    }
-    throw error;
-  }
-  globalThis.__rt.keyed_metric("domMoves", moves);
-  globalThis.__rt.keyed_metric("createdRows", created.length);
-  globalThis.__rt.keyed_metric("retainedRows", retained);
-  globalThis.__rt.keyed_metric("removedRows", removed.length);
-  globalThis.__rt.keyed_metric("liveRowRecords", created.length);
-  globalThis.__rt._keyed_metrics.liveRowRecords -= removed.length;
-
-  const cleanupErrors = [];
-  for (const row of removed) {
-    try {
-      globalThis.__rt.keyed_dispose_row(row);
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-  }
-  if (cleanupErrors.length > 0) {
-    const error = new Error("keyed row cleanup failed");
-    error.keyedCommitted = true;
-    error.errors = cleanupErrors;
-    throw error;
-  }
-  return ordered.map(row => row.value);
-};
-
-// keyed_reconcile(state, values, keyOf, createRow, commit) -> row values.
-//
-// Phase A evaluates every key, validates one typed key lane, and rejects all
-// duplicates. Phase B creates new rows under temporary owners. Only then may
-// `commit` publish DOM order. A commit registers each inverse operation through
-// its third `journal` argument before mutating the DOM. A reentrant call queues
-// the newest request; cleanup failures report a committed state after every
-// removed row has been attempted. Owner disposal takes precedence over pending
-// reconciliations and runs after the current transaction finishes or rolls back.
-globalThis.__rt.keyed_reconcile = (state, values, keyOf, createRow, commit) => {
-  if (state.disposed || state.disposePending) throw new Error("cannot reconcile a disposed keyed list");
-  if (typeof keyOf !== "function" || typeof createRow !== "function") {
-    throw new TypeError("keyed reconciliation requires key and row factories");
-  }
-  if (commit !== undefined && typeof commit !== "function") {
-    throw new TypeError("a keyed commit must be a function");
-  }
-  const outer = !state.running;
-  const previousPending = state.pending;
-  const request = { commit, createRow, keyOf, source: null };
-  state.running = true;
-  state.pending = request;
-  let failure = null;
-  let result = [];
-  try {
-    // Reserve this request before iterating. A source may queue a newer request,
-    // whose snapshot must not be overwritten when the older iterator returns.
-    request.source = globalThis.__rt.keyed_values(values);
-    if (state.disposed || state.disposePending) throw new Error("cannot reconcile a disposed keyed list");
-    if (!outer) return state.order.map(row => row.value);
-    if (state.pending === request) state.pending = null;
-    let current = request;
-    while (current !== null && !state.disposePending) {
-      try {
-        result = keyedReconcileOnce(
-          state,
-          current.source,
-          current.keyOf,
-          current.createRow,
-          current.commit,
-        );
-      } catch (error) {
-        if (failure === null) failure = { error };
-        if (error === null || typeof error !== "object" || error.keyedCommitted !== true) {
-          state.pending = null;
-          break;
-        }
-      }
-      current = state.pending;
-      state.pending = null;
-    }
-  } catch (error) {
-    if (!outer) {
-      if (state.pending === request) state.pending = previousPending;
-      throw error;
-    }
-    failure = { error };
-    state.pending = null;
-  } finally {
-    if (outer) {
-      state.running = false;
-      if (state.disposePending) {
-        state.disposePending = false;
-        try {
-          if (state.dom) globalThis.__rt.keyed_dom_dispose(state);
-          else globalThis.__rt.keyed_dispose(state);
-        } catch (error) {
-          if (failure === null) failure = { error };
-        }
-        result = [];
-      }
-    }
-  }
-  if (failure !== null) throw failure.error;
-  return result;
-};
-
-globalThis.__rt.keyed_dispose = (state) => {
-  if (state.disposed) return;
-  if (state.running) {
-    state.disposePending = true;
-    state.pending = null;
-    return;
-  }
-  state.disposed = true;
-  const rows = [...state.rows.values()];
-  state.rows.clear();
-  state.order = [];
-  state.pending = null;
-  globalThis.__rt._keyed_states.delete(state);
-  globalThis.__rt._keyed_metrics.transactionStates -= 1;
-  globalThis.__rt._keyed_metrics.liveRowRecords -= rows.length;
-  globalThis.__rt.keyed_metric("removedRows", rows.length);
-  let firstError = null;
-  for (const row of rows) {
-    try {
-      globalThis.__rt.keyed_dispose_row(row);
-    } catch (error) {
-      if (firstError === null) firstError = { error };
-    }
-  }
-  if (firstError !== null) throw firstError.error;
-};
-
-// ---------------------------------------------------------------------------
-// Legacy keyed rows
-// ---------------------------------------------------------------------------
-//
-// The row cache behind `view_abi::push_keyed`. A view's `for` is an eager Rust
-// loop, so every row is built on every render; what a key buys is that a row
-// whose key was seen before contributes the NODE it contributed last time. So
-// reordering a list moves the existing nodes instead of replacing them, and
-// whatever DOM state they carry (focus, scroll, a playing video) survives.
-//
-// One cache per loop, identified by the `site` the emitter numbers the
-// `push_keyed` call with, so two loops never share rows. The cache is keyed by
-// the key's text, which is what `view_abi::push_keyed` documents.
-//
-// The freshly built row of a cached key is DISCARDED, which is the cost of
-// keying an eager loop and is documented as a delta against the runtime's own
-// `_$mapArray`. The cache is not pruned: a key that stops appearing keeps its
-// node alive until the program ends. Both are why this is called pragmatic.
-globalThis.__rt._keyed = new Map();
-
-// keyed_row(site, key, node) -> node: the row this key contributed last time,
-// or `node`, which becomes that row.
-globalThis.__rt.keyed_row = (site, key, node) => {
-  let rows = globalThis.__rt._keyed.get(site);
-  if (rows === undefined) {
-    rows = new Map();
-    globalThis.__rt._keyed.set(site, rows);
-  }
-  const seen = rows.get(key);
-  if (seen !== undefined) return seen;
-  rows.set(key, node);
-  return node;
 };
 
 // ---------------------------------------------------------------------------
@@ -7290,63 +5817,6 @@ globalThis.__rt.host_task = (f) => {
   };
   channel.port2.postMessage(undefined);
 };
-
-// convert_host_sb(s): a host string entering the mutable native String carrier
-// `{ text, cap, len }` (Phase 4 Convert adapter). The text is taken as Rust
-// holds it (native_str_wf), and an immutable host string's capacity is its
-// UTF-8 byte length, measured once: the builder's length and its exact-fit
-// capacity both.
-globalThis.__rt.convert_host_sb = (s) => {
-  const text = globalThis.__rt.native_str_wf(s);
-  const len = globalThis.__rt.str_len(text);
-  return { text: text, cap: len, len: len };
-};
-
-// convert_str_block(s): the UTF-8 bytes of a host string as a fresh `{ buf, off,
-// len }` block the caller owns (Phase 4 Convert adapter, host string back to the
-// baseline `Vec<u8>` String). `str_bytes` may return a memoized record whose
-// buffer other `as_bytes` calls alias, and an owned baseline String must not
-// share its allocation, so the bytes are copied into a new plain array.
-globalThis.__rt.convert_str_block = (s) => {
-  const shared = globalThis.__rt.str_bytes(s);
-  const copy = shared.buf.slice(shared.off, shared.off + shared.len);
-  // The baseline String's byte block is a heap block: reads reach it through
-  // `unscale`, which answers from the block registry, so the fresh copy is
-  // registered exactly as `alloc` would have (already element-typed at 1 byte).
-  const p = globalThis.__rt._register(copy, copy.length, false);
-  globalThis.__rt._blk_get(copy).fresh = false;
-  // A host string is immutable and exact-fit: its capacity is its byte length.
-  return { buf: p.buf, off: 0, len: shared.len, cap: shared.len };
-};
-
-// convert_sb_block(sb): a mutable native `{ text, cap, len }` String's bytes as
-// a fresh registered `{ buf, off, len, cap }` block (Phase 4 Convert adapter,
-// builder back to the baseline `Vec<u8>` String). The backing array is capacity
-// length with `[0, len)` initialized, and the builder's Rust-visible capacity
-// rides along for the baseline cap leaf — a moved String keeps its capacity.
-// The bytes have to be encoded here anyway, so the block's length is theirs.
-globalThis.__rt.convert_sb_block = (sb) => {
-  const shared = globalThis.__rt.str_bytes(sb.text);
-  const cap = Math.max(sb.cap, shared.len);
-  const copy = shared.buf.slice(shared.off, shared.off + shared.len);
-  copy.length = cap;
-  const p = globalThis.__rt._register(copy, cap, false);
-  globalThis.__rt._blk_get(copy).fresh = false;
-  return { buf: p.buf, off: 0, len: shared.len, cap };
-};
-
-// convert_nv_block(nv, size): a native `{ buf, len, cap }` Vec's elements as a
-// registered baseline heap block of `size`-byte elements (Phase 4 Convert
-// adapter, native Vec back to the baseline raw parts). The block keeps the
-// carrier's capacity and is already element-typed, exactly as an `alloc` +
-// first-cast retype would have left it. TypedArray copies pre-box the target
-// Array (`c[0] = null`) so V8 stays in `HOLEY_ELEMENTS` and preserves f32/f64
-// NaN bit payloads (MIRES-023).
-globalThis.__rt.convert_nv_block = (nv, s, k, t) => { const b = nv.buf, l = nv.len, n = nv.cap > l ? nv.cap : l; let c; if (ArrayBuffer.isView(b)) { c = new Array(n); if (l) { c[0] = null; for (let i = 0; i < l; i++) c[i] = b[i]; } } else { c = b.slice(0, l); c.length = n; } const p = __rt._register(c, c.length * s, false), m = __rt._blk_get(c); m.es = s; if (typeof k === "string") m.sk = k; if (typeof k === "function" || k === true) { m.cl = k; if (__rt._boxes !== null) for (let i = 0; i < l; i++) { const v = c[i]; if (v !== null && typeof v === "object") __rt._boxes.set(v, {buf:c,off:i}); } } m.fresh = false; if (s > 1 && __rt._bv !== null) { const r = []; m.raw = r; m.typed = c; __rt._blocks.set(r, m); if (!t) return {buf:r,off:0}; } return p; };
-globalThis.__rt.convert_nv_typed = (nv, k, tracked) => { const b = nv.buf, l = nv.len, n = nv.cap > l ? nv.cap : l; let c; if (k !== void 0) { c = new __rt._tv_ctors[k](n); if (l) { if (ArrayBuffer.isView(b) && b.constructor === c.constructor) c.set(l < b.length ? b.subarray(0, l) : b); else for (let i = 0; i < l; i++) c[i] = b[i]; } } else { c = b.slice(0, l); c.length = n; if (tracked && __rt._boxes !== null) { for (let i = 0; i < l; i++) { const v = c[i]; if (v !== null && typeof v === "object") __rt._boxes.set(v, {buf:c,off:i}); } } } return {buf:c,off:0}; };
-globalThis.__rt.convert_block_nv = (buf, off, len, cap, k) => { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } const c = k !== void 0 ? new __rt._tv_ctors[k](cap) : new Array(cap); if (k !== void 0 && ArrayBuffer.isView(buf) && buf.constructor === c.constructor) { if (len) c.set(buf.subarray(off, off + len)); } else { for (let i = 0; i < len; i++) c[i] = buf[off + i]; } return {buf:c,len,cap}; };
-globalThis.__rt.convert_block_sv = (p, len) => { if (typeof p === "number" && p > 0 && p < 4096) p = __rt._dangling(p); let buf = p.buf, off = p.off; if (p.sc !== void 0) off /= p.sc; else { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } } return {buf,off,len}; };
-globalThis.__rt.convert_sv_nv = (s, k) => __rt.nv_from_slice(s, k);
 
 // The `%TypedArray%.prototype` accessors, captured when the runtime loads. They
 // read a typed array's internal slots, so an own `length` or `subarray`
@@ -7652,7 +6122,6 @@ globalThis.__rt.nstr_repeat = (s, n) => {
 // Phase 5 fast core::str byte-string comparison & search helpers (js-str=bytes).
 // Every code unit is an unsigned UTF-8 byte (0..=255), so native JS lexicographic
 // comparison and String.prototype.{indexOf,lastIndexOf} are exact and zero-allocation.
-globalThis.__rt.bstr_cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 globalThis.__rt.bstr_find_char = (s, start, end, ch) => {
   const p = ch < 128 ? String.fromCharCode(ch) : globalThis.__rt.bstr_char(ch);
@@ -7713,22 +6182,10 @@ globalThis.__rt._nv_ea = (align) => {
   }
   return buf;
 };
-globalThis.__rt.nv_with_cap_ta = (cap, k, maxElems) => {
-  if (cap === 0) return { buf: globalThis.__rt._nv_et(k), len: 0 };
-  if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  const Ctor = globalThis.__rt._nv_ctors[k];
-  return { buf: new Ctor(cap), len: 0 };
-};
 globalThis.__rt.nv_with_cap_arr = (cap, align, maxElems) => {
   if (cap === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
   if (cap > maxElems) globalThis.__rt.js_abort("capacity overflow");
   return { buf: new Array(cap), len: 0 };
-};
-globalThis.__rt.nv_zeroed_ta = (n, k, maxElems) => {
-  if (n === 0) return { buf: globalThis.__rt._nv_et(k), len: 0 };
-  if (n > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  const Ctor = globalThis.__rt._nv_ctors[k];
-  return { buf: new Ctor(n), len: n };
 };
 globalThis.__rt.nv_zeroed_arr = (n, align, maxElems, val) => {
   if (n === 0) return { buf: globalThis.__rt._nv_ea(align), len: 0 };
@@ -7827,92 +6284,43 @@ globalThis.__rt.nv_from_raw_arr = (ptr, len, cap, align) => {
   }
   return { buf: nb, len: len };
 };
-globalThis.__rt.nv_grow_one_ta = (v, minCap, k, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
-  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
+globalThis.__rt._nv_next_cap = (old, req, minCap, exact, maxElems) => {
+  if (exact) return req;
   let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const Ctor = globalThis.__rt._nv_ctors[k];
-  const nb = new Ctor(next);
-  if (old > 0) nb.set(v.buf);
-  v.buf = nb;
+  if (req > next) next = req;
+  if (minCap > next) next = minCap;
+  return next > maxElems ? maxElems : next;
 };
 globalThis.__rt.nv_grow_one_arr = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
+  const next = globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems);
   if (old === 0) v.buf = new Array(next);
   else v.buf.length = next;
 };
-globalThis.__rt.nv_reserve_ta = (v, used, add, minCap, exact, k, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
-  if (req <= old) return;
-  if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const Ctor = globalThis.__rt._nv_ctors[k];
-  const nb = new Ctor(next);
-  if (old > 0) nb.set(v.buf);
-  v.buf = nb;
-};
 globalThis.__rt.nv_reserve_arr = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
+  const next = globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems);
   if (old === 0) v.buf = new Array(next);
   else v.buf.length = next;
 };
 globalThis.__rt.nv_try_reserve_ta = (v, used, add, minCap, exact, k, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return true;
   if (req > maxElems) return false;
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
   const Ctor = globalThis.__rt._nv_ctors[k];
-  const nb = new Ctor(next);
+  const nb = new Ctor(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
   return true;
 };
 globalThis.__rt.nv_try_reserve_arr = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return true;
   if (req > maxElems) return false;
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
+  const next = globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems);
   if (old === 0) v.buf = new Array(next);
   else v.buf.length = next;
   return true;
@@ -8021,227 +6429,123 @@ globalThis.__rt.nv_zeroed_f64 = (n, maxElems) => {
 };
 
 globalThis.__rt.nv_grow_u8 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Uint8Array(next);
+  const nb = new Uint8Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_i8 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Int8Array(next);
+  const nb = new Int8Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_u16 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Uint16Array(next);
+  const nb = new Uint16Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_i16 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Int16Array(next);
+  const nb = new Int16Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_u32 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Uint32Array(next);
+  const nb = new Uint32Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_i32 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Int32Array(next);
+  const nb = new Int32Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_f32 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Float32Array(next);
+  const nb = new Float32Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_grow_f64 = (v, minCap, maxElems) => {
-  const old = v.buf.length;
-  const req = old + 1;
+  const old = v.buf.length, req = old + 1;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = old * 2;
-  if (next < req) next = req;
-  if (next < minCap) next = minCap;
-  if (next > maxElems) next = maxElems;
-  const nb = new Float64Array(next);
+  const nb = new Float64Array(globalThis.__rt._nv_next_cap(old, req, minCap, false, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 
 globalThis.__rt.nv_reserve_u8 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Uint8Array(next);
+  const nb = new Uint8Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_i8 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Int8Array(next);
+  const nb = new Int8Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_u16 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Uint16Array(next);
+  const nb = new Uint16Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_i16 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Int16Array(next);
+  const nb = new Int16Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_u32 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Uint32Array(next);
+  const nb = new Uint32Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_i32 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Int32Array(next);
+  const nb = new Int32Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_f32 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Float32Array(next);
+  const nb = new Float32Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
 globalThis.__rt.nv_reserve_f64 = (v, used, add, minCap, exact, maxElems) => {
-  const old = v.buf.length;
-  const req = used + add;
+  const old = v.buf.length, req = used + add;
   if (req <= old) return;
   if (req > maxElems) globalThis.__rt.js_abort("capacity overflow");
-  let next = req;
-  if (!exact) {
-    const doubled = old * 2;
-    if (doubled > next) next = doubled;
-    if (minCap > next) next = minCap;
-    if (next > maxElems) next = maxElems;
-  }
-  const nb = new Float64Array(next);
+  const nb = new Float64Array(globalThis.__rt._nv_next_cap(old, req, minCap, exact, maxElems));
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };

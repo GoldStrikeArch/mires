@@ -74,7 +74,7 @@ pub fn run_with(
     let mut changed = if options.no_deletions {
         false
     } else {
-        split_unsigned_checked_adds(func, table, witnesses)
+        split_unsigned_checked_adds(func, table)
     };
     for _ in 0..ROUNDS {
         let mut round = false;
@@ -127,17 +127,12 @@ pub fn run_with(
 ///
 /// Refusing the rewrite on any other use keeps aggregate identity and storage semantics out of
 /// this small lowering normalization.
-fn split_unsigned_checked_adds(
-    func: &mut Func,
-    table: &TypeTable,
-    witnesses: &mut Vec<Witness>,
-) -> bool {
+fn split_unsigned_checked_adds(func: &mut Func, table: &TypeTable) -> bool {
     #[derive(Clone, Copy)]
     struct Candidate {
         lhs: ValueId,
         ty: TypeId,
         origin: crate::jir::origin::OriginId,
-        bits: u32,
         bool_ty: Option<TypeId>,
         projected: bool,
         valid: bool,
@@ -158,7 +153,7 @@ fn split_unsigned_checked_adds(
             else {
                 continue;
             };
-            let Some((false, bits)) = table.int_info(*ty) else {
+            let Some((false, _bits)) = table.int_info(*ty) else {
                 continue;
             };
             candidates.insert(
@@ -167,7 +162,6 @@ fn split_unsigned_checked_adds(
                     lhs: *l,
                     ty: *ty,
                     origin: op.origin,
-                    bits,
                     bool_ty: None,
                     projected: false,
                     valid: true,
@@ -236,9 +230,6 @@ fn split_unsigned_checked_adds(
             });
             overflow_values.insert(*pair, overflow);
         }
-        witnesses.push(Witness::UnsignedAddOverflowSplit {
-            bits: candidate.bits,
-        });
     }
 
     for block in &mut func.blocks {
@@ -542,19 +533,6 @@ fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
         return false;
     }
 
-    let dominates = |a: RBlockId, b: RBlockId| -> bool {
-        let mut at = b;
-        loop {
-            if at == a {
-                return true;
-            }
-            match doms.idom.get(at.0 as usize).copied().flatten() {
-                Some(up) if up != at => at = up,
-                _ => return false,
-            }
-        }
-    };
-
     #[derive(Clone, Copy)]
     struct Candidate {
         ty: TypeId,
@@ -588,11 +566,11 @@ fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
             let r_root = strip_aliases(*r);
             let proven = (is_signed_one(*r, *ty)
                 && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
-                    fact_ty == *ty && fact_x == l_root && dominates(fact_b, b_id)
+                    fact_ty == *ty && fact_x == l_root && doms.dominates(fact_b, b_id)
                 }))
                 || (is_signed_one(*l, *ty)
                     && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
-                        fact_ty == *ty && fact_x == r_root && dominates(fact_b, b_id)
+                        fact_ty == *ty && fact_x == r_root && doms.dominates(fact_b, b_id)
                     }));
             if proven {
                 candidates.insert(
@@ -3571,9 +3549,6 @@ mod tests {
             &mut witnesses
         ));
         func.verify(&types).expect("split checked add verifies");
-        assert!(witnesses
-            .iter()
-            .any(|witness| matches!(witness, Witness::UnsignedAddOverflowSplit { bits: 32 })));
         assert!(!func.blocks[0].ops.iter().any(|op| matches!(
             op.kind,
             OpKind::Binary {
@@ -4362,7 +4337,7 @@ mod tests {
             function: None,
             args: Vec::new(),
             track_caller: None,
-            semantic: CallSemantic::ViewAbi,
+            semantic: CallSemantic::Host,
             host: None,
         };
         let mut b = builder();

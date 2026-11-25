@@ -24,9 +24,9 @@ use super::origin::{SourceFact, SourceFactId};
 use super::semantic::{
     AbiSignature, AggregateKind, AssertMessage, BasicBlock, BlockId, Body, BodyKind, BodySemantic,
     Call, CallSemantic, Callee, CastKind, ConstTree, Constant, DirectItemRef, DropGlue,
-    GlobalReference, HostPayload, ItemId, KeyedListCallable, KeyedListPayload, Local, LocalId,
-    LocalRole, Operand, OperandKind, Place, Projection, Rvalue, Signature, SpreadArgument,
-    Statement, StatementKind, StaticStep, Terminator, TypeId, Unwind, VtableEntry,
+    GlobalReference, HostPayload, ItemId, Local, LocalId, LocalRole, Operand, OperandKind, Place,
+    Projection, Rvalue, Signature, SpreadArgument, Statement, StatementKind, StaticStep,
+    Terminator, TypeId, Unwind, VtableEntry,
 };
 use super::types::{TypeKind, TypeTable};
 use super::JIR_SCHEMA;
@@ -460,7 +460,7 @@ impl PhysicalScan<'_> {
         if call.host.is_some()
             || matches!(
                 call.semantic,
-                CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
+                CallSemantic::Host | CallSemantic::RawJavaScript
             )
         {
             self.boundary.host = true;
@@ -724,9 +724,7 @@ impl ItemClass {
                     let host = call.host.is_some()
                         || matches!(
                             call.semantic,
-                            CallSemantic::Host
-                                | CallSemantic::ViewAbi
-                                | CallSemantic::RawJavaScript
+                            CallSemantic::Host | CallSemantic::RawJavaScript
                         )
                         || matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. });
                     if host {
@@ -1579,15 +1577,6 @@ impl<'a> Normalizer<'a> {
             .collect()
     }
 
-    fn keyed_callable(&mut self, callable: &KeyedListCallable) -> KeyedListCallable {
-        KeyedListCallable {
-            ty: callable.ty,
-            body: callable.body.map(|body| self.direct_item(body)),
-            cleanup: self.drop_glue(callable.cleanup),
-            source: callable.source.map(|source| self.source_fact(source)),
-        }
-    }
-
     fn host(&mut self, host: &HostPayload) -> HostPayload {
         match host {
             HostPayload::Extern(id) => HostPayload::Extern(self.blob(*id)),
@@ -1595,38 +1584,15 @@ impl<'a> Normalizer<'a> {
             HostPayload::Marker {
                 section,
                 def,
-                template,
                 helpers,
             } => HostPayload::Marker {
                 section: self.string(*section),
-                def: *def,
-                template: template.as_ref().map(|tree| self.const_tree(tree)),
-                helpers: self.helpers(helpers),
-            },
-            HostPayload::ViewAbi {
-                marker,
-                def,
-                helpers,
-            } => HostPayload::ViewAbi {
-                marker: self.string(*marker),
                 def: *def,
                 helpers: self.helpers(helpers),
             },
             HostPayload::Map { marker } => HostPayload::Map {
                 marker: self.string(*marker),
             },
-            HostPayload::KeyedList(payload) => HostPayload::KeyedList(Box::new(KeyedListPayload {
-                format: payload.format,
-                site: payload.site.map(|source| self.source_fact(source)),
-                def: payload.def,
-                collection_ty: payload.collection_ty,
-                item_ty: payload.item_ty,
-                key_ty: payload.key_ty,
-                row_ty: payload.row_ty,
-                collection: self.keyed_callable(&payload.collection),
-                key: self.keyed_callable(&payload.key),
-                row: self.keyed_callable(&payload.row),
-            })),
         }
     }
 }
@@ -2448,7 +2414,7 @@ mod identity_tests {
                     body: Some((body, &origins(body))),
                 },
             );
-            writer.finish(&[], &[], &std::collections::BTreeMap::new())
+            writer.finish(&[], &std::collections::BTreeMap::new())
         };
 
         let left = write(&plain(), "left");

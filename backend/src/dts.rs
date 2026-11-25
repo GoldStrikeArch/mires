@@ -106,7 +106,7 @@ fn ts_type<'tcx>(
         ty::Str => "string".to_owned(),
         ty::Never => "never".to_owned(),
         ty::Ref(_, pointee, mutbl) => {
-            match crate::ptr::is_slot(tcx, ty)
+            match crate::value::is_slot(tcx, ty)
                 || (mutbl.is_mut() && matches!(pointee.kind(), ty::Str))
             {
                 // A reference the model keeps in a slot record (or a mutable `str` byte slice) is
@@ -146,14 +146,8 @@ fn ts_type<'tcx>(
 /// Matched by def path rather than by shape: a `repr(transparent)` wrapper around a `u32` is a
 /// number to the value model, and these four are the cases where that is true of the Rust type and
 /// false of the value the runtime actually keeps there.
-fn opaque_handle(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> Option<&'static str> {
-    const HANDLES: [&str; 5] = ["Sig", "Node", "JsValue", "Owner", "Event"];
-
-    if tcx.crate_name(def_id.krate).as_str() != "view_abi" {
-        return None;
-    }
-    let last = tcx.item_name(def_id);
-    HANDLES.into_iter().find(|name| *name == last.as_str())
+fn opaque_handle(_tcx: TyCtxt<'_>, _def_id: rustc_hir::def_id::DefId) -> Option<&'static str> {
+    None
 }
 
 /// A struct, as an object type keyed by field name.

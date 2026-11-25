@@ -12,12 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{item_map, ItemKind, JsItem, JsName, LinkItem, Linkage};
 use crate::jir::decline::Decline;
-use crate::jir::semantic::{CallSemantic, Callee, HostPayload, Terminator};
+use crate::jir::semantic::{CallSemantic, Callee, Terminator};
 use crate::jir::types::{
     FieldKey, NominalAbi, NominalForm, PinnedBoundary, TypeId, TypeKind, TypeTable,
 };
 use crate::jir::{DefinitionId, Interns, ItemId};
-use crate::jsast::{self, ArrowBody, BinOp, Expr, Stmt, SwitchCase, UnOp};
+use crate::jsast::{
+    self, walk_expr, walk_stmt, ArrowBody, BinOp, Expr, Stmt, UnOp, Visit, VisitMut,
+};
 use crate::lower::LoweredItem;
 use crate::opt::OptStats;
 use crate::opts::{EcmaTarget, OptimizerMode, Opts};
@@ -236,6 +238,7 @@ struct HoistCollector {
     bstr_strings: bool,
     speed_profile: bool,
     allow_u8_lut: bool,
+    in_loop: bool,
     counts: BTreeMap<String, (Expr, ConstUsage)>,
     unreachable_throws: usize,
 }
@@ -245,232 +248,119 @@ fn is_hoistable_bstr(s: &str) -> bool {
 }
 
 impl HoistCollector {
-    fn record(&mut self, key: String, expr: &Expr, in_loop: bool) {
+    fn record(&mut self, key: String, expr: &Expr) {
         let entry = self
             .counts
             .entry(key)
             .or_insert_with(|| (expr.clone(), ConstUsage::default()));
         entry.1.count += 1;
-        entry.1.in_loop |= in_loop;
+        entry.1.in_loop |= self.in_loop;
     }
 
-    fn visit_stmt(&mut self, stmt: &Stmt, in_loop: bool) {
-        match stmt {
-            Stmt::ExprStmt(e) => self.visit_expr(e, in_loop, false),
-            Stmt::Let(_, init) => {
-                if let Some(e) = init {
-                    self.visit_expr(e, in_loop, false);
-                }
-            }
-            Stmt::Lets(decls) => {
-                for (_, init) in decls {
-                    if let Some(e) = init {
-                        self.visit_expr(e, in_loop, false);
-                    }
-                }
-            }
-            Stmt::Const(_, e) => self.visit_expr(e, in_loop, false),
-            Stmt::Return(Some(e)) => self.visit_expr(e, in_loop, false),
-            Stmt::Return(None) => {}
-            Stmt::Throw(e) => {
-                if is_unreachable_abort_expr(e) {
-                    self.unreachable_throws += 1;
-                } else {
-                    self.visit_expr(e, in_loop, false);
-                }
-            }
-            Stmt::If(test, then_b, else_b) => {
-                self.visit_expr(test, in_loop, false);
-                for s in then_b {
-                    self.visit_stmt(s, in_loop);
-                }
-                if let Some(else_b) = else_b {
-                    for s in else_b {
-                        self.visit_stmt(s, in_loop);
-                    }
-                }
-            }
-            Stmt::Switch(disc, cases) => {
-                self.visit_expr(disc, in_loop, false);
-                for c in cases {
-                    for t in &c.tests {
-                        self.visit_expr(t, in_loop, false);
-                    }
-                    for s in &c.body {
-                        self.visit_stmt(s, in_loop);
-                    }
-                }
-            }
-            Stmt::Labeled(_, inner) => self.visit_stmt(inner, in_loop),
-            Stmt::LoopForever(_, body) => {
-                for s in body {
-                    self.visit_stmt(s, true);
-                }
-            }
-            Stmt::While(test, body) => {
-                self.visit_expr(test, true, false);
-                for s in body {
-                    self.visit_stmt(s, true);
-                }
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                for s in body {
-                    self.visit_stmt(s, in_loop);
-                }
-                for s in handler {
-                    self.visit_stmt(s, in_loop);
-                }
-            }
-            Stmt::FunctionDecl { body, .. } | Stmt::Block(body) => {
-                for s in body {
-                    self.visit_stmt(s, in_loop);
-                }
-            }
-            Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &Expr, in_loop: bool, is_assign_target: bool) {
+    fn scan_expr(&mut self, expr: &Expr, is_assign_target: bool) {
         if !is_assign_target {
             if is_location_object(expr) {
-                let key = format!("loc:{expr}");
-                self.record(key, expr, in_loop);
+                self.record(format!("loc:{expr}"), expr);
                 return;
             }
             if let Expr::Index(obj, idx) = expr {
                 if self.allow_u8_lut && is_u8_lut_lit(obj) {
-                    let key = format!("u8lut:{obj}");
-                    self.record(key, obj, in_loop);
-                    self.visit_expr(idx, in_loop, false);
+                    self.record(format!("u8lut:{obj}"), obj);
+                    self.scan_expr(idx, false);
                     return;
                 }
                 let min_inline_arr = if self.speed_profile { 2 } else { 4 };
                 if is_scalar_array_lit(obj, min_inline_arr, self.allow_bigint) {
-                    let key = format!("arr:{obj}");
-                    self.record(key, obj, in_loop);
-                    self.visit_expr(idx, in_loop, false);
+                    self.record(format!("arr:{obj}"), obj);
+                    self.scan_expr(idx, false);
                     return;
                 }
             }
             if let Expr::Arrow(params, ArrowBody::Expr(inner)) = expr {
                 if params.is_empty() && is_pure_factory_expr(inner, self.allow_bigint) {
-                    let key = format!("fn:{expr}");
-                    self.record(key, expr, in_loop);
+                    self.record(format!("fn:{expr}"), expr);
                     return;
                 }
             }
             if self.bstr_strings {
                 if let Expr::Str(s) = expr {
                     if is_hoistable_bstr(s) {
-                        self.record(format!("str:{s}"), expr, in_loop);
+                        self.record(format!("str:{s}"), expr);
                         return;
                     }
                 }
             }
         }
-        match expr {
-            Expr::Member(obj, _) => self.visit_expr(obj, in_loop, false),
-            Expr::Index(obj, idx) => {
-                self.visit_expr(obj, in_loop, false);
-                self.visit_expr(idx, in_loop, false);
-            }
-            Expr::Call(callee, args) | Expr::New(callee, args) => {
-                self.visit_expr(callee, in_loop, false);
-                for a in args {
-                    self.visit_expr(a, in_loop, false);
-                }
-            }
-            Expr::Unary(_, inner) => self.visit_expr(inner, in_loop, false),
-            Expr::Binary(_, l, r) => {
-                self.visit_expr(l, in_loop, false);
-                self.visit_expr(r, in_loop, false);
-            }
-            Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.visit_expr(l, in_loop, true);
-                self.visit_expr(r, in_loop, false);
-            }
-            Expr::Cond(t, c, a) => {
-                self.visit_expr(t, in_loop, false);
-                self.visit_expr(c, in_loop, false);
-                self.visit_expr(a, in_loop, false);
-            }
-            Expr::Object(entries) => {
-                for (_, v) in entries {
-                    self.visit_expr(v, in_loop, false);
-                }
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for item in items {
-                    self.visit_expr(item, in_loop, false);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.visit_expr(b, in_loop, false),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => {
-                for s in stmts {
-                    self.visit_stmt(s, in_loop);
-                }
-            }
-            _ => {}
+        if let Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) = expr {
+            self.scan_expr(l, true);
+            self.scan_expr(r, false);
+            return;
         }
+        walk_expr(self, expr);
+    }
+}
+
+impl Visit for HoistCollector {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Throw(e) => {
+                if is_unreachable_abort_expr(e) {
+                    self.unreachable_throws += 1;
+                } else {
+                    self.scan_expr(e, false);
+                }
+            }
+            Stmt::LoopForever(_, body) => {
+                let prev = self.in_loop;
+                self.in_loop = true;
+                self.visit_stmts(body);
+                self.in_loop = prev;
+            }
+            Stmt::While(test, body) => {
+                let prev = self.in_loop;
+                self.in_loop = true;
+                self.scan_expr(test, false);
+                self.visit_stmts(body);
+                self.in_loop = prev;
+            }
+            _ => walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        self.scan_expr(expr, false);
     }
 }
 
 /// Collects `let` bindings declared in `stmts` (recursing through nested control-flow statements
 /// such as loops and conditionals, without entering nested functions or arrows).
 fn collect_declared_locals(stmts: &[Stmt], params: &BTreeSet<String>, out: &mut Vec<String>) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::Let(n, _) => {
-                if !params.contains(n) {
-                    out.push(n.clone());
-                }
-            }
-            Stmt::Lets(decls) => {
-                for (n, _) in decls {
-                    if !params.contains(n) {
-                        out.push(n.clone());
+    struct V<'a> {
+        params: &'a BTreeSet<String>,
+        out: &'a mut Vec<String>,
+    }
+    impl Visit for V<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            match stmt {
+                Stmt::Let(n, _) => {
+                    if !self.params.contains(n) {
+                        self.out.push(n.clone());
                     }
                 }
-            }
-            Stmt::If(_, a, b) => {
-                collect_declared_locals(a, params, out);
-                if let Some(b) = b {
-                    collect_declared_locals(b, params, out);
+                Stmt::Lets(decls) => {
+                    for (n, _) in decls {
+                        if !self.params.contains(n) {
+                            self.out.push(n.clone());
+                        }
+                    }
                 }
+                Stmt::FunctionDecl { .. } => {}
+                _ => walk_stmt(self, stmt),
             }
-            Stmt::Switch(_, cases) => {
-                for SwitchCase { body, .. } in cases {
-                    collect_declared_locals(body, params, out);
-                }
-            }
-            Stmt::Labeled(_, inner) => {
-                collect_declared_locals(std::slice::from_ref(inner.as_ref()), params, out);
-            }
-            Stmt::LoopForever(_, b) | Stmt::While(_, b) | Stmt::Block(b) => {
-                collect_declared_locals(b, params, out);
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                collect_declared_locals(body, params, out);
-                collect_declared_locals(handler, params, out);
-            }
-            Stmt::ExprStmt(_)
-            | Stmt::Const(_, _)
-            | Stmt::Return(_)
-            | Stmt::Throw(_)
-            | Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::FunctionDecl { .. }
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
         }
+        fn visit_expr(&mut self, _: &Expr) {}
     }
+    V { params, out }.visit_stmts(stmts);
 }
 
 /// Checks whether `local` across the entire `body` (at any nesting depth, including inside loops)
@@ -495,141 +385,67 @@ fn find_read_only_nested_array_init(
     local: &str,
     allow_bigint: bool,
 ) -> Option<Expr> {
-    fn collect_elem_aliases(
-        stmts: &[Stmt],
-        local: &str,
-        aliases: &mut BTreeSet<String>,
-        multi_or_bad: &mut BTreeSet<String>,
-    ) {
-        fn scan_e(
-            e: &Expr,
-            local: &str,
-            aliases: &mut BTreeSet<String>,
-            multi_or_bad: &mut BTreeSet<String>,
-        ) {
-            match e {
-                Expr::Assign(lhs, rhs) => {
-                    if let Expr::Ident(name) = lhs.as_ref() {
-                        if let Expr::Index(obj, _) = rhs.as_ref() {
-                            if matches!(obj.as_ref(), Expr::Ident(o) if o == local) {
-                                if !aliases.insert(name.clone()) {
-                                    // Re-assigned in a loop (`E = am[an + l]`): still a valid
-                                    // element alias if every assignment is `local[...]`.
-                                }
-                                scan_e(rhs, local, aliases, multi_or_bad);
-                                return;
-                            }
-                        }
-                        multi_or_bad.insert(name.clone());
-                    }
-                    scan_e(lhs, local, aliases, multi_or_bad);
-                    scan_e(rhs, local, aliases, multi_or_bad);
-                }
-                Expr::CompoundAssign(_, l, r) | Expr::Binary(_, l, r) | Expr::Index(l, r) => {
-                    scan_e(l, local, aliases, multi_or_bad);
-                    scan_e(r, local, aliases, multi_or_bad);
-                }
-                Expr::Member(o, _) | Expr::Unary(_, o) => scan_e(o, local, aliases, multi_or_bad),
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    scan_e(c, local, aliases, multi_or_bad);
-                    args.iter()
-                        .for_each(|a| scan_e(a, local, aliases, multi_or_bad));
-                }
-                Expr::Cond(c, t, f) => {
-                    scan_e(c, local, aliases, multi_or_bad);
-                    scan_e(t, local, aliases, multi_or_bad);
-                    scan_e(f, local, aliases, multi_or_bad);
-                }
-                Expr::Object(entries) => {
-                    entries
-                        .iter()
-                        .for_each(|(_, v)| scan_e(v, local, aliases, multi_or_bad));
-                }
-                Expr::Array(items) | Expr::Seq(items) => {
-                    items
-                        .iter()
-                        .for_each(|x| scan_e(x, local, aliases, multi_or_bad));
-                }
-                Expr::Arrow(_, ArrowBody::Expr(b)) => scan_e(b, local, aliases, multi_or_bad),
-                Expr::Arrow(_, ArrowBody::Block(s)) => {
-                    collect_elem_aliases(s, local, aliases, multi_or_bad);
-                }
-                _ => {}
-            }
-        }
-        for s in stmts {
+    struct AliasScan<'a> {
+        local: &'a str,
+        aliases: BTreeSet<String>,
+        multi_or_bad: BTreeSet<String>,
+    }
+    impl Visit for AliasScan<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
             match s {
                 Stmt::Let(n, Some(init)) | Stmt::Const(n, init) => {
-                    if let Expr::Index(obj, _) = init {
-                        if matches!(obj.as_ref(), Expr::Ident(o) if o == local) {
-                            aliases.insert(n.clone());
-                            scan_e(init, local, aliases, multi_or_bad);
-                            continue;
-                        }
+                    if matches!(init, Expr::Index(obj, _) if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local))
+                    {
+                        self.aliases.insert(n.clone());
+                    } else {
+                        self.multi_or_bad.insert(n.clone());
                     }
-                    multi_or_bad.insert(n.clone());
-                    scan_e(init, local, aliases, multi_or_bad);
+                    self.visit_expr(init);
                 }
                 Stmt::Lets(decls) => {
                     for (n, init) in decls {
                         if let Some(init) = init {
-                            multi_or_bad.insert(n.clone());
-                            scan_e(init, local, aliases, multi_or_bad);
+                            self.multi_or_bad.insert(n.clone());
+                            self.visit_expr(init);
                         }
                     }
-                }
-                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
-                    scan_e(e, local, aliases, multi_or_bad);
-                }
-                Stmt::If(t, a, b) => {
-                    scan_e(t, local, aliases, multi_or_bad);
-                    collect_elem_aliases(a, local, aliases, multi_or_bad);
-                    if let Some(b) = b {
-                        collect_elem_aliases(b, local, aliases, multi_or_bad);
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    scan_e(d, local, aliases, multi_or_bad);
-                    for c in cases {
-                        c.tests
-                            .iter()
-                            .for_each(|t| scan_e(t, local, aliases, multi_or_bad));
-                        collect_elem_aliases(&c.body, local, aliases, multi_or_bad);
-                    }
-                }
-                Stmt::Labeled(_, inner) => {
-                    collect_elem_aliases(
-                        std::slice::from_ref(inner.as_ref()),
-                        local,
-                        aliases,
-                        multi_or_bad,
-                    );
-                }
-                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
-                    collect_elem_aliases(b, local, aliases, multi_or_bad);
-                }
-                Stmt::While(t, b) => {
-                    scan_e(t, local, aliases, multi_or_bad);
-                    collect_elem_aliases(b, local, aliases, multi_or_bad);
                 }
                 Stmt::TryCatch {
                     body,
                     binding,
                     handler,
                 } => {
-                    multi_or_bad.insert(binding.clone());
-                    collect_elem_aliases(body, local, aliases, multi_or_bad);
-                    collect_elem_aliases(handler, local, aliases, multi_or_bad);
+                    self.multi_or_bad.insert(binding.clone());
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
                 }
-                _ => {}
+                _ => walk_stmt(self, s),
             }
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Assign(lhs, rhs) = e {
+                if let Expr::Ident(name) = lhs.as_ref() {
+                    if matches!(rhs.as_ref(), Expr::Index(obj, _) if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local))
+                    {
+                        self.aliases.insert(name.clone());
+                        self.visit_expr(rhs);
+                        return;
+                    }
+                    self.multi_or_bad.insert(name.clone());
+                }
+            }
+            walk_expr(self, e);
         }
     }
 
-    let mut aliases = BTreeSet::new();
-    let mut bad_aliases = BTreeSet::new();
-    collect_elem_aliases(body, local, &mut aliases, &mut bad_aliases);
-    for b in &bad_aliases {
+    let mut alias_scan = AliasScan {
+        local,
+        aliases: BTreeSet::new(),
+        multi_or_bad: BTreeSet::new(),
+    };
+    alias_scan.visit_stmts(body);
+    let mut aliases = alias_scan.aliases;
+    for b in &alias_scan.multi_or_bad {
         aliases.remove(b);
     }
     aliases.remove(local);
@@ -644,6 +460,23 @@ fn find_read_only_nested_array_init(
         bad: bool,
     }
     impl Check<'_> {
+        fn record_local_decl(&mut self, init: &Option<Expr>) {
+            self.decl_count += 1;
+            if self.decl_count > 1 {
+                self.bad = true;
+                return;
+            }
+            if let Some(rhs) = init {
+                if self.found_init.is_some()
+                    || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
+                {
+                    self.bad = true;
+                    return;
+                }
+                self.found_init = Some(rhs.clone());
+            }
+        }
+
         fn check_assign(&mut self, lhs: &Expr, rhs: &Expr) {
             if let Expr::Ident(n) = lhs {
                 if n == self.local {
@@ -674,139 +507,6 @@ fn find_read_only_nested_array_init(
             }
             self.expr(lhs, true);
             self.expr(rhs, false);
-        }
-
-        fn stmt(&mut self, s: &Stmt) {
-            if self.bad {
-                return;
-            }
-            match s {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => self.check_assign(lhs, rhs),
-                Stmt::ExprStmt(Expr::Seq(items)) => {
-                    for item in items {
-                        if let Expr::Assign(lhs, rhs) = item {
-                            self.check_assign(lhs, rhs);
-                        } else {
-                            self.expr(item, false);
-                        }
-                    }
-                }
-                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => self.expr(e, false),
-                Stmt::Let(n, init) => {
-                    if n == self.local {
-                        self.decl_count += 1;
-                        if self.decl_count > 1 {
-                            self.bad = true;
-                            return;
-                        }
-                        if let Some(rhs) = init {
-                            if self.found_init.is_some()
-                                || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
-                            {
-                                self.bad = true;
-                                return;
-                            }
-                            self.found_init = Some(rhs.clone());
-                        }
-                        return;
-                    }
-                    if let Some(e) = init {
-                        if self.aliases.contains(n) {
-                            if let Expr::Index(obj, idx) = e {
-                                if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local) {
-                                    self.reads += 1;
-                                    self.expr(idx, false);
-                                    return;
-                                }
-                            }
-                            self.bad = true;
-                            return;
-                        }
-                        self.expr(e, false);
-                    }
-                }
-                Stmt::Lets(decls) => {
-                    for (n, init) in decls {
-                        if n == self.local {
-                            self.decl_count += 1;
-                            if self.decl_count > 1 {
-                                self.bad = true;
-                                return;
-                            }
-                            if let Some(rhs) = init {
-                                if self.found_init.is_some()
-                                    || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
-                                {
-                                    self.bad = true;
-                                    return;
-                                }
-                                self.found_init = Some(rhs.clone());
-                            }
-                            continue;
-                        }
-                        if let Some(e) = init {
-                            if self.aliases.contains(n) {
-                                self.bad = true;
-                                return;
-                            }
-                            self.expr(e, false);
-                        }
-                    }
-                }
-                Stmt::Const(n, e) => {
-                    if n == self.local || self.aliases.contains(n) {
-                        self.bad = true;
-                        return;
-                    }
-                    self.expr(e, false);
-                }
-                Stmt::If(t, a, b) => {
-                    self.expr(t, false);
-                    a.iter().for_each(|x| self.stmt(x));
-                    if let Some(b) = b {
-                        b.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    self.expr(d, false);
-                    for c in cases {
-                        c.tests.iter().for_each(|t| self.expr(t, false));
-                        c.body.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().for_each(|x| self.stmt(x)),
-                Stmt::While(t, b) => {
-                    self.expr(t, false);
-                    b.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::TryCatch {
-                    body,
-                    binding,
-                    handler,
-                } => {
-                    if binding == self.local || self.aliases.contains(binding) {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                    handler.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::FunctionDecl { name, params, body } => {
-                    if name == self.local
-                        || self.aliases.contains(name)
-                        || params
-                            .iter()
-                            .any(|p| p == self.local || self.aliases.contains(p))
-                    {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::Raw(_) => self.bad = true,
-                _ => {}
-            }
         }
 
         fn expr(&mut self, e: &Expr, is_lhs: bool) {
@@ -870,31 +570,11 @@ fn find_read_only_nested_array_init(
                     }
                     self.expr(obj, false);
                 }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.expr(c, false);
-                    args.iter().for_each(|a| self.expr(a, false));
-                }
-                Expr::Unary(_, inner) => self.expr(inner, false),
-                Expr::Binary(_, l, r) => {
-                    self.expr(l, false);
-                    self.expr(r, false);
-                }
                 Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
                     self.expr(l, true);
                     self.expr(r, false);
                 }
-                Expr::Cond(c, t, f) => {
-                    self.expr(c, false);
-                    self.expr(t, false);
-                    self.expr(f, false);
-                }
-                Expr::Array(items) | Expr::Seq(items) => {
-                    items.iter().for_each(|x| self.expr(x, false));
-                }
-                Expr::Object(entries) => {
-                    entries.iter().for_each(|(_, v)| self.expr(v, false));
-                }
-                Expr::Arrow(params, ArrowBody::Expr(b)) => {
+                Expr::Arrow(params, _) => {
                     if params
                         .iter()
                         .any(|p| p == self.local || self.aliases.contains(p))
@@ -902,20 +582,100 @@ fn find_read_only_nested_array_init(
                         self.bad = true;
                         return;
                     }
-                    self.expr(b, false);
+                    walk_expr(self, e);
                 }
-                Expr::Arrow(params, ArrowBody::Block(s)) => {
-                    if params
-                        .iter()
-                        .any(|p| p == self.local || self.aliases.contains(p))
-                    {
-                        self.bad = true;
-                        return;
-                    }
-                    s.iter().for_each(|x| self.stmt(x));
-                }
-                _ => {}
+                _ => walk_expr(self, e),
             }
+        }
+    }
+    impl Visit for Check<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => self.check_assign(lhs, rhs),
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            self.check_assign(lhs, rhs);
+                        } else {
+                            self.expr(item, false);
+                        }
+                    }
+                }
+                Stmt::Let(n, init) => {
+                    if n == self.local {
+                        self.record_local_decl(init);
+                        return;
+                    }
+                    if let Some(e) = init {
+                        if self.aliases.contains(n) {
+                            if let Expr::Index(obj, idx) = e {
+                                if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local) {
+                                    self.reads += 1;
+                                    self.expr(idx, false);
+                                    return;
+                                }
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                        self.expr(e, false);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if n == self.local {
+                            self.record_local_decl(init);
+                            continue;
+                        }
+                        if let Some(e) = init {
+                            if self.aliases.contains(n) {
+                                self.bad = true;
+                                return;
+                            }
+                            self.expr(e, false);
+                        }
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    if n == self.local || self.aliases.contains(n) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(e, false);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if binding == self.local || self.aliases.contains(binding) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if name == self.local
+                        || self.aliases.contains(name)
+                        || params
+                            .iter()
+                            .any(|p| p == self.local || self.aliases.contains(p))
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => walk_stmt(self, s),
+            }
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            self.expr(e, false);
         }
     }
 
@@ -928,7 +688,7 @@ fn find_read_only_nested_array_init(
         reads: 0,
         bad: false,
     };
-    body.iter().for_each(|s| check.stmt(s));
+    check.visit_stmts(body);
     if !check.bad && check.decl_count == 1 && check.reads > 0 {
         check.found_init
     } else {
@@ -966,121 +726,18 @@ fn find_read_only_table_init(
             self.found_init = Some(rhs.clone());
         }
 
-        fn stmt(&mut self, s: &Stmt) {
-            if self.bad {
+        fn record_local_decl(&mut self, init: &Option<Expr>) {
+            self.decl_count += 1;
+            if self.decl_count > 1 {
+                self.bad = true;
                 return;
             }
-            match s {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
-                {
-                    self.check_init_rhs(rhs);
-                }
-                Stmt::ExprStmt(Expr::Seq(items)) => {
-                    for item in items {
-                        if let Expr::Assign(lhs, rhs) = item {
-                            if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) {
-                                self.check_init_rhs(rhs);
-                                continue;
-                            }
-                        }
-                        self.expr(item, false);
-                    }
-                }
-                Stmt::ExprStmt(e) | Stmt::Throw(e) => self.expr(e, false),
-                Stmt::Let(n, init) => {
-                    if n == self.local {
-                        self.decl_count += 1;
-                        if self.decl_count > 1 {
-                            self.bad = true;
-                            return;
-                        }
-                        if let Some(rhs) = init {
-                            if self.found_init.is_some() {
-                                self.bad = true;
-                                return;
-                            }
-                            self.check_init_rhs(rhs);
-                        }
-                        return;
-                    }
-                    if let Some(e) = init {
-                        self.expr(e, false);
-                    }
-                }
-                Stmt::Lets(decls) => {
-                    for (n, init) in decls {
-                        if n == self.local {
-                            self.decl_count += 1;
-                            if self.decl_count > 1 {
-                                self.bad = true;
-                                return;
-                            }
-                            if let Some(rhs) = init {
-                                if self.found_init.is_some() {
-                                    self.bad = true;
-                                    return;
-                                }
-                                self.check_init_rhs(rhs);
-                            }
-                            continue;
-                        }
-                        if let Some(e) = init {
-                            self.expr(e, false);
-                        }
-                    }
-                }
-                Stmt::Const(n, e) => {
-                    if n == self.local {
-                        self.bad = true;
-                        return;
-                    }
-                    self.expr(e, false);
-                }
-                Stmt::Return(Some(e)) => self.expr(e, false),
-                Stmt::Return(None) => {}
-                Stmt::If(t, a, b) => {
-                    self.expr(t, false);
-                    a.iter().for_each(|x| self.stmt(x));
-                    if let Some(b) = b {
-                        b.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    self.expr(d, false);
-                    for SwitchCase { tests, body } in cases {
-                        tests.iter().for_each(|t| self.expr(t, false));
-                        body.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().for_each(|x| self.stmt(x)),
-                Stmt::While(t, b) => {
-                    self.expr(t, false);
-                    b.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::TryCatch {
-                    body,
-                    binding,
-                    handler,
-                } => {
-                    if binding == self.local {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                    handler.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::FunctionDecl { name, params, body } => {
-                    if name == self.local || params.iter().any(|p| p == self.local) {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::Raw(_) => {
+            if let Some(rhs) = init {
+                if self.found_init.is_some() {
                     self.bad = true;
+                    return;
                 }
-                _ => {}
+                self.check_init_rhs(rhs);
             }
         }
 
@@ -1120,41 +777,95 @@ fn find_read_only_table_init(
                     }
                     self.expr(obj, false);
                 }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.expr(c, false);
-                    args.iter().for_each(|a| self.expr(a, false));
-                }
-                Expr::Unary(_, inner) => self.expr(inner, false),
-                Expr::Binary(_, l, r) => {
-                    self.expr(l, false);
-                    self.expr(r, false);
-                }
                 Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
                     self.expr(l, true);
                     self.expr(r, false);
                 }
-                Expr::Cond(t, c, a) => {
-                    self.expr(t, false);
-                    self.expr(c, false);
-                    self.expr(a, false);
-                }
-                Expr::Object(entries) => entries.iter().for_each(|(_, v)| self.expr(v, false)),
-                Expr::Array(items) | Expr::Seq(items) => {
-                    items.iter().for_each(|x| self.expr(x, false));
-                }
-                Expr::Arrow(params, body) => {
+                Expr::Arrow(params, _) => {
                     if params.iter().any(|p| p == self.local) {
                         self.bad = true;
                         return;
                     }
-                    match body {
-                        ArrowBody::Expr(b) => self.expr(b, false),
-                        ArrowBody::Block(stmts) => stmts.iter().for_each(|s| self.stmt(s)),
-                    }
+                    walk_expr(self, e);
                 }
                 Expr::Raw(_) => self.bad = true,
-                _ => {}
+                _ => walk_expr(self, e),
             }
+        }
+    }
+    impl Visit for Check<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
+                {
+                    self.check_init_rhs(rhs);
+                }
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) {
+                                self.check_init_rhs(rhs);
+                                continue;
+                            }
+                        }
+                        self.expr(item, false);
+                    }
+                }
+                Stmt::Let(n, init) => {
+                    if n == self.local {
+                        self.record_local_decl(init);
+                        return;
+                    }
+                    if let Some(e) = init {
+                        self.expr(e, false);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if n == self.local {
+                            self.record_local_decl(init);
+                            continue;
+                        }
+                        if let Some(e) = init {
+                            self.expr(e, false);
+                        }
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    if n == self.local {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(e, false);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if binding == self.local {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if name == self.local || params.iter().any(|p| p == self.local) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => walk_stmt(self, s),
+            }
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            self.expr(e, false);
         }
     }
 
@@ -1167,9 +878,7 @@ fn find_read_only_table_init(
         reads: 0,
         bad: false,
     };
-    for stmt in body {
-        check.stmt(stmt);
-    }
+    check.visit_stmts(body);
     if !check.bad && check.decl_count == 1 && check.reads >= 1 {
         check.found_init
     } else {
@@ -1236,7 +945,27 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
         bad: bool,
     }
     impl FindInit<'_> {
-        fn stmt(&mut self, s: &Stmt) {
+        fn record_decl(&mut self, init: &Option<Expr>) {
+            self.decl_count += 1;
+            if self.decl_count > 1 {
+                self.bad = true;
+                return;
+            }
+            if let Some(rhs) = init {
+                if self.found_init.is_some() {
+                    self.bad = true;
+                    return;
+                }
+                if let Some(nested) = is_pure_const_slice_lit(rhs, self.allow_bigint) {
+                    self.found_init = Some((rhs.clone(), nested));
+                } else {
+                    self.bad = true;
+                }
+            }
+        }
+    }
+    impl Visit for FindInit<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
             if self.bad {
                 return;
             }
@@ -1254,64 +983,15 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                         self.bad = true;
                     }
                 }
-                Stmt::Let(n, init) if n == self.local => {
-                    self.decl_count += 1;
-                    if self.decl_count > 1 {
-                        self.bad = true;
-                        return;
-                    }
-                    if let Some(rhs) = init {
-                        if self.found_init.is_some() {
-                            self.bad = true;
-                            return;
-                        }
-                        if let Some(nested) = is_pure_const_slice_lit(rhs, self.allow_bigint) {
-                            self.found_init = Some((rhs.clone(), nested));
-                        } else {
-                            self.bad = true;
-                        }
-                    }
-                }
+                Stmt::Let(n, init) if n == self.local => self.record_decl(init),
                 Stmt::Lets(decls) => {
                     for (n, init) in decls {
                         if n == self.local {
-                            self.decl_count += 1;
-                            if self.decl_count > 1 {
-                                self.bad = true;
-                                return;
-                            }
-                            if let Some(rhs) = init {
-                                if self.found_init.is_some() {
-                                    self.bad = true;
-                                    return;
-                                }
-                                if let Some(nested) =
-                                    is_pure_const_slice_lit(rhs, self.allow_bigint)
-                                {
-                                    self.found_init = Some((rhs.clone(), nested));
-                                } else {
-                                    self.bad = true;
-                                }
-                            }
+                            self.record_decl(init);
                         }
                     }
                 }
                 Stmt::Const(n, _) if n == self.local => self.bad = true,
-                Stmt::If(_, a, b) => {
-                    a.iter().for_each(|x| self.stmt(x));
-                    if let Some(b) = b {
-                        b.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Switch(_, cases) => {
-                    for c in cases {
-                        c.body.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
-                    b.iter().for_each(|x| self.stmt(x));
-                }
                 Stmt::TryCatch {
                     body,
                     binding,
@@ -1321,20 +1001,21 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                         self.bad = true;
                         return;
                     }
-                    body.iter().for_each(|x| self.stmt(x));
-                    handler.iter().for_each(|x| self.stmt(x));
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
                 }
                 Stmt::FunctionDecl { name, params, body } => {
                     if name == self.local || params.iter().any(|p| p == self.local) {
                         self.bad = true;
                         return;
                     }
-                    body.iter().for_each(|x| self.stmt(x));
+                    self.visit_stmts(body);
                 }
                 Stmt::Raw(_) => self.bad = true,
-                _ => {}
+                _ => walk_stmt(self, s),
             }
         }
+        fn visit_expr(&mut self, _: &Expr) {}
     }
     let mut fi = FindInit {
         local,
@@ -1343,105 +1024,64 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
         found_init: None,
         bad: false,
     };
-    body.iter().for_each(|s| fi.stmt(s));
+    fi.visit_stmts(body);
     if fi.bad || fi.decl_count != 1 {
         return None;
     }
     let (init_expr, nested_elems) = fi.found_init?;
 
     // Pass B: Collect slice aliases and (for nested elements) element aliases to a fixpoint.
-    let mut slice_aliases = BTreeSet::from([local.to_owned()]);
-    let mut elem_aliases = BTreeSet::new();
-    fn collect_aliases(
-        stmts: &[Stmt],
-        slice_aliases: &mut BTreeSet<String>,
-        elem_aliases: &mut BTreeSet<String>,
+    struct AliasPass<'a> {
+        slice_aliases: &'a mut BTreeSet<String>,
+        elem_aliases: &'a mut BTreeSet<String>,
         nested_elems: bool,
-        changed: &mut bool,
-    ) {
-        for s in stmts {
-            match s {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                    if let Expr::Ident(dst) = lhs.as_ref() {
-                        if (is_derived_slice_expr(rhs, slice_aliases)
-                            && slice_aliases.insert(dst.clone()))
-                            || (nested_elems
-                                && is_elem_read_expr(rhs, slice_aliases)
-                                && elem_aliases.insert(dst.clone()))
-                        {
-                            *changed = true;
-                        }
-                    }
-                }
-                Stmt::Let(dst, Some(rhs)) => {
-                    if (is_derived_slice_expr(rhs, slice_aliases)
-                        && slice_aliases.insert(dst.clone()))
-                        || (nested_elems
-                            && is_elem_read_expr(rhs, slice_aliases)
-                            && elem_aliases.insert(dst.clone()))
-                    {
-                        *changed = true;
-                    }
-                }
-                Stmt::Lets(decls) => {
-                    for (dst, init) in decls {
-                        if let Some(rhs) = init {
-                            if (is_derived_slice_expr(rhs, slice_aliases)
-                                && slice_aliases.insert(dst.clone()))
-                                || (nested_elems
-                                    && is_elem_read_expr(rhs, slice_aliases)
-                                    && elem_aliases.insert(dst.clone()))
-                            {
-                                *changed = true;
-                            }
-                        }
-                    }
-                }
-                Stmt::If(_, a, b) => {
-                    collect_aliases(a, slice_aliases, elem_aliases, nested_elems, changed);
-                    if let Some(b) = b {
-                        collect_aliases(b, slice_aliases, elem_aliases, nested_elems, changed);
-                    }
-                }
-                Stmt::Switch(_, cases) => {
-                    for c in cases {
-                        collect_aliases(
-                            &c.body,
-                            slice_aliases,
-                            elem_aliases,
-                            nested_elems,
-                            changed,
-                        );
-                    }
-                }
-                Stmt::Labeled(_, inner) => collect_aliases(
-                    std::slice::from_ref(inner.as_ref()),
-                    slice_aliases,
-                    elem_aliases,
-                    nested_elems,
-                    changed,
-                ),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
-                    collect_aliases(b, slice_aliases, elem_aliases, nested_elems, changed);
-                }
-                Stmt::TryCatch { body, handler, .. } => {
-                    collect_aliases(body, slice_aliases, elem_aliases, nested_elems, changed);
-                    collect_aliases(handler, slice_aliases, elem_aliases, nested_elems, changed);
-                }
-                _ => {}
+        changed: bool,
+    }
+    impl AliasPass<'_> {
+        fn record(&mut self, dst: &str, rhs: &Expr) {
+            if (is_derived_slice_expr(rhs, self.slice_aliases)
+                && self.slice_aliases.insert(dst.to_owned()))
+                || (self.nested_elems
+                    && is_elem_read_expr(rhs, self.slice_aliases)
+                    && self.elem_aliases.insert(dst.to_owned()))
+            {
+                self.changed = true;
             }
         }
     }
+    impl Visit for AliasPass<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(dst) = lhs.as_ref() {
+                        self.record(dst, rhs);
+                    }
+                }
+                Stmt::Let(dst, Some(rhs)) => self.record(dst, rhs),
+                Stmt::Lets(decls) => {
+                    for (dst, init) in decls {
+                        if let Some(rhs) = init {
+                            self.record(dst, rhs);
+                        }
+                    }
+                }
+                Stmt::FunctionDecl { .. } => {}
+                _ => walk_stmt(self, s),
+            }
+        }
+        fn visit_expr(&mut self, _: &Expr) {}
+    }
+    let mut slice_aliases = BTreeSet::from([local.to_owned()]);
+    let mut elem_aliases = BTreeSet::new();
     loop {
-        let mut changed = false;
-        collect_aliases(
-            body,
-            &mut slice_aliases,
-            &mut elem_aliases,
+        let mut pass = AliasPass {
+            slice_aliases: &mut slice_aliases,
+            elem_aliases: &mut elem_aliases,
             nested_elems,
-            &mut changed,
-        );
-        if !changed {
+            changed: false,
+        };
+        pass.visit_stmts(body);
+        if !pass.changed {
             break;
         }
     }
@@ -1456,154 +1096,6 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
         bad: bool,
     }
     impl Verify<'_> {
-        fn stmt(&mut self, s: &Stmt) {
-            if self.bad {
-                return;
-            }
-            match s {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                    if let Expr::Ident(dst) = lhs.as_ref() {
-                        if dst == self.local {
-                            // Single init of `local` already checked in Pass A.
-                            return;
-                        }
-                        if self.slice_aliases.contains(dst) {
-                            if is_derived_slice_expr(rhs, self.slice_aliases) {
-                                self.check_derived_slice(rhs);
-                                return;
-                            }
-                            self.bad = true;
-                            return;
-                        }
-                        if self.elem_aliases.contains(dst) {
-                            if is_elem_read_expr(rhs, self.slice_aliases) {
-                                if let Expr::Index(_, idx) = rhs.as_ref() {
-                                    self.reads += 1;
-                                    self.expr(idx, false);
-                                }
-                                return;
-                            }
-                            self.bad = true;
-                            return;
-                        }
-                    }
-                    self.expr(lhs, true);
-                    self.expr(rhs, false);
-                }
-                Stmt::ExprStmt(e) | Stmt::Throw(e) => self.expr(e, false),
-                Stmt::Let(n, Some(rhs)) => {
-                    if n == self.local {
-                        return;
-                    }
-                    if self.slice_aliases.contains(n) {
-                        if is_derived_slice_expr(rhs, self.slice_aliases) {
-                            self.check_derived_slice(rhs);
-                            return;
-                        }
-                        self.bad = true;
-                        return;
-                    }
-                    if self.elem_aliases.contains(n) {
-                        if is_elem_read_expr(rhs, self.slice_aliases) {
-                            if let Expr::Index(_, idx) = rhs {
-                                self.reads += 1;
-                                self.expr(idx, false);
-                            }
-                            return;
-                        }
-                        self.bad = true;
-                        return;
-                    }
-                    self.expr(rhs, false);
-                }
-                Stmt::Let(_, None) => {}
-                Stmt::Lets(decls) => {
-                    for (n, init) in decls {
-                        if let Some(rhs) = init {
-                            if n == self.local {
-                                continue;
-                            }
-                            if self.slice_aliases.contains(n) {
-                                if is_derived_slice_expr(rhs, self.slice_aliases) {
-                                    self.check_derived_slice(rhs);
-                                    continue;
-                                }
-                                self.bad = true;
-                                return;
-                            }
-                            if self.elem_aliases.contains(n) {
-                                if is_elem_read_expr(rhs, self.slice_aliases) {
-                                    if let Expr::Index(_, idx) = rhs {
-                                        self.reads += 1;
-                                        self.expr(idx, false);
-                                    }
-                                    continue;
-                                }
-                                self.bad = true;
-                                return;
-                            }
-                            self.expr(rhs, false);
-                        }
-                    }
-                }
-                Stmt::Const(n, e) => {
-                    if self.slice_aliases.contains(n) || self.elem_aliases.contains(n) {
-                        self.bad = true;
-                        return;
-                    }
-                    self.expr(e, false);
-                }
-                Stmt::Return(Some(e)) => self.expr(e, false),
-                Stmt::Return(None) => {}
-                Stmt::If(t, a, b) => {
-                    self.expr(t, false);
-                    a.iter().for_each(|x| self.stmt(x));
-                    if let Some(b) = b {
-                        b.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    self.expr(d, false);
-                    for c in cases {
-                        c.tests.iter().for_each(|t| self.expr(t, false));
-                        c.body.iter().for_each(|x| self.stmt(x));
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().for_each(|x| self.stmt(x)),
-                Stmt::While(t, b) => {
-                    self.expr(t, false);
-                    b.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::TryCatch {
-                    body,
-                    binding,
-                    handler,
-                } => {
-                    if self.slice_aliases.contains(binding) || self.elem_aliases.contains(binding) {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                    handler.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::FunctionDecl { name, params, body } => {
-                    if self.slice_aliases.contains(name)
-                        || self.elem_aliases.contains(name)
-                        || params.iter().any(|p| {
-                            self.slice_aliases.contains(p) || self.elem_aliases.contains(p)
-                        })
-                    {
-                        self.bad = true;
-                        return;
-                    }
-                    body.iter().for_each(|x| self.stmt(x));
-                }
-                Stmt::Raw(_) => self.bad = true,
-                _ => {}
-            }
-        }
-
         fn check_derived_slice(&mut self, expr: &Expr) {
             if let Expr::Object(entries) = expr {
                 for (k, v) in entries {
@@ -1616,6 +1108,34 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
             } else {
                 self.reads += 1;
             }
+        }
+
+        /// Handles binding/assignment to `local`, a slice alias, or an element alias.
+        /// Returns `true` if `dst` was one of them.
+        fn check_alias_write(&mut self, dst: &str, rhs: &Expr) -> bool {
+            if dst == self.local {
+                return true;
+            }
+            if self.slice_aliases.contains(dst) {
+                if is_derived_slice_expr(rhs, self.slice_aliases) {
+                    self.check_derived_slice(rhs);
+                } else {
+                    self.bad = true;
+                }
+                return true;
+            }
+            if self.elem_aliases.contains(dst) {
+                if is_elem_read_expr(rhs, self.slice_aliases) {
+                    if let Expr::Index(_, idx) = rhs {
+                        self.reads += 1;
+                        self.expr(idx, false);
+                    }
+                } else {
+                    self.bad = true;
+                }
+                return true;
+            }
+            false
         }
 
         fn expr(&mut self, e: &Expr, is_lhs: bool) {
@@ -1650,8 +1170,6 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                     self.expr(obj, false);
                 }
                 Expr::Index(obj, idx) => {
-                    // `alias.buf[idx]` for scalar slices (nested element slices must assign to an
-                    // element alias or immediately project a scalar field/index).
                     if is_elem_read_expr(e, self.slice_aliases) {
                         if is_lhs || self.nested_elems {
                             self.bad = true;
@@ -1661,7 +1179,6 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                         self.expr(idx, false);
                         return;
                     }
-                    // `elem_alias[idx]` or `alias.buf[idx][k]` (read-only scalar read of nested element).
                     if let Expr::Ident(name) = obj.as_ref() {
                         if self.elem_aliases.contains(name) {
                             if is_lhs {
@@ -1697,29 +1214,11 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                         }
                     }
                 }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.expr(c, false);
-                    args.iter().for_each(|a| self.expr(a, false));
-                }
-                Expr::Unary(_, inner) => self.expr(inner, false),
-                Expr::Binary(_, l, r) => {
-                    self.expr(l, false);
-                    self.expr(r, false);
-                }
                 Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
                     self.expr(l, true);
                     self.expr(r, false);
                 }
-                Expr::Cond(t, c, a) => {
-                    self.expr(t, false);
-                    self.expr(c, false);
-                    self.expr(a, false);
-                }
-                Expr::Object(entries) => entries.iter().for_each(|(_, v)| self.expr(v, false)),
-                Expr::Array(items) | Expr::Seq(items) => {
-                    items.iter().for_each(|x| self.expr(x, false));
-                }
-                Expr::Arrow(params, body) => {
+                Expr::Arrow(params, _) => {
                     if params
                         .iter()
                         .any(|p| self.slice_aliases.contains(p) || self.elem_aliases.contains(p))
@@ -1727,14 +1226,82 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                         self.bad = true;
                         return;
                     }
-                    match body {
-                        ArrowBody::Expr(b) => self.expr(b, false),
-                        ArrowBody::Block(stmts) => stmts.iter().for_each(|s| self.stmt(s)),
-                    }
+                    walk_expr(self, e);
                 }
                 Expr::Raw(_) => self.bad = true,
-                _ => {}
+                _ => walk_expr(self, e),
             }
+        }
+    }
+    impl Visit for Verify<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(dst) = lhs.as_ref() {
+                        if self.check_alias_write(dst, rhs) {
+                            return;
+                        }
+                    }
+                    self.expr(lhs, true);
+                    self.expr(rhs, false);
+                }
+                Stmt::Let(n, Some(rhs)) => {
+                    if !self.check_alias_write(n, rhs) {
+                        self.expr(rhs, false);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(rhs) = init {
+                            if !self.check_alias_write(n, rhs) {
+                                self.expr(rhs, false);
+                            }
+                            if self.bad {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    if self.slice_aliases.contains(n) || self.elem_aliases.contains(n) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(e, false);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if self.slice_aliases.contains(binding) || self.elem_aliases.contains(binding) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if self.slice_aliases.contains(name)
+                        || self.elem_aliases.contains(name)
+                        || params.iter().any(|p| {
+                            self.slice_aliases.contains(p) || self.elem_aliases.contains(p)
+                        })
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    self.visit_stmts(body);
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => walk_stmt(self, s),
+            }
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            self.expr(e, false);
         }
     }
 
@@ -1746,7 +1313,7 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
         reads: 0,
         bad: false,
     };
-    body.iter().for_each(|s| verify.stmt(s));
+    verify.visit_stmts(body);
     if !verify.bad && verify.reads >= 1 {
         Some(init_expr)
     } else {
@@ -1827,92 +1394,7 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>, 
 }
 
 fn replace_ident_in_stmts(stmts: &mut [Stmt], from: &str, to: &str) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
-                replace_ident_in_expr(e, from, to);
-            }
-            Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => replace_ident_in_expr(e, from, to),
-            Stmt::Lets(decls) => {
-                for (_, init) in decls {
-                    if let Some(e) = init {
-                        replace_ident_in_expr(e, from, to);
-                    }
-                }
-            }
-            Stmt::If(t, a, b) => {
-                replace_ident_in_expr(t, from, to);
-                replace_ident_in_stmts(a, from, to);
-                if let Some(b) = b {
-                    replace_ident_in_stmts(b, from, to);
-                }
-            }
-            Stmt::Switch(d, cases) => {
-                replace_ident_in_expr(d, from, to);
-                for c in cases {
-                    for t in &mut c.tests {
-                        replace_ident_in_expr(t, from, to);
-                    }
-                    replace_ident_in_stmts(&mut c.body, from, to);
-                }
-            }
-            Stmt::Labeled(_, inner) => {
-                replace_ident_in_stmts(std::slice::from_mut(inner), from, to)
-            }
-            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
-                replace_ident_in_stmts(b, from, to);
-            }
-            Stmt::While(t, b) => {
-                replace_ident_in_expr(t, from, to);
-                replace_ident_in_stmts(b, from, to);
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                replace_ident_in_stmts(body, from, to);
-                replace_ident_in_stmts(handler, from, to);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn replace_ident_in_expr(expr: &mut Expr, from: &str, to: &str) {
-    match expr {
-        Expr::Ident(name) if name == from => *name = to.to_owned(),
-        Expr::Member(obj, _) => replace_ident_in_expr(obj, from, to),
-        Expr::Index(obj, idx) => {
-            replace_ident_in_expr(obj, from, to);
-            replace_ident_in_expr(idx, from, to);
-        }
-        Expr::Call(c, args) | Expr::New(c, args) => {
-            replace_ident_in_expr(c, from, to);
-            for a in args {
-                replace_ident_in_expr(a, from, to);
-            }
-        }
-        Expr::Unary(_, inner) => replace_ident_in_expr(inner, from, to),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-            replace_ident_in_expr(l, from, to);
-            replace_ident_in_expr(r, from, to);
-        }
-        Expr::Cond(t, c, a) => {
-            replace_ident_in_expr(t, from, to);
-            replace_ident_in_expr(c, from, to);
-            replace_ident_in_expr(a, from, to);
-        }
-        Expr::Object(entries) => {
-            for (_, v) in entries {
-                replace_ident_in_expr(v, from, to);
-            }
-        }
-        Expr::Array(items) | Expr::Seq(items) => {
-            for item in items {
-                replace_ident_in_expr(item, from, to);
-            }
-        }
-        Expr::Arrow(_, ArrowBody::Expr(b)) => replace_ident_in_expr(b, from, to),
-        Expr::Arrow(_, ArrowBody::Block(stmts)) => replace_ident_in_stmts(stmts, from, to),
-        _ => {}
-    }
+    crate::lower::js::ast_util::rename_ident_stmts(stmts, from, to);
 }
 
 struct HoistRewriter<'a> {
@@ -1927,77 +1409,7 @@ struct HoistRewriter<'a> {
 
 impl HoistRewriter<'_> {
     fn rewrite_stmt(&mut self, stmt: &mut Stmt) {
-        match stmt {
-            Stmt::ExprStmt(e) => self.rewrite_expr(e, false),
-            Stmt::Let(_, Some(e)) => self.rewrite_expr(e, false),
-            Stmt::Let(_, None) => {}
-            Stmt::Lets(decls) => {
-                for (_, init) in decls {
-                    if let Some(e) = init {
-                        self.rewrite_expr(e, false);
-                    }
-                }
-            }
-            Stmt::Const(_, e) => self.rewrite_expr(e, false),
-            Stmt::Return(Some(e)) => self.rewrite_expr(e, false),
-            Stmt::Return(None) => {}
-            Stmt::Throw(e) => {
-                if let Some(ur_name) = self.unreachable_fn {
-                    if is_unreachable_abort_expr(e) {
-                        *e = Expr::Call(
-                            Box::new(Expr::Ident(ur_name.as_str().to_owned())),
-                            Vec::new(),
-                        );
-                        self.changed = true;
-                        return;
-                    }
-                }
-                self.rewrite_expr(e, false);
-            }
-            Stmt::If(t, a, b) => {
-                self.rewrite_expr(t, false);
-                for s in a {
-                    self.rewrite_stmt(s);
-                }
-                if let Some(b) = b {
-                    for s in b {
-                        self.rewrite_stmt(s);
-                    }
-                }
-            }
-            Stmt::Switch(d, cases) => {
-                self.rewrite_expr(d, false);
-                for c in cases {
-                    for t in &mut c.tests {
-                        self.rewrite_expr(t, false);
-                    }
-                    for s in &mut c.body {
-                        self.rewrite_stmt(s);
-                    }
-                }
-            }
-            Stmt::Labeled(_, inner) => self.rewrite_stmt(inner),
-            Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
-                for s in body {
-                    self.rewrite_stmt(s);
-                }
-            }
-            Stmt::While(t, body) => {
-                self.rewrite_expr(t, false);
-                for s in body {
-                    self.rewrite_stmt(s);
-                }
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                for s in body {
-                    self.rewrite_stmt(s);
-                }
-                for s in handler {
-                    self.rewrite_stmt(s);
-                }
-            }
-            _ => {}
-        }
+        jsast::VisitMut::visit_stmt_mut(self, stmt);
     }
 
     fn rewrite_expr(&mut self, expr: &mut Expr, is_assign_target: bool) {
@@ -2053,50 +1465,34 @@ impl HoistRewriter<'_> {
                 }
             }
         }
-        match expr {
-            Expr::Member(obj, _) => self.rewrite_expr(obj, false),
-            Expr::Index(obj, idx) => {
-                self.rewrite_expr(obj, false);
-                self.rewrite_expr(idx, false);
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                self.rewrite_expr(c, false);
-                for a in args {
-                    self.rewrite_expr(a, false);
-                }
-            }
-            Expr::Unary(_, inner) => self.rewrite_expr(inner, false),
-            Expr::Binary(_, l, r) => {
-                self.rewrite_expr(l, false);
-                self.rewrite_expr(r, false);
-            }
-            Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.rewrite_expr(l, true);
-                self.rewrite_expr(r, false);
-            }
-            Expr::Cond(t, c, a) => {
-                self.rewrite_expr(t, false);
-                self.rewrite_expr(c, false);
-                self.rewrite_expr(a, false);
-            }
-            Expr::Object(entries) => {
-                for (_, v) in entries {
-                    self.rewrite_expr(v, false);
-                }
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for item in items {
-                    self.rewrite_expr(item, false);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.rewrite_expr(b, false),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => {
-                for s in stmts {
-                    self.rewrite_stmt(s);
-                }
-            }
-            _ => {}
+        if let Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) = expr {
+            self.rewrite_expr(l, true);
+            self.rewrite_expr(r, false);
+            return;
         }
+        jsast::walk_expr_mut(self, expr);
+    }
+}
+
+impl jsast::VisitMut for HoistRewriter<'_> {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        if let Stmt::Throw(e) = stmt {
+            if let Some(ur_name) = self.unreachable_fn {
+                if is_unreachable_abort_expr(e) {
+                    *e = Expr::Call(
+                        Box::new(Expr::Ident(ur_name.as_str().to_owned())),
+                        Vec::new(),
+                    );
+                    self.changed = true;
+                    return;
+                }
+            }
+        }
+        jsast::walk_stmt_mut(self, stmt);
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        self.rewrite_expr(expr, false);
     }
 }
 
@@ -2135,8 +1531,7 @@ fn build_synthesized_link_item(
         names: Vec::new(),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: None,
         jir_decline: None,
         jir_item: None,
@@ -2156,8 +1551,7 @@ fn build_synthesized_link_item(
         map: item_map(mappings),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: Default::default(),
     }
 }
@@ -2269,77 +1663,10 @@ fn upgrade_readonly_static_int_arrays(
         cands: &'a mut BTreeSet<String>,
     }
     impl UseChecker<'_> {
-        fn stmts(&mut self, stmts: &[Stmt]) {
-            for s in stmts {
-                if self.cands.is_empty() {
-                    return;
-                }
-                self.stmt(s);
-            }
-        }
-        fn stmt(&mut self, s: &Stmt) {
-            match s {
-                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => self.expr(e, false),
-                Stmt::Const(n, e) => {
-                    self.cands.remove(n);
-                    self.expr(e, false);
-                }
-                Stmt::Let(n, init) => {
-                    self.cands.remove(n);
-                    if let Some(e) = init {
-                        self.expr(e, false);
-                    }
-                }
-                Stmt::Lets(decls) => {
-                    for (n, init) in decls {
-                        self.cands.remove(n);
-                        if let Some(e) = init {
-                            self.expr(e, false);
-                        }
-                    }
-                }
-                Stmt::If(t, a, b) => {
-                    self.expr(t, false);
-                    self.stmts(a);
-                    if let Some(b) = b {
-                        self.stmts(b);
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    self.expr(d, false);
-                    for c in cases {
-                        for t in &c.tests {
-                            self.expr(t, false);
-                        }
-                        self.stmts(&c.body);
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => self.stmts(b),
-                Stmt::While(t, b) => {
-                    self.expr(t, false);
-                    self.stmts(b);
-                }
-                Stmt::TryCatch {
-                    body,
-                    binding,
-                    handler,
-                } => {
-                    self.cands.remove(binding);
-                    self.stmts(body);
-                    self.stmts(handler);
-                }
-                Stmt::FunctionDecl { name, params, body } => {
-                    self.cands.remove(name);
-                    for p in params {
-                        self.cands.remove(p);
-                    }
-                    self.stmts(body);
-                }
-                _ => {}
-            }
-        }
         fn expr(&mut self, e: &Expr, is_lhs: bool) {
+            if self.cands.is_empty() {
+                return;
+            }
             match e {
                 Expr::Ident(id) => {
                     self.cands.remove(id);
@@ -2370,43 +1697,45 @@ fn upgrade_readonly_static_int_arrays(
                     self.expr(l, true);
                     self.expr(r, false);
                 }
-                Expr::Unary(_, inner) => self.expr(inner, false),
-                Expr::Binary(_, l, r) => {
-                    self.expr(l, false);
-                    self.expr(r, false);
-                }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.expr(c, false);
-                    for a in args {
-                        self.expr(a, false);
-                    }
-                }
-                Expr::Cond(c, t, f) => {
-                    self.expr(c, false);
-                    self.expr(t, false);
-                    self.expr(f, false);
-                }
-                Expr::Array(items) | Expr::Seq(items) => {
-                    for x in items {
-                        self.expr(x, false);
-                    }
-                }
-                Expr::Object(entries) => {
-                    for (_, v) in entries {
-                        self.expr(v, false);
-                    }
-                }
-                Expr::Arrow(params, body) => {
+                Expr::Arrow(params, _) => {
                     for p in params {
                         self.cands.remove(p);
                     }
-                    match body {
-                        ArrowBody::Expr(b) => self.expr(b, false),
-                        ArrowBody::Block(s) => self.stmts(s),
+                    walk_expr(self, e);
+                }
+                _ => walk_expr(self, e),
+            }
+        }
+    }
+    impl Visit for UseChecker<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.cands.is_empty() {
+                return;
+            }
+            match s {
+                Stmt::Const(n, _) | Stmt::Let(n, _) => {
+                    self.cands.remove(n);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, _) in decls {
+                        self.cands.remove(n);
+                    }
+                }
+                Stmt::TryCatch { binding, .. } => {
+                    self.cands.remove(binding);
+                }
+                Stmt::FunctionDecl { name, params, .. } => {
+                    self.cands.remove(name);
+                    for p in params {
+                        self.cands.remove(p);
                     }
                 }
                 _ => {}
             }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            self.expr(e, false);
         }
     }
 
@@ -2468,7 +1797,7 @@ fn upgrade_readonly_static_int_arrays(
             continue;
         }
         let mut checker = UseChecker { cands: &mut cands };
-        checker.stmt(&item.decl);
+        checker.visit_stmt(&item.decl);
     }
     if cands.is_empty() {
         return;
@@ -2586,58 +1915,38 @@ fn run_with_opts(
     encode_internal_tags(lowered, &exclusions, speed_profile);
 
     fn decl_shadows_ident(stmt: &Stmt, target: &str) -> bool {
-        fn check_stmts(stmts: &[Stmt], target: &str) -> bool {
-            for s in stmts {
-                match s {
-                    Stmt::Let(n, _) | Stmt::Const(n, _) if n == target => return true,
-                    Stmt::Lets(decls) if decls.iter().any(|(n, _)| n == target) => return true,
-                    Stmt::If(_, a, b) => {
-                        if check_stmts(a, target)
-                            || b.as_ref().is_some_and(|b| check_stmts(b, target))
-                        {
-                            return true;
-                        }
+        struct V<'a> {
+            target: &'a str,
+            found: bool,
+        }
+        impl Visit for V<'_> {
+            fn visit_stmt(&mut self, s: &Stmt) {
+                if self.found {
+                    return;
+                }
+                let hit = match s {
+                    Stmt::Let(n, _) | Stmt::Const(n, _) => n == self.target,
+                    Stmt::Lets(decls) => decls.iter().any(|(n, _)| n == self.target),
+                    Stmt::TryCatch { binding, .. } => binding == self.target,
+                    Stmt::FunctionDecl { name, params, .. } => {
+                        name == self.target || params.iter().any(|p| p == self.target)
                     }
-                    Stmt::Switch(_, cases) => {
-                        if cases.iter().any(|c| check_stmts(&c.body, target)) {
-                            return true;
-                        }
-                    }
-                    Stmt::Labeled(_, inner) => {
-                        if check_stmts(std::slice::from_ref(inner.as_ref()), target) {
-                            return true;
-                        }
-                    }
-                    Stmt::LoopForever(_, b) | Stmt::While(_, b) | Stmt::Block(b) => {
-                        if check_stmts(b, target) {
-                            return true;
-                        }
-                    }
-                    Stmt::TryCatch {
-                        body,
-                        binding,
-                        handler,
-                    } => {
-                        if binding == target
-                            || check_stmts(body, target)
-                            || check_stmts(handler, target)
-                        {
-                            return true;
-                        }
-                    }
-                    Stmt::FunctionDecl { name, params, body }
-                        if name == target
-                            || params.iter().any(|p| p == target)
-                            || check_stmts(body, target) =>
-                    {
-                        return true;
-                    }
-                    _ => {}
+                    _ => false,
+                };
+                if hit {
+                    self.found = true;
+                } else {
+                    walk_stmt(self, s);
                 }
             }
-            false
+            fn visit_expr(&mut self, _: &Expr) {}
         }
-        check_stmts(std::slice::from_ref(stmt), target)
+        let mut v = V {
+            target,
+            found: false,
+        };
+        v.visit_stmt(stmt);
+        v.found
     }
 
     // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, inline `new Uint8Array([...])[i]`
@@ -2649,13 +1958,14 @@ fn run_with_opts(
         bstr_strings,
         speed_profile,
         allow_u8_lut: true,
+        in_loop: false,
         counts: BTreeMap::new(),
         unreachable_throws: 0,
     };
     for (_, res, _, _) in lowered.iter() {
         if let Ok(lowered_item) = res {
             collector.allow_u8_lut = !decl_shadows_ident(&lowered_item.decl, "Uint8Array");
-            collector.visit_stmt(&lowered_item.decl, false);
+            collector.visit_stmt(&lowered_item.decl);
         }
     }
 
@@ -3113,116 +2423,32 @@ fn collect_js_text_tokens_and_strings(
     collect_js_text_span(text, &mut i, false, tokens, strings);
 }
 
-fn collect_raw_from_stmts(
-    stmts: &[Stmt],
-    tokens: &mut BTreeSet<String>,
-    strings: &mut BTreeSet<String>,
-) {
-    for stmt in stmts {
-        collect_raw_from_stmt(stmt, tokens, strings);
-    }
-}
-
 fn collect_raw_from_stmt(
     stmt: &Stmt,
     tokens: &mut BTreeSet<String>,
     strings: &mut BTreeSet<String>,
 ) {
-    match stmt {
-        Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Throw(e) => {
-            collect_raw_from_expr(e, tokens, strings);
-        }
-        Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => {
-            collect_raw_from_expr(e, tokens, strings);
-        }
-        Stmt::Lets(decls) => {
-            for (_, init) in decls {
-                if let Some(e) = init {
-                    collect_raw_from_expr(e, tokens, strings);
-                }
-            }
-        }
-        Stmt::If(t, a, b) => {
-            collect_raw_from_expr(t, tokens, strings);
-            collect_raw_from_stmts(a, tokens, strings);
-            if let Some(b) = b {
-                collect_raw_from_stmts(b, tokens, strings);
-            }
-        }
-        Stmt::Switch(d, cases) => {
-            collect_raw_from_expr(d, tokens, strings);
-            for case in cases {
-                for t in &case.tests {
-                    collect_raw_from_expr(t, tokens, strings);
-                }
-                collect_raw_from_stmts(&case.body, tokens, strings);
-            }
-        }
-        Stmt::Labeled(_, inner) => collect_raw_from_stmt(inner, tokens, strings),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
-            collect_raw_from_stmts(body, tokens, strings);
-        }
-        Stmt::While(t, body) => {
-            collect_raw_from_expr(t, tokens, strings);
-            collect_raw_from_stmts(body, tokens, strings);
-        }
-        Stmt::TryCatch { body, handler, .. } => {
-            collect_raw_from_stmts(body, tokens, strings);
-            collect_raw_from_stmts(handler, tokens, strings);
-        }
-        Stmt::Raw(text) => collect_js_text_tokens_and_strings(text, tokens, strings),
-        Stmt::Let(_, None)
-        | Stmt::Return(None)
-        | Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => {}
+    struct V<'a> {
+        tokens: &'a mut BTreeSet<String>,
+        strings: &'a mut BTreeSet<String>,
     }
-}
-
-fn collect_raw_from_expr(
-    expr: &Expr,
-    tokens: &mut BTreeSet<String>,
-    strings: &mut BTreeSet<String>,
-) {
-    match expr {
-        Expr::Member(obj, _) => collect_raw_from_expr(obj, tokens, strings),
-        Expr::Index(obj, idx) => {
-            collect_raw_from_expr(obj, tokens, strings);
-            collect_raw_from_expr(idx, tokens, strings);
-        }
-        Expr::Call(c, args) | Expr::New(c, args) => {
-            collect_raw_from_expr(c, tokens, strings);
-            for a in args {
-                collect_raw_from_expr(a, tokens, strings);
+    impl jsast::Visit for V<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if let Stmt::Raw(text) = stmt {
+                collect_js_text_tokens_and_strings(text, self.tokens, self.strings);
+                return;
             }
+            jsast::walk_stmt(self, stmt);
         }
-        Expr::Unary(_, inner) => collect_raw_from_expr(inner, tokens, strings),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-            collect_raw_from_expr(l, tokens, strings);
-            collect_raw_from_expr(r, tokens, strings);
-        }
-        Expr::Cond(t, c, a) => {
-            collect_raw_from_expr(t, tokens, strings);
-            collect_raw_from_expr(c, tokens, strings);
-            collect_raw_from_expr(a, tokens, strings);
-        }
-        Expr::Object(entries) => {
-            for (_, v) in entries {
-                collect_raw_from_expr(v, tokens, strings);
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::Raw(text) = expr {
+                collect_js_text_tokens_and_strings(text, self.tokens, self.strings);
+                return;
             }
+            jsast::walk_expr(self, expr);
         }
-        Expr::Array(items) | Expr::Seq(items) => {
-            for item in items {
-                collect_raw_from_expr(item, tokens, strings);
-            }
-        }
-        Expr::Arrow(_, ArrowBody::Expr(b)) => collect_raw_from_expr(b, tokens, strings),
-        Expr::Arrow(_, ArrowBody::Block(stmts)) => collect_raw_from_stmts(stmts, tokens, strings),
-        Expr::Raw(text) => collect_js_text_tokens_and_strings(text, tokens, strings),
-        _ => {}
     }
+    V { tokens, strings }.visit_stmt(stmt);
 }
 
 struct BoundaryWalkCtx<'a> {
@@ -3464,7 +2690,6 @@ fn collect_program_exclusions(
                         || matches!(
                             call.semantic,
                             CallSemantic::Host
-                                | CallSemantic::ViewAbi
                                 | CallSemantic::RawJavaScript
                                 | CallSemantic::RawParts
                         )
@@ -3499,21 +2724,6 @@ fn collect_program_exclusions(
                     if let Some(host) = &call.host {
                         for (_, helper) in host.helpers() {
                             ctx.walk_item_id(helper.item);
-                        }
-                        if let HostPayload::KeyedList(kl) = host {
-                            ctx.walk_type(kl.collection_ty, interns);
-                            ctx.walk_type(kl.item_ty, interns);
-                            ctx.walk_type(kl.key_ty, interns);
-                            ctx.walk_type(kl.row_ty, interns);
-                            ctx.walk_type(kl.collection.ty, interns);
-                            ctx.walk_type(kl.key.ty, interns);
-                            ctx.walk_type(kl.row.ty, interns);
-                            for body_ref in [kl.collection.body, kl.key.body, kl.row.body]
-                                .into_iter()
-                                .flatten()
-                            {
-                                ctx.walk_item_id(body_ref.item);
-                            }
                         }
                     }
                 }
@@ -3742,93 +2952,54 @@ fn to_clean_i32_expr(mut expr: Expr) -> Expr {
 }
 
 fn expr_mentions_ident(expr: &Expr, target: &str) -> bool {
-    match expr {
-        Expr::Ident(n) => n == target,
-        Expr::Member(obj, _) => expr_mentions_ident(obj, target),
-        Expr::Index(obj, idx) => {
-            expr_mentions_ident(obj, target) || expr_mentions_ident(idx, target)
-        }
-        Expr::Call(c, args) | Expr::New(c, args) => {
-            expr_mentions_ident(c, target) || args.iter().any(|a| expr_mentions_ident(a, target))
-        }
-        Expr::Unary(_, inner) => expr_mentions_ident(inner, target),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-            expr_mentions_ident(l, target) || expr_mentions_ident(r, target)
-        }
-        Expr::Cond(t, c, a) => {
-            expr_mentions_ident(t, target)
-                || expr_mentions_ident(c, target)
-                || expr_mentions_ident(a, target)
-        }
-        Expr::Object(entries) => entries.iter().any(|(_, v)| expr_mentions_ident(v, target)),
-        Expr::Array(items) | Expr::Seq(items) => {
-            items.iter().any(|x| expr_mentions_ident(x, target))
-        }
-        Expr::Arrow(params, body) => {
-            params.iter().any(|p| p == target)
-                || match body {
-                    ArrowBody::Expr(b) => expr_mentions_ident(b, target),
-                    ArrowBody::Block(stmts) => stmts.iter().any(|s| stmt_mentions_ident(s, target)),
+    struct V<'a> {
+        target: &'a str,
+        found: bool,
+    }
+    impl Visit for V<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if self.found {
+                return;
+            }
+            let hit = match stmt {
+                Stmt::Let(n, _) => n == self.target,
+                Stmt::Lets(decls) => decls.iter().any(|(n, _)| n == self.target),
+                Stmt::TryCatch { binding, .. } => binding == self.target,
+                Stmt::FunctionDecl { name, params, .. } => {
+                    name == self.target || params.iter().any(|p| p == self.target)
                 }
+                Stmt::Raw(s) => s.contains(self.target),
+                _ => false,
+            };
+            if hit {
+                self.found = true;
+            } else {
+                walk_stmt(self, stmt);
+            }
         }
-        Expr::Raw(s) => s.contains(target),
-        _ => false,
+        fn visit_expr(&mut self, expr: &Expr) {
+            if self.found {
+                return;
+            }
+            let hit = match expr {
+                Expr::Ident(n) => n == self.target,
+                Expr::Arrow(params, _) => params.iter().any(|p| p == self.target),
+                Expr::Raw(s) => s.contains(self.target),
+                _ => false,
+            };
+            if hit {
+                self.found = true;
+            } else {
+                walk_expr(self, expr);
+            }
+        }
     }
-}
-
-fn stmt_mentions_ident(stmt: &Stmt, target: &str) -> bool {
-    match stmt {
-        Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Throw(e) => expr_mentions_ident(e, target),
-        Stmt::Let(n, init) => {
-            n == target
-                || init
-                    .as_ref()
-                    .is_some_and(|e| expr_mentions_ident(e, target))
-        }
-        Stmt::Lets(decls) => decls.iter().any(|(n, init)| {
-            n == target
-                || init
-                    .as_ref()
-                    .is_some_and(|e| expr_mentions_ident(e, target))
-        }),
-        Stmt::Return(Some(e)) => expr_mentions_ident(e, target),
-        Stmt::If(t, a, b) => {
-            expr_mentions_ident(t, target)
-                || a.iter().any(|s| stmt_mentions_ident(s, target))
-                || b.as_ref()
-                    .is_some_and(|bs| bs.iter().any(|s| stmt_mentions_ident(s, target)))
-        }
-        Stmt::Switch(d, cases) => {
-            expr_mentions_ident(d, target)
-                || cases.iter().any(|c| {
-                    c.tests.iter().any(|t| expr_mentions_ident(t, target))
-                        || c.body.iter().any(|s| stmt_mentions_ident(s, target))
-                })
-        }
-        Stmt::Labeled(_, inner) => stmt_mentions_ident(inner, target),
-        Stmt::LoopForever(_, b) | Stmt::Block(b) => {
-            b.iter().any(|s| stmt_mentions_ident(s, target))
-        }
-        Stmt::While(t, b) => {
-            expr_mentions_ident(t, target) || b.iter().any(|s| stmt_mentions_ident(s, target))
-        }
-        Stmt::TryCatch {
-            body,
-            binding,
-            handler,
-        } => {
-            binding == target
-                || body.iter().any(|s| stmt_mentions_ident(s, target))
-                || handler.iter().any(|s| stmt_mentions_ident(s, target))
-        }
-        Stmt::FunctionDecl { name, params, body } => {
-            name == target
-                || params.iter().any(|p| p == target)
-                || body.iter().any(|s| stmt_mentions_ident(s, target))
-        }
-        Stmt::Raw(s) => s.contains(target),
-        _ => false,
-    }
+    let mut v = V {
+        target,
+        found: false,
+    };
+    v.visit_expr(expr);
+    v.found
 }
 
 fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String, String> {
@@ -3840,6 +3011,49 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
         all_idents: BTreeSet<String>,
     }
 
+    struct MarkBad<'a>(&'a mut TempScan);
+    impl Visit for MarkBad<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            match stmt {
+                Stmt::Const(n, _) | Stmt::Let(n, _) => self.0.mark_bad(n),
+                Stmt::Lets(decls) => {
+                    for (n, _) in decls {
+                        self.0.mark_bad(n);
+                    }
+                }
+                Stmt::TryCatch { binding, .. } => self.0.mark_bad(binding),
+                Stmt::FunctionDecl { name, params, .. } => {
+                    self.0.mark_bad(name);
+                    for p in params {
+                        self.0.mark_bad(p);
+                    }
+                }
+                Stmt::Raw(text) => {
+                    let mut dummy = BTreeSet::new();
+                    collect_js_text_tokens_and_strings(text, &mut self.0.bad_names, &mut dummy);
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &Expr) {
+            match expr {
+                Expr::Ident(name) => self.0.mark_bad(name),
+                Expr::Arrow(params, _) => {
+                    for p in params {
+                        self.0.mark_bad(p);
+                    }
+                }
+                Expr::Raw(text) => {
+                    let mut dummy = BTreeSet::new();
+                    collect_js_text_tokens_and_strings(text, &mut self.0.bad_names, &mut dummy);
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+
     impl TempScan {
         fn mark_bad(&mut self, name: &str) {
             self.bad_names.insert(name.to_owned());
@@ -3847,129 +3061,11 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
         }
 
         fn mark_idents_bad_in_stmts(&mut self, stmts: &[Stmt]) {
-            for stmt in stmts {
-                match stmt {
-                    Stmt::ExprStmt(e) | Stmt::Throw(e) => self.mark_idents_bad_in_expr(e),
-                    Stmt::Const(n, e) => {
-                        self.mark_bad(n);
-                        self.mark_idents_bad_in_expr(e);
-                    }
-                    Stmt::Let(n, init) => {
-                        self.mark_bad(n);
-                        if let Some(e) = init {
-                            self.mark_idents_bad_in_expr(e);
-                        }
-                    }
-                    Stmt::Lets(decls) => {
-                        for (n, init) in decls {
-                            self.mark_bad(n);
-                            if let Some(e) = init {
-                                self.mark_idents_bad_in_expr(e);
-                            }
-                        }
-                    }
-                    Stmt::Return(Some(e)) => self.mark_idents_bad_in_expr(e),
-                    Stmt::If(t, a, b) => {
-                        self.mark_idents_bad_in_expr(t);
-                        self.mark_idents_bad_in_stmts(a);
-                        if let Some(b) = b {
-                            self.mark_idents_bad_in_stmts(b);
-                        }
-                    }
-                    Stmt::Switch(d, cases) => {
-                        self.mark_idents_bad_in_expr(d);
-                        for c in cases {
-                            for t in &c.tests {
-                                self.mark_idents_bad_in_expr(t);
-                            }
-                            self.mark_idents_bad_in_stmts(&c.body);
-                        }
-                    }
-                    Stmt::Labeled(_, inner) => {
-                        self.mark_idents_bad_in_stmts(std::slice::from_ref(inner.as_ref()));
-                    }
-                    Stmt::LoopForever(_, b) | Stmt::Block(b) => self.mark_idents_bad_in_stmts(b),
-                    Stmt::While(t, b) => {
-                        self.mark_idents_bad_in_expr(t);
-                        self.mark_idents_bad_in_stmts(b);
-                    }
-                    Stmt::TryCatch {
-                        body,
-                        binding,
-                        handler,
-                    } => {
-                        self.mark_bad(binding);
-                        self.mark_idents_bad_in_stmts(body);
-                        self.mark_idents_bad_in_stmts(handler);
-                    }
-                    Stmt::FunctionDecl { name, params, body } => {
-                        self.mark_bad(name);
-                        for p in params {
-                            self.mark_bad(p);
-                        }
-                        self.mark_idents_bad_in_stmts(body);
-                    }
-                    Stmt::Raw(text) => {
-                        let mut dummy = BTreeSet::new();
-                        collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
-                    }
-                    Stmt::Return(None)
-                    | Stmt::Continue(_)
-                    | Stmt::Break(_)
-                    | Stmt::Import { .. }
-                    | Stmt::Comment(_)
-                    | Stmt::Loc(_) => {}
-                }
-            }
+            MarkBad(self).visit_stmts(stmts);
         }
 
         fn mark_idents_bad_in_expr(&mut self, expr: &Expr) {
-            match expr {
-                Expr::Ident(name) => self.mark_bad(name),
-                Expr::Member(obj, _) | Expr::Unary(_, obj) => self.mark_idents_bad_in_expr(obj),
-                Expr::Index(obj, idx)
-                | Expr::Binary(_, obj, idx)
-                | Expr::Assign(obj, idx)
-                | Expr::CompoundAssign(_, obj, idx) => {
-                    self.mark_idents_bad_in_expr(obj);
-                    self.mark_idents_bad_in_expr(idx);
-                }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.mark_idents_bad_in_expr(c);
-                    for a in args {
-                        self.mark_idents_bad_in_expr(a);
-                    }
-                }
-                Expr::Cond(t, c, a) => {
-                    self.mark_idents_bad_in_expr(t);
-                    self.mark_idents_bad_in_expr(c);
-                    self.mark_idents_bad_in_expr(a);
-                }
-                Expr::Object(entries) => {
-                    for (_, v) in entries {
-                        self.mark_idents_bad_in_expr(v);
-                    }
-                }
-                Expr::Array(items) | Expr::Seq(items) => {
-                    for x in items {
-                        self.mark_idents_bad_in_expr(x);
-                    }
-                }
-                Expr::Arrow(params, body) => {
-                    for p in params {
-                        self.mark_bad(p);
-                    }
-                    match body {
-                        ArrowBody::Expr(b) => self.mark_idents_bad_in_expr(b),
-                        ArrowBody::Block(stmts) => self.mark_idents_bad_in_stmts(stmts),
-                    }
-                }
-                Expr::Raw(text) => {
-                    let mut dummy = BTreeSet::new();
-                    collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
-                }
-                _ => {}
-            }
+            MarkBad(self).visit_expr(expr);
         }
 
         fn record_assign(&mut self, name: &str, rhs: &Expr) {
@@ -3996,11 +3092,15 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
         }
 
         fn visit_stmts(&mut self, stmts: &[Stmt]) {
-            for s in stmts {
-                self.visit_stmt(s);
-            }
+            jsast::Visit::visit_stmts(self, stmts);
         }
 
+        fn visit_expr(&mut self, expr: &Expr) {
+            jsast::Visit::visit_expr(self, expr);
+        }
+    }
+
+    impl jsast::Visit for TempScan {
         fn visit_stmt(&mut self, stmt: &Stmt) {
             match stmt {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs))
@@ -4010,7 +3110,6 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                         self.record_assign(name, rhs);
                     }
                 }
-                Stmt::ExprStmt(e) | Stmt::Throw(e) => self.visit_expr(e),
                 Stmt::Const(n, e) => {
                     self.mark_bad(n);
                     self.visit_expr(e);
@@ -4030,29 +3129,6 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                             self.record_assign(n, rhs);
                         }
                     }
-                }
-                Stmt::Return(Some(e)) => self.visit_expr(e),
-                Stmt::If(t, a, b) => {
-                    self.visit_expr(t);
-                    self.visit_stmts(a);
-                    if let Some(b) = b {
-                        self.visit_stmts(b);
-                    }
-                }
-                Stmt::Switch(d, cases) => {
-                    self.visit_expr(d);
-                    for c in cases {
-                        for t in &c.tests {
-                            self.visit_expr(t);
-                        }
-                        self.visit_stmts(&c.body);
-                    }
-                }
-                Stmt::Labeled(_, inner) => self.visit_stmt(inner),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => self.visit_stmts(b),
-                Stmt::While(t, b) => {
-                    self.visit_expr(t);
-                    self.visit_stmts(b);
                 }
                 Stmt::TryCatch {
                     body,
@@ -4074,12 +3150,7 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                     let mut dummy = BTreeSet::new();
                     collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
                 }
-                Stmt::Return(None)
-                | Stmt::Continue(_)
-                | Stmt::Break(_)
-                | Stmt::Import { .. }
-                | Stmt::Comment(_)
-                | Stmt::Loc(_) => {}
+                _ => jsast::walk_stmt(self, stmt),
             }
         }
 
@@ -4095,37 +3166,6 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                     self.read_ok.insert(name.clone(), false);
                     self.mark_bad(name);
                 }
-                Expr::Member(obj, _) => self.visit_expr(obj),
-                Expr::Index(obj, idx) => {
-                    self.visit_expr(obj);
-                    self.visit_expr(idx);
-                }
-                Expr::Call(c, args) | Expr::New(c, args) => {
-                    self.visit_expr(c);
-                    for a in args {
-                        self.visit_expr(a);
-                    }
-                }
-                Expr::Unary(_, inner) => self.visit_expr(inner),
-                Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-                    self.visit_expr(l);
-                    self.visit_expr(r);
-                }
-                Expr::Cond(t, c, a) => {
-                    self.visit_expr(t);
-                    self.visit_expr(c);
-                    self.visit_expr(a);
-                }
-                Expr::Object(entries) => {
-                    for (_, v) in entries {
-                        self.visit_expr(v);
-                    }
-                }
-                Expr::Array(items) | Expr::Seq(items) => {
-                    for x in items {
-                        self.visit_expr(x);
-                    }
-                }
                 Expr::Arrow(params, body) => {
                     for p in params {
                         self.mark_bad(p);
@@ -4139,7 +3179,7 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                     let mut dummy = BTreeSet::new();
                     collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
                 }
-                _ => {}
+                _ => jsast::walk_expr(self, expr),
             }
         }
     }
@@ -4217,194 +3257,148 @@ impl BigIntPropScanner {
         }
     }
 
-    fn scan_stmts(&mut self, stmts: &[Stmt], temp_props: &BTreeMap<String, String>) {
-        for s in stmts {
-            self.scan_stmt(s, temp_props);
-        }
-    }
-
     fn scan_stmt(&mut self, stmt: &Stmt, temp_props: &BTreeMap<String, String>) {
-        match stmt {
-            Stmt::FunctionDecl { params, body, .. } => {
-                let inner_temps = collect_fn_unpack_temps(params, body);
-                self.scan_stmts(body, &inner_temps);
-            }
-            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => match (lhs.as_ref(), rhs.as_ref()) {
-                (Expr::Ident(v), Expr::Member(obj, k))
-                    if temp_props.get(v).is_some_and(|p| p == k) && is_pure_obj(obj) =>
-                {
-                    self.scan_expr(obj, temp_props);
-                }
-                (Expr::Member(lhs_obj, k), _) => {
-                    self.scan_expr(lhs_obj, temp_props);
-                    if is_pure_obj(lhs_obj) {
-                        match classify_prop_rhs(rhs, k) {
-                            Some(PackedRhs::Const) => {
-                                self.has_pack_write.insert(k.clone());
-                            }
-                            Some(PackedRhs::Pack(lo, hi)) => {
-                                self.has_pack_write.insert(k.clone());
-                                self.scan_expr(lo, temp_props);
-                                self.scan_expr(hi, temp_props);
-                            }
-                            Some(PackedRhs::MemberCopy(rhs_obj)) => {
-                                self.scan_expr(rhs_obj, temp_props);
-                            }
-                            None => {
-                                self.exclude_prop_and_base(k);
-                                self.scan_expr(rhs, temp_props);
+        struct S<'a, 'b> {
+            scanner: &'a mut BigIntPropScanner,
+            temp_props: &'b BTreeMap<String, String>,
+        }
+        impl jsast::Visit for S<'_, '_> {
+            fn visit_stmt(&mut self, stmt: &Stmt) {
+                match stmt {
+                    Stmt::FunctionDecl { params, body, .. } => {
+                        let inner_temps = collect_fn_unpack_temps(params, body);
+                        S {
+                            scanner: self.scanner,
+                            temp_props: &inner_temps,
+                        }
+                        .visit_stmts(body);
+                    }
+                    Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => match (lhs.as_ref(), rhs.as_ref()) {
+                        (Expr::Ident(v), Expr::Member(obj, k))
+                            if self.temp_props.get(v).is_some_and(|p| p == k)
+                                && is_pure_obj(obj) =>
+                        {
+                            self.visit_expr(obj);
+                        }
+                        (Expr::Member(lhs_obj, k), _) => {
+                            self.visit_expr(lhs_obj);
+                            if is_pure_obj(lhs_obj) {
+                                match classify_prop_rhs(rhs, k) {
+                                    Some(PackedRhs::Const) => {
+                                        self.scanner.has_pack_write.insert(k.clone());
+                                    }
+                                    Some(PackedRhs::Pack(lo, hi)) => {
+                                        self.scanner.has_pack_write.insert(k.clone());
+                                        self.visit_expr(lo);
+                                        self.visit_expr(hi);
+                                    }
+                                    Some(PackedRhs::MemberCopy(rhs_obj)) => {
+                                        self.visit_expr(rhs_obj);
+                                    }
+                                    None => {
+                                        self.scanner.exclude_prop_and_base(k);
+                                        self.visit_expr(rhs);
+                                    }
+                                }
+                            } else {
+                                self.scanner.exclude_prop_and_base(k);
+                                self.visit_expr(rhs);
                             }
                         }
-                    } else {
-                        self.exclude_prop_and_base(k);
-                        self.scan_expr(rhs, temp_props);
+                        _ => {
+                            self.visit_expr(lhs);
+                            self.visit_expr(rhs);
+                        }
+                    },
+                    Stmt::Let(n, Some(Expr::Member(obj, k)))
+                        if self.temp_props.get(n).is_some_and(|p| p == k) && is_pure_obj(obj) =>
+                    {
+                        self.visit_expr(obj);
+                    }
+                    Stmt::Lets(decls) => {
+                        for (n, init) in decls {
+                            if let Some(e) = init {
+                                if let Expr::Member(obj, k) = e {
+                                    if self.temp_props.get(n).is_some_and(|p| p == k)
+                                        && is_pure_obj(obj)
+                                    {
+                                        self.visit_expr(obj);
+                                        continue;
+                                    }
+                                }
+                                self.visit_expr(e);
+                            }
+                        }
+                    }
+                    _ => jsast::walk_stmt(self, stmt),
+                }
+            }
+
+            fn visit_expr(&mut self, expr: &Expr) {
+                if let Some((_, inner)) = match_unpack_bigint_part(expr) {
+                    match inner {
+                        Expr::Member(obj, _) if is_pure_obj(obj) => {
+                            self.visit_expr(obj);
+                            return;
+                        }
+                        Expr::Ident(v) if self.temp_props.contains_key(v) => return,
+                        _ => {}
                     }
                 }
-                _ => {
-                    self.scan_expr(lhs, temp_props);
-                    self.scan_expr(rhs, temp_props);
-                }
-            },
-            Stmt::Let(n, Some(Expr::Member(obj, k)))
-                if temp_props.get(n).is_some_and(|p| p == k) && is_pure_obj(obj) =>
-            {
-                self.scan_expr(obj, temp_props);
-            }
-            Stmt::Let(_, Some(e)) | Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Throw(e) => {
-                self.scan_expr(e, temp_props);
-            }
-            Stmt::Lets(decls) => {
-                for (n, init) in decls {
-                    if let Some(e) = init {
-                        if let Expr::Member(obj, k) = e {
-                            if temp_props.get(n).is_some_and(|p| p == k) && is_pure_obj(obj) {
-                                self.scan_expr(obj, temp_props);
+                match expr {
+                    Expr::Str(s) => self.scanner.exclude_prop_and_base(s),
+                    Expr::Object(entries) => {
+                        let mut seen_keys = BTreeSet::new();
+                        for (k, val) in entries {
+                            if !seen_keys.insert(k.as_str()) {
+                                self.scanner.exclude_prop_and_base(k);
+                            }
+                            if is_fixed_blacklisted_prop(k) || self.scanner.excluded.contains(k) {
+                                self.scanner.exclude_prop_and_base(k);
+                                self.visit_expr(val);
                                 continue;
                             }
+                            match classify_prop_rhs(val, k) {
+                                Some(PackedRhs::Const) => {
+                                    self.scanner.has_pack_write.insert(k.clone());
+                                }
+                                Some(PackedRhs::Pack(lo, hi)) => {
+                                    self.scanner.has_pack_write.insert(k.clone());
+                                    self.visit_expr(lo);
+                                    self.visit_expr(hi);
+                                }
+                                Some(PackedRhs::MemberCopy(rhs_obj)) => self.visit_expr(rhs_obj),
+                                None => {
+                                    self.scanner.exclude_prop_and_base(k);
+                                    self.visit_expr(val);
+                                }
+                            }
                         }
-                        self.scan_expr(e, temp_props);
                     }
-                }
-            }
-            Stmt::Return(Some(e)) => self.scan_expr(e, temp_props),
-            Stmt::If(t, a, b) => {
-                self.scan_expr(t, temp_props);
-                self.scan_stmts(a, temp_props);
-                if let Some(b) = b {
-                    self.scan_stmts(b, temp_props);
-                }
-            }
-            Stmt::Switch(d, cases) => {
-                self.scan_expr(d, temp_props);
-                for c in cases {
-                    for t in &c.tests {
-                        self.scan_expr(t, temp_props);
+                    Expr::Member(obj, k) => {
+                        self.scanner.exclude_prop_and_base(k);
+                        self.visit_expr(obj);
                     }
-                    self.scan_stmts(&c.body, temp_props);
+                    Expr::Arrow(_, body) => {
+                        let empty = BTreeMap::new();
+                        let mut inner = S {
+                            scanner: self.scanner,
+                            temp_props: &empty,
+                        };
+                        match body {
+                            ArrowBody::Expr(b) => inner.visit_expr(b),
+                            ArrowBody::Block(stmts) => inner.visit_stmts(stmts),
+                        }
+                    }
+                    _ => jsast::walk_expr(self, expr),
                 }
-            }
-            Stmt::Labeled(_, inner) => self.scan_stmt(inner, temp_props),
-            Stmt::LoopForever(_, b) | Stmt::Block(b) => self.scan_stmts(b, temp_props),
-            Stmt::While(t, b) => {
-                self.scan_expr(t, temp_props);
-                self.scan_stmts(b, temp_props);
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                self.scan_stmts(body, temp_props);
-                self.scan_stmts(handler, temp_props);
-            }
-            Stmt::Let(_, None)
-            | Stmt::Return(None)
-            | Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
-        }
-    }
-
-    fn scan_expr(&mut self, expr: &Expr, temp_props: &BTreeMap<String, String>) {
-        if let Some((_, inner)) = match_unpack_bigint_part(expr) {
-            match inner {
-                Expr::Member(obj, k) if is_pure_obj(obj) => {
-                    let _ = k;
-                    self.scan_expr(obj, temp_props);
-                    return;
-                }
-                Expr::Ident(v) if temp_props.contains_key(v) => {
-                    return;
-                }
-                _ => {}
             }
         }
-        match expr {
-            Expr::Str(s) => {
-                self.exclude_prop_and_base(s);
-            }
-            Expr::Object(entries) => {
-                let mut seen_keys = BTreeSet::new();
-                for (k, val) in entries {
-                    if !seen_keys.insert(k.as_str()) {
-                        self.exclude_prop_and_base(k);
-                    }
-                    if is_fixed_blacklisted_prop(k) || self.excluded.contains(k) {
-                        self.exclude_prop_and_base(k);
-                        self.scan_expr(val, temp_props);
-                        continue;
-                    }
-                    match classify_prop_rhs(val, k) {
-                        Some(PackedRhs::Const) => {
-                            self.has_pack_write.insert(k.clone());
-                        }
-                        Some(PackedRhs::Pack(lo, hi)) => {
-                            self.has_pack_write.insert(k.clone());
-                            self.scan_expr(lo, temp_props);
-                            self.scan_expr(hi, temp_props);
-                        }
-                        Some(PackedRhs::MemberCopy(rhs_obj)) => {
-                            self.scan_expr(rhs_obj, temp_props);
-                        }
-                        None => {
-                            self.exclude_prop_and_base(k);
-                            self.scan_expr(val, temp_props);
-                        }
-                    }
-                }
-            }
-            Expr::Member(obj, k) => {
-                self.exclude_prop_and_base(k);
-                self.scan_expr(obj, temp_props);
-            }
-            Expr::Index(obj, idx) => {
-                self.scan_expr(obj, temp_props);
-                self.scan_expr(idx, temp_props);
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                self.scan_expr(c, temp_props);
-                for a in args {
-                    self.scan_expr(a, temp_props);
-                }
-            }
-            Expr::Unary(_, inner) => self.scan_expr(inner, temp_props),
-            Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.scan_expr(l, temp_props);
-                self.scan_expr(r, temp_props);
-            }
-            Expr::Cond(t, c, a) => {
-                self.scan_expr(t, temp_props);
-                self.scan_expr(c, temp_props);
-                self.scan_expr(a, temp_props);
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for x in items {
-                    self.scan_expr(x, temp_props);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.scan_expr(b, &BTreeMap::new()),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => self.scan_stmts(stmts, &BTreeMap::new()),
-            _ => {}
+        S {
+            scanner: self,
+            temp_props,
         }
+        .visit_stmt(stmt);
     }
 }
 
@@ -4598,79 +3592,69 @@ impl BigIntPropRewriter<'_> {
     }
 
     fn rewrite_expr(&mut self, expr: &mut Expr, temp_props: &BTreeMap<String, String>) {
-        if let Some((part, inner)) = match_unpack_bigint_part(expr) {
-            let suffix = match part {
-                UnpackPart::Lo => "$lo",
-                UnpackPart::Hi => "$hi",
-            };
-            match inner {
-                Expr::Member(obj, k) if self.split_props.contains(k) => {
-                    let mut new_obj = (**obj).clone();
-                    self.rewrite_expr(&mut new_obj, temp_props);
-                    *expr = Expr::Member(Box::new(new_obj), format!("{k}{suffix}"));
-                    self.changed = true;
-                    return;
-                }
-                Expr::Ident(v)
-                    if temp_props
-                        .get(v)
-                        .is_some_and(|p| self.split_props.contains(p)) =>
-                {
-                    *expr = Expr::Ident(format!("{v}{suffix}"));
-                    self.changed = true;
-                    return;
-                }
-                _ => {}
-            }
+        struct E<'a, 'b, 'c> {
+            rewriter: &'a mut BigIntPropRewriter<'b>,
+            temp_props: &'c BTreeMap<String, String>,
         }
-        match expr {
-            Expr::Object(entries) => {
-                let mut new_entries = Vec::with_capacity(entries.len());
-                for (k, mut v) in std::mem::take(entries) {
-                    if self.split_props.contains(&k) {
-                        let (lo_expr, hi_expr) = self.split_rhs_expr(v, &k);
-                        new_entries.push((format!("{k}$lo"), lo_expr));
-                        new_entries.push((format!("{k}$hi"), hi_expr));
-                        self.changed = true;
-                    } else {
-                        self.rewrite_expr(&mut v, temp_props);
-                        new_entries.push((k, v));
+        impl jsast::VisitMut for E<'_, '_, '_> {
+            fn visit_expr_mut(&mut self, expr: &mut Expr) {
+                if let Some((part, inner)) = match_unpack_bigint_part(expr) {
+                    let suffix = match part {
+                        UnpackPart::Lo => "$lo",
+                        UnpackPart::Hi => "$hi",
+                    };
+                    match inner {
+                        Expr::Member(obj, k) if self.rewriter.split_props.contains(k) => {
+                            let mut new_obj = (**obj).clone();
+                            self.visit_expr_mut(&mut new_obj);
+                            *expr = Expr::Member(Box::new(new_obj), format!("{k}{suffix}"));
+                            self.rewriter.changed = true;
+                            return;
+                        }
+                        Expr::Ident(v)
+                            if self
+                                .temp_props
+                                .get(v)
+                                .is_some_and(|p| self.rewriter.split_props.contains(p)) =>
+                        {
+                            *expr = Expr::Ident(format!("{v}{suffix}"));
+                            self.rewriter.changed = true;
+                            return;
+                        }
+                        _ => {}
                     }
                 }
-                *entries = new_entries;
-            }
-            Expr::Member(obj, _) => self.rewrite_expr(obj, temp_props),
-            Expr::Index(obj, idx) => {
-                self.rewrite_expr(obj, temp_props);
-                self.rewrite_expr(idx, temp_props);
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                self.rewrite_expr(c, temp_props);
-                for a in args {
-                    self.rewrite_expr(a, temp_props);
+                match expr {
+                    Expr::Object(entries) => {
+                        let mut new_entries = Vec::with_capacity(entries.len());
+                        for (k, mut v) in std::mem::take(entries) {
+                            if self.rewriter.split_props.contains(&k) {
+                                let (lo_expr, hi_expr) = self.rewriter.split_rhs_expr(v, &k);
+                                new_entries.push((format!("{k}$lo"), lo_expr));
+                                new_entries.push((format!("{k}$hi"), hi_expr));
+                                self.rewriter.changed = true;
+                            } else {
+                                self.visit_expr_mut(&mut v);
+                                new_entries.push((k, v));
+                            }
+                        }
+                        *entries = new_entries;
+                    }
+                    Expr::Arrow(_, ArrowBody::Expr(b)) => {
+                        self.rewriter.rewrite_expr(b, &BTreeMap::new());
+                    }
+                    Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+                        self.rewriter.rewrite_stmts(stmts, &BTreeMap::new());
+                    }
+                    _ => jsast::walk_expr_mut(self, expr),
                 }
             }
-            Expr::Unary(_, inner) => self.rewrite_expr(inner, temp_props),
-            Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.rewrite_expr(l, temp_props);
-                self.rewrite_expr(r, temp_props);
-            }
-            Expr::Cond(t, c, a) => {
-                self.rewrite_expr(t, temp_props);
-                self.rewrite_expr(c, temp_props);
-                self.rewrite_expr(a, temp_props);
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for x in items {
-                    self.rewrite_expr(x, temp_props);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.rewrite_expr(b, &BTreeMap::new()),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => {
-                self.rewrite_stmts(stmts, &BTreeMap::new());
-            }
-            _ => {}
         }
+        E {
+            rewriter: self,
+            temp_props,
+        }
+        .visit_expr_mut(expr);
     }
 }
 
@@ -4728,79 +3712,33 @@ struct TagScanner {
 }
 
 impl TagScanner {
-    fn scan_stmts(&mut self, stmts: &[Stmt]) {
-        for s in stmts {
-            self.scan_stmt(s);
-        }
-    }
-
     fn scan_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Switch(disc, cases) => {
-                if let Expr::Member(obj, prop) = disc {
-                    if prop == "TAG" {
-                        self.scan_expr(obj);
-                        for c in cases {
-                            for t in &c.tests {
-                                if let Expr::Str(s) = t {
-                                    self.candidates.insert(s.clone());
-                                } else {
-                                    self.scan_expr(t);
-                                }
-                            }
-                            self.scan_stmts(&c.body);
-                        }
-                        return;
-                    }
-                }
-                self.scan_expr(disc);
+        jsast::Visit::visit_stmt(self, stmt);
+    }
+}
+
+impl jsast::Visit for TagScanner {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if let Stmt::Switch(Expr::Member(obj, prop), cases) = stmt {
+            if prop == "TAG" {
+                self.visit_expr(obj);
                 for c in cases {
                     for t in &c.tests {
-                        self.scan_expr(t);
+                        if let Expr::Str(s) = t {
+                            self.candidates.insert(s.clone());
+                        } else {
+                            self.visit_expr(t);
+                        }
                     }
-                    self.scan_stmts(&c.body);
+                    self.visit_stmts(&c.body);
                 }
+                return;
             }
-            Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Throw(e) => self.scan_expr(e),
-            Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => self.scan_expr(e),
-            Stmt::Lets(decls) => {
-                for (_, init) in decls {
-                    if let Some(e) = init {
-                        self.scan_expr(e);
-                    }
-                }
-            }
-            Stmt::If(t, a, b) => {
-                self.scan_expr(t);
-                self.scan_stmts(a);
-                if let Some(b) = b {
-                    self.scan_stmts(b);
-                }
-            }
-            Stmt::Labeled(_, inner) => self.scan_stmt(inner),
-            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
-                self.scan_stmts(b);
-            }
-            Stmt::While(t, b) => {
-                self.scan_expr(t);
-                self.scan_stmts(b);
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                self.scan_stmts(body);
-                self.scan_stmts(handler);
-            }
-            Stmt::Let(_, None)
-            | Stmt::Return(None)
-            | Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
         }
+        jsast::walk_stmt(self, stmt);
     }
 
-    fn scan_expr(&mut self, expr: &Expr) {
+    fn visit_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Str(s) => {
                 self.bad.insert(s.clone());
@@ -4813,68 +3751,39 @@ impl TagScanner {
                             continue;
                         }
                     }
-                    self.scan_expr(val);
+                    self.visit_expr(val);
                 }
             }
             Expr::Assign(lhs, rhs) => {
                 if let (Expr::Member(obj, k), Expr::Str(s)) = (lhs.as_ref(), rhs.as_ref()) {
                     if k == "TAG" {
                         self.candidates.insert(s.clone());
-                        self.scan_expr(obj);
+                        self.visit_expr(obj);
                         return;
                     }
                 }
-                self.scan_expr(lhs);
-                self.scan_expr(rhs);
+                self.visit_expr(lhs);
+                self.visit_expr(rhs);
             }
-            Expr::Binary(op @ (BinOp::StrictEq | BinOp::StrictNe), l, r) => {
-                let _ = op;
+            Expr::Binary(BinOp::StrictEq | BinOp::StrictNe, l, r) => {
                 if let (Expr::Member(obj, k), Expr::Str(s)) = (l.as_ref(), r.as_ref()) {
                     if k == "TAG" {
                         self.candidates.insert(s.clone());
-                        self.scan_expr(obj);
+                        self.visit_expr(obj);
                         return;
                     }
                 }
                 if let (Expr::Str(s), Expr::Member(obj, k)) = (l.as_ref(), r.as_ref()) {
                     if k == "TAG" {
                         self.candidates.insert(s.clone());
-                        self.scan_expr(obj);
+                        self.visit_expr(obj);
                         return;
                     }
                 }
-                self.scan_expr(l);
-                self.scan_expr(r);
+                self.visit_expr(l);
+                self.visit_expr(r);
             }
-            Expr::Member(obj, _) => self.scan_expr(obj),
-            Expr::Index(obj, idx) => {
-                self.scan_expr(obj);
-                self.scan_expr(idx);
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                self.scan_expr(c);
-                for a in args {
-                    self.scan_expr(a);
-                }
-            }
-            Expr::Unary(_, inner) => self.scan_expr(inner),
-            Expr::Binary(_, l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.scan_expr(l);
-                self.scan_expr(r);
-            }
-            Expr::Cond(t, c, a) => {
-                self.scan_expr(t);
-                self.scan_expr(c);
-                self.scan_expr(a);
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for x in items {
-                    self.scan_expr(x);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.scan_expr(b),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => self.scan_stmts(stmts),
-            _ => {}
+            _ => jsast::walk_expr(self, expr),
         }
     }
 }
@@ -4894,109 +3803,62 @@ impl TagRewriter<'_> {
         }
     }
 
-    fn rewrite_stmts(&mut self, stmts: &mut [Stmt]) {
-        for s in stmts {
-            self.rewrite_stmt(s);
-        }
-    }
-
     fn rewrite_stmt(&mut self, stmt: &mut Stmt) {
-        match stmt {
-            Stmt::Switch(disc, cases) => {
-                if let Expr::Member(obj, prop) = disc {
-                    if prop == "TAG" {
-                        self.rewrite_expr(obj);
-                        for c in cases {
-                            for t in &mut c.tests {
-                                if matches!(t, Expr::Str(_)) {
-                                    self.rewrite_str_if_mapped(t);
-                                } else {
-                                    self.rewrite_expr(t);
-                                }
-                            }
-                            self.rewrite_stmts(&mut c.body);
-                        }
-                        return;
-                    }
-                }
-                self.rewrite_expr(disc);
+        jsast::VisitMut::visit_stmt_mut(self, stmt);
+    }
+}
+
+impl jsast::VisitMut for TagRewriter<'_> {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        if let Stmt::Switch(Expr::Member(obj, prop), cases) = stmt {
+            if prop == "TAG" {
+                self.visit_expr_mut(obj);
                 for c in cases {
                     for t in &mut c.tests {
-                        self.rewrite_expr(t);
+                        if matches!(t, Expr::Str(_)) {
+                            self.rewrite_str_if_mapped(t);
+                        } else {
+                            self.visit_expr_mut(t);
+                        }
                     }
-                    self.rewrite_stmts(&mut c.body);
+                    self.visit_stmts_mut(&mut c.body);
                 }
+                return;
             }
-            Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Throw(e) => self.rewrite_expr(e),
-            Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => self.rewrite_expr(e),
-            Stmt::Lets(decls) => {
-                for (_, init) in decls {
-                    if let Some(e) = init {
-                        self.rewrite_expr(e);
-                    }
-                }
-            }
-            Stmt::If(t, a, b) => {
-                self.rewrite_expr(t);
-                self.rewrite_stmts(a);
-                if let Some(b) = b {
-                    self.rewrite_stmts(b);
-                }
-            }
-            Stmt::Labeled(_, inner) => self.rewrite_stmt(inner),
-            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
-                self.rewrite_stmts(b);
-            }
-            Stmt::While(t, b) => {
-                self.rewrite_expr(t);
-                self.rewrite_stmts(b);
-            }
-            Stmt::TryCatch { body, handler, .. } => {
-                self.rewrite_stmts(body);
-                self.rewrite_stmts(handler);
-            }
-            Stmt::Let(_, None)
-            | Stmt::Return(None)
-            | Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
         }
+        jsast::walk_stmt_mut(self, stmt);
     }
 
-    fn rewrite_expr(&mut self, expr: &mut Expr) {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
         match expr {
             Expr::Object(entries) => {
                 for (k, val) in entries {
                     if k == "TAG" && matches!(val, Expr::Str(_)) {
                         self.rewrite_str_if_mapped(val);
                     } else {
-                        self.rewrite_expr(val);
+                        self.visit_expr_mut(val);
                     }
                 }
             }
             Expr::Assign(lhs, rhs) => {
-                if let (Expr::Member(obj, k), Expr::Str(_)) = (&**lhs, &**rhs) {
-                    if k == "TAG" {
-                        let _ = obj;
-                        self.rewrite_str_if_mapped(rhs);
-                        if let Expr::Member(obj, _) = &mut **lhs {
-                            self.rewrite_expr(obj);
-                        }
-                        return;
+                if matches!(&**lhs, Expr::Member(_, k) if k == "TAG")
+                    && matches!(&**rhs, Expr::Str(_))
+                {
+                    self.rewrite_str_if_mapped(rhs);
+                    if let Expr::Member(obj, _) = &mut **lhs {
+                        self.visit_expr_mut(obj);
                     }
+                    return;
                 }
-                self.rewrite_expr(lhs);
-                self.rewrite_expr(rhs);
+                self.visit_expr_mut(lhs);
+                self.visit_expr_mut(rhs);
             }
             Expr::Binary(BinOp::StrictEq | BinOp::StrictNe, l, r) => {
                 if matches!(&**l, Expr::Member(_, k) if k == "TAG") && matches!(&**r, Expr::Str(_))
                 {
                     self.rewrite_str_if_mapped(r);
                     if let Expr::Member(obj, _) = &mut **l {
-                        self.rewrite_expr(obj);
+                        self.visit_expr_mut(obj);
                     }
                     return;
                 }
@@ -5004,42 +3866,14 @@ impl TagRewriter<'_> {
                 {
                     self.rewrite_str_if_mapped(l);
                     if let Expr::Member(obj, _) = &mut **r {
-                        self.rewrite_expr(obj);
+                        self.visit_expr_mut(obj);
                     }
                     return;
                 }
-                self.rewrite_expr(l);
-                self.rewrite_expr(r);
+                self.visit_expr_mut(l);
+                self.visit_expr_mut(r);
             }
-            Expr::Member(obj, _) => self.rewrite_expr(obj),
-            Expr::Index(obj, idx) => {
-                self.rewrite_expr(obj);
-                self.rewrite_expr(idx);
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                self.rewrite_expr(c);
-                for a in args {
-                    self.rewrite_expr(a);
-                }
-            }
-            Expr::Unary(_, inner) => self.rewrite_expr(inner),
-            Expr::Binary(_, l, r) | Expr::CompoundAssign(_, l, r) => {
-                self.rewrite_expr(l);
-                self.rewrite_expr(r);
-            }
-            Expr::Cond(t, c, a) => {
-                self.rewrite_expr(t);
-                self.rewrite_expr(c);
-                self.rewrite_expr(a);
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                for x in items {
-                    self.rewrite_expr(x);
-                }
-            }
-            Expr::Arrow(_, ArrowBody::Expr(b)) => self.rewrite_expr(b),
-            Expr::Arrow(_, ArrowBody::Block(stmts)) => self.rewrite_stmts(stmts),
-            _ => {}
+            _ => jsast::walk_expr_mut(self, expr),
         }
     }
 }
@@ -5099,6 +3933,8 @@ fn encode_internal_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jir::semantic::HostPayload;
+    use crate::jsast::SwitchCase;
 
     type TestRunOutput = (
         BTreeMap<JsName, LinkItem>,
@@ -5459,8 +4295,7 @@ mod tests {
                 map: item_map(Vec::new()),
                 dts: None,
                 optimization: Default::default(),
-                late_ir: Default::default(),
-                baseline_shadow: Default::default(),
+                allocator_provider: Default::default(),
                 jir: Default::default(),
             },
         );
@@ -5573,8 +4408,7 @@ mod tests {
                 map: item_map(Vec::new()),
                 dts: None,
                 optimization: Default::default(),
-                late_ir: Default::default(),
-                baseline_shadow: Default::default(),
+                allocator_provider: Default::default(),
                 jir: Default::default(),
             },
         );
@@ -5876,7 +4710,6 @@ mod tests {
                         host: Some(HostPayload::Marker {
                             section: host_section,
                             def: def_of(40),
-                            template: None,
                             helpers: Vec::new(),
                         }),
                     }),
@@ -5928,8 +4761,7 @@ mod tests {
                     map: item_map(Vec::new()),
                     dts: None,
                     optimization: Default::default(),
-                    late_ir: Default::default(),
-                    baseline_shadow: Default::default(),
+                    allocator_provider: Default::default(),
                     jir,
                 },
             );

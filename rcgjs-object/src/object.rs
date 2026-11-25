@@ -52,7 +52,7 @@ use crate::jir::summary::{self, Availability, ItemClass, ItemSummary, SemanticKe
 use crate::jir::JIR_SCHEMA;
 
 /// The object format. Every object in a program has to carry this one.
-pub const FORMAT_VERSION: u16 = 27;
+pub const FORMAT_VERSION: u16 = 28;
 
 /// The marker that opens the member and the trailer.
 pub const MAGIC: [u8; 6] = *b"RCGJS\0";
@@ -256,18 +256,16 @@ pub enum SectionId {
     Bodies = 3,
     Baseline = 4,
     Origins = 5,
-    Legacy = 6,
     Sources = 7,
 }
 
 impl SectionId {
-    pub const ALL: [SectionId; 7] = [
+    pub const ALL: [SectionId; 6] = [
         SectionId::Interns,
         SectionId::Summaries,
         SectionId::Bodies,
         SectionId::Baseline,
         SectionId::Origins,
-        SectionId::Legacy,
         SectionId::Sources,
     ];
 
@@ -278,7 +276,6 @@ impl SectionId {
             SectionId::Bodies => "S3 bodies",
             SectionId::Baseline => "S4 baseline",
             SectionId::Origins => "S5 origins",
-            SectionId::Legacy => "S6 legacy",
             SectionId::Sources => "S7 sources",
         }
     }
@@ -524,13 +521,8 @@ impl Writer {
         &self.summaries
     }
 
-    /// Finishes the object. `baseline` and `legacy` are the producer's S4 and S6 payloads.
-    pub fn finish(
-        self,
-        baseline: &[u8],
-        legacy: &[u8],
-        sources: &BTreeMap<String, String>,
-    ) -> Vec<u8> {
+    /// Finishes the object. `baseline` is the producer's S4 payload.
+    pub fn finish(self, baseline: &[u8], sources: &BTreeMap<String, String>) -> Vec<u8> {
         let codec = self.header.codec;
 
         let interns_plain = codec::encode(&self.interns);
@@ -561,13 +553,12 @@ impl Writer {
             ulen: source_bytes.len() as u64,
             data: codec.compress(&source_bytes),
         });
-        let sections: [(SectionId, &[u8]); 7] = [
+        let sections: [(SectionId, &[u8]); 6] = [
             (SectionId::Interns, &s1),
             (SectionId::Summaries, &s2),
             (SectionId::Bodies, &s3),
             (SectionId::Baseline, baseline),
             (SectionId::Origins, &s5),
-            (SectionId::Legacy, legacy),
             (SectionId::Sources, &s7),
         ];
 
@@ -635,8 +626,6 @@ pub struct Object {
     pub text: String,
     /// The producer's S4 payload.
     pub baseline: Vec<u8>,
-    /// The producer's S6 payload.
-    pub legacy: Vec<u8>,
     /// The section table, for size reports.
     pub sections: Vec<SectionEntry>,
     bodies: Vec<u8>,
@@ -730,15 +719,6 @@ pub fn read(bytes: &[u8]) -> Result<Option<Object>, ObjectError> {
         .decompress(&packed.data, packed.ulen as usize)?;
     let mut interns: Interns = codec::decode(&interns_plain, "interns")?;
     interns.rebuild_indices();
-    if !interns
-        .coroutine_sources
-        .values()
-        .all(|source| source.valid(&interns))
-    {
-        return Err(ObjectError::Corrupt(
-            "invalid coroutine source facts".to_owned(),
-        ));
-    }
 
     let summaries: Vec<ItemSummary> =
         codec::decode(section(SectionId::Summaries)?, "summary index")?;
@@ -755,7 +735,6 @@ pub fn read(bytes: &[u8]) -> Result<Option<Object>, ObjectError> {
         blobs,
         text,
         baseline: section(SectionId::Baseline)?.to_vec(),
-        legacy: section(SectionId::Legacy)?.to_vec(),
         sections,
         bodies: s3.to_vec(),
         origins: section(SectionId::Origins)?.to_vec(),
@@ -1136,7 +1115,7 @@ mod tests {
             "pub fn generic<T>(x: T) -> T { x }\n".to_owned(),
         )]);
         let build =
-            || Writer::new(test_header("generic"), "", Interns::new()).finish(b"", b"", &sources);
+            || Writer::new(test_header("generic"), "", Interns::new()).finish(b"", &sources);
         let bytes = build();
         let object = read(&bytes).unwrap().unwrap();
         assert!(object.summaries.is_empty());
@@ -1178,7 +1157,7 @@ mod tests {
             input("c", &["b"], Some((&c, &origins_c))),
         );
         writer.push_item("function d() {}\n", input("d", &[], None));
-        (writer.finish(b"S4", b"S6", &BTreeMap::new()), vec![a, b, c])
+        (writer.finish(b"S4", &BTreeMap::new()), vec![a, b, c])
     }
 
     #[test]
@@ -1189,7 +1168,6 @@ mod tests {
         let object = read(&bytes).unwrap().unwrap();
         assert_eq!(object.header, test_header("crate"));
         assert_eq!(object.baseline, b"S4");
-        assert_eq!(object.legacy, b"S6");
         assert_eq!(object.summaries.len(), 4);
         assert_eq!(object.blobs.len(), 2, "identical bodies share one blob");
 

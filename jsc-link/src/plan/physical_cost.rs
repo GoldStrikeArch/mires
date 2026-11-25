@@ -71,14 +71,6 @@ pub struct DecisionEvaluation {
 }
 
 impl Evaluation {
-    pub fn final_emitted(&self) -> Option<ProgramMetrics> {
-        self.final_metrics.or(if self.accepted && self.applied {
-            self.validated
-        } else {
-            self.before
-        })
-    }
-
     /// The surviving program after a verification retry removed the physical plan.
     pub fn after_retry(&self) -> Evaluation {
         Evaluation {

@@ -29,7 +29,6 @@ use crate::jir::BodyKind;
 use crate::lower::js::unsize::VtableIndex;
 
 use super::observed_carriers;
-use super::witness::{self, Witness};
 
 /// What the pass did, for the sidecar's `devirt` block.
 #[derive(Clone, Debug, Default)]
@@ -74,7 +73,7 @@ pub fn run(
         }
         let table = &caller_interns.types;
         let mut rewritten = func.clone();
-        let mut witnesses = Vec::new();
+        let mut applied_count = 0u32;
         for rewrite in &rewrites {
             let op = &mut rewritten.blocks[rewrite.block].ops[rewrite.op];
             let OpKind::Call {
@@ -94,23 +93,16 @@ pub fn run(
             if let Some(receiver) = rewrite.receiver {
                 args[0] = receiver;
             }
-            witnesses.push(Witness::Devirt {
-                target: rewrite.link_name,
-            });
+            applied_count += 1;
         }
-        stats.witnesses_recorded += witnesses.len() as u32;
+        stats.witnesses_recorded += applied_count;
         let verified = rewritten
             .verify_carriers(table, observed_carriers(&rewritten))
             .is_ok();
-        let checked =
-            !witness::enabled() || witness::check_all(&witnesses, &rewritten, table).is_ok();
-        if !verified || !checked {
-            if verified {
-                stats.witnesses_failed += 1;
-            }
+        if !verified {
             continue; // The func in the map is still the backup's content: nothing changed.
         }
-        stats.applied += witnesses.len() as u32;
+        stats.applied += applied_count;
         stats.items.insert(name.clone());
         funcs.insert(name, Ok(rewritten));
     }

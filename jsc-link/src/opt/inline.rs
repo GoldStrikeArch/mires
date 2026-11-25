@@ -50,7 +50,6 @@ use crate::jir::semantic::{
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
 use crate::lower::js::host::ItemIndex;
 
-use super::witness::{self, Witness};
 use super::{candidates, observed_carriers};
 
 mod remap;
@@ -565,19 +564,7 @@ pub(crate) fn run_with_profile_and_retargets(
                 stats.decline("inline.cost-rejected");
                 continue;
             }
-            let record = Witness::Inline {
-                callee_bytes: effective_callee_bytes.min(u32::MAX as u64) as u32,
-                limit: size_limit.min(u32::MAX as u64) as u32,
-                bytes_before: bytes.min(u32::MAX as u64) as u32,
-                bytes_after: after.min(u32::MAX as u64) as u32,
-            };
             stats.witnesses_recorded += 1;
-            if witness::enabled() && record.check(&candidate, table).is_err() {
-                stats.witnesses_failed += 1;
-                current = backup;
-                stats.decline("inline.witness-invalid");
-                continue;
-            }
             if !bounded_loop_virtualization && !speed_tiny_leaf {
                 growth += charge;
             }
@@ -740,21 +727,7 @@ pub(crate) fn run_with_profile_and_retargets(
                     stats.decline("inline.cost-rejected");
                     continue;
                 }
-                let record = Witness::Inline {
-                    callee_bytes: callee_bytes.min(u32::MAX as u64) as u32,
-                    limit: size_limit.min(u32::MAX as u64) as u32,
-                    bytes_before: batch_bytes.min(u32::MAX as u64) as u32,
-                    bytes_after: after.min(u32::MAX as u64) as u32,
-                };
                 stats.witnesses_recorded += 1;
-                if witness::enabled() && record.check(&candidate, table).is_err() {
-                    stats.witnesses_failed += 1;
-                    current = batch_backup;
-                    current_metadata = batch_meta;
-                    bytes = batch_bytes;
-                    stats.decline("inline.witness-invalid");
-                    continue;
-                }
                 bytes = after;
                 applied_here += remaining.len() as u32;
                 stats.cross_object_applied += (remaining.len() as u32)
@@ -1906,10 +1879,7 @@ fn is_host_boundary_op(kind: &OpKind, interns: &Interns, speed: bool) -> bool {
                 .as_ref()
                 .is_some_and(|payload| independent_host(payload, interns, speed))
                 && (host.is_some()
-                    || matches!(
-                        semantic,
-                        CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
-                    ))
+                    || matches!(semantic, CallSemantic::Host | CallSemantic::RawJavaScript))
         }
         _ => false,
     }
@@ -2084,10 +2054,7 @@ fn is_direct_alloc_call(callee: &Callee, interns: &Interns) -> bool {
 fn independent_host(payload: &HostPayload, interns: &Interns, speed: bool) -> bool {
     match payload {
         HostPayload::Marker {
-            section,
-            template: None,
-            helpers,
-            ..
+            section, helpers, ..
         } if helpers.is_empty() => {
             let Some(marker) = interns
                 .str(*section)
@@ -2730,13 +2697,7 @@ mod tests {
                             caller_location: func.sig.abi.caller_location,
                             caller_location_def: None,
                             is_core: false,
-                            used_params: BTreeSet::new(),
                             standard: None,
-                            keyed_purity: None,
-                            keyed_read_params: None,
-                            keyed_may_unwind: None,
-                            keyed_row_capture: None,
-                            keyed_proxy_safe_params: None,
                         },
                     );
                 }
@@ -3038,7 +2999,7 @@ mod tests {
                 function: None,
                 args: vec![x],
                 track_caller: None,
-                semantic: CallSemantic::ViewAbi,
+                semantic: CallSemantic::Host,
                 host: None,
             },
             I32,
@@ -3063,18 +3024,12 @@ mod tests {
             ("rcgjs.tc.text", false),
         ] {
             let section = interns.intern_str(marker);
-            let mut payload = HostPayload::Marker {
+            let payload = HostPayload::Marker {
                 section,
                 def: item(1).definition,
-                template: None,
                 helpers: Vec::new(),
             };
             assert_eq!(independent_host(&payload, &interns, false), supported);
-            let HostPayload::Marker { template, .. } = &mut payload else {
-                unreachable!()
-            };
-            *template = Some(ConstTree::Unit);
-            assert!(!independent_host(&payload, &interns, false));
         }
     }
 
@@ -3970,7 +3925,6 @@ mod tests {
                 payload: HostPayload::Marker {
                     section,
                     def: item(2).definition,
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: vec![hx],
@@ -6172,13 +6126,7 @@ mod tests {
                 caller_location: false,
                 caller_location_def: None,
                 is_core: false,
-                used_params: BTreeSet::new(),
                 standard: Some(StandardOperation::NativeVecAsSlice),
-                keyed_purity: None,
-                keyed_read_params: None,
-                keyed_may_unwind: None,
-                keyed_row_capture: None,
-                keyed_proxy_safe_params: None,
             },
         );
         let make_origins = |fact| OriginTable {

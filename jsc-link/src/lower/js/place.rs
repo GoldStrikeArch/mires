@@ -665,10 +665,11 @@ impl<'a> JsCx<'a> {
             ));
         };
         if !matches!(value::kind(self.table, tail_ty), Some(TypeKind::Slice(_))) {
-            return Err(decline(
-                OpClass::Place,
-                "a struct with a non-slice unsized tail",
-            ));
+            return Ok(JsPlace::Var(self.zombie(format!(
+                "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice \
+                 tail is, because only a run of elements can be laid out after the header",
+                self.type_display(tail_ty),
+            ))));
         }
         let key_name = value::key_name(self.interns, key).expect("tail field key");
         let heap = self.heap();

@@ -12,19 +12,12 @@ pub enum Step {
     Backend,
     /// The sysroot holding the `core` the backend compiled.
     Sysroot,
-    /// The view macros, built for the host that runs them.
-    ViewMacros,
 }
 
 impl Step {
     /// Every step, in the order they have to be performed: each one is built
     /// with the ones before it.
-    pub const ALL: [Self; 4] = [
-        Self::Toolchain,
-        Self::Backend,
-        Self::Sysroot,
-        Self::ViewMacros,
-    ];
+    pub const ALL: [Self; 3] = [Self::Toolchain, Self::Backend, Self::Sysroot];
 
     /// A short name for the step, for progress output.
     #[must_use]
@@ -33,7 +26,6 @@ impl Step {
             Self::Toolchain => "toolchain",
             Self::Backend => "backend",
             Self::Sysroot => "sysroot",
-            Self::ViewMacros => "view macros",
         }
     }
 }
@@ -228,14 +220,11 @@ mod tests {
 
     #[test]
     fn a_command_with_a_directory_prints_the_cd_that_reaches_it() {
-        let fix = Fix::new(Step::ViewMacros, "cargo")
-            .args(["build", "--release", "-p", "view-dom-macro"])
+        let fix = Fix::new(Step::Backend, "cargo")
+            .args(["build", "--release"])
             .dir("/spike");
 
-        assert_eq!(
-            fix.to_string(),
-            "cd /spike && cargo build --release -p view-dom-macro"
-        );
+        assert_eq!(fix.to_string(), "cd /spike && cargo build --release");
         assert_eq!(fix.directory(), Some(Path::new("/spike")));
     }
 
@@ -290,6 +279,5 @@ mod tests {
         assert_eq!(Step::Toolchain.label(), "toolchain");
         assert_eq!(Step::Backend.label(), "backend");
         assert_eq!(Step::Sysroot.label(), "sysroot");
-        assert_eq!(Step::ViewMacros.label(), "view macros");
     }
 }

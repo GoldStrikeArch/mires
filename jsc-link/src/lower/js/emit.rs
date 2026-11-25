@@ -15,17 +15,13 @@
 //! with the sign-bias decode over `TypeTable::int_info`; a switch on a tag enum spells its cases
 //! as variant names.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::origin::SourceFactId;
-use rcgjs_object::jir::repr::{
-    Carrier, CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
-};
-use rcgjs_object::jir::semantic::{
-    BinaryOp, CoroutineDesugaring, CoroutineKind, HostPayload, TypeId,
-};
+use rcgjs_object::jir::repr::{CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId};
+use rcgjs_object::jir::semantic::{BinaryOp, CoroutineDesugaring, CoroutineKind, TypeId};
 use rcgjs_object::jir::types::{EnumRepr, IntRepr, PointerForm, TypeKind};
 use rcgjs_object::jsast::{self, BinOp, Expr, Loc, Stmt};
 use rcgjs_object::ptr;
@@ -1244,56 +1240,8 @@ impl<'a> JsCx<'a> {
         *last = Some(loc);
     }
 
-    /// The keyed marker owns a source fact for its whole synthesized runtime
-    /// call. Prefer that over the enclosing macro expansion's MIR origin so an
-    /// exact debugger position lands on the written `for ... key (...)` site.
     fn op_loc(&self, op: &Op) -> Option<Loc> {
-        if let Some(loc) = self.keyed_op_loc(op) {
-            return Some(loc);
-        }
-        let args = match &op.kind {
-            OpKind::Call { args, .. } | OpKind::Host { args, .. } => args.as_slice(),
-            _ => &[],
-        };
-        let mut seen = BTreeSet::new();
-        if let Some(loc) = args
-            .iter()
-            .find_map(|value| self.inlined_keyed_loc(*value, &mut seen))
-        {
-            return Some(loc);
-        }
         self.loc_of(op.origin)
-    }
-
-    /// Finds a keyed expression that this operation prints at its use site.
-    fn inlined_keyed_loc(&self, value: ValueId, seen: &mut BTreeSet<ValueId>) -> Option<Loc> {
-        if !self.is_inline(value) || !seen.insert(value) {
-            return None;
-        }
-        let op = self.def_of(value)?;
-        if let Some(loc) = self.keyed_op_loc(op) {
-            return Some(loc);
-        }
-        let args = match &op.kind {
-            OpKind::Call { args, .. } | OpKind::Host { args, .. } => args.as_slice(),
-            OpKind::Copy(value) | OpKind::Move(value) => {
-                return self.inlined_keyed_loc(*value, seen);
-            }
-            _ => &[],
-        };
-        args.iter()
-            .find_map(|value| self.inlined_keyed_loc(*value, seen))
-    }
-
-    fn keyed_op_loc(&self, op: &Op) -> Option<Loc> {
-        let OpKind::Call {
-            host: Some(HostPayload::KeyedList(payload)),
-            ..
-        } = &op.kind
-        else {
-            return None;
-        };
-        payload.site.and_then(|site| self.loc_of_fact(site))
     }
 
     /// The op an `OpRef` names.
@@ -1624,11 +1572,7 @@ impl<'a> JsCx<'a> {
                 | OpKind::Host { .. }
                 | OpKind::Drop { .. }
         ) && !self.is_byte_view_intrinsic(op)
-            && !self.is_inlined_vec_bypass_call(op)
         {
-            if let Some(stmts) = self.inlined_vec_reserve_stmts(op)? {
-                return Ok(stmts);
-            }
             if let Some(result) = op.result.filter(|result| self.is_inline(*result)) {
                 // Spelled at its one use site (`JsCx::expr_of`) — but the statements its lowering
                 // needs have no position there, so they are emitted here, at the definition, and
@@ -1739,26 +1683,6 @@ impl<'a> JsCx<'a> {
                 }
                 if let Some(stmts) = self.try_scalarize_soa_view(op, result)? {
                     return Ok(stmts);
-                }
-                if let (OpKind::Convert { v: src, .. }, Some(kind)) =
-                    (&op.kind, self.dropped_string_kind(result))
-                {
-                    let skip = match kind {
-                        DroppedStringKind::NoOp => self.only_used_by_empty_drop(result),
-                        DroppedStringKind::BaselineDealloc { .. } => {
-                            self.only_used_by_adjacent_drop(result)
-                        }
-                    };
-                    if skip {
-                        let mut stmts = Vec::new();
-                        if matches!(kind, DroppedStringKind::NoOp) && self.is_inline(*src) {
-                            let expr = self.expr_of(*src)?;
-                            if !jsast::is_droppable(&expr) {
-                                stmts.push(jsast::expr_stmt(expr));
-                            }
-                        }
-                        return Ok(stmts);
-                    }
                 }
                 let expr = self.op_expr(op, result)?;
                 self.record_allocation_origin(result, &expr);
@@ -2311,24 +2235,6 @@ impl<'a> JsCx<'a> {
             return Ok(None);
         };
 
-        if let Some((carrier, cluster)) = self.inlined_vec_cluster_of(result) {
-            if cluster.slice_values.contains(&result) {
-                let base = self.inlined_vec_text_expr(carrier, cluster.root)?;
-                return Ok(Some(match res_bv.mode {
-                    super::ByteViewMode::FullSlice => base,
-                    super::ByteViewMode::VarSlice => {
-                        let len_expr = jsast::member(base.clone(), "length");
-                        jsast::object_of(vec![
-                            ("buf", base),
-                            ("off", jsast::num(0)),
-                            ("len", len_expr),
-                        ])
-                    }
-                    super::ByteViewMode::ThinPtr => jsast::num(0),
-                }));
-            }
-        }
-
         let expr = match &op.kind {
             OpKind::Const(tree)
                 if super::byte_view_analysis::const_u8_slice_str(tree).is_some() =>
@@ -2460,13 +2366,6 @@ impl<'a> JsCx<'a> {
                 };
                 if res_bv.mode == super::ByteViewMode::FullSlice {
                     base
-                } else if self.inlined_vec_cluster_of(result).is_some() {
-                    let len_expr = jsast::member(base.clone(), "length");
-                    jsast::object_of(vec![
-                        ("buf", base),
-                        ("off", jsast::num(0)),
-                        ("len", len_expr),
-                    ])
                 } else {
                     let off = self.byte_view_off_expr(*ptr)?;
                     let len_expr = self.expr_of(*len)?;
@@ -2567,27 +2466,6 @@ impl<'a> JsCx<'a> {
             {
                 self.byte_view_cast_or_alias(*base, res_bv, result)?
             }
-            OpKind::Call {
-                semantic:
-                    rcgjs_object::jir::semantic::CallSemantic::Standard(
-                        rcgjs_object::jir::semantic::StandardOperation::VecAsSlice,
-                    ),
-                ..
-            } if self.inlined_vec_cluster_of(result).is_some() => {
-                let base = self.byte_view_base_expr(res_bv, result)?;
-                match res_bv.mode {
-                    super::ByteViewMode::FullSlice => base,
-                    super::ByteViewMode::VarSlice => {
-                        let len_expr = jsast::member(base.clone(), "length");
-                        jsast::object_of(vec![
-                            ("buf", base),
-                            ("off", jsast::num(0)),
-                            ("len", len_expr),
-                        ])
-                    }
-                    super::ByteViewMode::ThinPtr => return Ok(None),
-                }
-            }
             OpKind::Binary {
                 op: BinaryOp::Offset,
                 l,
@@ -2645,181 +2523,6 @@ impl<'a> JsCx<'a> {
         }
     }
 
-    /// Stage 3 (`js-str=bytes`): looks up a closed MIR-inlined `String.vec` cluster if `v`
-    /// belongs to one AND the planner committed the `String` root natively (`HostString` or
-    /// `StringBuilder`). Always returns `None` when `bstr` is disabled or `root` stayed Baseline.
-    fn inlined_vec_cluster_of(
-        &self,
-        v: ValueId,
-    ) -> Option<(
-        rcgjs_object::jir::repr::Carrier,
-        &crate::lower::semantic_ops::string::InlinedVecCluster,
-    )> {
-        if !crate::lower::bstr::enabled() {
-            return None;
-        }
-        let analysis = self.inlined_string_vec()?;
-        let &cid = analysis.value_cluster.get(&v)?;
-        let cluster = analysis.clusters.get(cid)?;
-        let carrier = cluster
-            .witness_values
-            .first()
-            .map(|w| self.func.values[w.0 as usize].carrier)
-            .filter(|c| {
-                matches!(
-                    c,
-                    rcgjs_object::jir::repr::Carrier::HostString
-                        | rcgjs_object::jir::repr::Carrier::StringBuilder
-                )
-            })?;
-        Some((carrier, cluster))
-    }
-
-    fn inlined_vec_text_expr(
-        &self,
-        carrier: rcgjs_object::jir::repr::Carrier,
-        root: crate::lower::semantic_ops::string::StringRoot,
-    ) -> Res<Expr> {
-        let base = match root {
-            crate::lower::semantic_ops::string::StringRoot::Cell(c) => {
-                let walk = self.walk_place(&rcgjs_object::jir::repr::Root::Cell(c), &[])?;
-                self.read_place(&walk.place)
-            }
-            crate::lower::semantic_ops::string::StringRoot::Value(v) => self.expr_of(v)?,
-        };
-        Ok(match carrier {
-            rcgjs_object::jir::repr::Carrier::StringBuilder => jsast::member(base, "text"),
-            _ => base,
-        })
-    }
-
-    fn is_inlined_vec_bypass_call(&self, op: &Op) -> bool {
-        if !crate::lower::bstr::enabled() {
-            return false;
-        }
-        let OpKind::Call {
-            semantic: rcgjs_object::jir::semantic::CallSemantic::Standard(std_op),
-            ..
-        } = &op.kind
-        else {
-            return false;
-        };
-        if !matches!(
-            std_op,
-            rcgjs_object::jir::semantic::StandardOperation::VecLen
-                | rcgjs_object::jir::semantic::StandardOperation::VecAsSlice
-        ) {
-            return false;
-        }
-        op.result
-            .is_some_and(|r| self.inlined_vec_cluster_of(r).is_some())
-    }
-
-    fn inlined_vec_reserve_stmts(&self, op: &Op) -> Res<Option<Vec<Stmt>>> {
-        if !crate::lower::bstr::enabled() {
-            return Ok(None);
-        }
-        let OpKind::Call {
-            callee,
-            args,
-            semantic,
-            host: None,
-            ..
-        } = &op.kind
-        else {
-            return Ok(None);
-        };
-        let (anchor, add, is_raw_vec) = match semantic {
-            rcgjs_object::jir::semantic::CallSemantic::Standard(
-                rcgjs_object::jir::semantic::StandardOperation::VecReserve,
-            ) => {
-                if args.len() != 2 {
-                    return Ok(None);
-                }
-                (args[0], args[1], false)
-            }
-            rcgjs_object::jir::semantic::CallSemantic::Ordinary => {
-                let rcgjs_object::jir::semantic::Callee::Direct { item, link_name } = callee else {
-                    return Ok(None);
-                };
-                if args.len() != 4
-                    || !crate::lower::semantic_ops::string::is_raw_vec_reserve_by_link_name(
-                        self.interns,
-                        Some(self.items),
-                        *item,
-                        *link_name,
-                    )
-                {
-                    return Ok(None);
-                }
-                (args[0], args[2], true)
-            }
-            _ => return Ok(None),
-        };
-        let Some((carrier, cluster)) = self.inlined_vec_cluster_of(anchor) else {
-            return Ok(None);
-        };
-        if carrier != rcgjs_object::jir::repr::Carrier::StringBuilder
-            || !cluster.internal_values.contains(&anchor)
-        {
-            return Ok(None);
-        }
-        if is_raw_vec && !cluster.len_values.contains(&args[1]) {
-            return Ok(None);
-        }
-        let sb_expr = match cluster.root {
-            crate::lower::semantic_ops::string::StringRoot::Cell(c) => {
-                let walk = self.walk_place(&rcgjs_object::jir::repr::Root::Cell(c), &[])?;
-                self.read_place(&walk.place)
-            }
-            crate::lower::semantic_ops::string::StringRoot::Value(v) => self.expr_of(v)?,
-        };
-        let add_expr = self.expr_of(add)?;
-        let ptr_bits = self
-            .table
-            .get(self.ty_of(anchor)?)
-            .and_then(|d| d.layout.size)
-            .and_then(|b| b.checked_mul(8))
-            .and_then(|bits| u32::try_from(bits).ok())
-            .unwrap_or(32);
-        let max = crate::lower::semantic_ops::pointer_limit(ptr_bits)
-            .map_err(|e| decline(OpClass::Call, format!("reserve limit: {e:?}")))?;
-        let (sb_init, sb_id) = self.temp(sb_expr);
-        let (_, req_id) = self.temp(jsast::undefined());
-        let req_target = req_id.clone();
-        let mut helpers = std::collections::BTreeSet::new();
-        let stmts = crate::lower::semantic_ops::string::reserve_builder_stmts_with(
-            sb_init,
-            sb_id,
-            "",
-            |len_expr| {
-                jsast::assign_stmt(req_target, jsast::binary(BinOp::Add, len_expr, add_expr))
-            },
-            req_id,
-            max,
-            &mut helpers,
-        );
-        Ok(Some(stmts))
-    }
-
-    fn inlined_vec_op_expr(&self, _op: &Op, result: ValueId) -> Res<Option<Expr>> {
-        let Some((carrier, cluster)) = self.inlined_vec_cluster_of(result) else {
-            return Ok(None);
-        };
-        if cluster.internal_values.contains(&result) {
-            return Ok(Some(jsast::num(0)));
-        }
-        if cluster.len_values.contains(&result) {
-            let text = self.inlined_vec_text_expr(carrier, cluster.root)?;
-            return Ok(Some(jsast::member(text, "length")));
-        }
-        if cluster.slice_values.contains(&result) {
-            let text = self.inlined_vec_text_expr(carrier, cluster.root)?;
-            return Ok(Some(jsast::rt_call("bstr_bytes", vec![text])));
-        }
-        Ok(None)
-    }
-
     /// The expression of a value-producing op (v1 `codegen_rvalue`/`codegen_operand`).
     pub(super) fn op_expr(&self, op: &Op, result: ValueId) -> Res<Expr> {
         let table = self.table;
@@ -2847,9 +2550,6 @@ impl<'a> JsCx<'a> {
         if let Some(expr) = self.byte_view_op_expr(op, result)? {
             return Ok(expr);
         }
-        if let Some(expr) = self.inlined_vec_op_expr(op, result)? {
-            return Ok(expr);
-        }
         match &op.kind {
             OpKind::Const(tree) => {
                 if let Some(expr) = self.soa_const_expr(tree, result_ty)? {
@@ -2870,15 +2570,6 @@ impl<'a> JsCx<'a> {
                 match self.func.values[v.0 as usize].carrier {
                     rcgjs_object::jir::repr::Carrier::HostString
                     | rcgjs_object::jir::repr::Carrier::NativeMap => Ok(value),
-                    rcgjs_object::jir::repr::Carrier::StringBuilder => {
-                        Ok(record_clone(value, &["text", "cap", "len"], &[]))
-                    }
-                    rcgjs_object::jir::repr::Carrier::NativeVec => {
-                        Ok(record_clone(value, &["len", "cap"], &["buf"]))
-                    }
-                    rcgjs_object::jir::repr::Carrier::SliceView => {
-                        Ok(record_clone(value, &["buf", "off", "len"], &[]))
-                    }
                     _ => Ok(if table.needs_clone(ty) {
                         value::clone_expr_with(table, self.interns, ty, value, self.nested_clone)
                     } else {
@@ -3179,17 +2870,16 @@ impl<'a> JsCx<'a> {
                 OpClass::Rvalue,
                 "Materialize is a Phase 3 op with no baseline lowering",
             )),
-            // A carrier conversion: the registry-owned adapter expression over the value
-            // (`adapters.rs`). The value's Rust type is unchanged — `result_ty` is it.
-            OpKind::Convert { v, from, to } => super::adapters::convert_with_heap(
-                self.table,
-                self.interns,
-                self.expr_of(*v)?,
-                result_ty,
-                *from,
-                *to,
-                self.heap(),
-            ),
+            OpKind::Convert { v, from, to } => {
+                if from == to {
+                    self.expr_of(*v)
+                } else {
+                    Err(decline(
+                        OpClass::Rvalue,
+                        format!("unsupported carrier conversion {from:?} -> {to:?}"),
+                    ))
+                }
+            }
             OpKind::SetField { .. }
             | OpKind::SetDiscriminant { .. }
             | OpKind::CellAlloc(_)
@@ -4199,112 +3889,6 @@ fn snapshot_scratch(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, expr: Expr) -> Expr {
 /// Keeps `EnumRepr` in scope for the documentation of the tag rules above.
 #[allow(dead_code)]
 fn _repr(_: EnumRepr) {}
-
-/// A fresh record over a carrier value: `fields` copied as they are, `sliced` copied with
-/// `.slice()` (the one owned buffer a native Vec clone must not share). Evaluates `value` once.
-fn record_clone(value: Expr, fields: &[&str], sliced: &[&str]) -> Expr {
-    let (value, wrap): (Expr, Box<dyn FnOnce(Expr) -> Expr>) = if matches!(&value, Expr::Ident(_)) {
-        (value, Box::new(|body| body))
-    } else {
-        (
-            jsast::id("$cp"),
-            Box::new(move |body| {
-                jsast::call(jsast::arrow(vec!["$cp".to_owned()], body), vec![value])
-            }),
-        )
-    };
-    let mut entries = Vec::new();
-    for field in sliced {
-        entries.push((
-            (*field).to_owned(),
-            jsast::method_call(jsast::member(value.clone(), *field), "slice", Vec::new()),
-        ));
-    }
-    for field in fields {
-        entries.push(((*field).to_owned(), jsast::member(value.clone(), *field)));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    wrap(jsast::object(entries))
-}
-
-/// How a `String` drop whose carrier differs from (or bypasses) its drop glue should lower.
-pub(super) enum DroppedStringKind {
-    NoOp,
-    BaselineDealloc {
-        src: ValueId,
-        layout: super::adapters::StringLayout,
-    },
-}
-
-impl<'a> JsCx<'a> {
-    pub(super) fn only_used_by_empty_drop(&self, v: ValueId) -> bool {
-        let mut drops = 0usize;
-        for block in &self.func.blocks {
-            for op in &block.ops {
-                match &op.kind {
-                    OpKind::Drop {
-                        root: Root::Value(r),
-                        path,
-                        ..
-                    } if path.is_empty() && *r == v => drops += 1,
-                    kind if kind.uses().contains(&v) => return false,
-                    _ => {}
-                }
-            }
-            if block.term.uses().contains(&v) {
-                return false;
-            }
-        }
-        drops >= 1
-    }
-
-    pub(super) fn only_used_by_adjacent_drop(&self, v: ValueId) -> bool {
-        let mut drops = 0usize;
-        let mut adjacent = false;
-        for block in &self.func.blocks {
-            for (idx, op) in block.ops.iter().enumerate() {
-                match &op.kind {
-                    OpKind::Drop {
-                        root: Root::Value(r),
-                        path,
-                        ..
-                    } if path.is_empty() && *r == v => {
-                        drops += 1;
-                        adjacent = idx > 0 && block.ops[idx - 1].result == Some(v);
-                    }
-                    kind if kind.uses().contains(&v) => return false,
-                    _ => {}
-                }
-            }
-            if block.term.uses().contains(&v) {
-                return false;
-            }
-        }
-        drops == 1 && adjacent
-    }
-
-    pub(super) fn dropped_string_kind(&self, v: ValueId) -> Option<DroppedStringKind> {
-        if let Some(op) = self.def_of(v) {
-            if let OpKind::Convert { v: src, from, to } = &op.kind {
-                return match (*from, *to) {
-                    (Carrier::HostString, Carrier::Baseline | Carrier::StringBuilder)
-                    | (Carrier::StringBuilder, Carrier::Baseline) => Some(DroppedStringKind::NoOp),
-                    (Carrier::Baseline, Carrier::StringBuilder) => {
-                        let ty = self.ty_of(*src).ok()?;
-                        let layout =
-                            super::adapters::StringLayout::of(self.table, self.interns, ty).ok()?;
-                        Some(DroppedStringKind::BaselineDealloc { src: *src, layout })
-                    }
-                    _ => None,
-                };
-            }
-        }
-        if self.func.values.get(v.0 as usize).map(|d| d.carrier) == Some(Carrier::HostString) {
-            return Some(DroppedStringKind::NoOp);
-        }
-        None
-    }
-}
 
 #[cfg(test)]
 mod sentinel_tests {

@@ -82,25 +82,6 @@ pub(crate) fn link(
             llvm_ir: None,
             links_from_incr_cache: Vec::new(),
         });
-        if let Some(bytes) = crate::coroutine_source::artifact() {
-            let name = format!("{crate_name}.rcgjs-mir");
-            let path = outputs.temp_path_for_cgu(OutputType::Object, &name);
-            std::fs::write(&path, bytes).unwrap_or_else(|error| {
-                sess.dcx()
-                    .fatal(format!("cannot retain cleanup MIR: {error}"))
-            });
-            compiled_modules.modules.push(CompiledModule {
-                name,
-                kind: ModuleKind::Regular,
-                object: Some(path),
-                global_asm_object: None,
-                dwarf_object: None,
-                bytecode: None,
-                assembly: None,
-                llvm_ir: None,
-                links_from_incr_cache: Vec::new(),
-            });
-        }
         link_binary(
             sess,
             &ArArchiveBuilderBuilder,

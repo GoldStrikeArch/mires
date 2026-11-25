@@ -15,9 +15,9 @@ use super::interns::{BytesId, Interns, StrId};
 use super::origin::{OriginTable, SourceFactId};
 use super::semantic::{
     AggregateKind, AssertMessage, BasicBlock, BlockId, Body, BodyKind, BodySemantic, Call, Callee,
-    ConstTree, Constant, DirectItemRef, DropGlue, GlobalReference, HostPayload, KeyedListCallable,
-    LocalId, LocalRole, Operand, OperandKind, Place, Projection, Rvalue, StatementKind, StaticStep,
-    Terminator, TypeId, Unwind, VtableEntry,
+    ConstTree, Constant, DirectItemRef, DropGlue, GlobalReference, HostPayload, LocalId, LocalRole,
+    Operand, OperandKind, Place, Projection, Rvalue, StatementKind, StaticStep, Terminator, TypeId,
+    Unwind, VtableEntry,
 };
 use super::types::{TypeKind, TypeTable};
 
@@ -578,76 +578,15 @@ fn verify_call(call: &Call, context: &Context<'_>) -> Result<(), VerifyError> {
             context.bytes(*bytes)?;
         }
         Some(HostPayload::Marker {
-            section,
-            template,
-            helpers,
-            ..
+            section, helpers, ..
         }) => {
             context.str(*section)?;
-            if let Some(template) = template {
-                verify_const_tree(template, context)?;
-            }
-            verify_helpers(helpers, context)?;
-        }
-        Some(HostPayload::ViewAbi {
-            marker, helpers, ..
-        }) => {
-            context.str(*marker)?;
             verify_helpers(helpers, context)?;
         }
         Some(HostPayload::Map { marker }) => {
             context.str(*marker)?;
         }
-        Some(HostPayload::KeyedList(payload)) => {
-            if let Some(site) = payload.site {
-                context.source_fact(site)?;
-            }
-            context
-                .types
-                .require(payload.collection_ty, "keyed-list collection")?;
-            context.types.require(payload.item_ty, "keyed-list item")?;
-            context.types.require(payload.key_ty, "keyed-list key")?;
-            context.types.require(payload.row_ty, "keyed-list row")?;
-            let callables = [&payload.collection, &payload.key, &payload.row];
-            for callable in callables {
-                verify_keyed_callable(callable, context)?;
-            }
-            if call.arguments.len() != callables.len() {
-                return Err(VerifyError::new(format!(
-                    "late-IR keyed-list call has {} arguments, expected {}",
-                    call.arguments.len(),
-                    callables.len()
-                )));
-            }
-            for (argument, callable) in call.arguments.iter().zip(callables) {
-                if argument.ty != callable.ty {
-                    return Err(VerifyError::new(
-                        "late-IR keyed-list callable type does not match its call argument",
-                    ));
-                }
-            }
-        }
         None => {}
-    }
-    Ok(())
-}
-
-fn verify_keyed_callable(
-    callable: &KeyedListCallable,
-    context: &Context<'_>,
-) -> Result<(), VerifyError> {
-    context.types.require(callable.ty, "keyed-list callable")?;
-    if let Some(body) = &callable.body {
-        context.item_ref(body)?;
-    }
-    match callable.cleanup {
-        DropGlue::Direct { item, link_name } => {
-            context.item_ref(&DirectItemRef { item, link_name })?
-        }
-        DropGlue::None | DropGlue::Dynamic => {}
-    }
-    if let Some(source) = callable.source {
-        context.source_fact(source)?;
     }
     Ok(())
 }

@@ -66,12 +66,10 @@ use crate::jir::{Body, Interns, ItemId, OriginTable, TypeTable};
 use crate::jsast;
 use crate::opts::Opts;
 
-/// Whether a function carries a nested native Vec/SliceView or String carrier inside an
-/// aggregate, requiring `clone_expr` to handle both native and baseline shapes at `OpKind::Copy`.
+/// Whether a function carries a nested native container carrier inside an aggregate, requiring
+/// `clone_expr` to handle native shapes at `OpKind::Copy`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NestedClone {
-    pub vec: bool,
-    pub string: bool,
     pub map: bool,
     pub native_string: bool,
     pub native_vec: bool,
@@ -123,9 +121,9 @@ pub struct LowerInput<'a> {
     /// The whole-program physical call ABI selected for this phase-C lowering. `None` while JIR
     /// is being built and while representation costing runs before ABI planning.
     pub abi: Option<&'a crate::plan::abi_flat::AbiPlan>,
-    /// The value-local physical storage plan selected after representation and ABI planning.
-    /// `None` while building JIR and during the earlier representation cost probes.
-    pub physical: Option<&'a crate::plan::physical::PhysicalPlan>,
+    /// True during final Phase-C lowering (enables code-duplicating speed post-opts such as loop
+    /// unrolling and loop-versioned BCE); false during inline/ABI/representation cost trials.
+    pub final_lowering: bool,
     /// A private native version's direct callees, keyed by their semantic item identity. The
     /// encoded `StrId` remains untouched; version names are a linker decision and never mutate an
     /// object file's shared intern table.
@@ -182,103 +180,6 @@ pub fn lower_item(input: &LowerInput<'_>) -> Result<LoweredItem, Decline> {
     }
 }
 
-/// Test-only: `RCGJS_REPR_FORCE=<substring>=<carrier>[,...]` replaces a matching
-/// producer-tagged standard-operation body with the semantic-op registry's native lowering at the
-/// forced carrier — the Phase 4 wave-1 harness that exercises the emitters before the
-/// representation solver exists to select carriers. `<carrier>` is `host-string`,
-/// `string-builder`, `native-vec`, `native-box` or `slice-view`. Inert without the environment
-/// variable; a forced item that fails the registry's proof gate is a loud `Decline`, never a silent
-/// baseline fallback. No element drop glue is resolved here, so a vec of drop-needing elements
-/// declines loudly too.
-fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem, Decline>> {
-    use crate::jir::decline::{LowerDecline, OpClass};
-    use crate::jir::repr::Carrier;
-
-    let force = std::env::var("RCGJS_REPR_FORCE").ok()?;
-    let name = input.name.as_str();
-    let carrier = force.split(',').find_map(|pair| {
-        let (key, carrier) = pair.split_once('=')?;
-        if !key.is_empty() && name.contains(key) {
-            Some(match carrier {
-                "host-string" => Ok(Carrier::HostString),
-                "string-builder" => Ok(Carrier::StringBuilder),
-                "native-vec" => Ok(Carrier::NativeVec),
-                "native-box" => Ok(Carrier::NativeBox),
-                "native-map" => Ok(Carrier::NativeMap),
-                "slice-view" => Ok(Carrier::SliceView),
-                other => Err(other.to_owned()),
-            })
-        } else {
-            None
-        }
-    })?;
-    let decline_with = |detail: String| {
-        Some(Err(Decline::Lower(LowerDecline::Other {
-            op: OpClass::Other,
-            detail,
-        })))
-    };
-    let carrier = match carrier {
-        Ok(carrier) => carrier,
-        Err(other) => {
-            return decline_with(format!(
-                "RCGJS_REPR_FORCE names unknown carrier `{other}` (host-string, string-builder, \
-                 native-vec, slice-view)"
-            ));
-        }
-    };
-
-    let cx = semantic_ops::LowerCx {
-        semantic: input.body.semantic,
-        sig: &input.body.signature,
-        table: input.table,
-        interns: input.interns,
-        element_glue: None,
-        element_glue_nonthrowing: false,
-        panic_impl: None,
-        panic_reads_info: false,
-        native_string_enabled: input.heap.is_some_and(|h| h.native_string_enabled),
-    };
-    let (op, slots) = match semantic_ops::support_of(&cx) {
-        Ok(support) => support,
-        Err(decline) => {
-            return decline_with(format!(
-                "RCGJS_REPR_FORCE matched `{name}` but {}",
-                decline.reason()
-            ));
-        }
-    };
-    let selected: Vec<Carrier> = slots.iter().map(|_| carrier).collect();
-    match semantic_ops::rewrite(&cx, &selected) {
-        Ok(rewrite) => {
-            let decl = jsast::function(name, rewrite.parameters, rewrite.statements);
-            // Refs exactly as `js::function::finish` reports them: every identifier the
-            // declaration mentions, the item's own name excluded (the driver demands equality).
-            let mut refs = BTreeSet::new();
-            jsast::visit_idents(&decl, &mut |ident| {
-                if ident != name {
-                    refs.insert(JsName::new(ident.to_owned()));
-                }
-            });
-            Some(Ok(LoweredItem {
-                decl,
-                refs,
-                names: Vec::new(),
-                loc: None,
-                dts: None,
-                zombies: Vec::new(),
-                js_alloc_origins: Vec::new(),
-                bigints: BTreeSet::new(),
-            }))
-        }
-        Err(decline) => decline_with(format!(
-            "RCGJS_REPR_FORCE could not lower `{name}` as {:?} at {carrier:?}: {}",
-            op.id,
-            decline.reason()
-        )),
-    }
-}
-
 /// The function pipeline: `ssa::build → fuse::plan → structure::structure → js::function::lower`.
 ///
 /// # Why runtime checks are not folded here
@@ -327,9 +228,6 @@ pub fn lower_func_with_ascii(
     func: &Func,
     ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'_>>,
 ) -> Result<LoweredItem, Decline> {
-    if let Some(forced) = forced_semantic_rewrite(input) {
-        return forced;
-    }
     if let crate::jir::semantic::BodySemantic::Standard(
         op @ (crate::jir::semantic::StandardOperation::F64FromStr
         | crate::jir::semantic::StandardOperation::F32FromStr),

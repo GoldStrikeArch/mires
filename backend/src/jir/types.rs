@@ -20,10 +20,9 @@ use rcgjs_object::jir::decline::EncodeDecline;
 use rcgjs_object::jir::interns::{Interns, SigId, StrId};
 use rcgjs_object::jir::semantic::{DefinitionId, DirectItemRef};
 use rcgjs_object::jir::types::{
-    AllocatorIdentity, EnumRepr, FieldDescriptor, FieldKey, IntFacts, IntRepr, IteratorIdentity,
-    JsFacts, LayoutFacts, Niche, NominalAbi, NominalDiscriminant, NominalForm, PinnedBoundary,
-    PointerForm, RepresentationCandidate, SigAbi, SigDescriptor, TransparentField, TypeDescriptor,
-    TypeId, TypeKind, TypeMeta, VariantDescriptor,
+    EnumRepr, FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, Niche,
+    NominalDiscriminant, NominalForm, PointerForm, SigAbi, SigDescriptor, TransparentField,
+    TypeDescriptor, TypeId, TypeKind, TypeMeta, VariantDescriptor,
 };
 
 use crate::value::{self, typing_env};
@@ -535,7 +534,7 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
             enum_repr,
             is_primitive_enum: value::is_primitive_enum(tcx, ty),
             pointer_form,
-            byte_element: crate::ptr::ByteElement::of(tcx, ty).is_some(),
+            byte_element: value::is_byte_element(tcx, ty),
             fields,
         })
     }
@@ -566,7 +565,7 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
             return PointerForm::FatTail;
         }
         if raw {
-            if crate::ptr::is_slot_pointee(tcx, pointee) {
+            if value::is_slot_pointee(tcx, pointee) {
                 PointerForm::Slot
             } else {
                 PointerForm::Thin
@@ -753,60 +752,8 @@ fn niche_facts<'tcx>(tcx: TyCtxt<'tcx>, layout: TyAndLayout<'tcx>) -> Option<Nic
     })
 }
 
-/// v1's `late_ir::type_metadata`, as the schema's [`TypeMeta`].
 pub(crate) fn type_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMeta {
-    let old = crate::late_ir::type_metadata(tcx, ty);
-    TypeMeta {
-        candidate: match old.candidate {
-            crate::late_ir::RepresentationCandidate::None => RepresentationCandidate::None,
-            crate::late_ir::RepresentationCandidate::Box => RepresentationCandidate::Box,
-            crate::late_ir::RepresentationCandidate::Vec => RepresentationCandidate::Vec,
-            crate::late_ir::RepresentationCandidate::String => RepresentationCandidate::String,
-            crate::late_ir::RepresentationCandidate::BTreeMap => RepresentationCandidate::BTreeMap,
-        },
-        abi: match old.abi {
-            crate::late_ir::NominalAbi::Rust => NominalAbi::Rust,
-            crate::late_ir::NominalAbi::C => NominalAbi::C,
-            crate::late_ir::NominalAbi::Transparent => NominalAbi::Transparent,
-        },
-        boundary: match old.boundary {
-            crate::late_ir::PinnedBoundary::None => PinnedBoundary::None,
-            crate::late_ir::PinnedBoundary::Host => PinnedBoundary::Host,
-            crate::late_ir::PinnedBoundary::ViewAbi => PinnedBoundary::ViewAbi,
-        },
-        allocator: match old.allocator {
-            crate::late_ir::AllocatorIdentity::NotApplicable => AllocatorIdentity::NotApplicable,
-            crate::late_ir::AllocatorIdentity::Global => AllocatorIdentity::Global,
-            crate::late_ir::AllocatorIdentity::Custom => AllocatorIdentity::Custom,
-            crate::late_ir::AllocatorIdentity::Unknown => AllocatorIdentity::Unknown,
-        },
-        iterator: iterator_identity(tcx, ty),
-    }
-}
-
-fn iterator_identity(tcx: TyCtxt<'_>, ty: Ty<'_>) -> IteratorIdentity {
-    let ty::Adt(definition, _) = ty.kind() else {
-        return IteratorIdentity::None;
-    };
-    if let Some(name) = tcx.get_diagnostic_name(definition.did()) {
-        return match name.as_str() {
-            "SliceIter" => IteratorIdentity::Slice,
-            "Enumerate" => IteratorIdentity::Enumerate,
-            "Take" => IteratorIdentity::Take,
-            "Skip" => IteratorIdentity::Skip,
-            _ => IteratorIdentity::None,
-        };
-    }
-    // `core::slice::IterMut` has no `#[rustc_diagnostic_item]` on this toolchain,
-    // so identify it unforgeably as the `IterMut` sibling inside `SliceIter`'s `core` module.
-    if let Some(slice_iter) = tcx.get_diagnostic_item(rustc_span::Symbol::intern("SliceIter")) {
-        if tcx.parent(definition.did()) == tcx.parent(slice_iter)
-            && tcx.item_name(definition.did()).as_str() == "IterMut"
-        {
-            return IteratorIdentity::SliceMut;
-        }
-    }
-    IteratorIdentity::None
+    crate::jir::classify::type_meta(tcx, ty)
 }
 
 pub(crate) fn definition_id(tcx: TyCtxt<'_>, definition: DefId) -> DefinitionId {

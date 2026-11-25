@@ -108,26 +108,17 @@ impl OptimizerMode {
 
 /// Which lowering the link step prints an item from.
 ///
-/// v2 keeps v1's printed baseline JavaScript in every object file as a per item fallback, so the
-/// lane is a *choice between two available spellings* rather than a mode the whole compilation
-/// commits to. It is decided entirely at link time — an object carries both lanes — which is what
-/// keeps it out of the sysroot cache key.
+/// The compiler is JIR-only: every object carries JIR-S bodies lowered at link time.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Lane {
-    /// v1's printed text, item for item. The frozen oracle.
+    /// Print from JIR-S.
     #[default]
-    Baseline,
-    /// Print the baseline, and the JIR lane beside it, for differential comparison.
-    Shadow,
-    /// Print from JIR-S wherever the item's class has been promoted, baseline text elsewhere.
     Jir,
 }
 
 impl Lane {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Baseline => "baseline",
-            Self::Shadow => "shadow",
             Self::Jir => "jir",
         }
     }
@@ -241,12 +232,12 @@ impl Profile {
         match self {
             Self::Dev => {
                 opts.optimizer = OptimizerMode::Off;
-                opts.lane = Lane::Baseline;
+                opts.lane = Lane::Jir;
                 opts.str_repr = StrRepr::Utf16;
             }
             Self::Report => {
                 opts.optimizer = OptimizerMode::Report;
-                opts.lane = Lane::Baseline;
+                opts.lane = Lane::Jir;
                 opts.str_repr = StrRepr::Utf16;
             }
             Self::ReleaseSize | Self::ReleaseBalanced => {
@@ -732,7 +723,6 @@ pub trait Diagnostics {
 
 pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
     let mut opts = Opts::default();
-    let mut explicit_str = false;
 
     // The alias layer, resolved first so that an explicitly spelled option overrides whatever the
     // profile asked for regardless of which side of it the option was written on. A profile is a
@@ -932,14 +922,12 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
                 None => bad_value(dcx, key, value, "on`, `off"),
             },
             "js-jir" => match on_off(value) {
-                Some(on) => opts.jir = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
+                Some(true) => opts.jir = true,
+                _ => bad_value(dcx, key, value, "on"),
             },
             "js-lane" => match value {
-                Some("baseline") => opts.lane = Lane::Baseline,
-                Some("shadow") => opts.lane = Lane::Shadow,
                 Some("jir") => opts.lane = Lane::Jir,
-                other => bad_value(dcx, key, other, "baseline`, `shadow`, `jir"),
+                other => bad_value(dcx, key, other, "jir"),
             },
             "js-lane-report" => match value {
                 Some(path) if !path.is_empty() => opts.lane_report = Some(path.to_owned()),
@@ -985,14 +973,11 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
                 Some(path) if !path.is_empty() => opts.jir_dump_conflicts = Some(path.to_owned()),
                 other => bad_value(dcx, key, other, "a file path"),
             },
-            "js-str" => {
-                explicit_str = true;
-                match value {
-                    Some("utf16") => opts.str_repr = StrRepr::Utf16,
-                    Some("bytes") => opts.str_repr = StrRepr::Bytes,
-                    other => bad_value(dcx, key, other, "utf16`, `bytes"),
-                }
-            }
+            "js-str" => match value {
+                Some("utf16") => opts.str_repr = StrRepr::Utf16,
+                Some("bytes") => opts.str_repr = StrRepr::Bytes,
+                other => bad_value(dcx, key, other, "utf16`, `bytes"),
+            },
             // Already resolved, ahead of this loop, so that an explicit option wins.
             "js-profile" => {}
             _ => {
@@ -1040,61 +1025,6 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
         {
             dcx.err(&format!("`js-chunk-role` was given twice for {name}"));
         }
-    }
-
-    // Minification turns off header comments: they are the larger half of a small item and say
-    // nothing a minified program can use. Source maps remain independent. The local renamer moves
-    // their emitted-name keys with the AST and the link-time item renamer rebases generated
-    // columns, so compact output retains the same Rust locations and names.
-    // Phase 3 note: `js-lane=jir` and `js-opt=on` were refused together through Phase 2, because
-    // the v1 optimizer rewrites PRINTED baseline JavaScript that the JIR lane does not print, and
-    // two rewriters may not own one item. The rule lifted when the rewrites were re-landed as JIR
-    // passes (`jsc-link/src/opt/`): on the jir lane the frozen text optimizer never runs — the
-    // link step gates `representation_plan`/`late_lower` on `Lane::Baseline` — and the shadow
-    // lane's baseline half still gets the v1 rewrites, its JIR half the new passes.
-
-    // The shadow lane writes a second program beside the first, and a chunked build's file names
-    // are fixed by the chunk names rather than derived from the output path, so the two lanes
-    // would write each other's chunks. Refused rather than raced.
-    if opts.lane == Lane::Shadow && !opts.chunks.is_empty() {
-        dcx.err(
-            "`-Cllvm-args=js-lane=shadow` cannot be combined with `-Cllvm-args=js-chunk`: both \
-             lanes would write the same chunk files. Compare the lanes unsplit, or run the two \
-             lanes as two builds",
-        );
-    }
-
-    // A lane with no bodies to lower is a build that measures the baseline and calls it the lane.
-    if opts.lane != Lane::Baseline && !opts.jir {
-        dcx.warn(
-            "`-Cllvm-args=js-lane` with `js-jir=off` falls back to the baseline for every item: \
-             the objects carry no JIR bodies to lower",
-        );
-    }
-
-    // A lane report describes a choice only the link step makes, so asking for one without a lane
-    // to report on is a build script that will read an empty file and believe it.
-    if opts.lane_report.is_some() && !opts.jir {
-        dcx.warn(
-            "`-Cllvm-args=js-lane-report` with `js-jir=off` reports every item as unavailable: \
-             the objects carry no JIR bodies to choose from",
-        );
-    }
-
-    // Release profiles default to byte strings on the JIR lane. If an explicit `js-lane` or
-    // `js-jir=off` takes compilation off that lane without spelling `js-str`, revert to UTF-16
-    // rather than failing validation.
-    if !explicit_str && (opts.lane != Lane::Jir || !opts.jir) {
-        opts.str_repr = StrRepr::Utf16;
-    }
-
-    // Byte strings exist only in the JIR lowering: the baseline text every object carries holds a
-    // `str` as UTF-16 text, and a program that printed some items from it would mix the two.
-    if opts.str_repr == StrRepr::Bytes && opts.lane != Lane::Jir {
-        dcx.err(
-            "`-Cllvm-args=js-str=bytes` needs `-Cllvm-args=js-lane=jir`: byte strings are a \
-             JIR-lane lowering, and the baseline lane prints a `str` as UTF-16 text",
-        );
     }
 
     if opts.minify {
@@ -1198,13 +1128,13 @@ mod tests {
     }
 
     #[test]
-    fn the_lane_options_default_to_carrying_jir_and_printing_the_baseline() {
+    fn the_lane_options_default_to_carrying_jir() {
         let opts = opts_of("");
 
         assert!(opts.jir);
         assert!(!opts.cleanup);
         assert_eq!(opts.ecma_target, EcmaTarget::Latest);
-        assert_eq!(opts.lane, Lane::Baseline);
+        assert_eq!(opts.lane, Lane::Jir);
         assert_eq!(opts.lane_report, None);
         assert_eq!(opts.jir_dump_conflicts, None);
         assert_eq!(opts.profile, None);
@@ -1213,11 +1143,11 @@ mod tests {
     #[test]
     fn every_lane_option_is_parsed_and_validated() {
         let opts = opts_of(
-            "js-jir=off js-lane=shadow js-lane-report=/out/lane.json \
+            "js-jir=on js-lane=jir js-lane-report=/out/lane.json \
              js-jir-dump-conflicts=/out/conflicts.json",
         );
-        assert!(!opts.jir);
-        assert_eq!(opts.lane, Lane::Shadow);
+        assert!(opts.jir);
+        assert_eq!(opts.lane, Lane::Jir);
         assert_eq!(opts.lane_report.as_deref(), Some("/out/lane.json"));
         assert_eq!(
             opts.jir_dump_conflicts.as_deref(),
@@ -1228,7 +1158,6 @@ mod tests {
         assert!(opts_of("js-cleanup=on").cleanup);
         assert!(!opts_of("js-cleanup=off").cleanup);
         assert!(!opts_of("js-cleanup=on js-cleanup=off").cleanup);
-        assert_eq!(opts_of("js-lane=baseline").lane, Lane::Baseline);
         assert_eq!(opts_of("js-lane=jir").lane, Lane::Jir);
 
         // The promoted set defaults to every class and narrows to what a promotion round names.
@@ -1256,6 +1185,9 @@ mod tests {
 
         for (line, expected) in [
             ("js-lane=fast", "`fast` is not a valid `js-lane`"),
+            ("js-lane=baseline", "`baseline` is not a valid `js-lane`"),
+            ("js-lane=shadow", "`shadow` is not a valid `js-lane`"),
+            ("js-jir=off", "`off` is not a valid `js-jir`"),
             ("js-jir=maybe", "`maybe` is not a valid `js-jir`"),
             ("js-cleanup=maybe", "`maybe` is not a valid `js-cleanup`"),
             (
@@ -1297,13 +1229,13 @@ mod tests {
         let dev = opts_of("js-profile=dev");
         assert_eq!(dev.profile, Some(Profile::Dev));
         assert_eq!(dev.optimizer, OptimizerMode::Off);
-        assert_eq!(dev.lane, Lane::Baseline);
+        assert_eq!(dev.lane, Lane::Jir);
         assert_eq!(dev.str_repr, StrRepr::Utf16);
         assert!(!dev.minify);
 
         let report = opts_of("js-profile=report");
         assert_eq!(report.optimizer, OptimizerMode::Report);
-        assert_eq!(report.lane, Lane::Baseline);
+        assert_eq!(report.lane, Lane::Jir);
         assert_eq!(report.str_repr, StrRepr::Utf16);
 
         for name in ["release-size", "release-balanced"] {
@@ -1333,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn release_profiles_default_to_byte_strings_while_overrides_and_non_jir_keep_utf16() {
+    fn release_profiles_default_to_byte_strings_while_overrides_keep_utf16() {
         assert_eq!(opts_of("").str_repr, StrRepr::Utf16);
         assert_eq!(opts_of("js-lane=jir").str_repr, StrRepr::Utf16);
 
@@ -1350,29 +1282,7 @@ mod tests {
                 assert_eq!(overridden.lane, Lane::Jir, "{line}");
                 assert_eq!(overridden.str_repr, StrRepr::Utf16, "{line}");
             }
-
-            for line in [
-                format!("js-profile={profile} js-lane=baseline"),
-                format!("js-lane=baseline js-profile={profile}"),
-                format!("js-profile={profile} js-lane=shadow"),
-            ] {
-                let non_jir = opts_of(&line);
-                assert_ne!(non_jir.lane, Lane::Jir, "{line}");
-                assert_eq!(non_jir.str_repr, StrRepr::Utf16, "{line}");
-            }
-
-            let (no_jir, collected) = parse_line(&format!("js-profile={profile} js-jir=off"));
-            assert!(collected.errors.borrow().is_empty(), "{profile}");
-            assert_eq!(no_jir.str_repr, StrRepr::Utf16, "{profile}");
-
-            let (_, explicit_err) = parse_line(&format!(
-                "js-profile={profile} js-str=bytes js-lane=baseline"
-            ));
-            assert_eq!(explicit_err.errors.borrow().len(), 1, "{profile}");
         }
-
-        let (_, collected) = parse_line("js-str=bytes js-lane=baseline");
-        assert_eq!(collected.errors.borrow().len(), 1);
 
         // `js-str` is link-only and never joins normalized emit args or sysroot keys.
         let with_bytes = [
@@ -1402,14 +1312,14 @@ mod tests {
     #[test]
     fn an_explicit_option_beats_the_profile_on_either_side_of_it() {
         for line in [
-            "js-profile=release-size js-minify=off js-lane=baseline js-ecma-target=latest",
-            "js-minify=off js-ecma-target=latest js-lane=baseline js-profile=release-size",
+            "js-profile=release-size js-minify=off js-ecma-target=latest",
+            "js-minify=off js-ecma-target=latest js-profile=release-size",
         ] {
             let opts = opts_of(line);
             assert_eq!(opts.profile, Some(Profile::ReleaseSize), "{line}");
             assert!(!opts.minify, "{line}");
             assert_eq!(opts.ecma_target, EcmaTarget::Latest, "{line}");
-            assert_eq!(opts.lane, Lane::Baseline, "{line}");
+            assert_eq!(opts.lane, Lane::Jir, "{line}");
             // Nothing the profile decided and the command line did not is disturbed.
             assert_eq!(opts.optimizer, OptimizerMode::On, "{line}");
         }
@@ -1453,16 +1363,10 @@ mod tests {
         assert_eq!(collected.errors.borrow().len(), 1);
     }
 
-    /// Phase 2 refused this combination — one item, two rewriters. Phase 3 re-landed the rewrites
-    /// as JIR passes, so the lane runs them itself and the refusal is gone. The test stays,
-    /// inverted: re-introducing the error would be a silent loss of every pass on the lane.
     #[test]
     fn the_jir_lane_runs_the_optimizer_itself() {
         for line in [
             "js-lane=jir js-opt=on",
-            // The shadow lane's two halves each get their own: the baseline the frozen v1 text
-            // rewrites, the JIR half the passes in `jsc-link/src/opt/`.
-            "js-lane=shadow js-opt=on",
             "js-profile=release-size js-opt=on",
             "js-lane=jir js-opt=report",
             "js-opt=on js-profile=release-size js-opt=off",
@@ -1523,39 +1427,9 @@ mod tests {
     }
 
     #[test]
-    fn the_shadow_lane_and_chunks_cannot_both_name_the_output_files() {
-        let (_, collected) = parse_line("js-lane=shadow js-modules=esm js-chunk=main:rust_entry");
-        let errors = collected.errors.borrow();
-        assert!(
-            errors.iter().any(|error| error.contains("js-lane=shadow")
-                && error.contains("same chunk files")),
-            "{errors:?}"
-        );
-
-        // Either lane on its own is fine: only the pair would write one file twice.
+    fn jir_lane_and_chunks_work_together() {
         let (_, collected) = parse_line("js-lane=jir js-modules=esm js-chunk=main:rust_entry");
         assert!(collected.errors.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_lane_without_jir_bodies_is_warned_about() {
-        let (_, collected) = parse_line("js-jir=off js-lane=jir");
-        let warnings = collected.warnings.borrow();
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("falls back to the baseline for every item")),
-            "{warnings:?}"
-        );
-    }
-
-    #[test]
-    fn a_lane_report_without_jir_bodies_is_warned_about() {
-        let (_, collected) = parse_line("js-jir=off js-lane-report=/out/lane.json");
-        let warnings = collected.warnings.borrow();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("no JIR bodies"), "{warnings:?}");
-
         let (_, collected) = parse_line("js-lane-report=/out/lane.json");
         assert_eq!(collected.warnings.borrow().as_slice(), [] as [String; 0]);
     }

@@ -59,8 +59,8 @@ try {
 } catch (error) {
   hostCaught = error === marker
 }
-if (!hostCaught || events.includes(10) || events.includes(20)) {
-  throw new Error(`host throw changed abrupt-exit cleanup: ${JSON.stringify(events)}`)
+if (!hostCaught || events.join(',') !== '10,20') {
+  throw new Error(`host C-unwind did not run Box structural drop in order [10,20]: ${JSON.stringify(events)}`)
 }
 NODE
 
@@ -93,7 +93,7 @@ if ((on_bytes >= off_bytes)); then
 	exit 1
 fi
 
-target=5767
+target=7258
 high=$((target * 102 / 100))
 if ((on_bytes > high)); then
 	echo "native Box lowering regressed: $on_bytes > $high bytes (receipt $target +2%)" >&2

@@ -28,6 +28,7 @@ brotli = "8.0.4"
 serde_json.workspace = true
 
 [dev-dependencies]
+rcgjs-object = { path = "../rcgjs-object", features = ["interp"] }
 sha2.workspace = true
 # The JavaScript the tests check runs in reused node workers (RCGJS_TEST_NODE=spawn: one node each).
 test-node = { path = "../test-node" }

@@ -1748,7 +1748,7 @@ impl Intrinsic<'_, '_> {
         }
         if table
             .get(pointee)
-            .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+            .and_then(crate::lower::semantic_ops::typed_array_kind)
             .is_none()
         {
             return false;
@@ -2554,7 +2554,7 @@ mod tests {
                 vtables: &vtables,
                 spills: &[],
                 abi: None,
-                physical: None,
+                final_lowering: false,
                 call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
                 bigints: None,
                 byte_views: ByteViewPlan {

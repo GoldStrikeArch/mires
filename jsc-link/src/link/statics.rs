@@ -797,8 +797,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         }
     }

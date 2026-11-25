@@ -42,24 +42,9 @@ use rustc_session::Session;
 use rustc_span::{sym, Symbol};
 use rustc_target::spec::{Arch, Os};
 
-mod abi;
 mod alloc_support;
-mod assembly;
-mod async_analysis;
-mod base;
-pub(crate) use rcgjs_object::baseline_shadow;
-/// The `js!{}` block format.
-///
-/// Included from `js-macro` for the same reason [`descriptor`] is included from
-/// `js-extern-macro`: the macro encodes, this backend decodes, and one file is what keeps the two
-/// from drifting. See its own docs for the encoding.
-#[path = "../../js-macro/src/block.rs"]
-mod block;
-mod cfg_adapter;
 mod cgu;
-mod constant;
-mod constread;
-mod coroutine_source;
+mod const_raw;
 /// The `#[js_extern]` descriptor format.
 ///
 /// The file itself lives in `js-extern-macro`, which is where it is written, and is included here
@@ -74,33 +59,14 @@ mod coroutine_source;
 mod descriptor;
 mod driver;
 mod dts;
-mod emit;
-mod host;
 mod identity;
-mod intrinsics;
 mod item;
 mod jir;
-mod js_block;
-mod js_extern;
-mod source_mir;
 pub(crate) use rcgjs_object::jsast;
-mod late_ir;
 mod link;
-mod map;
 pub(crate) use rcgjs_object::minify;
-mod names;
 mod naming;
-mod opportunity;
 mod opts;
-mod place;
-mod ptr;
-mod queue;
-mod representation;
-mod rvalue;
-mod tag;
-mod template;
-mod unsize;
-mod uses;
 mod value;
 mod vtable;
 
@@ -116,7 +82,6 @@ impl CodegenBackend for JsCodegenBackend {
 
         opts::init(sess);
         identity::init(sess);
-        coroutine_source::init();
 
         match sess.lto() {
             Lto::No | Lto::ThinLocal => {}
@@ -124,10 +89,6 @@ impl CodegenBackend for JsCodegenBackend {
                 sess.dcx().fatal("LTO is not supported by rustc_codegen_js");
             }
         }
-    }
-
-    fn provide(&self, providers: &mut rustc_middle::util::Providers) {
-        coroutine_source::provide(providers);
     }
 
     fn thin_lto_supported(&self) -> bool {
@@ -178,7 +139,6 @@ impl CodegenBackend for JsCodegenBackend {
     }
 
     fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
-        coroutine_source::prepare(tcx);
         if tcx.sess.codegen_units().as_usize() > 1 {
             // More than one CGU still codegens fine, but rustc refuses to copy several object
             // files onto a single `-o` path, so the .js output would go missing.

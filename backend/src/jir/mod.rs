@@ -7,6 +7,7 @@
 //! [`Body`]: rcgjs_object::jir::semantic::Body
 //! [`OriginTable`]: rcgjs_object::jir::origin::OriginTable
 
+pub(crate) mod classify;
 pub(crate) mod encode;
 pub(crate) mod types;
 

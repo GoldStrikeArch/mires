@@ -36,13 +36,11 @@
 //! * a marker's **sibling helper instances** — `poll_once::<F>`/`poll_result::<F>` for the async
 //!   markers, `display_to_str::<T>` for `rcgjs.tc.text` — off `HostPayload::helper`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{Op, OpKind, ValueId};
-use rcgjs_object::jir::semantic::{
-    Callee, DefinitionId, HostPayload, ItemId, KeyedListPayload, TypeId,
-};
+use rcgjs_object::jir::semantic::{Callee, DefinitionId, HostPayload, ItemId, TypeId};
 use rcgjs_object::jir::types::TypeKind;
 use rcgjs_object::jsast::{self, BinOp, Expr, UnOp};
 use rcgjs_object::ptr;
@@ -54,8 +52,6 @@ use super::{decline, value, JsCx, Res};
 
 /// The `link_section` prefix every host marker carries (v1 `host.rs::HOST_PREFIX`).
 pub const HOST_PREFIX: &str = "rcgjs.host.";
-/// The `link_section` prefix every `view-abi` marker carries (v1 `abi.rs::MARKER_PREFIX`).
-pub const VIEW_ABI_PREFIX: &str = "rcgjs.tc.";
 /// The `link_section` prefix every `mires-js` collection marker carries (v1 `map.rs`).
 pub const MAP_PREFIX: &str = "rcgjs.map.";
 
@@ -65,22 +61,13 @@ const CAPTURED_ENVIRONMENT: &str = "$c";
 /// Whether a host marker has a safe Rust body that optimizer modes may replace
 /// (v1 `host.rs::is_async_marker`).
 pub fn is_async_marker(marker: &str) -> bool {
-    matches!(
-        marker,
-        "spawn" | "spawnowner" | "spawnowner.v2" | "futurepromise" | "futurenativepromise"
-    )
+    matches!(marker, "spawn" | "futurepromise" | "futurenativepromise")
 }
 
 /// Whether a `Callee::Direct` link name is one of the marker functions W9 intercepts.
-///
-/// The encoder records a payload for every marker it recognizes; this is the belt-and-braces
-/// check `call.rs` applies to a `Direct` callee that arrived without one, so a marker never
-/// lowers to a call to the marker's own (empty) body.
 #[allow(dead_code)]
 pub fn is_marker_name(name: &str) -> bool {
-    name.starts_with(HOST_PREFIX)
-        || name.starts_with(VIEW_ABI_PREFIX)
-        || name.starts_with(MAP_PREFIX)
+    name.starts_with(HOST_PREFIX) || name.starts_with(MAP_PREFIX)
 }
 
 /// What one host call turned out to be, after the payload has been read.
@@ -88,9 +75,7 @@ enum Family<'a> {
     Extern(&'a [u8]),
     Block(&'a [u8]),
     Host(String),
-    ViewAbi(String),
     Map(String),
-    KeyedList(&'a KeyedListPayload),
 }
 
 /// The payload family of a call, or `None` for a call this module does not own.
@@ -101,23 +86,14 @@ fn family<'a>(cx: &'a JsCx<'_>, op: &'a Op) -> Option<Family<'a>> {
     match host {
         Some(HostPayload::Extern(bytes)) => cx.interns.bytes(*bytes).map(Family::Extern),
         Some(HostPayload::Block(bytes)) => cx.interns.bytes(*bytes).map(Family::Block),
-        Some(HostPayload::Marker { section, .. }) => {
-            let section = cx.interns.str(*section)?;
-            if let Some(marker) = section.strip_prefix(HOST_PREFIX) {
-                return Some(Family::Host(marker.to_owned()));
-            }
-            section
-                .strip_prefix(VIEW_ABI_PREFIX)
-                .map(|marker| Family::ViewAbi(marker.to_owned()))
-        }
-        Some(HostPayload::ViewAbi { marker, .. }) => cx
+        Some(HostPayload::Marker { section, .. }) => cx
             .interns
-            .str(*marker)
-            .map(|m| Family::ViewAbi(m.to_owned())),
+            .str(*section)?
+            .strip_prefix(HOST_PREFIX)
+            .map(|marker| Family::Host(marker.to_owned())),
         Some(HostPayload::Map { marker }) => {
             cx.interns.str(*marker).map(|m| Family::Map(m.to_owned()))
         }
-        Some(HostPayload::KeyedList(payload)) => Some(Family::KeyedList(payload)),
         // A marker the encoder did not recognize, reaching here through its link name alone.
         None => {
             let Callee::Direct { link_name, .. } = callee else {
@@ -127,9 +103,6 @@ fn family<'a>(cx: &'a JsCx<'_>, op: &'a Op) -> Option<Family<'a>> {
             if let Some(marker) = name.strip_prefix(HOST_PREFIX) {
                 return Some(Family::Host(marker.to_owned()));
             }
-            if let Some(marker) = name.strip_prefix(VIEW_ABI_PREFIX) {
-                return Some(Family::ViewAbi(marker.to_owned()));
-            }
             name.strip_prefix(MAP_PREFIX)
                 .map(|marker| Family::Map(marker.to_owned()))
         }
@@ -138,11 +111,6 @@ fn family<'a>(cx: &'a JsCx<'_>, op: &'a Op) -> Option<Family<'a>> {
 
 /// Whether this call is one the JavaScript lowering intercepts instead of calling the callee's
 /// body.
-///
-/// Every payload family is intercepted, with one exception v1 makes too: the async markers
-/// (`spawn`/`spawnowner`/`futurepromise`) have safe Rust bodies of their own and are compiled as
-/// ordinary calls unless the optimizer's future-poller pass applies to this compilation
-/// (v1 `abi.rs::codegen_call`).
 pub fn intercepts(cx: &JsCx<'_>, op: &Op) -> bool {
     match family(cx, op) {
         Some(Family::Host(marker)) if is_async_marker(&marker) => cx
@@ -170,9 +138,7 @@ pub fn lower_call(cx: &JsCx<'_>, op: &Op) -> Res<Expr> {
         Family::Extern(bytes) => js_extern(cx, op, bytes, args),
         Family::Block(bytes) => js_block(cx, op, bytes, args),
         Family::Host(marker) => host_marker(cx, op, &marker, args),
-        Family::ViewAbi(marker) => super::template::lower_marker(cx, op, &marker, args),
         Family::Map(marker) => map_marker(cx, op, &marker, args),
-        Family::KeyedList(payload) => super::template::lower_keyed_list(cx, payload, args),
     }
 }
 
@@ -672,23 +638,13 @@ fn closure_drop(cx: &JsCx<'_>, closure: ValueId) -> Res<Option<Expr>> {
 fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Expr> {
     let promise = matches!(marker, "futurepromise" | "futurenativepromise");
     let native = marker == "futurenativepromise";
-    let with_owner = matches!(marker, "spawnowner" | "spawnowner.v2");
-    let (future, owner) = match (with_owner, args) {
-        (false, [future]) => (*future, None),
-        (true, [future, owner]) => (*future, Some(*owner)),
-        (false, _) => {
-            return Err(decline(
-                OpClass::Host,
-                format!("`{HOST_PREFIX}{marker}` takes one future"),
-            ));
-        }
-        (true, _) => {
-            return Err(decline(
-                OpClass::Host,
-                format!("`{HOST_PREFIX}{marker}` takes a future and an owner"),
-            ));
-        }
+    let [future] = args else {
+        return Err(decline(
+            OpClass::Host,
+            format!("`{HOST_PREFIX}{marker}` takes one future"),
+        ));
     };
+    let future = *future;
     let helper = match &op.kind {
         OpKind::Call {
             host: Some(payload),
@@ -733,34 +689,20 @@ fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<
         return Ok(jsast::rt_call(
             if native {
                 "host_future_async"
-            } else if cx
-                .physical
-                .is_some_and(|(_, plan)| plan.ready_futures.contains(&future_ty))
-            {
-                "host_future_ready"
             } else {
                 "host_future_promise"
             },
             vec![future, poll, drop],
         ));
     }
-    // The owner is passed as a value, separately from the re-entry function: inside a deferred
-    // arrow it would be captured by binding rather than by value.
-    let (owner, runner) = match owner {
-        Some(owner) => (cx.expr_of(owner)?, super::template::dom("runWithOwner")),
-        None => (jsast::undefined(), jsast::undefined()),
-    };
-    let mut arguments = vec![
+    let arguments = vec![
         future,
         poll,
         drop,
-        jsast::boolean(with_owner),
-        owner,
-        runner,
+        jsast::boolean(false),
+        jsast::undefined(),
+        jsast::undefined(),
     ];
-    if marker == "spawnowner.v2" {
-        arguments.push(super::template::dom("onCleanup"));
-    }
     Ok(jsast::rt_call("host_spawn", arguments))
 }
 
@@ -1397,39 +1339,9 @@ pub struct ItemEntry {
     pub caller_location_def: Option<DefinitionId>,
     /// Whether this item belongs to an authenticated `core` crate (`crate_name == "core"`).
     pub is_core: bool,
-    /// Direct SSA parameters mentioned by the body before optimization. This conservative set
-    /// lets special call boundaries reject a live argument lane they cannot represent yet.
-    pub used_params: BTreeSet<u16>,
     /// The body's `BodySemantic::Standard` tag, when it has one: the exact linked identity the
     /// call-site format kernel resolves a callee by (`lower/semantic_ops/fmt_kernel.rs`).
     pub standard: Option<crate::jir::semantic::StandardOperation>,
-    /// The validated effects class a keyed-list key extractor may rely on.
-    pub keyed_purity: Option<KeyedPurity>,
-    /// The exact caller-visible parameters read by a `Read` keyed callable. `None` means some
-    /// read came from a global, spill, capture of unknown provenance, or unresolved callee.
-    pub keyed_read_params: Option<BTreeSet<u16>>,
-    /// Whether the keyed callable's validated effects summary can unwind.
-    pub keyed_may_unwind: Option<bool>,
-    /// Whether every reachable row operation is creation-only in the initial static lane.
-    pub keyed_row_capture: Option<KeyedRowCapture>,
-    /// Parameters for which the linker proved that the stable callable proxy used by the first
-    /// live-slot lane cannot escape or reach an operation with object-identity semantics.
-    pub keyed_proxy_safe_params: Option<BTreeSet<u16>>,
-}
-
-/// Whether a direct callable reads or changes anything beyond its arguments.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyedPurity {
-    Const,
-    Read,
-    Effect,
-}
-
-/// The row-capture class proven from the direct whole-program call graph.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyedRowCapture {
-    Static,
-    Live,
 }
 
 /// Every item of the program by its semantic identity: what a closure body is called and how many

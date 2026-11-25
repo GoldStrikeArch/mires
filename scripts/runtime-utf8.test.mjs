@@ -180,27 +180,6 @@ test('without queueMicrotask the byte bound alone applies', () => {
   assert.equal(rt._str_memo.armed, true)
 })
 
-test('an owned String converted from a host string never aliases the memoized view', () => {
-  const { rt } = scheduled()
-  for (const text of ['owned', 'Grüße ' + astral, 'a'.repeat(5000)]) {
-    const shared = rt.str_bytes(text)
-    const before = view(shared)
-    const owned = rt.convert_str_block(text)
-    assert.notEqual(owned.buf, shared.buf)
-    owned.buf[0] = 0x21
-    owned.buf.push(0x21)
-    assert.deepEqual(view(rt.str_bytes(text)), before)
-    const builder = rt.convert_sb_block({ text, cap: before.length + 8, len: before.length })
-    assert.notEqual(builder.buf, shared.buf)
-    builder.buf[1] = 0x21
-    assert.deepEqual(view(rt.str_bytes(text)), before)
-    // A mutated String derefs to a different JavaScript string: never a stale view.
-    const mutated = rt.bytes_str(owned.buf, 0, before.length)
-    assert.notEqual(mutated, text)
-    assert.deepEqual(view(rt.str_bytes(mutated)), utf8(mutated))
-  }
-})
-
 test('a mutable byte view (as_bytes_mut) is fresh, so a write through it never reaches the memo', () => {
   const { rt } = scheduled()
   const text = 'Hello World'
@@ -350,18 +329,6 @@ test('ASCII source tracking and 4-slot subslice ring make bytes_str -> str_bytes
   assert.equal(rn.off, 6)
   assert.equal(rn.len, 17)
   assert.equal(rt.str_len(nested), 17)
-
-  // convert_str_block and convert_sb_block slice from shared.off, not 0.
-  const blk = rt.convert_str_block(s2)
-  assert.notEqual(blk.buf, rec.buf)
-  assert.equal(blk.off, 0)
-  assert.equal(blk.len, 22)
-  assert.deepEqual(view(blk), utf8(s2))
-  const sbBlk = rt.convert_sb_block({ text: s4, cap: 24, len: 18 })
-  assert.notEqual(sbBlk.buf, rec.buf)
-  assert.equal(sbBlk.len, 18)
-  assert.equal(sbBlk.cap, 24)
-  assert.deepEqual(Array.from(sbBlk.buf.slice(0, 18)), utf8(s4))
 
   // Unwinding clears the subslice ring; turn 2 bytes_str re-arms queueMicrotask.
   unwind()

@@ -312,16 +312,12 @@ impl<'a> JsCx<'a> {
                 }
                 let candidate_safe = match desc.meta.candidate {
                     RepresentationCandidate::None => true,
-                    RepresentationCandidate::Vec => {
-                        !self.nested_clone.vec && self.all_baseline_carriers()
-                    }
-                    RepresentationCandidate::String => {
-                        !self.nested_clone.string && self.all_baseline_carriers()
-                    }
+                    RepresentationCandidate::Vec
+                    | RepresentationCandidate::String
+                    | RepresentationCandidate::Box => self.all_baseline_carriers(),
                     RepresentationCandidate::BTreeMap => {
                         !self.nested_clone.map && self.all_baseline_carriers()
                     }
-                    RepresentationCandidate::Box => self.all_baseline_carriers(),
                 };
                 let [variant] = variants.as_slice() else {
                     return Err((target, value));
@@ -1285,10 +1281,12 @@ impl<'a> JsCx<'a> {
             }
         };
         let unsupported = || {
-            Err(decline(
-                OpClass::Cast,
-                "a pointer cast with a `str` on one side that is not the UTF-8 byte view",
-            ))
+            Ok(self.zombie(format!(
+                "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`: a `str` \
+                 is a JavaScript string, whose only byte view is the UTF-8 one `as_bytes` produces",
+                self.type_display(from_pointee),
+                self.type_display(to_pointee),
+            )))
         };
         Some(match (from_str, to_str) {
             (true, true) => Ok(match (from_fat, to_fat) {
@@ -1375,6 +1373,23 @@ impl<'a> JsCx<'a> {
         self.cast_pointer_at(from_pointee, to_pointee, value, 0)
     }
 
+    /// Human-readable Rust type name for zombie diagnostics, falling back to the stable type hash
+    /// when the producer did not record a printed path.
+    pub(crate) fn type_display(&self, ty: TypeId) -> String {
+        if let Some(name) = self
+            .table
+            .get(ty)
+            .and_then(|descriptor| descriptor.name)
+            .and_then(|id| self.interns.str(id))
+        {
+            return name.to_owned();
+        }
+        if matches!(value::kind(self.table, ty), Some(TypeKind::Str)) {
+            return "str".to_owned();
+        }
+        format!("{:032x}", ty.0)
+    }
+
     fn cast_pointer_at(
         &self,
         from_pointee: TypeId,
@@ -1384,13 +1399,11 @@ impl<'a> JsCx<'a> {
     ) -> Res<Expr> {
         let table = self.table;
         let unsupported = || {
-            Err(decline(
-                OpClass::Cast,
-                format!(
-                    "a pointer cast from pointee {:032x} to pointee {:032x} has no row in the cast matrix",
-                    from_pointee.0, to_pointee.0
-                ),
-            ))
+            Ok(self.zombie(format!(
+                "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`",
+                self.type_display(from_pointee),
+                self.type_display(to_pointee),
+            )))
         };
         if depth >= CAST_DEPTH {
             return unsupported();
@@ -1463,13 +1476,11 @@ impl<'a> JsCx<'a> {
     ) -> Res<Expr> {
         let table = self.table;
         let unsupported = || {
-            Err(decline(
-                OpClass::Cast,
-                format!(
-                    "a pointer cast from pointee {:032x} to pointee {:032x} has no row in the cast matrix",
-                    from_pointee.0, to_pointee.0
-                ),
-            ))
+            Ok(self.zombie(format!(
+                "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`",
+                self.type_display(from_pointee),
+                self.type_display(to_pointee),
+            )))
         };
         if table.unsized_tail(to).is_some() {
             return self.reshape_to_tail(from, to, value);
@@ -1698,22 +1709,25 @@ impl<'a> JsCx<'a> {
             return Err(decline(OpClass::Cast, "reshape to a struct without a tail"));
         };
         let Some(TypeKind::Slice(element)) = value::kind(table, tail.ty) else {
-            return Err(decline(
-                OpClass::Cast,
-                "a pointer to a struct with a non-slice unsized tail",
-            ));
+            return Ok(self.zombie(format!(
+                "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice \
+                 tail is, because only a run of elements can be laid out after the header",
+                self.type_display(tail.ty),
+            )));
         };
         let Some(element_size) = size_of(table, *element) else {
-            return Err(decline(
-                OpClass::Cast,
-                "the elements of a slice tail have no size",
-            ));
+            return Ok(self.zombie(format!(
+                "the elements of `{}` have no size here",
+                self.type_display(tail.ty),
+            )));
         };
         if !matches!(value::kind(table, from), Some(TypeKind::Slice(_))) {
-            return Err(decline(
-                OpClass::Cast,
-                "a cast to a struct with an unsized tail from a pointer that carries no length",
-            ));
+            return Ok(self.zombie(format!(
+                "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`: the \
+                 length of the tail is not carried by the source pointer",
+                self.type_display(from),
+                self.type_display(to),
+            )));
         }
         let (setup, pointer) = self.reread(value, &[BUF, OFF, LEN]);
         let reshaped = jsast::rt_call(

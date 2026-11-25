@@ -149,44 +149,37 @@ function observeLoop(value) { loopTrace.push(value); }
 assert.equal(loopRecovery(), 3); assert.deepEqual(loopTrace, [1, 2]);
 console.log(checks);
 "#;
-    for jir in [false, true] {
-        for mode in [OptimizerMode::Off, OptimizerMode::Report, OptimizerMode::On] {
-            for rename in [false, true] {
-                for style in [Style::Readable, Style::Compact] {
-                    for target in [EcmaTarget::Es2018, EcmaTarget::Latest] {
-                        let original = fixture();
-                        let declarations: Vec<_> = original
-                            .iter()
-                            .cloned()
-                            .map(|decl| {
-                                let decl = optimizer::analyze(decl, mode).decl;
-                                let mut decl = if jir {
-                                    sroa::analyze_jir(decl, mode)
-                                } else {
-                                    sroa::analyze(decl, mode)
-                                }
-                                .decl;
-                                if mode != OptimizerMode::On {
-                                    assert!(original.contains(&decl));
-                                }
-                                if rename {
-                                    minify::shorten_locals_for_measurement(&mut decl);
-                                }
-                                decl
-                            })
-                            .collect();
-                        let text =
-                            js::program_to_string_styled_for_target(&declarations, style, target);
-                        let output = test_node::run(Node::Stdin(&format!("{text}\n{harness}")))
-                            .expect("Node is required for the exception regression");
-                        assert!(
-                            output.status.success(),
-                            "jir={jir} {:?} {rename} {style:?} {target:?}\n{}\n{text}",
-                            mode,
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        assert_eq!(output.stdout, b"80\n");
-                    }
+    for mode in [OptimizerMode::Off, OptimizerMode::Report, OptimizerMode::On] {
+        for rename in [false, true] {
+            for style in [Style::Readable, Style::Compact] {
+                for target in [EcmaTarget::Es2018, EcmaTarget::Latest] {
+                    let original = fixture();
+                    let declarations: Vec<_> = original
+                        .iter()
+                        .cloned()
+                        .map(|decl| {
+                            let decl = optimizer::analyze(decl, mode).decl;
+                            let mut decl = sroa::analyze_jir(decl, mode).decl;
+                            if mode != OptimizerMode::On {
+                                assert!(original.contains(&decl));
+                            }
+                            if rename {
+                                minify::shorten_locals_for_measurement(&mut decl);
+                            }
+                            decl
+                        })
+                        .collect();
+                    let text =
+                        js::program_to_string_styled_for_target(&declarations, style, target);
+                    let output = test_node::run(Node::Stdin(&format!("{text}\n{harness}")))
+                        .expect("Node is required for the exception regression");
+                    assert!(
+                        output.status.success(),
+                        "{:?} {rename} {style:?} {target:?}\n{}\n{text}",
+                        mode,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(output.stdout, b"80\n");
                 }
             }
         }

@@ -28,7 +28,7 @@
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::interns::StrId;
 use rcgjs_object::jir::origin::SourceFactId;
-use rcgjs_object::jir::repr::{Carrier, Op, OpKind, Proj, Root, ValueId};
+use rcgjs_object::jir::repr::{Op, OpKind, Proj, Root, ValueId};
 use rcgjs_object::jir::semantic::{CallSemantic, Callee, DropGlue, ItemId, StandardOperation};
 use rcgjs_object::jsast::{self, Expr, Stmt};
 use rcgjs_object::ptr;
@@ -142,81 +142,20 @@ impl JsCx<'_> {
         // retained-view escape. `buf` is allocated once at the greater of the two lengths while
         // `cap` continues to carry Rust's logical capacity independently. An admitted immutable
         // slice is constructed inline; its only consumers have selected `buf, off, len` lanes,
-        // whose member folding removes the temporary slice object.
-        if matches!(
-            semantic,
-            CallSemantic::Standard(StandardOperation::VecWithCapacity)
-        ) {
-            let Some(result) = op.result else {
-                return Err(decline(
-                    OpClass::Call,
-                    "selected typed Vec construction has no result",
-                ));
-            };
-            if let Some(storage) = self.typed_storage(result) {
-                let [capacity] = args.as_slice() else {
-                    return Err(decline(
-                        OpClass::Call,
-                        "selected typed Vec construction has the wrong arity",
-                    ));
-                };
-                let value = jsast::object_of(vec![
-                    (
-                        "buf",
-                        jsast::new(
-                            jsast::id(storage.constructor),
-                            vec![jsast::raw_num(storage.allocation_length.to_string())],
-                        ),
-                    ),
-                    ("len", jsast::num(0)),
-                    ("cap", self.expr_of(*capacity)?),
-                ]);
-                return Ok(Lowered::value(value));
-            }
-        }
         if matches!(
             semantic,
             CallSemantic::Standard(StandardOperation::VecAsSlice)
-        ) {
-            let [receiver] = args.as_slice() else {
-                return Err(decline(
-                    OpClass::Call,
-                    "selected typed Vec::as_slice has the wrong arity",
-                ));
-            };
-            if self.typed_storage(*receiver).is_some() {
-                let receiver = self.expr_of(*receiver)?;
-                return Ok(Lowered::value(ptr::fat_slice(
-                    jsast::member(receiver.clone(), "buf"),
-                    jsast::num(0),
-                    jsast::member(receiver, "len"),
-                )));
+        ) && self.heap().native_vec_enabled
+        {
+            if let Some(lowered) =
+                self.lower_soa_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
+            {
+                return Ok(lowered);
             }
-            if self.heap().native_vec_enabled {
-                if let Some(lowered) =
-                    self.lower_soa_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
-                {
-                    return Ok(lowered);
-                }
-                if let Some(lowered) =
-                    self.lower_native_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
-                {
-                    return Ok(lowered);
-                }
-            }
-        }
-        if matches!(semantic, CallSemantic::Standard(StandardOperation::VecPush)) {
-            let [receiver, value] = args.as_slice() else {
-                return Err(decline(
-                    OpClass::Call,
-                    "selected typed Vec push has the wrong arity",
-                ));
-            };
-            if self.typed_storage(*receiver).is_some() {
-                return Ok(Lowered::value(jsast::rt_call(
-                    "typed_vec_push",
-                    vec![self.expr_of(*receiver)?, self.expr_of(*value)?],
-                )));
+            if let Some(lowered) =
+                self.lower_native_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
+            {
+                return Ok(lowered);
             }
         }
         // `CallSemantic` is not a codegen distinction on the baseline lane: an allocator shim, a
@@ -240,25 +179,23 @@ impl JsCx<'_> {
                 let receiver = self.expr_of(*receiver)?;
                 return Ok(Lowered::value(jsast::member(receiver, "s")));
             }
-            if let Some(carrier) = self.borrowed_carrier(*receiver) {
-                let receiver = self.expr_of(*receiver)?;
-                return match carrier {
-                    Carrier::HostString => Ok(Lowered::value(receiver)),
-                    Carrier::StringBuilder => Ok(Lowered::value(jsast::member(receiver, "text"))),
-                    _ => Err(decline(
-                        OpClass::Call,
-                        "String::deref marked with an unsupported carrier",
-                    )),
-                };
-            }
         }
 
-        // Phase 5 fast `core::str` comparison/search hooks (`ReleaseSpeed`).
+        // Phase 5 fast `core::str` comparison/search hooks (`ReleaseSpeed`, plus exact JS string
+        // predicates `BstrEq`/`BstrStartsWith`/`BstrEndsWith`/`BstrContains` whenever `js-opt=on`,
+        // since UTF-8 and UTF-16 equality/prefix/suffix/substring predicates agree identically).
         if let CallSemantic::Standard(operation) = semantic {
-            if operation.is_fast_str_op()
-                && (self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
-                    || crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed))
-            {
+            let release_speed = self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+                || crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed);
+            let exact_str_pred = self.opts.applies(crate::opts::OptimizerPass::AstDce)
+                && matches!(
+                    operation,
+                    StandardOperation::BstrEq
+                        | StandardOperation::BstrStartsWith
+                        | StandardOperation::BstrEndsWith
+                        | StandardOperation::BstrContains
+                );
+            if operation.is_fast_str_op() && (release_speed || exact_str_pred) {
                 if let Some(lowered) = self.lower_fast_str_call(op, *operation, args)? {
                     return Ok(lowered);
                 }
@@ -644,31 +581,6 @@ impl JsCx<'_> {
         Ok((self.expr_of(receiver)?, false))
     }
 
-    /// The carrier of the place a reference value borrows, through alias-preserving renames.
-    fn borrowed_carrier(&self, mut reference: rcgjs_object::jir::repr::ValueId) -> Option<Carrier> {
-        for _ in 0..self.func.values.len() {
-            let def = self.def_of(reference)?;
-            match &def.kind {
-                OpKind::Move(value) | OpKind::Copy(value) => reference = *value,
-                OpKind::BorrowView {
-                    root: Root::Value(value),
-                    path,
-                    ..
-                } if path.as_slice() == [Proj::Deref] => reference = *value,
-                OpKind::BorrowView {
-                    root: Root::Value(value),
-                    path,
-                    ..
-                } if path.is_empty() => {
-                    let carrier = self.func.values.get(value.0 as usize)?.carrier;
-                    return (carrier != Carrier::Baseline).then_some(carrier);
-                }
-                _ => return None,
-            }
-        }
-        None
-    }
-
     /// The trailing caller `Location` argument of a call, or `None` when the callee takes none
     /// (`intrinsics.rs::caller_location_argument`).
     ///
@@ -860,9 +772,16 @@ impl JsCx<'_> {
             // The same answer one byte at a time over a `{ buf, off, len }` slice (or directly
             // over a `js-str=bytes` byte-string view).
             (StandardOperation::SliceIsAscii, [bytes])
-                if crate::lower::semantic_ops::string::is_immutable_u8_slice_ref(
-                    table,
-                    self.ty_of(*bytes)?,
+                if matches!(
+                    table.get(table.peeled(self.ty_of(*bytes)?)).map(|d| &d.kind),
+                    Some(rcgjs_object::jir::types::TypeKind::Reference {
+                        pointee,
+                        mutable: false,
+                    }) if matches!(
+                        table.get(table.peeled(*pointee)).map(|d| &d.kind),
+                        Some(rcgjs_object::jir::types::TypeKind::Slice(elem))
+                            if table.byte_element(*elem)
+                    )
                 ) =>
             {
                 if let Some(bv) = self.byte_view(*bytes) {
@@ -1271,16 +1190,7 @@ impl JsCx<'_> {
         operation: StandardOperation,
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
-        const TA_CTORS: [&str; 8] = [
-            "Uint8Array",
-            "Int8Array",
-            "Uint16Array",
-            "Int16Array",
-            "Uint32Array",
-            "Int32Array",
-            "Float32Array",
-            "Float64Array",
-        ];
+        use super::ast_util::TA_CTORS;
         let table = self.table;
         let heap = self.heap();
 
@@ -1330,7 +1240,7 @@ impl JsCx<'_> {
                 let cap = self.expr_of(*cap_v)?;
                 if let Some(k) = table
                     .get(elem)
-                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                    .and_then(crate::lower::semantic_ops::typed_array_kind)
                 {
                     let buf = jsast::new(jsast::id(TA_CTORS[k as usize]), vec![cap]);
                     return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
@@ -1398,7 +1308,7 @@ impl JsCx<'_> {
                 let checked = heap.non_rc_raw_alloc_reachable;
                 if let Some(k) = table
                     .get(elem)
-                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                    .and_then(crate::lower::semantic_ops::typed_array_kind)
                 {
                     let helper = if checked {
                         "t_realloc_ta_checked"
@@ -1492,7 +1402,7 @@ impl JsCx<'_> {
                     jsast::num(align as f64)
                 } else if let Some(k) = table
                     .get(*elem_ty)
-                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                    .and_then(crate::lower::semantic_ops::typed_array_kind)
                 {
                     jsast::new(jsast::id(TA_CTORS[k as usize]), vec![len_ref.clone()])
                 } else {
@@ -2017,17 +1927,8 @@ impl JsCx<'_> {
         operation: StandardOperation,
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
+        use super::ast_util::TA_CTORS;
         use rcgjs_object::jir::types::{NominalForm, PointerForm, TypeKind};
-        const TA_CTORS: [&str; 8] = [
-            "Uint8Array",
-            "Int8Array",
-            "Uint16Array",
-            "Int16Array",
-            "Uint32Array",
-            "Int32Array",
-            "Float32Array",
-            "Float64Array",
-        ];
         const TA_SUFFIXES: [&str; 8] = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "f64"];
 
         let table = self.table;
@@ -4023,78 +3924,6 @@ impl JsCx<'_> {
             }
             return Ok(Lowered::Done(stmts));
         }
-        if let Root::Value(value) = root {
-            if path.is_empty() {
-                if self.typed_storage(*value).is_some() {
-                    // Eligibility proves a POD element and an unobservable global allocator. The
-                    // exact backing store becomes unreachable with this value, so running the
-                    // generic NativeVec release helper can have no Rust-visible effect.
-                    let mut stmts = Vec::new();
-                    if self.is_inline(*value) {
-                        let expr = self.expr_of(*value)?;
-                        if !jsast::is_droppable(&expr) {
-                            stmts.push(jsast::expr_stmt(expr));
-                        }
-                    }
-                    return Ok(Lowered::Done(stmts));
-                }
-                match self.dropped_string_kind(*value) {
-                    Some(emit::DroppedStringKind::NoOp) => {
-                        let is_host_str = self.func.values.get(value.0 as usize).map(|d| d.carrier)
-                            == Some(Carrier::HostString);
-                        if is_host_str || self.only_used_by_empty_drop(*value) {
-                            let mut stmts = Vec::new();
-                            if self.is_inline(*value) {
-                                let target = match self.def_of(*value).map(|op| &op.kind) {
-                                    Some(OpKind::Convert { v: src, .. }) => *src,
-                                    _ => *value,
-                                };
-                                let expr = self.expr_of(target)?;
-                                if !jsast::is_droppable(&expr) {
-                                    stmts.push(jsast::expr_stmt(expr));
-                                }
-                            }
-                            return Ok(Lowered::Done(stmts));
-                        }
-                    }
-                    Some(emit::DroppedStringKind::BaselineDealloc { src, layout })
-                        if self.is_inline(*value) || self.only_used_by_adjacent_drop(*value) =>
-                    {
-                        let src_expr = self.expr_of(src)?;
-                        let mut stmts = Vec::new();
-                        let heap = self.heap();
-                        if heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable {
-                            if !jsast::is_droppable(&src_expr) {
-                                stmts.push(jsast::expr_stmt(src_expr));
-                            }
-                            return Ok(Lowered::Done(stmts));
-                        }
-                        let base = if matches!(src_expr, Expr::Ident(_)) {
-                            src_expr
-                        } else {
-                            let (bind, name) = self.temp(src_expr);
-                            stmts.push(bind);
-                            name
-                        };
-                        let cap = layout.member(base.clone(), &layout.cap);
-                        let ptr = layout.member(base, &layout.ptr);
-                        if cap != jsast::num(0) {
-                            let dealloc_call = if heap.typed_heap_enabled {
-                                jsast::rt_call("t_dealloc_maybe", vec![ptr])
-                            } else {
-                                jsast::rt_call("dealloc", vec![ptr, cap.clone(), jsast::num(1)])
-                            };
-                            stmts.push(jsast::if_(
-                                jsast::binary(jsast::BinOp::StrictNe, cap, jsast::num(0)),
-                                vec![jsast::expr_stmt(dealloc_call)],
-                            ));
-                        }
-                        return Ok(Lowered::Done(stmts));
-                    }
-                    _ => {}
-                }
-            }
-        }
         match glue {
             // Empty glue is not emitted as an item, so naming it would dangle. Evaluate any
             // inlined non-droppable root/index operand as defense-in-depth so effects never drop.
@@ -4223,20 +4052,10 @@ fn uninit_shell(
             if depth == 0 {
                 if let Some(k) = table
                     .get(*element)
-                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                    .and_then(crate::lower::semantic_ops::typed_array_kind)
                 {
-                    const TA_CTORS: [&str; 8] = [
-                        "Uint8Array",
-                        "Int8Array",
-                        "Uint16Array",
-                        "Int16Array",
-                        "Uint32Array",
-                        "Int32Array",
-                        "Float32Array",
-                        "Float64Array",
-                    ];
                     return Some(jsast::new(
-                        jsast::id(TA_CTORS[k as usize]),
+                        jsast::id(super::ast_util::TA_CTORS[k as usize]),
                         vec![jsast::num(*length as f64)],
                     ));
                 }
@@ -4439,7 +4258,7 @@ mod tests {
             vtables: &vtables,
             spills: &[],
             abi: None,
-            physical: None,
+            final_lowering: false,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: ByteViewPlan {
@@ -4955,7 +4774,7 @@ mod tests {
             vtables: &vtables,
             spills: &[],
             abi: None,
-            physical: None,
+            final_lowering: false,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views,

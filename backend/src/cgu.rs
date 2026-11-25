@@ -10,14 +10,13 @@
 //! mutability is confined to the two sinks below.
 
 use std::cell::{Ref, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use rcgjs_object::jir::Interns;
 
 use rustc_middle::ty::TyCtxt;
 
-use crate::item::{ItemKind, JsItem, JsName, Linkage, SourceOrder};
-use crate::jsast::{self, Expr};
+use crate::item::{JsItem, JsName};
 use crate::naming::Namer;
 use crate::opts::Opts;
 
@@ -29,11 +28,8 @@ pub(crate) struct CguCx<'tcx> {
     pub(crate) opts: &'static Opts,
     /// Items discovered while lowering, appended to the unit after the mono item walk.
     extra: RefCell<Vec<JsItem>>,
-    required: RefCell<BTreeMap<JsName, rustc_middle::mono::MonoItem<'tcx>>>,
     /// The names already emitted into this unit, so an interned item is built exactly once.
     emitted: RefCell<BTreeSet<JsName>>,
-    /// How many keyed loops have been numbered in this unit. See [`CguCx::next_keyed_site`].
-    keyed_sites: RefCell<u32>,
     /// The crate-scope JIR-S tables (strings, bytes, signatures, source facts, the type table)
     /// every body of this unit refers into. See [`CguCx::interns`].
     interns: RefCell<Interns>,
@@ -46,48 +42,9 @@ impl<'tcx> CguCx<'tcx> {
             namer: Namer::new(tcx, opts.names),
             opts,
             extra: RefCell::new(Vec::new()),
-            required: RefCell::new(BTreeMap::new()),
             emitted: RefCell::new(BTreeSet::new()),
-            keyed_sites: RefCell::new(0),
             interns: RefCell::new(Interns::new()),
         }
-    }
-
-    /// Records a resolved semantic dependency before the JIR encoder releases its intern borrow.
-    pub(crate) fn require_function(&self, instance: rustc_middle::ty::Instance<'tcx>) {
-        use rustc_middle::ty::{InstanceKind, ShimKind};
-        if !crate::coroutine_source::cleanup_probe()
-            || matches!(
-                instance.def,
-                InstanceKind::Virtual(..)
-                    | InstanceKind::Intrinsic(_)
-                    | InstanceKind::LlvmIntrinsic(_)
-                    | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-            )
-            || !self.tcx.should_codegen_locally(instance)
-        {
-            return;
-        }
-        let name = self.namer.fn_name(instance);
-        self.required
-            .borrow_mut()
-            .insert(name, rustc_middle::mono::MonoItem::Fn(instance));
-    }
-
-    pub(crate) fn require_static(&self, definition: rustc_hir::def_id::DefId) {
-        if crate::coroutine_source::cleanup_probe() && definition.is_local() {
-            let name = self.namer.static_name(definition);
-            self.required
-                .borrow_mut()
-                .insert(name, rustc_middle::mono::MonoItem::Static(definition));
-        }
-    }
-
-    pub(crate) fn take_required(&self) -> Vec<(JsName, rustc_middle::mono::MonoItem<'tcx>)> {
-        std::mem::take(&mut *self.required.borrow_mut())
-            .into_iter()
-            .filter(|(name, _)| !self.emitted.borrow().contains(name))
-            .collect()
     }
 
     /// The JIR-S interns of this unit, accumulated across every item encoded into it.
@@ -113,48 +70,9 @@ impl<'tcx> CguCx<'tcx> {
         std::mem::take(&mut self.interns.borrow_mut())
     }
 
-    /// The next keyed loop's site, which is what separates one keyed loop's row cache from
-    /// another's at run time.
-    ///
-    /// Per `push_keyed` call site, and a keyed `for` contains exactly one of those, so per call
-    /// site is per loop. The counter is per codegen unit, so the CRATE NAME is part of the site:
-    /// every unit would otherwise start at zero and two loops compiled in different crates would
-    /// share one row cache, which is a wrong-rows bug rather than a slow one.
-    pub(crate) fn next_keyed_site(&self) -> String {
-        let mut sites = self.keyed_sites.borrow_mut();
-        let site = *sites;
-        *sites += 1;
-        format!(
-            "{}#{site}",
-            self.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
-        )
-    }
-
     /// Records that `name` has an item in this unit. Returns `false` if it already had one.
     pub(crate) fn claim(&self, name: &JsName) -> bool {
         self.emitted.borrow_mut().insert(name.clone())
-    }
-
-    /// Moves an already interned item to `order` if that is earlier than where it is now.
-    ///
-    /// An item whose declaration order matters is interned by the first *codegenned* use, and
-    /// codegen order is a symbol-hash order. The reference compiler declares one per template in
-    /// the order the module first *writes* them, so every use offers its own position and the
-    /// earliest wins. See [`crate::item::SourceOrder`].
-    ///
-    /// Only uses in this codegen unit can offer one: two units that build the same template each
-    /// emit an item, and `link.rs` keeps one of the two. With one unit per crate, which is what the
-    /// suites compile with, that is every use in the crate.
-    pub(crate) fn order_at_most(&self, name: &JsName, order: SourceOrder) {
-        for item in self.extra.borrow_mut().iter_mut() {
-            if item.name != *name {
-                continue;
-            }
-            if item.order.as_ref().is_none_or(|current| order < *current) {
-                item.order = Some(order);
-            }
-            return;
-        }
     }
 
     /// Adds a discovered item, unless one of that name is already there.
@@ -179,45 +97,6 @@ impl<'tcx> CguCx<'tcx> {
             );
             self.extra.borrow_mut().push(item);
         }
-    }
-
-    /// Hoists a value the program repeats into a module level `const`, and names it.
-    ///
-    /// The same value is emitted once per program however many times it is written: `key` is the
-    /// interning key, and it goes through [`Namer::synthetic_name`], whose hash is stable across
-    /// crates and compilations. Two crates that hoist the same value therefore produce items with
-    /// the same name *and* the same text, which is exactly the shape the duplicate check in
-    /// `link.rs` drops silently. Nothing has to record the edge from a use to the constant either:
-    /// the use is the constant's identifier, so `JsItem::new` picks it up as an outgoing reference
-    /// and the reachability pass keeps it alive — and drops it when the last user goes.
-    ///
-    /// `key` must describe the *value*, never a `def_path_str` (see the note in `naming.rs`), or
-    /// two crates would disagree about the name.
-    ///
-    /// With `-Cllvm-args=js-hoist-consts=off` the value is returned inline instead, which is what
-    /// makes a size or behaviour change from this bisectable.
-    pub(crate) fn hoist(
-        &self,
-        prefix: &str,
-        key: &str,
-        debug_path: String,
-        value: impl FnOnce() -> Expr,
-    ) -> Expr {
-        if !self.opts.hoist_consts {
-            return value();
-        }
-        let name = self.namer.synthetic_name(prefix, key);
-        self.intern(name.clone(), || {
-            JsItem::new(
-                name.clone(),
-                ItemKind::Const,
-                jsast::const_(name.as_str(), value()),
-                Vec::new(),
-                Linkage::internal(),
-                debug_path,
-            )
-        });
-        jsast::id(name.into_string())
     }
 
     /// Takes the discovered items.

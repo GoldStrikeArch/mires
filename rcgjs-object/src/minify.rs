@@ -932,8 +932,7 @@ mod tests {
             map: crate::item::ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         };
         let items = [
@@ -1019,8 +1018,7 @@ let beta = obj.gamma + "delta" + 0x1f + eps;
             map: crate::item::ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         };
         let items = [
@@ -1060,8 +1058,7 @@ let beta = obj.gamma + "delta" + 0x1f + eps;
             map: crate::item::ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         };
         let items = [
@@ -1124,8 +1121,7 @@ let beta = obj.gamma + "delta" + 0x1f + eps;
             map: crate::item::ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         };
         // An item named exactly like a variant, so that a pass that did not skip strings would

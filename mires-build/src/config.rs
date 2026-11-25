@@ -81,29 +81,17 @@ impl OptimizerPass {
 }
 
 /// Which lowering the link step prints an item from. Mirrors the backend's `js-lane`.
-///
-/// Every object carries both v1's printed baseline JavaScript and the JIR-S body it was encoded
-/// from, so this is a link step choice between two available spellings rather than a mode the
-/// compilation commits to — which is why it is not matched against the sysroot. The lanes
-/// themselves land in a later phase; a non-baseline lane compiles today and warns that the
-/// baseline is what ran.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum Lane {
-    /// The frozen v1 text, item for item.
+    /// Print from JIR-S (the sole lowering lane).
     #[default]
-    Baseline,
-    /// Print the baseline, and the JIR lane beside it, for differential comparison.
-    Shadow,
-    /// Print from JIR-S wherever the item's class has been promoted.
     Jir,
 }
 
 impl Lane {
-    fn backend_arg(self) -> Option<&'static str> {
+    fn backend_arg(self) -> &'static str {
         match self {
-            Self::Baseline => None,
-            Self::Shadow => Some("js-lane=shadow"),
-            Self::Jir => Some("js-lane=jir"),
+            Self::Jir => "js-lane=jir",
         }
     }
 }
@@ -169,14 +157,6 @@ impl Profile {
             ],
         }
     }
-
-    /// The lane this profile selects. Link-only, so it never reaches the sysroot key.
-    fn lane(self) -> Lane {
-        match self {
-            Self::Dev | Self::Report => Lane::Baseline,
-            Self::ReleaseSize | Self::ReleaseBalanced | Self::ReleaseSpeed => Lane::Jir,
-        }
-    }
 }
 
 /// A rustc optimization level applied consistently to the client and its JavaScript sysroot.
@@ -225,9 +205,6 @@ pub struct BuildConfig {
     emit_args: Vec<String>,
     crate_args: Vec<String>,
     cfgs: Vec<String>,
-    views: bool,
-    keyed_views: bool,
-    procedures: bool,
     chunking: Option<Chunking>,
     spike_root: Option<PathBuf>,
     bootstrap: bool,
@@ -266,9 +243,6 @@ impl BuildConfig {
             emit_args: Vec::new(),
             crate_args: Vec::new(),
             cfgs: Vec::new(),
-            views: false,
-            keyed_views: false,
-            procedures: false,
             chunking: None,
             spike_root: None,
             bootstrap: false,
@@ -464,50 +438,6 @@ impl BuildConfig {
         self
     }
 
-    /// Compile a client crate that uses the view macros. Defaults to `false`.
-    ///
-    /// The host proc macros run in the same rustc invocation as the backend,
-    /// preserving the original crate's spans for diagnostics and source maps.
-    /// The template ABI their client expansion names is built as an rlib by
-    /// the same backend first, so the crate has one `core` and one ABI rather
-    /// than two of either.
-    ///
-    /// The macros themselves run inside rustc and so are built for the host,
-    /// which [`render`](Self::render) reports rather than does: it is an
-    /// ordinary cargo build in the spike checkout.
-    #[must_use]
-    pub fn views(mut self, on: bool) -> Self {
-        self.views = on;
-        self
-    }
-
-    /// Use the transitional keyed-list lowering for keyed `view!` loops.
-    ///
-    /// Defaults to `false`, so [`views`](Self::views) keeps expanding through
-    /// the legacy `push_keyed` compatibility lane. Enabling this also enables
-    /// views and selects a separately built proc-macro artifact; it cannot
-    /// change the expansion used by another build in the same checkout.
-    #[must_use]
-    pub fn keyed_views(mut self, on: bool) -> Self {
-        self.keyed_views = on;
-        self.views |= on;
-        self
-    }
-
-    /// Compile a client crate that calls functions declared with
-    /// `#[topcoat_runtime_macro::procedure]` and may spawn their futures.
-    /// Defaults to `false`.
-    ///
-    /// Procedure clients compile the host macro and target crate in one rustc
-    /// invocation, plus the packaged client-side `topcoat-dom` seam and async
-    /// executor. The framework proc macro is run unchanged; this option only
-    /// supplies the target crates its client expansion names.
-    #[must_use]
-    pub fn procedures(mut self, on: bool) -> Self {
-        self.procedures = on;
-        self
-    }
-
     /// Split the program into one file per island instead of emitting it as
     /// one. Defaults to not splitting.
     ///
@@ -575,18 +505,7 @@ impl BuildConfig {
         // Before anything that can fail: a build that ends in an error still
         // has to know when to try again.
         let emit_args = self.emit_arguments();
-        let rerun = Rerun::new(&self.client_root, &toolchain);
-        let rerun = if self.views {
-            rerun.views_with_keyed(&toolchain, self.keyed_views)
-        } else {
-            rerun
-        };
-        let rerun = if self.procedures {
-            rerun.procedures(&toolchain)
-        } else {
-            rerun
-        };
-        rerun.emit();
+        Rerun::new(&self.client_root, &toolchain).emit();
 
         if !self.client_root.is_file() {
             return Err(BuildError::ClientMissing {
@@ -614,10 +533,13 @@ impl BuildConfig {
         let staged_report = self
             .optimization_report
             .then(|| staging.join(STAGED_OPTIMIZATION_REPORT_NAME));
-        let (source, script_args) = self.prepare(&toolchain, &staging, &emit_args)?;
+        let mut script_args = Vec::new();
+        for cfg in &self.cfgs {
+            script_args.extend(["--cfg".to_owned(), cfg.clone()]);
+        }
         let workspace_root = self.backend_workspace_root(&toolchain);
         toolchain.compile_with_settings(
-            &source,
+            &self.client_root,
             &staged,
             &self.extra_args_for(
                 staged_report
@@ -865,147 +787,6 @@ impl BuildConfig {
             .to_owned()
     }
 
-    /// The source the backend compiles and the arguments the compile script
-    /// takes with it.
-    ///
-    /// View and procedure support crates are built first, then the original
-    /// client source is compiled with their host proc macros and target rlibs
-    /// in one rustc invocation. Keeping the original source as rustc's input is
-    /// what lets source maps reach the author's files instead of a staging
-    /// expansion.
-    fn prepare(
-        &self,
-        toolchain: &Toolchain,
-        staging: &Path,
-        emit_args: &str,
-    ) -> Result<(PathBuf, Vec<String>)> {
-        if !self.views && !self.procedures {
-            return Ok((self.client_root.clone(), Vec::new()));
-        }
-        if self.views {
-            toolchain.check_view_macros_with_keyed(self.keyed_views)?;
-        }
-        if self.procedures {
-            toolchain.check_procedure_support()?;
-        }
-
-        // The ABI is a crate of its own, compiled by the same backend against
-        // the same sysroot, so the proc-macro output and the program agree
-        // about it.
-        let view_abi = staging.join("libview_abi.rlib");
-        toolchain.compile_with_opt_level(
-            &toolchain.view_abi(),
-            &view_abi,
-            emit_args,
-            &[
-                "--crate-type".to_owned(),
-                "rlib".to_owned(),
-                "--crate-name".to_owned(),
-                "view_abi".to_owned(),
-            ],
-            self.rust_opt_level,
-        )?;
-
-        let mut compiled_externs = vec![
-            "--extern".to_owned(),
-            format!("view_abi={}", view_abi.display()),
-        ];
-        if self.views {
-            compiled_externs.extend([
-                "--extern".to_owned(),
-                format!(
-                    "view_dom_macro={}",
-                    toolchain.view_macros_with_keyed(self.keyed_views).display()
-                ),
-                "--extern".to_owned(),
-                format!(
-                    "js_extern_macro={}",
-                    toolchain
-                        .js_extern_macro_with_keyed(self.keyed_views)
-                        .display()
-                ),
-            ]);
-        }
-        if self.procedures {
-            let view_async = staging.join("libview_async.rlib");
-            toolchain.compile_with_opt_level(
-                &toolchain.view_async(),
-                &view_async,
-                emit_args,
-                &[
-                    "--crate-type".to_owned(),
-                    "rlib".to_owned(),
-                    "--crate-name".to_owned(),
-                    "view_async".to_owned(),
-                    "--extern".to_owned(),
-                    format!("view_abi={}", view_abi.display()),
-                ],
-                self.rust_opt_level,
-            )?;
-
-            // Keep the proc-macro search path free of host rlibs. rustc may
-            // resolve the transitive `js_macro` dependency by file name while
-            // loading `topcoat_dom` metadata, and a host `view_abi` beside it
-            // would be offered for the wasm target.
-            let macro_dir = staging.join("procedure-macros");
-            fs::create_dir_all(&macro_dir).map_err(|source| BuildError::Io {
-                path: macro_dir.clone(),
-                source,
-            })?;
-            let js_macro = toolchain.js_macro();
-            let js_macro_copy = macro_dir.join(
-                js_macro
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("js-macro")),
-            );
-            publish(&js_macro, &js_macro_copy)?;
-            let topcoat_dom = staging.join("libtopcoat_dom.rlib");
-            toolchain.compile_with_opt_level(
-                &toolchain.topcoat_dom(),
-                &topcoat_dom,
-                emit_args,
-                &[
-                    "--crate-type".to_owned(),
-                    "rlib".to_owned(),
-                    "--crate-name".to_owned(),
-                    "topcoat_dom".to_owned(),
-                    "--search".to_owned(),
-                    macro_dir.display().to_string(),
-                    "--extern".to_owned(),
-                    format!("view_abi={}", view_abi.display()),
-                    "--extern".to_owned(),
-                    format!("view_async={}", view_async.display()),
-                    "--extern".to_owned(),
-                    format!("js_macro={}", js_macro.display()),
-                ],
-                self.rust_opt_level,
-            )?;
-
-            compiled_externs.extend([
-                "--search".to_owned(),
-                staging.display().to_string(),
-                "--search".to_owned(),
-                macro_dir.display().to_string(),
-                "--extern".to_owned(),
-                format!("view_async={}", view_async.display()),
-                "--extern".to_owned(),
-                format!("topcoat_dom={}", topcoat_dom.display()),
-                "--extern".to_owned(),
-                format!("js_macro={}", js_macro.display()),
-                "--extern".to_owned(),
-                format!(
-                    "topcoat_runtime_macro={}",
-                    toolchain.procedure_macro().display()
-                ),
-            ]);
-        }
-        for cfg in &self.cfgs {
-            compiled_externs.extend(["--cfg".to_owned(), cfg.clone()]);
-        }
-
-        Ok((self.client_root.clone(), compiled_externs))
-    }
-
     /// The `JS_EXTRA_ARGS` value for this configuration: the emit-affecting
     /// options, the per crate ones, the chunk request, and the source map
     /// switch.
@@ -1043,13 +824,6 @@ impl BuildConfig {
             .collect()
     }
 
-    /// The lane that actually runs: the explicit one, else the profile's, else the baseline.
-    fn selected_lane(&self) -> Lane {
-        self.lane
-            .or_else(|| self.profile.map(Profile::lane))
-            .unwrap_or_default()
-    }
-
     fn optimizer_passes_arg(&self) -> Option<String> {
         let passes = self.optimizer_passes.as_ref()?;
         let value = match passes.as_slice() {
@@ -1080,7 +854,7 @@ impl BuildConfig {
         let profile_args = self.profile_emit_args();
         let profile = self.profile.map(Profile::backend_arg);
         let jir = (!self.jir).then_some("js-jir=off");
-        let lane = self.selected_lane().backend_arg();
+        let lane = self.lane.map(Lane::backend_arg);
         let args = profile_args
             .iter()
             .map(String::as_str)
@@ -1209,15 +983,6 @@ mod tests {
         assert_eq!(config.output_name, DEFAULT_OUTPUT_NAME);
         assert_eq!(config.extra_args(), "js-source-map=on");
         assert!(!config.minimal_shim);
-        assert!(!config.keyed_views);
-    }
-
-    #[test]
-    fn keyed_view_lowering_is_an_explicit_view_mode() {
-        let config = BuildConfig::new("client/app.rs").keyed_views(true);
-
-        assert!(config.views);
-        assert!(config.keyed_views);
     }
 
     #[test]
@@ -1270,7 +1035,7 @@ mod tests {
         );
         assert_eq!(
             size.extra_args(),
-            "js-cleanup=on js-ecma-target=2018 js-minify=on js-opt=on js-profile=release-size js-lane=jir"
+            "js-cleanup=on js-ecma-target=2018 js-minify=on js-opt=on js-profile=release-size"
         );
 
         let speed = BuildConfig::new("client/app.rs")
@@ -1282,7 +1047,7 @@ mod tests {
         );
         assert_eq!(
             speed.extra_args(),
-            "js-cleanup=on js-ecma-target=2018 js-minify=locals js-opt=on js-profile=release-speed js-lane=jir"
+            "js-cleanup=on js-ecma-target=2018 js-minify=locals js-opt=on js-profile=release-speed"
         );
 
         let balanced = BuildConfig::new("client/app.rs")
@@ -1291,14 +1056,13 @@ mod tests {
         assert_eq!(balanced.emit_arguments(), size.emit_arguments());
         assert_eq!(
             balanced.extra_args(),
-            "js-cleanup=on js-ecma-target=2018 js-minify=on js-opt=on js-profile=release-balanced js-lane=jir"
+            "js-cleanup=on js-ecma-target=2018 js-minify=on js-opt=on js-profile=release-balanced"
         );
 
         let dev = BuildConfig::new("client/app.rs")
             .source_map(false)
             .profile(Profile::Dev);
         assert_eq!(dev.emit_arguments(), "js-opt=off");
-        // The baseline lane is the default, so it costs no argument at all.
         assert_eq!(dev.extra_args(), "js-opt=off js-profile=dev");
 
         let report = BuildConfig::new("client/app.rs")
@@ -1316,8 +1080,7 @@ mod tests {
             .source_map(false)
             .profile(Profile::ReleaseSize)
             .optimizer(OptimizerMode::Report)
-            .emit_arg("js-minify=off")
-            .lane(Lane::Baseline);
+            .emit_arg("js-minify=off");
 
         assert_eq!(
             config.emit_arguments(),
@@ -1334,24 +1097,18 @@ mod tests {
 
     #[test]
     fn the_lane_is_a_link_step_choice_and_the_jir_body_is_an_emit_one() {
-        let shadow = BuildConfig::new("client/app.rs")
+        let jir = BuildConfig::new("client/app.rs")
             .source_map(false)
-            .lane(Lane::Shadow);
-        assert_eq!(shadow.emit_arguments(), "");
-        assert_eq!(shadow.extra_args(), "js-lane=shadow");
+            .lane(Lane::Jir);
+        assert_eq!(jir.emit_arguments(), "");
+        assert_eq!(jir.extra_args(), "js-lane=jir");
 
-        let without_jir = BuildConfig::new("client/app.rs")
-            .source_map(false)
-            .jir(false);
-        assert_eq!(without_jir.emit_arguments(), "js-jir=off");
-        assert_eq!(without_jir.extra_args(), "js-jir=off");
         let cleanup = BuildConfig::new("client/app.rs")
             .source_map(false)
             .emit_arg("js-cleanup=on");
         assert_eq!(cleanup.emit_arguments(), "js-cleanup=on");
         assert_eq!(cleanup.extra_args(), "js-cleanup=on");
 
-        // The default carries JIR bodies and prints the baseline, which is no argument either way.
         let default = BuildConfig::new("client/app.rs").source_map(false);
         assert_eq!(default.emit_arguments(), "");
         assert_eq!(default.extra_args(), "");

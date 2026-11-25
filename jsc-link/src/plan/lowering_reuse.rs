@@ -270,27 +270,8 @@ pub(crate) fn physical_calls_neutral(abi: &impl TrialAbi, deps: &Deps) -> bool {
             .any(|callee| abi.reshapes_calls_to(*callee))
 }
 
-/// Whether a representation trial leaves `name` alone: `committed` says whether the commit
-/// replaces, clones or retargets it, and `abi` is the trial's own ABI plan.
-pub(crate) fn representation_untouched(
-    abi: &impl TrialAbi,
-    committed: bool,
-    name: &JsName,
-    item: ItemId,
-) -> bool {
-    !committed && !abi.touches(name) && !abi.targets(name, item)
-}
-
-/// Which measurement a store serves, for its counters and messages.
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Physical,
-    Representation,
-}
-
-/// The neutral lowerings of one physical evaluation or one representation solve.
+/// The neutral lowerings of one physical evaluation.
 pub(crate) struct Reuse {
-    kind: Kind,
     /// The addresses of the source table, functions and options the store was first used with.
     scope: Option<[usize; 3]>,
     trials: usize,
@@ -301,17 +282,7 @@ pub(crate) struct Reuse {
 impl Reuse {
     /// A store for one `physical_cost::evaluate_groups`.
     pub(crate) fn physical() -> Reuse {
-        Reuse::new(Kind::Physical)
-    }
-
-    /// A store for one representation solve.
-    pub(crate) fn representation() -> Reuse {
-        Reuse::new(Kind::Representation)
-    }
-
-    fn new(kind: Kind) -> Reuse {
         Reuse {
-            kind,
             scope: None,
             trials: 0,
             deps: BTreeMap::new(),
@@ -356,22 +327,6 @@ impl Reuse {
         self.lower(name, neutral, input, func, || describe_physical(abi))
     }
 
-    /// `name`'s lowering in a representation trial. `committed` says whether the commit replaces,
-    /// clones or retargets `name`; `abi` is the trial's ABI plan; `describe` names the trial.
-    pub(crate) fn lower_representation(
-        &mut self,
-        abi: &AbiPlan,
-        committed: bool,
-        name: &JsName,
-        input: &LowerInput<'_>,
-        func: &Func,
-        describe: impl FnOnce() -> String,
-    ) -> Result<Lowering, Decline> {
-        let neutral = representation_untouched(abi, committed, name, func.item)
-            && self.deps(name, input, func).reusable();
-        self.lower(name, neutral, input, func, describe)
-    }
-
     fn deps(&mut self, name: &JsName, input: &LowerInput<'_>, func: &Func) -> &Deps {
         self.deps
             .entry(name.clone())
@@ -386,10 +341,7 @@ impl Reuse {
         func: &Func,
         describe: impl FnOnce() -> String,
     ) -> Result<Lowering, Decline> {
-        let (lowered, reused) = match self.kind {
-            Kind::Physical => (Counter::LowerPhysical, Counter::LowerPhysicalReused),
-            Kind::Representation => (Counter::LowerReprProgram, Counter::LowerReprReused),
-        };
+        let (lowered, reused) = (Counter::LowerPhysical, Counter::LowerPhysicalReused);
         if neutral {
             if let Some(stored) = self.neutral.get(name) {
                 profile::bump(reused);
@@ -404,9 +356,8 @@ impl Reuse {
                     if let Some(field) = mismatch {
                         panic!(
                             "lowering reuse: `{}` reused at its neutral input differs from a fresh \
-                             lowering in `{field}` ({:?} trial {}: {})",
+                             lowering in `{field}` (Physical trial {}: {})",
                             name.as_str(),
-                            self.kind,
                             self.trials,
                             describe(),
                         );
@@ -581,42 +532,5 @@ mod tests {
         assert!(!spills.reusable());
         assert!(!inexact.reusable());
         assert!(deps(&[item(2)]).reusable());
-    }
-
-    #[test]
-    fn a_representation_trial_reuses_only_items_neither_the_commit_nor_its_plan_changes() {
-        let plan = plan();
-        // The representation measurement lowers without an ABI plan, so calling a flat callee
-        // does not by itself change the lowering; the rewrite of a touched body does.
-        assert!(representation_untouched(
-            &plan,
-            false,
-            &name("stray"),
-            item(5)
-        ));
-        assert!(representation_untouched(
-            &plan,
-            false,
-            &name("leaf"),
-            item(4)
-        ));
-        assert!(!representation_untouched(
-            &plan,
-            true,
-            &name("leaf"),
-            item(4)
-        ));
-        assert!(!representation_untouched(
-            &plan,
-            false,
-            &name("caller"),
-            item(1)
-        ));
-        assert!(!representation_untouched(
-            &plan,
-            false,
-            &name("flat"),
-            item(2)
-        ));
     }
 }

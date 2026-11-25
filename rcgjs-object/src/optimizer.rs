@@ -7,7 +7,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::jsast::{self, ArrowBody, BinOp, Expr, Stmt, SwitchCase, UnOp};
+use crate::jsast::{
+    self, walk_expr, walk_expr_mut, walk_stmt, ArrowBody, BinOp, Expr, Stmt, SwitchCase, UnOp,
+    Visit, VisitMut,
+};
 use crate::opts::{OptimizerMode, OptimizerPass};
 
 pub struct Analysis {
@@ -61,85 +64,6 @@ pub fn analyze(decl: Stmt, mode: OptimizerMode) -> Analysis {
     }
 }
 
-/// Whether the final emitted AST contains a compiler-generated future poller terminal.
-///
-/// This checks the exact runtime member call emitted by `host.rs`. It deliberately runs after AST
-/// simplification, so a poller selected while lowering a branch that DCE removes is not reported as
-/// applied.
-pub fn contains_emitted_future_poller(decl: &Stmt) -> bool {
-    fn statement(stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::ExprStmt(expr) | Stmt::Throw(expr) => expression(expr),
-            Stmt::Let(_, init) => init.as_ref().is_some_and(expression),
-            Stmt::Lets(declarations) => declarations
-                .iter()
-                .any(|(_, init)| init.as_ref().is_some_and(expression)),
-            Stmt::Const(_, init) => expression(init),
-            Stmt::Return(value) => value.as_ref().is_some_and(expression),
-            Stmt::If(test, then, otherwise) => {
-                expression(test)
-                    || then.iter().any(statement)
-                    || otherwise.iter().flatten().any(statement)
-            }
-            Stmt::Switch(discriminant, cases) => {
-                expression(discriminant)
-                    || cases.iter().any(|case| {
-                        case.tests.iter().any(expression) || case.body.iter().any(statement)
-                    })
-            }
-            Stmt::Labeled(_, inner) => statement(inner),
-            Stmt::LoopForever(_, body) | Stmt::Block(body) => body.iter().any(statement),
-            Stmt::While(test, body) => expression(test) || body.iter().any(statement),
-            Stmt::TryCatch { body, handler, .. } => body.iter().chain(handler).any(statement),
-            Stmt::FunctionDecl { body, .. } => body.iter().any(statement),
-            Stmt::Continue(_)
-            | Stmt::Break(_)
-            | Stmt::Import { .. }
-            | Stmt::Comment(_)
-            | Stmt::Raw(_)
-            | Stmt::Loc(_) => false,
-        }
-    }
-
-    fn expression(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call(callee, arguments) => {
-                matches!(
-                    &**callee,
-                    Expr::Member(runtime, member)
-                        if matches!(&**runtime, Expr::Ident(name) if name == "__rt")
-                            && matches!(member.as_str(), "host_spawn" | "host_future_promise")
-                ) || expression(callee)
-                    || arguments.iter().any(expression)
-            }
-            Expr::Member(object, _) | Expr::Unary(_, object) => expression(object),
-            Expr::New(callee, arguments) => expression(callee) || arguments.iter().any(expression),
-            Expr::Index(left, right)
-            | Expr::Binary(_, left, right)
-            | Expr::Assign(left, right)
-            | Expr::CompoundAssign(_, left, right) => expression(left) || expression(right),
-            Expr::Cond(test, consequent, alternate) => {
-                expression(test) || expression(consequent) || expression(alternate)
-            }
-            Expr::Object(entries) => entries.iter().any(|(_, value)| expression(value)),
-            Expr::Array(items) | Expr::Seq(items) => items.iter().any(expression),
-            Expr::Arrow(_, ArrowBody::Expr(body)) => expression(body),
-            Expr::Arrow(_, ArrowBody::Block(body)) => body.iter().any(statement),
-            Expr::Num(_)
-            | Expr::RawNum(_)
-            | Expr::BigInt(_)
-            | Expr::Str(_)
-            | Expr::Bool(_)
-            | Expr::Undefined
-            | Expr::Null
-            | Expr::Ident(_)
-            | Expr::Raw(_) => false,
-        }
-    }
-
-    statement(decl)
-}
-
 fn simplify_stmts(
     stmts: Vec<Stmt>,
     locals: bool,
@@ -187,37 +111,73 @@ fn simplify_stmts(
     }
 }
 
+/// Walks statements only (ignoring expressions) to check a statement-level predicate.
+fn any_stmt_shallow(stmt: &Stmt, pred: fn(&Stmt) -> bool, recurse_try: bool) -> bool {
+    struct Check {
+        pred: fn(&Stmt) -> bool,
+        recurse_try: bool,
+        found: bool,
+    }
+    impl Visit for Check {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if self.found {
+                return;
+            }
+            if (self.pred)(stmt) {
+                self.found = true;
+                return;
+            }
+            match stmt {
+                Stmt::TryCatch { body, handler, .. } if self.recurse_try => {
+                    self.visit_stmts(body);
+                    self.visit_stmts(handler);
+                }
+                Stmt::If(_, then, els) => {
+                    self.visit_stmts(then);
+                    if let Some(els) = els {
+                        self.visit_stmts(els);
+                    }
+                }
+                Stmt::Switch(_, cases) => {
+                    for case in cases {
+                        self.visit_stmts(&case.body);
+                    }
+                }
+                Stmt::Labeled(_, inner) => self.visit_stmt(inner),
+                Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::While(_, body) => {
+                    self.visit_stmts(body);
+                }
+                _ => {}
+            }
+        }
+        fn visit_expr(&mut self, _: &Expr) {}
+    }
+    let mut c = Check {
+        pred,
+        recurse_try,
+        found: false,
+    };
+    c.visit_stmt(stmt);
+    c.found
+}
+
 /// Whether removing this statement could remove a binding visible before it executes.
 fn contains_scope_binding(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::TryCatch { .. }
-        | Stmt::Let(..)
-        | Stmt::Lets(..)
-        | Stmt::Const(..)
-        | Stmt::FunctionDecl { .. } => true,
-        // Raw code is opaque. Nested forms are conservative too, including Annex-B block
-        // function bindings when output is loaded as a classic script.
-        Stmt::Raw(_) => true,
-        Stmt::If(_, then, els) => {
-            then.iter().any(contains_scope_binding)
-                || els.iter().flatten().any(contains_scope_binding)
-        }
-        Stmt::Switch(_, cases) => cases
-            .iter()
-            .any(|case| case.body.iter().any(contains_scope_binding)),
-        Stmt::Labeled(_, stmt) => contains_scope_binding(stmt),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::While(_, body) => {
-            body.iter().any(contains_scope_binding)
-        }
-        Stmt::ExprStmt(_)
-        | Stmt::Return(_)
-        | Stmt::Throw(_)
-        | Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => false,
-    }
+    any_stmt_shallow(
+        stmt,
+        |s| {
+            matches!(
+                s,
+                Stmt::TryCatch { .. }
+                    | Stmt::Let(..)
+                    | Stmt::Lets(..)
+                    | Stmt::Const(..)
+                    | Stmt::FunctionDecl { .. }
+                    | Stmt::Raw(_)
+            )
+        },
+        false,
+    )
 }
 
 fn simplify_stmt(
@@ -336,140 +296,55 @@ fn simplify_stmt(
 
 /// Whether removing this syntax could remove a classic-script Annex-B binding.
 fn contains_annex_b_binding(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::TryCatch { body, handler, .. } => {
-            body.iter().chain(handler).any(contains_annex_b_binding)
-        }
-        Stmt::FunctionDecl { .. } | Stmt::Raw(_) => true,
-        Stmt::If(_, then, els) => {
-            then.iter().any(contains_annex_b_binding)
-                || els.iter().flatten().any(contains_annex_b_binding)
-        }
-        Stmt::Switch(_, cases) => cases
-            .iter()
-            .any(|case| case.body.iter().any(contains_annex_b_binding)),
-        Stmt::Labeled(_, stmt) => contains_annex_b_binding(stmt),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::While(_, body) => {
-            body.iter().any(contains_annex_b_binding)
-        }
-        Stmt::ExprStmt(_)
-        | Stmt::Let(..)
-        | Stmt::Lets(..)
-        | Stmt::Const(..)
-        | Stmt::Return(_)
-        | Stmt::Throw(_)
-        | Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => false,
-    }
+    any_stmt_shallow(
+        stmt,
+        |s| matches!(s, Stmt::FunctionDecl { .. } | Stmt::Raw(_)),
+        true,
+    )
 }
 
-fn simplify_expr(expr: Expr, misses: &mut BTreeSet<(&'static str, &'static str)>) -> Expr {
-    match expr {
-        Expr::Member(obj, name) => Expr::Member(Box::new(simplify_expr(*obj, misses)), name),
-        Expr::Index(obj, index) => Expr::Index(
-            Box::new(simplify_expr(*obj, misses)),
-            Box::new(simplify_expr(*index, misses)),
-        ),
-        Expr::Call(callee, args) => Expr::Call(
-            Box::new(simplify_expr(*callee, misses)),
-            args.into_iter()
-                .map(|arg| simplify_expr(arg, misses))
-                .collect(),
-        ),
-        Expr::New(callee, args) => Expr::New(
-            Box::new(simplify_expr(*callee, misses)),
-            args.into_iter()
-                .map(|arg| simplify_expr(arg, misses))
-                .collect(),
-        ),
-        Expr::Unary(UnOp::Not, operand) => {
-            let operand = simplify_expr(*operand, misses);
-            match literal_truthiness(&operand) {
-                Some(value) => Expr::Bool(!value),
-                None => Expr::Unary(UnOp::Not, Box::new(operand)),
+fn simplify_expr(mut expr: Expr, misses: &mut BTreeSet<(&'static str, &'static str)>) -> Expr {
+    struct ExprSimplifier<'a>(&'a mut BTreeSet<(&'static str, &'static str)>);
+    impl VisitMut for ExprSimplifier<'_> {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            if let Expr::Arrow(_, ArrowBody::Block(body)) = expr {
+                let taken = std::mem::take(body);
+                *body = simplify_stmts(taken, true, self.0);
+                return;
             }
+            walk_expr_mut(self, expr);
+            let cur = std::mem::replace(expr, Expr::Undefined);
+            *expr = match cur {
+                Expr::Unary(UnOp::Not, operand) => match literal_truthiness(&operand) {
+                    Some(value) => Expr::Bool(!value),
+                    None => Expr::Unary(UnOp::Not, operand),
+                },
+                Expr::Unary(op @ (UnOp::Neg | UnOp::Pos), operand) => match (&*operand, op) {
+                    (Expr::Num(value), UnOp::Neg) if value.is_finite() => Expr::Num(-value),
+                    (Expr::Num(value), UnOp::Pos) if value.is_finite() => Expr::Num(*value),
+                    _ => Expr::Unary(op, operand),
+                },
+                Expr::Binary(op @ (BinOp::And | BinOp::Or), lhs, rhs) => {
+                    match (op, literal_truthiness(&lhs)) {
+                        (BinOp::And, Some(true)) | (BinOp::Or, Some(false)) => *rhs,
+                        (BinOp::And, Some(false)) | (BinOp::Or, Some(true)) => *lhs,
+                        _ => Expr::Binary(op, lhs, rhs),
+                    }
+                }
+                Expr::Binary(op, lhs, rhs) => {
+                    fold_binary_literals(op, &lhs, &rhs).unwrap_or(Expr::Binary(op, lhs, rhs))
+                }
+                Expr::Cond(test, consequent, alternate) => match literal_truthiness(&test) {
+                    Some(true) => *consequent,
+                    Some(false) => *alternate,
+                    None => Expr::Cond(test, consequent, alternate),
+                },
+                other => other,
+            };
         }
-        Expr::Unary(op @ (UnOp::Neg | UnOp::Pos), operand) => {
-            let operand = simplify_expr(*operand, misses);
-            match (&operand, op) {
-                (Expr::Num(value), UnOp::Neg) if value.is_finite() => Expr::Num(-value),
-                (Expr::Num(value), UnOp::Pos) if value.is_finite() => Expr::Num(*value),
-                _ => Expr::Unary(op, Box::new(operand)),
-            }
-        }
-        Expr::Unary(op, operand) => Expr::Unary(op, Box::new(simplify_expr(*operand, misses))),
-        Expr::Binary(op @ (BinOp::And | BinOp::Or), lhs, rhs) => {
-            let lhs = simplify_expr(*lhs, misses);
-            let rhs = simplify_expr(*rhs, misses);
-            match (op, literal_truthiness(&lhs)) {
-                (BinOp::And, Some(true)) | (BinOp::Or, Some(false)) => rhs,
-                (BinOp::And, Some(false)) | (BinOp::Or, Some(true)) => lhs,
-                _ => Expr::Binary(op, Box::new(lhs), Box::new(rhs)),
-            }
-        }
-        Expr::Binary(op, lhs, rhs) => {
-            let lhs = simplify_expr(*lhs, misses);
-            let rhs = simplify_expr(*rhs, misses);
-            fold_binary_literals(op, &lhs, &rhs)
-                .unwrap_or_else(|| Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
-        }
-        Expr::Assign(lhs, rhs) => Expr::Assign(
-            Box::new(simplify_expr(*lhs, misses)),
-            Box::new(simplify_expr(*rhs, misses)),
-        ),
-        Expr::CompoundAssign(op, lhs, rhs) => Expr::CompoundAssign(
-            op,
-            Box::new(simplify_expr(*lhs, misses)),
-            Box::new(simplify_expr(*rhs, misses)),
-        ),
-        Expr::Cond(test, consequent, alternate) => {
-            let test = simplify_expr(*test, misses);
-            let consequent = simplify_expr(*consequent, misses);
-            let alternate = simplify_expr(*alternate, misses);
-            match literal_truthiness(&test) {
-                Some(true) => consequent,
-                Some(false) => alternate,
-                None => Expr::Cond(Box::new(test), Box::new(consequent), Box::new(alternate)),
-            }
-        }
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, simplify_expr(value, misses)))
-                .collect(),
-        ),
-        Expr::Array(items) => Expr::Array(
-            items
-                .into_iter()
-                .map(|item| simplify_expr(item, misses))
-                .collect(),
-        ),
-        Expr::Arrow(params, ArrowBody::Expr(body)) => Expr::Arrow(
-            params,
-            ArrowBody::Expr(Box::new(simplify_expr(*body, misses))),
-        ),
-        Expr::Arrow(params, ArrowBody::Block(body)) => {
-            Expr::Arrow(params, ArrowBody::Block(simplify_stmts(body, true, misses)))
-        }
-        Expr::Seq(items) => Expr::Seq(
-            items
-                .into_iter()
-                .map(|item| simplify_expr(item, misses))
-                .collect(),
-        ),
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Ident(_)
-        | Expr::Raw(_) => expr,
     }
+    ExprSimplifier(misses).visit_expr_mut(&mut expr);
+    expr
 }
 
 /// Folds operations whose JavaScript result follows directly from two primitive literals.
@@ -661,194 +536,66 @@ fn remove_unused_decls(stmts: Vec<Stmt>) -> Vec<Stmt> {
 
 /// Whether use analysis cannot see every binding this statement might read by name.
 fn has_opaque_scope_use(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Raw(_) => true,
-        Stmt::ExprStmt(expr) | Stmt::Throw(expr) => has_opaque_expr(expr),
-        Stmt::Let(_, init) => init.as_ref().is_some_and(has_opaque_expr),
-        Stmt::Lets(decls) => decls
-            .iter()
-            .any(|(_, init)| init.as_ref().is_some_and(has_opaque_expr)),
-        Stmt::Const(_, init) => has_opaque_expr(init),
-        Stmt::Return(value) => value.as_ref().is_some_and(has_opaque_expr),
-        Stmt::If(test, then, els) => {
-            has_opaque_expr(test)
-                || then.iter().any(has_opaque_scope_use)
-                || els.iter().flatten().any(has_opaque_scope_use)
+    struct Check(bool);
+    impl Visit for Check {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if self.0 {
+                return;
+            }
+            if matches!(stmt, Stmt::Raw(_) | Stmt::TryCatch { .. }) {
+                self.0 = true;
+                return;
+            }
+            walk_stmt(self, stmt);
         }
-        Stmt::Switch(disc, cases) => {
-            has_opaque_expr(disc)
-                || cases.iter().any(|case| {
-                    case.tests.iter().any(has_opaque_expr)
-                        || case.body.iter().any(has_opaque_scope_use)
-                })
+        fn visit_expr(&mut self, expr: &Expr) {
+            if self.0 {
+                return;
+            }
+            match expr {
+                Expr::Raw(_) => self.0 = true,
+                Expr::Call(callee, _) if matches!(&**callee, Expr::Ident(name) if name == "eval") =>
+                {
+                    self.0 = true;
+                }
+                _ => walk_expr(self, expr),
+            }
         }
-        Stmt::Labeled(_, stmt) => has_opaque_scope_use(stmt),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) => body.iter().any(has_opaque_scope_use),
-        Stmt::While(test, body) => has_opaque_expr(test) || body.iter().any(has_opaque_scope_use),
-        Stmt::TryCatch { .. } => true,
-        Stmt::FunctionDecl { body, .. } => body.iter().any(has_opaque_scope_use),
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Loc(_) => false,
     }
-}
-
-fn has_opaque_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Raw(_) => true,
-        Expr::Call(callee, args) => {
-            matches!(&**callee, Expr::Ident(name) if name == "eval")
-                || has_opaque_expr(callee)
-                || args.iter().any(has_opaque_expr)
-        }
-        Expr::Member(obj, _) | Expr::Unary(_, obj) => has_opaque_expr(obj),
-        Expr::New(callee, args) => has_opaque_expr(callee) || args.iter().any(has_opaque_expr),
-        Expr::Index(obj, index)
-        | Expr::Binary(_, obj, index)
-        | Expr::Assign(obj, index)
-        | Expr::CompoundAssign(_, obj, index) => has_opaque_expr(obj) || has_opaque_expr(index),
-        Expr::Cond(test, consequent, alternate) => {
-            has_opaque_expr(test) || has_opaque_expr(consequent) || has_opaque_expr(alternate)
-        }
-        Expr::Object(entries) => entries.iter().any(|(_, value)| has_opaque_expr(value)),
-        Expr::Array(items) | Expr::Seq(items) => items.iter().any(has_opaque_expr),
-        Expr::Arrow(_, ArrowBody::Expr(body)) => has_opaque_expr(body),
-        Expr::Arrow(_, ArrowBody::Block(body)) => body.iter().any(has_opaque_scope_use),
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Ident(_) => false,
-    }
+    let mut c = Check(false);
+    c.visit_stmt(stmt);
+    c.0
 }
 
 /// Expressions whose evaluation cannot call user code, trigger a getter, allocate, or mutate.
 fn strictly_droppable(expr: &Expr) -> bool {
-    match expr {
+    matches!(
+        expr,
         Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => true,
-        // A sequence can still contain an identifier in the temporal dead zone or a coercion.
-        // Keeping it avoids relying on a recursive syntactic proof before this pass has typed
-        // constant information.
-        Expr::Seq(_) => false,
-        // A name can be unbound or in its temporal dead zone. Operators can coerce values or
-        // throw (for example mixed Number/BigInt arithmetic). Member and Index can invoke a proxy
-        // or getter. Without a local proof, all of them remain observable.
-        Expr::Ident(_)
-        | Expr::Unary(..)
-        | Expr::Binary(..)
-        | Expr::Cond(..)
-        | Expr::Member(..)
-        | Expr::Index(..)
-        | Expr::Call(..)
-        | Expr::New(..)
-        | Expr::Assign(..)
-        | Expr::CompoundAssign(..)
-        | Expr::Object(_)
-        | Expr::Array(_)
-        | Expr::Arrow(..)
-        | Expr::Raw(_) => false,
-    }
+            | Expr::RawNum(_)
+            | Expr::BigInt(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Undefined
+            | Expr::Null
+    )
 }
 
 fn node_count_stmt(stmt: &Stmt) -> usize {
-    match stmt {
-        Stmt::ExprStmt(expr) | Stmt::Throw(expr) => 1 + node_count_expr(expr),
-        Stmt::Let(_, init) => 1 + init.as_ref().map_or(0, node_count_expr),
-        Stmt::Lets(decls) => {
-            1 + decls
-                .iter()
-                .filter_map(|(_, init)| init.as_ref())
-                .map(node_count_expr)
-                .sum::<usize>()
+    struct Count(usize);
+    impl Visit for Count {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            self.0 += 1;
+            walk_stmt(self, stmt);
         }
-        Stmt::Const(_, init) => 1 + node_count_expr(init),
-        Stmt::Return(value) => 1 + value.as_ref().map_or(0, node_count_expr),
-        Stmt::If(test, then, els) => {
-            1 + node_count_expr(test)
-                + then.iter().map(node_count_stmt).sum::<usize>()
-                + els.iter().flatten().map(node_count_stmt).sum::<usize>()
+        fn visit_expr(&mut self, expr: &Expr) {
+            self.0 += 1;
+            walk_expr(self, expr);
         }
-        Stmt::Switch(disc, cases) => {
-            1 + node_count_expr(disc)
-                + cases
-                    .iter()
-                    .map(|case| {
-                        case.tests.iter().map(node_count_expr).sum::<usize>()
-                            + case.body.iter().map(node_count_stmt).sum::<usize>()
-                    })
-                    .sum::<usize>()
-        }
-        Stmt::Labeled(_, stmt) => 1 + node_count_stmt(stmt),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) => {
-            1 + body.iter().map(node_count_stmt).sum::<usize>()
-        }
-        Stmt::While(test, body) => {
-            1 + node_count_expr(test) + body.iter().map(node_count_stmt).sum::<usize>()
-        }
-        Stmt::TryCatch { body, handler, .. } => {
-            1 + body
-                .iter()
-                .chain(handler)
-                .map(node_count_stmt)
-                .sum::<usize>()
-        }
-        Stmt::FunctionDecl { body, .. } => 1 + body.iter().map(node_count_stmt).sum::<usize>(),
-        Stmt::Continue(_)
-        | Stmt::Break(_)
-        | Stmt::Import { .. }
-        | Stmt::Comment(_)
-        | Stmt::Raw(_)
-        | Stmt::Loc(_) => 1,
     }
-}
-
-fn node_count_expr(expr: &Expr) -> usize {
-    match expr {
-        Expr::Member(obj, _) | Expr::Unary(_, obj) => 1 + node_count_expr(obj),
-        Expr::Index(obj, index)
-        | Expr::Binary(_, obj, index)
-        | Expr::Assign(obj, index)
-        | Expr::CompoundAssign(_, obj, index) => 1 + node_count_expr(obj) + node_count_expr(index),
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            1 + node_count_expr(callee) + args.iter().map(node_count_expr).sum::<usize>()
-        }
-        Expr::Cond(test, consequent, alternate) => {
-            1 + node_count_expr(test) + node_count_expr(consequent) + node_count_expr(alternate)
-        }
-        Expr::Object(entries) => {
-            1 + entries
-                .iter()
-                .map(|(_, value)| node_count_expr(value))
-                .sum::<usize>()
-        }
-        Expr::Array(items) | Expr::Seq(items) => {
-            1 + items.iter().map(node_count_expr).sum::<usize>()
-        }
-        Expr::Arrow(_, ArrowBody::Expr(body)) => 1 + node_count_expr(body),
-        Expr::Arrow(_, ArrowBody::Block(body)) => {
-            1 + body.iter().map(node_count_stmt).sum::<usize>()
-        }
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Ident(_)
-        | Expr::Raw(_) => 1,
-    }
+    let mut c = Count(0);
+    c.visit_stmt(stmt);
+    c.0
 }
 
 fn terminates(stmt: &Stmt) -> bool {
@@ -886,23 +633,6 @@ mod tests {
 
         assert!(analysis.changed);
         assert!(!text.contains("dead"), "{text}");
-    }
-
-    #[test]
-    fn future_poller_application_requires_a_surviving_runtime_terminal() {
-        let poller = || jsast::expr_stmt(jsast::rt_call("host_spawn", vec![jsast::id("future")]));
-        let emitted = function(vec![poller()]);
-        assert!(contains_emitted_future_poller(&emitted));
-
-        let dead = function(vec![jsast::if_(jsast::boolean(false), vec![poller()])]);
-        let optimized = analyze(dead, OptimizerMode::On).decl;
-        assert!(!contains_emitted_future_poller(&optimized));
-
-        let similarly_named = function(vec![jsast::expr_stmt(jsast::call(
-            jsast::id("host_spawn"),
-            Vec::new(),
-        ))]);
-        assert!(!contains_emitted_future_poller(&similarly_named));
     }
 
     #[test]

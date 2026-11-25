@@ -51,7 +51,7 @@ use crate::jir::summary::{MergeDecision, Side};
 use crate::jsast;
 use crate::lane_report::{ItemLane, LaneAvailability, LaneItem};
 use crate::manifest::{Manifest, Mode};
-use crate::opts::{Lane, Modules};
+use crate::opts::Modules;
 
 // `pub(crate)`: the representation planner (`plan/representation.rs`, W4b) fills the sidecar's
 // `ReprBlock`, which is defined beside the sidecar it is rendered into.
@@ -97,36 +97,23 @@ pub fn run(manifest: &Manifest) -> u32 {
             item.linkage.demote();
         }
     }
-    items.note_mixed_formats(&dcx);
     drop(read_scope);
     let sources = std::mem::take(&mut items.sources);
 
     match &manifest.mode {
         Mode::Program { output: Some(path) } => {
-            let program = emit(
-                &dcx,
-                &sources,
-                items.items,
-                &items.coroutine_sources,
-                Some(path.as_path()),
-            );
+            let program = emit(&dcx, &sources, items.items, Some(path.as_path()));
             if let Err(err) = fs::write(path, program.as_bytes()) {
                 dcx.err(format!("error writing `{}`: {err}", path.display()));
             }
         }
         // Nothing to hang a `.map` off: a program on stdout has no path to name one after.
         Mode::Program { output: None } => {
-            let program = emit(&dcx, &sources, items.items, &items.coroutine_sources, None);
+            let program = emit(&dcx, &sources, items.items, None);
             print!("{program}");
         }
         Mode::Prune { first, rest } => {
-            let program = emit(
-                &dcx,
-                &sources,
-                items.items,
-                &items.coroutine_sources,
-                Some(first.as_path()),
-            );
+            let program = emit(&dcx, &sources, items.items, Some(first.as_path()));
             if let Err(err) = fs::write(first, program.as_bytes()) {
                 dcx.err(format!("error writing `{}`: {err}", first.display()));
             }
@@ -140,124 +127,25 @@ pub fn run(manifest: &Manifest) -> u32 {
     dcx.errors()
 }
 
-/// One printing of the program, on one lane.
-///
-/// [`Lane::Shadow`] is the only setting that needs more than one: it prints the baseline program
-/// to the output path and the JIR program beside it, so that a differential run has two files
-/// that came out of one set of objects. The two passes differ in the lane they print from and in
-/// which of the link step's side files they own, and in nothing else — the whole point of the
-/// exercise is that everything downstream of the lane is the same code either way.
-struct Pass<'a> {
-    coroutine_sources: &'a crate::plan::async_graph::SourceCaptures,
-    /// Never [`Lane::Shadow`]: a pass prints one lowering.
-    lane: Lane,
-    /// Whether this pass writes the optimizer report and the dedup conflict autopsy. They
-    /// describe the baseline analyses, so the baseline pass owns them.
-    reports: bool,
-    /// Whether this pass writes `js-lane-report` and the `<out>.lane.json` sidecar. The pass that
-    /// ran a lane owns them, because it is the one with something to say.
-    lane_files: bool,
-    /// Where the sidecar goes: beside the program the user asked for, never beside `<out>.jir.js`.
-    /// `None` when no lane ran or there is no output path to hang it off.
-    sidecar: Option<PathBuf>,
-}
-
-/// Resolves the program once per lane the build asked for, and returns the text for the output
-/// path. The shadow lane's second program is written here, since only its own path names it.
-///
-/// The passes share one diagnostic sink, which is what lets a lowering that disagrees with the
-/// baseline fail the build from the second pass. The cost is that a shadow build reports a
-/// whole-program diagnostic — a zombie, a workspace miss — once per lane; a diagnostic is about
-/// the objects, and the objects were read once.
 fn emit(
     dcx: &Sink,
     sources: &BTreeMap<String, String>,
     items: Vec<LinkItem>,
-    coroutine_sources: &crate::plan::async_graph::SourceCaptures,
     path: Option<&Path>,
 ) -> String {
-    let opts = crate::opts::get();
-    let sidecar = match opts.lane {
-        Lane::Baseline => None,
-        _ => path.map(Path::to_path_buf),
-    };
-    match (opts.lane, path) {
-        (Lane::Shadow, Some(path)) => {
-            let baseline = resolve(
-                dcx,
-                sources,
-                items.clone(),
-                "program",
-                Some(path),
-                &Pass {
-                    coroutine_sources,
-                    lane: Lane::Baseline,
-                    reports: true,
-                    lane_files: false,
-                    sidecar: None,
-                },
-            );
-            let jir_path = lane::shadow_path(path);
-            let jir = resolve(
-                dcx,
-                sources,
-                items,
-                "program",
-                Some(&jir_path),
-                &Pass {
-                    coroutine_sources,
-                    lane: Lane::Jir,
-                    reports: false,
-                    lane_files: true,
-                    sidecar,
-                },
-            );
-            if let Err(err) = fs::write(&jir_path, jir.as_bytes()) {
-                dcx.err(format!("error writing `{}`: {err}", jir_path.display()));
-            }
-            baseline
-        }
-        // A shadow build compares two files, and a program on stdout is not a file.
-        (Lane::Shadow, None) => {
-            dcx.err(
-                "`-Cllvm-args=js-lane=shadow` needs an output path to write the JIR program \
-                 beside",
-            );
-            String::new()
-        }
-        (lane, _) => resolve(
-            dcx,
-            sources,
-            items,
-            "program",
-            path,
-            &Pass {
-                coroutine_sources,
-                lane,
-                reports: true,
-                lane_files: true,
-                sidecar,
-            },
-        ),
-    }
+    resolve(dcx, sources, items, "program", path)
 }
 
 // -------------------------------------------------------------------------------------------
 // Reading
 // -------------------------------------------------------------------------------------------
 
-/// The item lists read so far and which object formats they came from, so that a program mixing
-/// a format 20 crate with a format 19 sysroot can be told exactly once.
 #[derive(Default)]
 struct Read {
     items: Vec<LinkItem>,
-    coroutine_sources: crate::plan::async_graph::SourceCaptures,
     sources: BTreeMap<String, String>,
     source_map: bool,
-    formats: BTreeSet<u16>,
-    /// The first format 20 header seen, and where it came from. Every later object is held to it:
-    /// type ids, definition ids and printed text are only comparable within one JIR schema, one
-    /// rustc, one data layout and one set of emit-affecting options.
+    /// The first header seen, and where it came from. Every later object is held to it.
     header: Option<(String, crate::item::Header)>,
 }
 
@@ -283,10 +171,6 @@ impl Read {
                 Err(error) => dcx.err(format!("`{label}`: {error}")),
             }
         }
-        if let Some(interns) = read.interns() {
-            self.coroutine_sources.extend(interns);
-        }
-        self.formats.insert(read.format);
         // Once per object, not once per item: the answer is a property of the object pair.
         if let Some(header) = read.header {
             match &self.header {
@@ -308,26 +192,6 @@ impl Read {
             }
         }
         self.items.extend(read.items);
-    }
-
-    /// Notes once that some objects predate the binary member. Their items link, and print the
-    /// same baseline text as before; they only carry no JIR bodies.
-    fn note_mixed_formats(&self, dcx: &Sink) {
-        if self.formats.len() > 1 {
-            let legacy: Vec<String> = self
-                .formats
-                .iter()
-                .filter(|format| **format != FORMAT_VERSION)
-                .map(u16::to_string)
-                .collect();
-            dcx.warn(format!(
-                "this program links objects in format {FORMAT_VERSION} together with objects in \
-                 format {}: the older ones carry no JIR bodies, so their items can only print \
-                 from the baseline lane. Rebuild the sysroot and dependencies \
-                 (`scripts/build_sysroot.sh --clean`) to carry JIR throughout",
-                legacy.join(", ")
-            ));
-        }
     }
 }
 
@@ -415,7 +279,6 @@ fn resolve(
     mut items: Vec<LinkItem>,
     label: &str,
     path: Option<&Path>,
-    pass: &Pass,
 ) -> String {
     let opts = crate::opts::get();
     if opts.modules == Modules::Esm {
@@ -445,22 +308,9 @@ fn resolve(
     }
 
     let (mut reachable, mut parents) = reach(dcx, &table);
-    let baseline_count = reachable.len();
-    decode_reachable_bodies(dcx, &mut table, &mut reachable, pass.lane != Lane::Baseline);
-    // The lane, before anything reads an item's printed text. An item the lowerer takes is a
-    // `LinkItem` like any other from here on; one it declines still holds v1's text.
-    let mut lane_run = match pass.lane {
-        Lane::Baseline => None,
-        _ => Some(lane::run(
-            dcx,
-            &mut table,
-            &reachable,
-            pass.coroutine_sources,
-        )),
-    };
-    // The v1 text lowerer that once rewrote printed baseline JavaScript here is gone; the JIR
-    // lane above is the optimizer. On the baseline lane `js-opt=on` now means the producer-baked
-    // passes plus link-dedup, with no link-time text rewriting.
+    let initial_count = reachable.len();
+    decode_reachable_bodies(dcx, &mut table, &mut reachable, true);
+    let mut lane_run = lane::run(dcx, &mut table, &reachable);
     if table.values().any(|item| {
         item.jir
             .body
@@ -468,26 +318,21 @@ fn resolve(
             .is_some_and(|body| body.blocks.iter().any(|block| block.cleanup))
     }) {
         let (live, _) = reach(dcx, &table);
-        reject_cleanup_fallbacks(dcx, &table, &live, lane_run.as_ref());
+        reject_cleanup_fallbacks(dcx, &table, &live, Some(&lane_run));
     }
     let (mut dedup, references_changed) = if crate::lower::bstr::enabled() {
-        let pre_changed = baseline_count != reachable.len()
-            || lane_run
-                .as_ref()
-                .is_some_and(|run| run.added_items() || run.references_changed());
+        let pre_changed = initial_count != reachable.len()
+            || lane_run.added_items()
+            || lane_run.references_changed();
         if pre_changed {
             (reachable, parents) = reach(dcx, &table);
         }
         let facades = byte_string_facades(dcx, &mut table, &mut reachable);
         for (name, body) in &facades {
-            if let Some(run) = &mut lane_run {
-                run.rename(name, body);
-            }
+            lane_run.rename(name, body);
         }
         let pre_synth = reachable.len();
-        let native_vec_enabled = lane_run
-            .as_ref()
-            .is_some_and(|run| run.native_vec_enabled());
+        let native_vec_enabled = lane_run.native_vec_enabled();
         crate::lower::bstr::synthesize_converters(&mut table, &mut reachable, native_vec_enabled);
         let added_bstr = !facades.is_empty() || reachable.len() != pre_synth;
         let dedup = crate::profile::time("link.dedup", || {
@@ -501,18 +346,15 @@ fn resolve(
         let references_changed = added_bstr || dedup.references_changed();
         (dedup, references_changed)
     } else {
-        let pre_changed = baseline_count != reachable.len()
-            || lane_run
-                .as_ref()
-                .is_some_and(|run| run.added_items() || run.references_changed());
+        let pre_changed = initial_count != reachable.len()
+            || lane_run.added_items()
+            || lane_run.references_changed();
         if pre_changed {
             (reachable, parents) = reach(dcx, &table);
         }
         let facades = track_caller_location_facades(&mut table, &mut reachable);
         for (name, body) in &facades {
-            if let Some(run) = &mut lane_run {
-                run.rename(name, body);
-            }
+            lane_run.rename(name, body);
         }
         let dedup = crate::profile::time("link.dedup", || {
             crate::link_dedup::merge_duplicates(
@@ -532,9 +374,7 @@ fn resolve(
         refuse_hybrid_strings(dcx, &table, &reachable);
     }
     dedup.retain_reachable(&reachable);
-    if let Some(lane_run) = &mut lane_run {
-        lane_run.retain_reachable(&reachable);
-    }
+    lane_run.retain_reachable(&reachable);
     crate::report::warn_misses(dcx, &table, &reachable);
     // With chunks the same zombie would otherwise be reported twice, once here and once for the
     // chunk that reaches it. The per-chunk report is the more useful of the two: its chain names
@@ -562,7 +402,7 @@ fn resolve(
         exports: BTreeSet::new(),
         entry: None,
     };
-    let wide_byte_views = lane_run.as_ref().is_some_and(|run| run.wide_byte_views());
+    let wide_byte_views = lane_run.wide_byte_views();
     let mut printed = crate::profile::time("link.print", || {
         print_units(dcx, sources, std::slice::from_ref(&unit), wide_byte_views)
     });
@@ -606,7 +446,7 @@ fn resolve(
         }
     }
 
-    if pass.reports && !split {
+    if !split {
         if let (Some(report_path), Some(program)) = (&opts.optimization_report, printed.first()) {
             crate::report::write(
                 dcx,
@@ -619,30 +459,26 @@ fn resolve(
                 &reachable,
                 &parents,
                 &dedup,
-                lane_run.as_ref(),
+                Some(&lane_run),
             );
         }
     }
 
-    if pass.lane_files {
-        if let Some(report_path) = &opts.lane_report {
-            write_lane_report(
-                dcx,
-                Path::new(report_path),
-                &table,
-                &reachable,
-                lane_run.as_ref(),
-            );
-        }
-        if let (Some(sidecar), Some(lane_run)) = (&pass.sidecar, &lane_run) {
-            lane::write_sidecar(dcx, sidecar, lane_run, opts.lane);
-        }
+    if let Some(report_path) = &opts.lane_report {
+        write_lane_report(
+            dcx,
+            Path::new(report_path),
+            &table,
+            &reachable,
+            Some(&lane_run),
+        );
     }
-    if pass.reports {
-        if let Some(dump_path) = &opts.jir_dump_conflicts {
-            if let Err(err) = crate::jir::conflict::write(Path::new(dump_path), &conflicts) {
-                dcx.err(format!("error writing `{dump_path}`: {err}"));
-            }
+    if let Some(sidecar) = path {
+        lane::write_sidecar(dcx, sidecar, &lane_run, opts.lane);
+    }
+    if let Some(dump_path) = &opts.jir_dump_conflicts {
+        if let Err(err) = crate::jir::conflict::write(Path::new(dump_path), &conflicts) {
+            dcx.err(format!("error writing `{dump_path}`: {err}"));
         }
     }
 
@@ -800,8 +636,7 @@ pub(crate) fn collect_panic_location_context(
             }
         }
         if item.crate_name == "core" {
-            let (origin_crate, _) =
-                crate::lower::semantic_ops::string::item_origin_info(item, interns);
+            let (origin_crate, _) = crate::lower::semantic_ops::item_origin_info(item, interns);
             if origin_crate == "core" {
                 named_core_crates.insert(body.item.definition.crate_id);
             }
@@ -1157,8 +992,7 @@ fn install_export_facades(
             map: ItemMap::default(),
             dts: body.dts.take(),
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         };
         body.name = inner.clone();
@@ -1413,8 +1247,7 @@ fn shim_import() -> LinkItem {
         map: ItemMap::default(),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: Default::default(),
     }
 }
@@ -1587,8 +1420,7 @@ pub(crate) fn stub_missing(
                     map: ItemMap::default(),
                     dts: None,
                     optimization: Default::default(),
-                    late_ir: Default::default(),
-                    baseline_shadow: Default::default(),
+                    allocator_provider: Default::default(),
                     jir: Default::default(),
                 },
             );
@@ -2350,8 +2182,7 @@ fn cross_chunk_import(chunk: &str, names: &BTreeSet<&str>) -> LinkItem {
         map: ItemMap::default(),
         dts: None,
         optimization: Default::default(),
-        late_ir: Default::default(),
-        baseline_shadow: Default::default(),
+        allocator_provider: Default::default(),
         jir: Default::default(),
     }
 }
@@ -2812,8 +2643,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: crate::item::LinkJir::from_summary(summary),
         }
     }

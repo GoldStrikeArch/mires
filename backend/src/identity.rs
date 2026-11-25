@@ -1,12 +1,9 @@
 //! The producer binary is a tracked input to rustc and executable MIR transport.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use rustc_session::Session;
 use sha2::{Digest, Sha256};
-
-static DIGEST: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub(crate) fn init(sess: &Session) {
     let path = backend_path(sess);
@@ -40,7 +37,6 @@ pub(crate) fn init(sess: &Session) {
              use the compiler build scripts or hash the selected backend before invoking rustc"
         ));
     }
-    *DIGEST.lock().expect("producer identity poisoned") = Some(digest.into());
 }
 
 /// Resolve the same library as the pinned rustc loader, including a named sysroot backend.
@@ -84,11 +80,4 @@ fn backend_path(sess: &Session) -> PathBuf {
             .dcx()
             .fatal("cannot uniquely identify the loaded JavaScript backend"),
     }
-}
-
-pub(crate) fn get() -> [u8; 32] {
-    DIGEST
-        .lock()
-        .expect("producer identity poisoned")
-        .expect("producer identity initialized")
 }

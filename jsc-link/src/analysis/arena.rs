@@ -45,7 +45,7 @@ use crate::analysis::heap::{
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
 use crate::opts::Opts;
-use crate::plan::representation::NativeBody;
+use crate::plan::native_types::NativeBody;
 
 /// Whole-program bounds facts computed before per-function optimization and checked by witnesses.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1666,26 +1666,10 @@ fn check_func_arena_preconditions(
     }
 
     let is_ctor = ctor_summaries.contains_key(&func.item);
-    let mut defs_map: BTreeMap<ValueId, &OpKind> = BTreeMap::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            if let Some(res) = op.result {
-                defs_map.insert(res, &op.kind);
-            }
-        }
-    }
 
     // Track `CellStore` counts for cells holding `Vec<Elem>` (or containing `Vec<Elem>`).
     let mut vec_cell_stores: BTreeMap<(DefinitionId, CellId), usize> = BTreeMap::new();
     let doms = Dominators::of(func);
-    let mut cell_alloc_block: BTreeMap<CellId, RBlockId> = BTreeMap::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            if let OpKind::CellAlloc(c) = op.kind {
-                cell_alloc_block.insert(c, block.id);
-            }
-        }
-    }
     // Detect blocks in loops (any block reachable from itself via a backedge).
     let in_loop = blocks_in_loops(func, &doms);
 
@@ -1996,8 +1980,6 @@ fn check_func_arena_preconditions(
             }
         }
     }
-    let _ = defs_map;
-    let _ = cell_alloc_block;
 }
 
 fn blocks_in_loops(func: &Func, doms: &Dominators) -> BTreeSet<RBlockId> {
@@ -6593,7 +6575,7 @@ mod tests {
         PointerForm, RepresentationCandidate, TypeDescriptor, TypeMeta, VariantDescriptor,
     };
     use crate::jir::OriginId;
-    use rcgjs_object::late_ir::{AllocatorProvider, LateIrAnalysisSummary};
+    use rcgjs_object::item::AllocatorProvider;
     use rcgjs_object::object::Linkage;
 
     const UNIT: TypeId = TypeId(1);
@@ -6879,8 +6861,7 @@ mod tests {
             map: Default::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: LateIrAnalysisSummary::allocator_provider(AllocatorProvider::Default),
-            baseline_shadow: Default::default(),
+            allocator_provider: AllocatorProvider::Default,
             jir,
         }
     }

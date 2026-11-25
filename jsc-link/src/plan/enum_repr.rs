@@ -169,37 +169,12 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "bstr_trim"
             | "bstr_trim_start"
             | "bstr_trim_end"
-            | "bstr_push"
-            | "bstr_pop"
-            | "bstr_truncate"
-            | "bstr_host_sb"
-            | "bstr_block"
-            | "bstr_sb_block"
-            | "bstr_block_typed"
-            | "bstr_sb_block_typed"
-            | "bstr_sb_check"
             | "bstr_to_lowercase"
             | "bstr_to_uppercase"
-            | "native_str_wf"
-            | "native_str_utf16_index"
-            | "native_str_byte_index"
-            | "native_str_is_char_boundary"
-            | "native_str_push"
-            | "native_str_pop"
-            | "native_str_truncate"
-            | "_sb_check"
             | "sb_new"
             | "sb_push"
             | "sb_push_char"
             | "sb_take"
-            | "convert_host_sb"
-            | "convert_str_block"
-            | "convert_sb_block"
-            | "convert_nv_block"
-            | "convert_nv_typed"
-            | "convert_block_nv"
-            | "convert_block_sv"
-            | "convert_sv_nv"
             | "f2i"
             | "f2i_big"
             | "i2f32_big"
@@ -232,7 +207,6 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "native_vec_new"
             | "native_vec_set_capacity"
             | "native_vec_set_len"
-            | "tv_new"
             | "typed_vec_push"
             | "nv_push_arr"
             | "nv_push_ta"
@@ -256,22 +230,7 @@ pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Intern
             | "nv_from_raw_ta"
             | "nv_box_track_arr"
             | "nv_box_track_slot"
-            | "nv_cap"
-            | "nv_push"
-            | "nv_insert"
-            | "nv_reserve"
-            | "nv_shrink"
-            | "nv_from_elem"
-            | "nv_resize"
-            | "nv_extend"
-            | "nv_extend_slice"
-            | "nv_clone"
-            | "nv_from_slice"
-            | "nv_from_box"
-            | "nv_remove"
-            | "nv_swap_remove"
             | "nv_idx"
-            | "nv_range"
             | "nv_grow_u8"
             | "nv_grow_i8"
             | "nv_grow_u16"
@@ -355,8 +314,7 @@ impl EnumReprPlan {
             map: crate::item::ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: Default::default(),
         }]
     }
@@ -476,7 +434,7 @@ pub fn specialize_table(
         // host descriptor itself so user types stored inside `mires_js::HashMap` are not
         // spuriously poisoned (actual host crossings are walked at `Call`/`Export`/`Import`).
         for desc in local.descriptors() {
-            if desc.meta.boundary == PinnedBoundary::ViewAbi || desc.meta.abi == NominalAbi::C {
+            if desc.meta.abi == NominalAbi::C {
                 walk_both(
                     desc.id,
                     interns,
@@ -942,9 +900,7 @@ pub fn specialize_table(
                     let is_host_boundary = call.host.is_some()
                         || matches!(
                             call.semantic,
-                            CallSemantic::Host
-                                | CallSemantic::ViewAbi
-                                | CallSemantic::RawJavaScript
+                            CallSemantic::Host | CallSemantic::RawJavaScript
                         )
                         || (matches!(call.callee, Callee::Foreign { .. }) && !is_internal_foreign)
                         || (matches!(call.callee, Callee::Runtime { .. })
@@ -1010,57 +966,6 @@ pub fn specialize_table(
                                                 &mut visited_excl,
                                                 &mut visited_host,
                                             );
-                                        }
-                                    }
-                                }
-                            }
-                            if let HostPayload::KeyedList(kl) = host {
-                                for ty in [
-                                    kl.collection_ty,
-                                    kl.item_ty,
-                                    kl.key_ty,
-                                    kl.row_ty,
-                                    kl.collection.ty,
-                                    kl.key.ty,
-                                    kl.row.ty,
-                                ] {
-                                    walk_both(
-                                        ty,
-                                        interns,
-                                        &mut excluded_enums,
-                                        &mut host_boundary_types,
-                                        &mut visited_excl,
-                                        &mut visited_host,
-                                    );
-                                }
-                                for body_ref in [kl.collection.body, kl.key.body, kl.row.body]
-                                    .into_iter()
-                                    .flatten()
-                                {
-                                    if let Some(h_name) = items_by_id.get(&body_ref.item) {
-                                        if let Some(h_item) = table.get(h_name) {
-                                            if let (Some(h_body), Some(h_interns)) =
-                                                (&h_item.jir.body, h_item.jir.interns())
-                                            {
-                                                for &inp in &h_body.signature.arguments {
-                                                    walk_both(
-                                                        inp,
-                                                        h_interns,
-                                                        &mut excluded_enums,
-                                                        &mut host_boundary_types,
-                                                        &mut visited_excl,
-                                                        &mut visited_host,
-                                                    );
-                                                }
-                                                walk_both(
-                                                    h_body.signature.result,
-                                                    h_interns,
-                                                    &mut excluded_enums,
-                                                    &mut host_boundary_types,
-                                                    &mut visited_excl,
-                                                    &mut visited_host,
-                                                );
-                                            }
                                         }
                                     }
                                 }
@@ -2940,8 +2845,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir,
         }
     }
@@ -3186,8 +3090,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir,
         }
     }
@@ -3245,9 +3148,6 @@ mod tests {
             "bstr_trim",
             "bstr_trim_start",
             "bstr_trim_end",
-            "bstr_push",
-            "bstr_pop",
-            "bstr_truncate",
             "js_abort",
             "abort_error",
             "panic",
@@ -3584,7 +3484,6 @@ mod tests {
                         crate_id: 2,
                         local_hash: 1,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 }),
                 vec![dummy_operand(t_closure)],
@@ -3604,7 +3503,6 @@ mod tests {
                         crate_id: 2,
                         local_hash: 2,
                     },
-                    template: None,
                     helpers: vec![(
                         s_poll_result_key,
                         DirectItemRef {

@@ -100,68 +100,6 @@ test("scalar byte views alias storage and aggregate byte punning still refuses",
   );
 });
 
-test("native string indices use UTF-8 bytes and UTF-16 boundaries", () => {
-  const text = "a\u00e9\u20ac\u{1f600}z";
-  const boundaries = [
-    [0, 0],
-    [1, 1],
-    [3, 2],
-    [6, 3],
-    [10, 5],
-    [11, 6],
-  ];
-
-  assert.equal(rt.str_len(text), 11);
-  assert.equal(rt.str_len(""), 0);
-  assert.equal(rt.native_str_utf16_index("", 0), 0);
-  assert.equal(rt.native_str_byte_index("", 0), 0);
-  assert.equal(rt.native_str_is_char_boundary("", 0), true);
-  assert.equal(rt.native_str_is_char_boundary("", 1), false);
-  for (const [byteIndex, utf16Index] of boundaries) {
-    assert.equal(rt.native_str_utf16_index(text, byteIndex), utf16Index);
-    assert.equal(rt.native_str_byte_index(text, utf16Index), byteIndex);
-    assert.equal(rt.native_str_is_char_boundary(text, byteIndex), true);
-  }
-
-  for (const byteIndex of [2, 4, 5, 7, 8, 9, 12, -1, 1.5]) {
-    assert.equal(rt.native_str_utf16_index(text, byteIndex), -1);
-    assert.equal(rt.native_str_is_char_boundary(text, byteIndex), false);
-  }
-  for (const utf16Index of [4, 7, -1, 1.5]) {
-    assert.equal(rt.native_str_byte_index(text, utf16Index), -1);
-  }
-});
-
-test("native string mutation preserves byte capacity and the exact byte length", () => {
-  const value = { text: "", cap: 32, len: 0 };
-
-  rt.native_str_push(value, 0x61);
-  rt.native_str_push(value, 0x1f600);
-  rt.native_str_push(value, 0x20ac);
-  assert.deepEqual(value, { text: "a\u{1f600}\u20ac", cap: 32, len: 8 });
-
-  assert.equal(rt.native_str_pop(value), 0x20ac);
-  assert.equal(value.len, 5);
-  assert.equal(rt.native_str_pop(value), 0x1f600);
-  assert.equal(value.len, 1);
-  assert.equal(rt.native_str_pop(value), 0x61);
-  assert.equal(rt.native_str_pop(value), -1);
-  assert.deepEqual(value, { text: "", cap: 32, len: 0 });
-
-  value.text = "a\u00e9\u20ac\u{1f600}z";
-  value.len = 11;
-  rt.native_str_truncate(value, 10);
-  assert.deepEqual(value, { text: "a\u00e9\u20ac\u{1f600}", cap: 32, len: 10 });
-  rt.native_str_truncate(value, 6);
-  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
-  rt.native_str_truncate(value, 100);
-  rt.native_str_truncate(value, 6);
-  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
-  assert.throws(() => rt.native_str_truncate(value, 2), RangeError);
-  assert.throws(() => rt.native_str_truncate(value, -1), RangeError);
-  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
-});
-
 test("native f64 strings match Rust default Display", () => {
   const cases = [
     [NaN, "NaN"],
@@ -236,53 +174,6 @@ test("host float fixed/f32-shortest and integer hex/dec formatters match Rust", 
   assert.equal(rt.fmt_int_dec(-42, 5, true, false), "-0042");
   assert.equal(rt.fmt_int_dec(42, 5, true, true), "+0042");
   assert.equal(rt.fmt_int_dec(0, 0, false, true), "+0");
-});
-
-test("native vectors retain capacity and clear removed slots", () => {
-  const value = rt.native_vec_new(4);
-  assert.equal(value.buf.length, 4);
-  assert.deepEqual({ len: value.len, cap: value.cap }, { len: 0, cap: 4 });
-
-  const first = { id: 1 };
-  const second = { id: 2 };
-  value.buf[0] = first;
-  value.buf[1] = second;
-  rt.native_vec_set_len(value, 2);
-  assert.deepEqual(value.buf.slice(0, value.len), [first, second]);
-
-  rt.native_vec_set_len(value, 1);
-  assert.equal(value.len, 1);
-  assert.equal(value.buf[0], first);
-  assert.equal(value.buf[1], undefined);
-  assert.equal(value.buf.length, 4);
-
-  rt.native_vec_set_capacity(value, 8);
-  assert.deepEqual({ len: value.len, cap: value.cap }, { len: 1, cap: 8 });
-  assert.equal(value.buf.length, 8);
-  value.buf[7] = second;
-  rt.native_vec_set_capacity(value, 2);
-  assert.deepEqual({ len: value.len, cap: value.cap }, { len: 1, cap: 2 });
-  assert.equal(value.buf.length, 2);
-
-  assert.throws(() => rt.native_vec_set_len(value, 3), RangeError);
-  assert.throws(() => rt.native_vec_set_capacity(value, 0), RangeError);
-  assert.deepEqual({ len: value.len, cap: value.cap }, { len: 1, cap: 2 });
-
-  rt.native_vec_set_capacity(value, 8);
-  assert.equal(value.buf[7], undefined);
-});
-
-test("exact typed vectors keep physical allocation and logical capacity separate", () => {
-  const value = { buf: new Uint8Array(3), len: 0, cap: 1 };
-  rt.typed_vec_push(value, 257);
-  assert.deepEqual({ values: [...value.buf], len: value.len, cap: value.cap }, {
-    values: [1, 0, 0], len: 1, cap: 1,
-  });
-  rt.typed_vec_push(value, 258);
-  rt.typed_vec_push(value, 259);
-  assert.deepEqual({ values: [...value.buf], len: value.len, cap: value.cap }, {
-    values: [1, 2, 3], len: 3, cap: 3,
-  });
 });
 
 test("wider scalar byte views alias little-endian bytes and non-scalar storage refuses", () => {
@@ -365,10 +256,6 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   );
   rt.write_bytes(grown, 0x5a, 4);
   assert.deepEqual([typed.buf[0], typed.buf[1]], [0x5a5a, 0x5a5a]);
-  const sv = rt.convert_block_sv(rt.scale_scalar(typed, 2, "u16"), 2);
-  assert.equal(sv.buf, typed.buf);
-  assert.equal(sv.off, 0);
-  assert.equal(sv.len, 2);
   rt.dealloc(rt.scale_scalar(typed, 2, "u16"), 8, 2);
 
   // Erased pointer round-trip through thin(p, 1, signed?).
@@ -536,12 +423,8 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   const rp = rt.unscale(ra, 4, () => 0);
   rt.write_array({ buf: rp.buf, off: 0, w: 2 }, [borrowed, borrowed]);
   assert.equal(rt.ptr_eq(borrowed, rp), false);
-  const nvBlock = rt.convert_nv_block({ buf: [{ a: 5, b: 6 }, { a: 7, b: 8 }], len: 2, cap: 2 }, 8, clonePair);
-  const nvTyped = rt.unscale(nvBlock, 8, () => ({ a: 0, b: 0 }), clonePair);
-  assert.equal(rt.ptr_eq({ buf: nvBlock.buf, off: 8 }, nvTyped.buf[1]), true);
   rt.dealloc(wa, 16, 4);
   rt.dealloc(ra, 8, 4);
-  rt.dealloc(nvBlock, 16, 4);
 
   // write_bytes(0) fails closed on both raw non-scalar alloc proxy and scaled non-scalar pointer.
   assert.throws(
@@ -850,12 +733,6 @@ test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-vie
     rt.dealloc(g, size * 2, align);
     assert.throws(() => rt.read_byte(a), (err) => rt.is_abort(err) && /freed/.test(err.message));
   }
-  const nv = rt.convert_nv_block({ buf: [1, 2, 3], len: 3, cap: 4 }, 4, "u32");
-  assert.equal(types.isProxy(nv.buf), false);
-  const nvTyped = rt.unscale_scalar(nv, 4, () => 0, "u32");
-  assert.equal(types.isProxy(nvTyped.buf), false);
-  assert.deepEqual(nvTyped.buf.slice(0, 3), [1, 2, 3]);
-  rt.dealloc(nv, 16, 4);
 
   // 2. Static minimal-shim extraction: plain Vec<u8>/Vec<u32>/Vec<Struct> programs exclude
   //    all byte-view helpers and constant-fold `$rt__bv = null` in module mode.
@@ -893,7 +770,7 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   const minDirect = [
     "alloc", "realloc", "dealloc", "scale", "unscale", "unscale_scalar", "box",
     "ptr_eq", "addr", "slice_from_parts", "byte_slice_ref", "compare_bytes",
-    "convert_nv_block", "slice_sort", "is_abort",
+    "slice_sort", "is_abort",
   ];
   const min = minimalShim([], shimSource, { direct: minDirect });
   assert.equal(min.names.includes("_bv_enable"), false, "minimal shim must exclude _bv_enable");
@@ -939,11 +816,6 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   assert.equal(mrt.unscale(grownMin, 4), grownMin);
   mrt.dealloc(grownMin, 32, 4);
   assert.throws(() => mrt.unscale(grownMin, 4), (err) => mrt.is_abort(err));
-  // convert_nv_block under _bv === null skips raw/typed split
-  const nvPtr = mrt.convert_nv_block({ buf: [7, 8, 9], len: 3, cap: 4 }, 4, "u32");
-  assert.equal(mrt.unscale(nvPtr, 4), nvPtr);
-  assert.equal(nvPtr.buf[2], 9);
-  mrt.dealloc(nvPtr, 16, 4);
   // slice_sort fast paths: len=2, len=16, len=40 (stability + panic safety)
   const s2 = [9, 2];
   mrt.slice_sort(s2, 0, 2, null, (_c, a, b) => a.buf[a.off] < b.buf[b.off], false);
@@ -1110,163 +982,20 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   mrt.dealloc(a, 16, 4);
   mrt.dealloc(b, 16, 4);
 
-  // 2. Unified growable TypedArray & Array NativeVec helpers (kinds 0..=7)
-  const v = rt.tv_new(4); // u32
-  assert.equal(v.buf instanceof Uint32Array, true);
-  assert.throws(() => rt.nv_cap(101, 100, 4), (e) => e instanceof RangeError && rt.is_abort(e));
-  assert.throws(() => rt.nv_cap(101, 100), (e) => e instanceof RangeError && rt.is_abort(e));
-  rt.nv_push(v, 10, 100);
-  assert.equal(v.cap, 4); // RawVec min_non_zero_cap for 4-byte u32
-  rt.nv_push(v, 25, 100);
-  assert.equal(v.len, 2);
-  assert.equal(v.buf[1], 25);
-  rt.nv_insert(v, 1, 15, 100);
-  rt.nv_insert(v, 2, 19, 100);
-  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25]);
-  assert.throws(() => rt.nv_insert(v, 5, 1, 100), (e) => e instanceof RangeError && rt.is_abort(e));
-  // Panic-handler routing preserves caller location and registered abort identity
-  let panicSeen = null;
-  const fakeLoc = { filename: { buf: [97, 46, 114, 115], off: 0, len: 4 }, line: 42, col: 7 };
-  const fakePanic = (pi) => { panicSeen = pi; throw rt.abort_error(new Error("rust panic")); };
-  assert.throws(
-    () => rt.nv_insert(v, 9, 1, 100, 4, (m, l) => rt._nv_pinfo(m, fakePanic, l), fakeLoc),
-    (e) => e.message === "rust panic" && rt.is_abort(e),
-  );
-  assert.equal(panicSeen.location, fakeLoc);
-  // RawVec amortized growth formula: u32 min 4, u8 min 8, cap 9 -> 18, exact stays exact
-  const vu32 = rt.tv_new(4);
-  rt.nv_reserve(vu32, 1, 100, false, 4);
-  assert.equal(vu32.cap, 4);
-  const vu8 = rt.tv_new(0);
-  rt.nv_reserve(vu8, 1, 100, false, 8);
-  assert.equal(vu8.cap, 8);
-  const v9 = rt.nv_cap(9, 100, 4);
-  rt.nv_reserve(v9, 10, 100, false, 4);
-  assert.equal(v9.cap, 18);
-  const vLarge = rt.native_vec_new(0);
-  rt.nv_reserve(vLarge, 1, 100, false, 1);
-  assert.equal(vLarge.cap, 1);
-  rt.nv_reserve(v, 10, 100, true);
-  assert.equal(v.cap, 14);
-  rt.nv_resize(v, 5, 7, 100);
-  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25, 7]);
-  assert.equal(rt.nv_remove(v, 1), 15);
-  assert.equal(rt.nv_swap_remove(v, 0), 10);
-  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [7, 19, 25]);
-  rt.nv_shrink(v);
-  assert.equal(v.cap, 3);
-  assert.throws(() => rt.nv_remove(v, 3), RangeError);
-  assert.throws(() => rt.nv_swap_remove(v, 3), RangeError);
-  assert.throws(() => rt.nv_push(v, 1, 3), RangeError);
-  assert.equal(v.len, 3);
-
-  // -0.0 preservation in Float64Array / Float32Array nv_from_elem
-  const fz = rt.nv_from_elem(-0.0, 4, 100, 7);
-  assert.equal(fz.buf instanceof Float64Array, true);
-  assert.equal(Object.is(fz.buf[0], -0.0), true);
-  assert.equal(Object.is(fz.buf[3], -0.0), true);
-
-  // nv_extend, nv_extend_slice (same TypedArray, plain Array, Proxy-wrapped TypedArray), nv_clone, nv_from_slice
-  const dst = rt.nv_from_elem(1, 2, 100, 0);
-  const src = rt.nv_from_elem(2, 3, 100, 0);
-  rt.nv_extend(dst, src, 100);
-  assert.deepEqual(Array.from(dst.buf.subarray(0, dst.len)), [1, 1, 2, 2, 2]);
-  assert.equal(src.len, 0);
-  assert.equal(src.cap, 0);
-  rt.nv_extend_slice(dst, { buf: [9, 8], off: 0, len: 2 }, 100);
-  const proxied = new Proxy(new Uint8Array([4, 5, 6]), {});
-  rt.nv_extend_slice(dst, { buf: proxied, off: 1, len: 2 }, 100);
-  assert.deepEqual(Array.from(dst.buf.subarray(0, dst.len)), [1, 1, 2, 2, 2, 9, 8, 5, 6]);
-  const cloned = rt.nv_clone(dst);
-  assert.equal(cloned.buf instanceof Uint8Array, true);
-  cloned.buf[0] = 99;
-  assert.equal(dst.buf[0], 1);
-  const fromEmpty = rt.nv_from_slice({ buf: 1, off: 0, len: 0 }, 0);
-  assert.equal(fromEmpty.len, 0);
-  assert.equal(fromEmpty.buf instanceof Uint8Array, true);
-  const fromProxy = rt.nv_from_slice({ buf: proxied, off: 0, len: 3 }, 0);
-  assert.deepEqual(Array.from(fromProxy.buf), [4, 5, 6]);
-  // nv_from_box: plain slot, window slot, bare array, and empty dangling box; zero unwindow/_element_view_of deps
-  const boxPlain = rt.nv_from_box({ buf: [[10, 20, 30]], off: 0 }, 3, 4);
-  assert.equal(boxPlain.buf instanceof Uint32Array, true);
-  assert.deepEqual(Array.from(boxPlain.buf), [10, 20, 30]);
-  const boxWin = rt.nv_from_box({ buf: [99, 1, 2, 3, 99], off: 1, w: 3 }, 3, 0);
-  assert.equal(boxWin.buf instanceof Uint8Array, true);
-  assert.deepEqual(Array.from(boxWin.buf), [1, 2, 3]);
-  const boxBare = rt.nv_from_box(["x", "y"], 2);
-  assert.deepEqual(boxBare, { buf: ["x", "y"], len: 2, cap: 2 });
-  const boxEmpty = rt.nv_from_box(4, 0, 4);
-  assert.equal(boxEmpty.buf instanceof Uint32Array, true);
-  assert.equal(boxEmpty.len, 0);
-  const boxMin = minimalShim([], shimSrc, { module: true, direct: ["nv_from_box"] });
-  assert.equal(boxMin.names.includes("unwindow"), false);
-  assert.equal(boxMin.names.includes("_element_view_of"), false);
-
-  // 3. Plain-Array NativeVec helpers (nv_*) + dangling empty slice safety
-  const nv = rt.native_vec_new(0);
-  rt.nv_push(nv, "a", 100);
-  const obj = { x: 1 };
-  rt.nv_push(nv, obj, 100);
-  obj.x = 42;
-  assert.equal(nv.buf[1].x, 42);
-  rt.nv_reserve(nv, 10, 100, false);
-  assert.equal(nv.cap >= 12, true);
-  rt.nv_shrink(nv);
-  assert.equal(nv.cap, 2);
-  const nvEmpty = rt.nv_from_slice({ buf: 4, off: 0, len: 0 });
-  assert.deepEqual(nvEmpty, { buf: [], len: 0, cap: 0 });
-  const rng = rt.nv_range(nv, 0, 2);
-  assert.equal(rng.len, 2);
-  assert.throws(() => rt.nv_range(nv, 2, 1), RangeError);
-  assert.throws(() => rt.nv_range(nv, 0, 3), RangeError);
-  assert.throws(() => rt.nv_idx(nv, 2, false), RangeError);
-
-  // 4. TypedArray <-> baseline block adapters + offset_from/copy on TypedArray buffers
-  const blkPtr = rt.convert_nv_block(dst, 1);
-  assert.equal(blkPtr.buf[0], 1);
-  assert.equal(blkPtr.buf[8], 6);
-  const backTv = rt.convert_block_nv(blkPtr.buf, blkPtr.off, dst.len, dst.cap, 0);
-  assert.equal(backTv.buf instanceof Uint8Array, true);
-  assert.deepEqual(Array.from(backTv.buf.subarray(0, backTv.len)), [1, 1, 2, 2, 2, 9, 8, 5, 6]);
-  rt.dealloc(blkPtr, dst.cap, 1);
-  // Float NaN payload preservation across convert_nv_block (f32 and f64, repeated for V8 IC)
-  const f32Buf = new Float32Array(2);
-  new Uint32Array(f32Buf.buffer)[0] = 0x7fc00123;
-  f32Buf[1] = 1.5;
-  const f64Buf = new Float64Array(2);
-  new BigUint64Array(f64Buf.buffer)[0] = 0x7ff8000000000123n;
-  f64Buf[1] = 2.5;
-  for (let iter = 0; iter < 500; iter += 1) {
-    const p32 = rt.convert_nv_block({ buf: f32Buf, len: 2, cap: 4 }, 4, "f32");
-    const u32 = rt.unscale_scalar(p32, 4, () => 0, "f32");
-    assert.equal(new Uint32Array(Float32Array.of(u32.buf[u32.off]).buffer)[0], 0x7fc00123);
-    rt.dealloc(p32, 16, 4);
-    const p64 = rt.convert_nv_block({ buf: f64Buf, len: 2, cap: 4 }, 8, "f64");
-    const u64 = rt.unscale_scalar(p64, 8, () => 0, "f64");
-    assert.equal(new BigUint64Array(Float64Array.of(u64.buf[u64.off]).buffer)[0], 0x7ff8000000000123n);
-    rt.dealloc(p64, 32, 8);
-  }
-  assert.equal(rt.offset_from({ buf: dst.buf, off: 5 }, { buf: dst.buf, off: 2 }, 1), 3);
+  // 2. offset_from / copy / write_bytes on TypedArray buffers
+  const dstBuf = new Uint8Array([1, 1, 2, 2, 2, 9, 8, 5, 6]);
+  assert.equal(rt.offset_from({ buf: dstBuf, off: 5 }, { buf: dstBuf, off: 2 }, 1), 3);
   const dst2 = new Uint8Array(4);
-  rt.copy({ buf: dst2, off: 0 }, { buf: dst.buf, off: 5 }, 4);
+  rt.copy({ buf: dst2, off: 0 }, { buf: dstBuf, off: 5 }, 4);
   assert.deepEqual(Array.from(dst2), [9, 8, 5, 6]);
   rt.copy({ buf: dst2, off: 1 }, { buf: dst2, off: 0 }, 3);
   assert.deepEqual(Array.from(dst2), [9, 9, 8, 5]);
   rt.write_bytes({ buf: dst2, off: 1 }, 0xab, 2);
   assert.deepEqual(Array.from(dst2), [9, 0xab, 0xab, 5]);
 
-  // 5. Wave 4 runtime helpers: map_values, _nv_fail/_nv_pinfo, u8array_into_bytes fast path
+  // 3. Wave 4 runtime helpers: map_values, u8array_into_bytes fast path
   const m = new Map([["a", [10]], ["b", [20]]]);
   assert.deepEqual(rt.map_values(m), { buf: [[10], [20]], off: 0, len: 2 });
-  let seenPinfo = null;
-  assert.throws(
-    () => rt._nv_fail("oob", (msg, loc) => rt._nv_pinfo(msg, (info) => { seenPinfo = info; }, loc), { filename: { buf: [], off: 0, len: 0 }, line: 7, col: 3 }),
-    (err) => err instanceof RangeError && rt.is_abort(err),
-  );
-  assert.equal(seenPinfo.location.line, 7);
-  assert.equal(seenPinfo.location.col, 3);
-  assert.deepEqual(seenPinfo.message.template.buf, [111, 111, 98]);
-  assert.throws(() => rt._nv_fail("cap"), (err) => err instanceof RangeError && rt.is_abort(err));
   const sub = new Uint8Array([9, 1, 2, 3, 9]).subarray(1, 4);
   const taDst = new Uint8Array([0, 0, 0, 0, 0]);
   rt.u8array_into_bytes(sub, { buf: taDst, off: 1, len: 3 });

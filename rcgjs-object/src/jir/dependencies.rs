@@ -203,27 +203,9 @@ impl Dependencies {
     }
     fn host(&mut self, host: &HostPayload) {
         match host {
-            HostPayload::Marker {
-                template, helpers, ..
-            } => {
-                if let Some(template) = template {
-                    self.tree(template);
-                }
+            HostPayload::Marker { helpers, .. } => {
                 for (_, item) in helpers {
                     self.item(*item);
-                }
-            }
-            HostPayload::ViewAbi { helpers, .. } => {
-                for (_, item) in helpers {
-                    self.item(*item);
-                }
-            }
-            HostPayload::KeyedList(payload) => {
-                for callable in [&payload.collection, &payload.key, &payload.row] {
-                    if let Some(item) = callable.body {
-                        self.item(item);
-                    }
-                    self.drop(callable.cleanup);
                 }
             }
             HostPayload::Extern(_) | HostPayload::Block(_) | HostPayload::Map { .. } => {}
@@ -362,7 +344,6 @@ mod tests {
                     host: Some(HostPayload::Marker {
                         section: StrId(91),
                         def: item(0).item.definition,
-                        template: Some(global(10)),
                         helpers: vec![(StrId(92), item(11))],
                     }),
                 }),
@@ -384,35 +365,7 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(body.link_dependencies(), names(&[6, 7, 8, 9, 10, 11, 12]));
-        let callable = |id| KeyedListCallable {
-            ty: TypeId(1),
-            body: Some(item(id)),
-            cleanup: DropGlue::Direct {
-                item: item(id + 1).item,
-                link_name: StrId(id + 1),
-            },
-            source: None,
-        };
-        let Terminator::Call(call) = &mut body.blocks[0].terminator else {
-            unreachable!()
-        };
-        call.host = Some(HostPayload::KeyedList(Box::new(KeyedListPayload {
-            format: KEYED_LIST_FORMAT_V1,
-            site: None,
-            def: item(0).item.definition,
-            collection_ty: TypeId(1),
-            item_ty: TypeId(1),
-            key_ty: TypeId(1),
-            row_ty: TypeId(1),
-            collection: callable(20),
-            key: callable(22),
-            row: callable(24),
-        })));
-        assert_eq!(
-            body.link_dependencies(),
-            names(&[6, 7, 8, 9, 12, 20, 21, 22, 23, 24, 25])
-        );
+        assert_eq!(body.link_dependencies(), names(&[6, 7, 8, 9, 11, 12]));
     }
 
     #[test]

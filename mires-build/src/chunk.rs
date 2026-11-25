@@ -60,14 +60,12 @@ impl Chunk {
 ///
 /// BuildConfig::new("client-island/island.rs")
 ///     .output_name("islands.js")
-///     .views(true)
 ///     .crate_arg("js-modules=esm")
 ///     .chunks(
 ///         Chunking::new()
 ///             .island("counter")
 ///             .island("search")
-///             .url_base("/demo/chunks/")
-///             .import("topcoat-dom", "/demo/topcoat-dom.js"),
+///             .url_base("/demo/chunks/"),
 ///     )
 ///     .render()
 ///     .unwrap();

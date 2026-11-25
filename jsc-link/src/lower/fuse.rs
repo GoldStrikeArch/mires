@@ -33,9 +33,7 @@ use rcgjs_object::evaluation::OperandEvaluation;
 use crate::jir::interns::Interns;
 use crate::jir::origin::{OriginId, OriginTable};
 use crate::jir::repr::{CellId, Dominators, Func, OpKind, Proj, RBlockId, RTerm, Root, ValueId};
-use crate::jir::semantic::{
-    BinaryOp, CastKind, ConstTree, GlobalReference, HostPayload, TypeId, UnaryOp,
-};
+use crate::jir::semantic::{BinaryOp, CastKind, HostPayload, TypeId, UnaryOp};
 use crate::jir::types::{EnumRepr, PointerForm, TypeKind, TypeTable};
 use crate::jsast;
 use crate::opts::{NameStyle, Opts};
@@ -986,41 +984,6 @@ impl<'a> Planner<'a> {
             })
     }
 
-    /// The encoder has consumed this static address into every template call's payload.
-    /// It has no runtime evaluation, including when several calls share the same constant.
-    fn is_template_data(&self, result: ValueId, uses: &[Use]) -> bool {
-        let Some(Def::Op(block, index)) = self.defs[result.0 as usize] else {
-            return false;
-        };
-        if !matches!(
-            self.func.blocks[block.0 as usize].ops[index].kind,
-            OpKind::Const(ConstTree::Global {
-                target: GlobalReference::Static { .. },
-                offset: 0
-            })
-        ) {
-            return false;
-        }
-        let has_invoke = self.func.has_invoke();
-        !uses.is_empty()
-            && uses.iter().all(|use_| {
-                if has_invoke && (use_.block != block || use_.edge.is_some()) {
-                    return false;
-                }
-                if matches!(
-                    self.func.blocks[use_.block.0 as usize].term,
-                    RTerm::Invoke { .. }
-                ) && use_.position + 1 >= self.func.blocks[use_.block.0 as usize].ops.len()
-                {
-                    return false;
-                }
-                matches!(self.func.blocks[use_.block.0 as usize].ops.get(use_.position).map(|op| &op.kind),
-                    Some(OpKind::Call {
-                        host: Some(HostPayload::Marker { section, template: Some(_), .. }), args, ..
-                    }) if self.interns.str(*section) == Some("rcgjs.tc.template") && args.as_slice() == [result])
-            })
-    }
-
     fn inlinable(&self, result: ValueId, block: RBlockId, index: usize, purity: Purity) -> bool {
         // A use or return of a zero-sized value reads `undefined`, so its producer must
         // execute at its definition instead of disappearing with that value. Synthetic views
@@ -1042,9 +1005,6 @@ impl<'a> Planner<'a> {
             return false;
         }
         let uses = &self.uses[result.0 as usize];
-        if self.is_template_data(result, uses) {
-            return true;
-        }
         let [use_] = uses.as_slice() else {
             return false;
         };

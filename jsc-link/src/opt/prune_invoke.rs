@@ -9,8 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::witness::{self, InvokePruneReason, InvokePrunedSite, Witness};
+use super::witness::{self, InvokePruneReason, InvokePrunedSite};
 use crate::analysis::refs::{self, RefScan};
+use crate::item::AllocatorProvider;
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
@@ -20,7 +21,6 @@ use crate::jir::semantic::{
     ItemId, UnaryOp, VtableEntry,
 };
 use crate::jir::types::{TypeId, TypeKind, TypeTable};
-use crate::late_ir::AllocatorProvider;
 
 /// Statistics and witness outcomes for one [`run_checked`] pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -132,13 +132,6 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "bstr_trim"
             | "bstr_trim_start"
             | "bstr_trim_end"
-            | "bstr_push"
-            | "bstr_pop"
-            | "bstr_truncate"
-            | "bstr_host_sb"
-            | "bstr_block"
-            | "bstr_sb_block"
-            | "bstr_sb_check"
             | "sb_new"
             | "sb_push"
             | "sb_push_char"
@@ -159,10 +152,6 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "fmodf"
             | "clone"
             | "u8array_from_bytes"
-            | "native_str_wf"
-            | "native_str_utf16_index"
-            | "native_str_byte_index"
-            | "native_str_is_char_boundary"
             | "native_f64_to_string"
             | "native_f32_to_string"
             | "fmt_float_fixed"
@@ -171,26 +160,10 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "rcgjs_fmt_float_parts"
             | "parse_f64"
             | "parse_f32"
-            | "native_str_push"
-            | "native_str_pop"
-            | "native_str_truncate"
-            | "_sb_check"
             | "native_vec_new"
             | "typed_vec_push"
             | "native_vec_set_capacity"
             | "native_vec_set_len"
-            | "tv_new"
-            | "nv_shrink"
-            | "nv_clone"
-            | "nv_from_slice"
-            | "nv_from_box"
-            | "convert_host_sb"
-            | "convert_str_block"
-            | "convert_sb_block"
-            | "convert_nv_block"
-            | "convert_block_nv"
-            | "convert_block_sv"
-            | "convert_sv_nv"
             | "ptr_is_null"
             | "host_str_to_lowercase"
             | "host_str_to_uppercase"
@@ -204,9 +177,6 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "t_realloc_arr"
             | "t_realloc_arr_checked"
             | "t_dealloc_maybe"
-            | "convert_nv_typed"
-            | "bstr_block_typed"
-            | "bstr_sb_block_typed"
             | "nv_grow_u8"
             | "nv_grow_i8"
             | "nv_grow_u16"
@@ -246,7 +216,11 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
     )
 }
 
-fn type_contains_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeId>) -> bool {
+pub(crate) fn type_contains_fn_ptr(
+    ty: TypeId,
+    types: &TypeTable,
+    seen: &mut BTreeSet<TypeId>,
+) -> bool {
     if !seen.insert(ty) {
         return false;
     }
@@ -277,7 +251,7 @@ fn type_contains_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeI
 /// Both the JIR and baseline emitters wrap `PanicImpl` bodies in `try { ... } catch ($e) { throw
 /// __rt.abort_error($e); }` (unless already an unconditional literal abort), so calling one can
 /// only diverge or raise a registered abort — never a catchable host exception.
-fn is_panic_impl_item(table: &BTreeMap<JsName, LinkItem>, name: &JsName) -> bool {
+pub(crate) fn is_panic_impl_item(table: &BTreeMap<JsName, LinkItem>, name: &JsName) -> bool {
     table
         .get(name)
         .filter(|item| item.kind == ItemKind::Fn)
@@ -285,7 +259,7 @@ fn is_panic_impl_item(table: &BTreeMap<JsName, LinkItem>, name: &JsName) -> bool
         .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
 }
 
-fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
+pub(crate) fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
     match payload {
         HostPayload::Map { marker } => interns.str(*marker).is_some_and(|m| {
             matches!(
@@ -305,10 +279,7 @@ fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
             )
         }),
         HostPayload::Marker {
-            section,
-            template: None,
-            helpers,
-            ..
+            section, helpers, ..
         } => {
             if !helpers.is_empty() {
                 return false;
@@ -428,7 +399,7 @@ pub(crate) fn run_checked(
 
     let has_custom_allocator = table.values().any(|item| {
         matches!(
-            item.late_ir.artifact_allocator_provider(),
+            item.allocator_provider,
             AllocatorProvider::Custom | AllocatorProvider::Conflict
         )
     });
@@ -589,10 +560,7 @@ pub(crate) fn run_checked(
                 if let Some(hp) = host {
                     return !host_payload_cannot_throw(hp, interns);
                 }
-                if matches!(
-                    semantic,
-                    CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
-                ) {
+                if matches!(semantic, CallSemantic::Host | CallSemantic::RawJavaScript) {
                     return true;
                 }
                 match callee {
@@ -748,7 +716,7 @@ pub(crate) fn run_checked(
         .collect();
 
     let func_names: Vec<JsName> = funcs.keys().cloned().collect();
-    let mut pending: Vec<(JsName, Func, Vec<InvokePrunedSite>, Vec<Witness>)> = Vec::new();
+    let mut pending: Vec<(JsName, Func, Vec<InvokePrunedSite>, Vec<witness::Witness>)> = Vec::new();
     for name in func_names {
         let Some(interns) = interns_map.get(&name).copied() else {
             continue;
@@ -819,12 +787,8 @@ pub(crate) fn run_checked(
         let verified = rewritten
             .verify_carriers(&interns.types, crate::opt::observed_carriers(&rewritten))
             .is_ok();
-        let invoke_witness = Witness::InvokePruned {
-            count: pruned_sites.len() as u32,
-        };
         let checked = if witness::enabled() {
             witness::check_all(&dce_witnesses, &rewritten, &interns.types).is_ok()
-                && invoke_witness.check(&rewritten, &interns.types).is_ok()
                 && witness::check_invoke_pruning(
                     pre_func,
                     interns,
@@ -894,15 +858,32 @@ fn is_noop_unwind_chain(
     start: RBlockId,
     noop_funcs: &BTreeSet<JsName>,
 ) -> bool {
-    let is_unused = |v: ValueId| -> bool {
-        !func.blocks.iter().any(|b| {
+    check_noop_unwind_chain(func, interns, start, |link_name| {
+        let name = interns
+            .str(link_name)
+            .ok_or_else(|| format!("unresolvable str#{}", link_name.0))?;
+        if noop_funcs.contains(&JsName::new(name.to_owned())) {
+            Ok(())
+        } else {
+            Err(format!("unwind callee `{name}` is not an empty return"))
+        }
+    })
+    .is_ok()
+}
+
+pub(crate) fn check_noop_unwind_chain<F>(
+    func: &Func,
+    interns: &Interns,
+    start: RBlockId,
+    mut check_empty_callee: F,
+) -> Result<(), String>
+where
+    F: FnMut(StrId) -> Result<(), String>,
+{
+    let is_used = |v: ValueId| -> bool {
+        func.blocks.iter().any(|b| {
             b.ops.iter().any(|op| op.kind.uses().contains(&v)) || b.term.uses().contains(&v)
         })
-    };
-    let is_noop_target = |link_name: StrId| -> bool {
-        interns
-            .str(link_name)
-            .is_some_and(|s| noop_funcs.contains(&JsName::new(s.to_owned())))
     };
     let mut escaped_cells: Option<BTreeSet<CellId>> = None;
 
@@ -918,17 +899,18 @@ fn is_noop_unwind_chain(
         }
         match color.get(&cur).copied() {
             Some(2) => continue,
-            Some(1) => return false,
+            Some(1) => return Err(format!("noop unwind DAG cycles at bb{}", cur.0)),
             _ => {}
         }
         if color.len() >= MAX_NOOP_UNWIND_BLOCKS {
-            return false;
+            return Err("noop unwind DAG exceeds 64-block bound".to_owned());
         }
-        let Some(block) = func.blocks.get(cur.0 as usize) else {
-            return false;
-        };
-        let ops_noop =
-            block.ops.iter().all(|op| match &op.kind {
+        let block = func
+            .blocks
+            .get(cur.0 as usize)
+            .ok_or_else(|| format!("missing unwind block bb{}", cur.0))?;
+        for op in &block.ops {
+            match &op.kind {
                 OpKind::Copy(_)
                 | OpKind::Move(_)
                 | OpKind::Const(_)
@@ -936,16 +918,28 @@ fn is_noop_unwind_chain(
                 | OpKind::CellLoad(_)
                 | OpKind::BorrowView { .. }
                 | OpKind::RawView { .. }
-                | OpKind::Discriminant(_) => true,
+                | OpKind::Discriminant(_) => {}
                 OpKind::CellStore { cell, .. } => {
                     let escaped = escaped_cells.get_or_insert_with(|| collect_escaped_cells(func));
-                    !escaped.contains(cell)
+                    if escaped.contains(cell) {
+                        return Err(format!(
+                            "cell store to escaped cell c{} in unwind block bb{}",
+                            cell.0, cur.0
+                        ));
+                    }
                 }
                 OpKind::Unary {
                     op: UnaryOp::Not | UnaryOp::Neg,
                     ty,
                     ..
-                } => is_bool_or_int(*ty, &interns.types),
+                } => {
+                    if !is_bool_or_int(*ty, &interns.types) {
+                        return Err(format!(
+                            "unary op on non-bool/int type t{} in unwind block bb{}",
+                            ty.0, cur.0
+                        ));
+                    }
+                }
                 OpKind::Binary {
                     op:
                         BinaryOp::Eq
@@ -955,15 +949,24 @@ fn is_noop_unwind_chain(
                         | BinaryOp::BitXor,
                     ty,
                     ..
-                } => is_bool_or_int(*ty, &interns.types),
+                } => {
+                    if !is_bool_or_int(*ty, &interns.types) {
+                        return Err(format!(
+                            "binary op on non-bool/int type t{} in unwind block bb{}",
+                            ty.0, cur.0
+                        ));
+                    }
+                }
                 OpKind::Cast {
                     kind: CastKind::IntToInt | CastKind::Subtype,
                     ..
-                } => true,
+                } => {}
                 OpKind::Drop { glue, .. } => match glue {
-                    DropGlue::None => true,
-                    DropGlue::Direct { link_name, .. } => is_noop_target(*link_name),
-                    DropGlue::Dynamic => false,
+                    DropGlue::None => {}
+                    DropGlue::Direct { link_name, .. } => check_empty_callee(*link_name)?,
+                    DropGlue::Dynamic => {
+                        return Err(format!("dynamic drop in unwind block bb{}", cur.0));
+                    }
                 },
                 OpKind::Call {
                     callee: Callee::Direct { link_name, .. },
@@ -971,18 +974,31 @@ fn is_noop_unwind_chain(
                     host: None,
                     function: None,
                     ..
-                } => op.result.is_none_or(is_unused) && is_noop_target(*link_name),
+                } => {
+                    if let Some(res) = op.result {
+                        if is_used(res) {
+                            return Err(format!("unwind call result v{} is used", res.0));
+                        }
+                    }
+                    check_empty_callee(*link_name)?;
+                }
                 OpKind::Call {
                     callee: Callee::Nop,
                     semantic: CallSemantic::Ordinary,
                     host: None,
                     function: None,
                     ..
-                } => op.result.is_none_or(is_unused),
-                _ => false,
-            });
-        if !ops_noop {
-            return false;
+                } => {
+                    if let Some(res) = op.result {
+                        if is_used(res) {
+                            return Err(format!("unwind nop call result v{} is used", res.0));
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!("non-noop op {other:?} in unwind block bb{}", cur.0));
+                }
+            }
         }
         color.insert(cur, 1);
         stack.push((cur, true));
@@ -990,7 +1006,7 @@ fn is_noop_unwind_chain(
             RTerm::Throw(None) => {}
             RTerm::Goto(next, _) => {
                 if color.get(next).copied() == Some(1) {
-                    return false;
+                    return Err(format!("noop unwind DAG cycles at bb{}", next.0));
                 }
                 if !color.contains_key(next) {
                     stack.push((*next, false));
@@ -998,24 +1014,33 @@ fn is_noop_unwind_chain(
             }
             RTerm::Switch { cases, default, .. } => {
                 if color.get(&default.0).copied() == Some(1) {
-                    return false;
+                    return Err(format!("noop unwind DAG cycles at bb{}", default.0 .0));
                 }
                 if !color.contains_key(&default.0) {
                     stack.push((default.0, false));
                 }
                 for &(_, target, _) in cases {
                     if color.get(&target).copied() == Some(1) {
-                        return false;
+                        return Err(format!("noop unwind DAG cycles at bb{}", target.0));
                     }
                     if !color.contains_key(&target) {
                         stack.push((target, false));
                     }
                 }
             }
-            _ => return false,
+            other => {
+                return Err(format!(
+                    "unwind block bb{} ends in non-noop terminator {other:?}",
+                    cur.0
+                ));
+            }
         }
     }
-    !color.is_empty()
+    if color.is_empty() {
+        Err("noop unwind DAG is empty".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1057,8 +1082,7 @@ mod tests {
             map: item_map(Vec::new()),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir,
         }
     }
@@ -1196,7 +1220,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 10,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1467,7 +1490,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 20,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1569,7 +1591,7 @@ mod tests {
         let mut leaf_interns = Interns::new();
         let unit_leaf = unit_types(&mut leaf_interns);
         let rust_alloc_sym = leaf_interns.intern_str("_RNvCsxyz_7___rustc12___rust_alloc");
-        let rt_sym = leaf_interns.intern_str("native_str_wf");
+        let rt_sym = leaf_interns.intern_str("str_len");
         let mut lb = FuncBuilder::new(
             item_id(30),
             Signature {
@@ -1636,7 +1658,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 32,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1774,7 +1795,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 40,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1858,7 +1878,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 43,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1869,7 +1888,7 @@ mod tests {
         let caller = cb.finish();
 
         let mut alloc_item = test_item(alloc_name, alloc_interns);
-        alloc_item.late_ir.allocator_provider = AllocatorProvider::Custom;
+        alloc_item.allocator_provider = AllocatorProvider::Custom;
         let mut import_item = test_item("___rust_foo_import", Interns::new());
         import_item.kind = ItemKind::Import;
 
@@ -1922,7 +1941,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 11,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 },
                 args: Vec::new(),
@@ -1972,7 +1990,6 @@ mod tests {
                 crate_id: 0,
                 local_hash: 50,
             },
-            template: None,
             helpers: Vec::new(),
         };
 
@@ -3455,7 +3472,6 @@ mod tests {
                             crate_id: 0,
                             local_hash: 170,
                         },
-                        template: None,
                         helpers: Vec::new(),
                     },
                     args: Vec::new(),
@@ -3610,7 +3626,7 @@ mod tests {
 
                 let mut alloc_shim_item = test_item(rust_alloc_name, Interns::new());
                 alloc_shim_item.kind = ItemKind::Alloc;
-                alloc_shim_item.late_ir.allocator_provider = provider;
+                alloc_shim_item.allocator_provider = provider;
 
                 let mut table = BTreeMap::new();
                 table.insert(JsName::new(rust_alloc_name.to_owned()), alloc_shim_item);
@@ -3727,7 +3743,6 @@ mod tests {
                         crate_id: 0,
                         local_hash: 201,
                     },
-                    template: None,
                     helpers: Vec::new(),
                 }),
             },
@@ -4168,7 +4183,6 @@ mod tests {
                 crate_id: 0,
                 local_hash: 51,
             },
-            template: None,
             helpers: Vec::new(),
         };
 
@@ -4468,7 +4482,6 @@ mod tests {
                     crate_id: 0,
                     local_hash: 52,
                 },
-                template: None,
                 helpers: Vec::new(),
             };
 

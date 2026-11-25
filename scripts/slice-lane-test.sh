@@ -36,26 +36,12 @@ node "$script_dir/check-sourcemap.js" "$work/$fixture-on-map.js" "$fixture.rs" >
 jq -e '
   .abi.applied == true and
   (.abi.flat | length) == 0 and
-  (.physical.selected_calls | length) == 0 and
-  any(.physical.decisions[];
-    .item == "slice_fold" and
-    .shape == "slice(3)" and
-    .selected == false and
-    .reason == "cost.score-no-improvement" and
-    .after.score > .before.score) and
   .range.asserts_removed >= 6 and
   .witnesses.failed == 0
 ' "$work/$fixture-on.js.lane.json" >/dev/null
 jq -e '
   .abi.applied == false and
-  (.abi.flat | length) == 0 and
-  (.physical.selected_calls | length) == 0 and
-  any(.physical.decisions[];
-    .item == "slice_fold" and
-    .shape == "slice(3)" and
-    .selected == false and
-    .reason == "cost.score-no-improvement" and
-    .after.score > .before.score)
+  (.abi.flat | length) == 0
 ' "$work/$fixture-report.js.lane.json" >/dev/null
 
 # The new subslice, aligned-prefix, and loop-length facts do more than fold the local compares:

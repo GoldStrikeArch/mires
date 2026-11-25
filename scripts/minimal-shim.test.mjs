@@ -71,7 +71,7 @@ test("manifest publication distinguishes application hooks from canonical helper
   const publish = (source, requirement, flags = []) => {
     writeFileSync(path.join(directory, "program.js"), source);
     writeFileSync(manifestPath, JSON.stringify({
-      schema: 2, object_format: 27, jir_schema: 21,
+      schema: 2, object_format: 28, jir_schema: 24,
       semantic_policy: "faithful", syntax_ceiling: "2018",
       entries: { program: { role: "main", program: "program.js", roots: { entry: "rust:entry" } } },
       artifacts: { "program.js": {
@@ -141,12 +141,6 @@ test("module mode emits lexical ESM bindings, elides unused _boxes, and deduplic
   const literalMod = minimalShim(["__rt.str(); __rt.outer(1);"], literalShim, { module: true });
   assert.match(literalMod.source, /"__rt\.outer"/);
   assert.match(literalMod.source, /let \$rt_outer =/);
-
-  const keyedMod = minimalShim(["__rt.keyed_metrics_snapshot;"], fullShim, { module: true });
-  parse(keyedMod.source, { ecmaVersion: 2018, sourceType: "module" });
-  assert.match(keyedMod.source, /globalThis\.__rt = globalThis\.__rt \|\| \{\};/);
-  assert.match(keyedMod.source, /export const \{\n[\s\S]*  keyed_metrics_snapshot,\n[\s\S]*\} = globalThis\.__rt;/);
-  assert.doesNotMatch(keyedMod.source, /\$rt_/);
 });
 
 test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffers", () => {

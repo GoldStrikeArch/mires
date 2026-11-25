@@ -95,44 +95,6 @@ impl Rerun {
         })
     }
 
-    /// Also watch what a crate using the view macros compiles against: the
-    /// macros themselves and the sources they are built from.
-    ///
-    /// The sources matter as much as the dylib. Watching only the built macro
-    /// means an edit to the lowering reruns nothing until someone happens to
-    /// rebuild it, so the expansion keeps coming out of the macro that was
-    /// current when the dylib was written.
-    #[must_use]
-    pub fn views(self, toolchain: &Toolchain) -> Self {
-        self.views_with_keyed(toolchain, false)
-    }
-
-    /// Also watch the isolated proc-macro artifacts selected by `keyed`.
-    #[must_use]
-    pub(crate) fn views_with_keyed(mut self, toolchain: &Toolchain, keyed: bool) -> Self {
-        self.paths.push(toolchain.view_macros_with_keyed(keyed));
-        self.paths.push(toolchain.js_extern_macro_with_keyed(keyed));
-        for dir in toolchain.view_sources() {
-            // The directory itself covers a source file being added or
-            // removed, which no per-file directive can.
-            self.paths.push(dir.clone());
-            collect_inputs(&dir, &mut self.paths);
-        }
-        self
-    }
-
-    /// Also watch the framework procedure macro and its client runtime seam.
-    #[must_use]
-    pub fn procedures(mut self, toolchain: &Toolchain) -> Self {
-        self.paths.push(toolchain.procedure_macro());
-        self.paths.push(toolchain.js_macro());
-        for dir in toolchain.procedure_sources() {
-            self.paths.push(dir.clone());
-            collect_inputs(&dir, &mut self.paths);
-        }
-        self
-    }
-
     /// Print the directives.
     pub fn emit(&self) {
         self.emit_paths();
@@ -340,35 +302,6 @@ mod tests {
         assert!(rerun.paths().contains(&selected.join(".cache-key")));
         assert!(rerun.paths().contains(&selected.join(".js-args")));
         assert!(rerun.paths().contains(&selected.join(".rust-opt-level")));
-    }
-
-    #[test]
-    fn watching_the_views_covers_the_sources_and_not_only_the_dylib() {
-        let spike = TempDir::new("rerun-views");
-        fs::create_dir_all(spike.path().join("view-dom/src")).unwrap();
-        fs::write(spike.path().join("view-dom/src/lower.rs"), "").unwrap();
-
-        let toolchain = Toolchain::new(spike.path()).unwrap();
-        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain).views(&toolchain);
-        let paths = rerun.paths();
-
-        assert!(paths.contains(&toolchain.view_macros()));
-        assert!(paths.contains(&spike.path().join("view-dom")));
-        assert!(paths.contains(&spike.path().join("view-dom/src/lower.rs")));
-    }
-
-    #[test]
-    fn watching_keyed_views_selects_the_isolated_macro_artifact() {
-        let spike = TempDir::new("rerun-keyed-views");
-        let toolchain = Toolchain::new(spike.path()).unwrap();
-
-        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain)
-            .views_with_keyed(&toolchain, true);
-
-        assert!(rerun
-            .paths()
-            .contains(&toolchain.view_macros_with_keyed(true)));
-        assert!(!rerun.paths().contains(&toolchain.view_macros()));
     }
 
     #[test]

@@ -727,79 +727,12 @@ pub fn clone_expr_with(
                         ])
                     })
                 }
-                RepresentationCandidate::Vec if nested_clone.vec => clone_once(value, "$cv", |v| {
-                    let nv = jsast::object_of(vec![
-                        ("buf", jsast::member(v.clone(), "buf")),
-                        ("len", jsast::member(v.clone(), "len")),
-                        ("cap", jsast::member(v.clone(), "cap")),
-                    ]);
-                    let sv = jsast::object_of(vec![
-                        ("buf", jsast::member(v.clone(), "buf")),
-                        ("off", jsast::member(v.clone(), "off")),
-                        ("len", jsast::member(v.clone(), "len")),
-                    ]);
-                    jsast::cond(
-                        jsast::binary(
-                            BinOp::StrictNe,
-                            jsast::member(v.clone(), "cap"),
-                            jsast::undefined(),
-                        ),
-                        nv,
-                        jsast::cond(
-                            jsast::binary(
-                                BinOp::StrictNe,
-                                jsast::member(v.clone(), "off"),
-                                jsast::undefined(),
-                            ),
-                            sv,
-                            struct_clone(v),
-                        ),
-                    )
-                }),
                 RepresentationCandidate::String if nested_clone.native_string => {
                     clone_once(value, "$cs", |v| {
                         jsast::object_of(vec![
                             ("s", jsast::member(v.clone(), "s")),
                             ("cap", jsast::member(v, "cap")),
                         ])
-                    })
-                }
-                RepresentationCandidate::String if nested_clone.string => {
-                    clone_once(value, "$cs", |v| {
-                        let sb = jsast::object_of(vec![
-                            ("text", jsast::member(v.clone(), "text")),
-                            ("cap", jsast::member(v.clone(), "cap")),
-                            ("len", jsast::member(v.clone(), "len")),
-                        ]);
-                        let ns = jsast::object_of(vec![
-                            ("s", jsast::member(v.clone(), "s")),
-                            ("cap", jsast::member(v.clone(), "cap")),
-                        ]);
-                        jsast::cond(
-                            jsast::binary(
-                                BinOp::StrictEq,
-                                jsast::unary(UnOp::TypeOf, v.clone()),
-                                jsast::string("string"),
-                            ),
-                            v.clone(),
-                            jsast::cond(
-                                jsast::binary(
-                                    BinOp::StrictNe,
-                                    jsast::member(v.clone(), "s"),
-                                    jsast::undefined(),
-                                ),
-                                ns,
-                                jsast::cond(
-                                    jsast::binary(
-                                        BinOp::StrictNe,
-                                        jsast::member(v.clone(), "text"),
-                                        jsast::undefined(),
-                                    ),
-                                    sb,
-                                    struct_clone(v),
-                                ),
-                            ),
-                        )
                     })
                 }
                 RepresentationCandidate::BTreeMap if nested_clone.map => {

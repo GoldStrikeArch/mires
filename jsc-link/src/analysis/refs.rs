@@ -15,9 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::item::{JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::repr::{Func, Op, OpKind};
-use crate::jir::semantic::{
-    Callee, ConstTree, DropGlue, GlobalReference, HostPayload, ItemId, TypeId,
-};
+use crate::jir::semantic::{Callee, ConstTree, DropGlue, GlobalReference, ItemId, TypeId};
 use crate::jir::types::{TypeKind, TypeTable};
 
 /// What one pass over the program's ops mentioned, by how it was mentioned.
@@ -103,16 +101,6 @@ pub fn scan_op(func: &Func, op: &Op, table: Option<&TypeTable>, scan: &mut RefSc
             }
             for (_, helper) in payload.helpers() {
                 scan.named.insert(helper.item);
-            }
-            if let HostPayload::KeyedList(payload) = payload {
-                for callable in [&payload.collection, &payload.key, &payload.row] {
-                    if let Some(body) = callable.body {
-                        scan.named.insert(body.item);
-                    }
-                    if let DropGlue::Direct { item, .. } = callable.cleanup {
-                        scan.dropped.insert(item);
-                    }
-                }
             }
             for arg in args {
                 scan_closure_type(func.values[arg.0 as usize].ty, table, &mut scan.named);

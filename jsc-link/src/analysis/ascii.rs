@@ -14,13 +14,13 @@ use crate::analysis::refs::{self, RefScan};
 use crate::item::{JsName, LinkItem};
 use crate::jir::repr::{Carrier, CellId, Func, Op, OpKind, Proj, RTerm, Root, ValueId};
 use crate::jir::semantic::{
-    BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, HostPayload, ItemId,
-    StandardOperation, TypeId,
+    BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, ItemId, StandardOperation,
+    TypeId,
 };
 use crate::jir::types::{RepresentationCandidate, TypeKind, TypeTable, VariantDescriptor};
 use crate::jir::{Interns, StrId};
 use crate::plan::abi_flat::AbiPlan;
-use crate::plan::representation::ReprOutcome;
+use crate::plan::native_types::ReprOutcome;
 
 /// Whole-program ASCII facts consumed while lowering JIR functions under `js-str=bytes`.
 #[derive(Clone, Debug, Default)]
@@ -195,13 +195,6 @@ where
                 if let OpKind::Host { payload, .. } = &op.kind {
                     for (_, helper) in payload.helpers() {
                         scan.named.insert(helper.item);
-                    }
-                    if let HostPayload::KeyedList(payload) = payload {
-                        for callable in [&payload.collection, &payload.key, &payload.row] {
-                            if let Some(body) = callable.body {
-                                scan.named.insert(body.item);
-                            }
-                        }
                     }
                 }
             }
@@ -1289,17 +1282,10 @@ fn resolve_callee(
     item: ItemId,
     link_name: StrId,
     interns: &Interns,
-    repr: &ReprOutcome,
+    _repr: &ReprOutcome,
     abi: &AbiPlan,
 ) -> Option<JsName> {
     if let Some(target) = abi.call_retargets(caller_name).get(&item) {
-        return Some(target.clone());
-    }
-    if let Some(target) = repr
-        .call_retargets
-        .get(caller_name)
-        .and_then(|m| m.get(&item))
-    {
         return Some(target.clone());
     }
     interns.str(link_name).map(|s| JsName::new(s.to_owned()))
@@ -1442,7 +1428,7 @@ where
             if item.crate_name == "core" {
                 if let Some(interns) = get_interns(name) {
                     let (origin_crate, _) =
-                        crate::lower::semantic_ops::string::item_origin_info(item, interns);
+                        crate::lower::semantic_ops::item_origin_info(item, interns);
                     if origin_crate == "core" {
                         named_core_crates.insert(func.item.definition.crate_id);
                     }
@@ -1505,7 +1491,7 @@ where
             continue;
         };
         let (origin_crate, origin_path) =
-            crate::lower::semantic_ops::string::item_origin_info(item, interns);
+            crate::lower::semantic_ops::item_origin_info(item, interns);
         if origin_crate != "core" {
             continue;
         }
@@ -1662,7 +1648,7 @@ where
             continue;
         };
         let (origin_crate, origin_path) =
-            crate::lower::semantic_ops::string::item_origin_info(item, interns);
+            crate::lower::semantic_ops::item_origin_info(item, interns);
         if origin_crate != "core"
             || !matches!(
                 origin_path,
@@ -1981,8 +1967,7 @@ mod tests {
             map: ItemMap::default(),
             dts: None,
             optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
+            allocator_provider: Default::default(),
             jir: LinkJir::default(),
         }
     }

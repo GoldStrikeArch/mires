@@ -30,7 +30,7 @@ fn main() {
     }
     if summary {
         println!(
-            "{:<48} {:>7} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>6}",
+            "{:<48} {:>7} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>6}",
             "object",
             "format",
             "bytes",
@@ -40,7 +40,6 @@ fn main() {
             "S3",
             "S4",
             "S5",
-            "S6",
             "items",
             "bodies",
             "blobs"
@@ -138,7 +137,7 @@ fn report_20(label: &str, bytes: &[u8], object: &object::Object, summary: bool) 
         .sum();
     if summary {
         println!(
-            "{:<48} {:>7} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>6}",
+            "{:<48} {:>7} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>6}",
             truncate(label, 48),
             object::FORMAT_VERSION,
             bytes.len(),
@@ -148,7 +147,6 @@ fn report_20(label: &str, bytes: &[u8], object: &object::Object, summary: bool) 
             len(SectionId::Bodies),
             len(SectionId::Baseline),
             len(SectionId::Origins),
-            len(SectionId::Legacy),
             items,
             with_body,
             blobs

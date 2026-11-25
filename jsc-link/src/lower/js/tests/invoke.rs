@@ -343,7 +343,7 @@ fn check_emission(
                         vtables: &super::super::unsize::EMPTY_VTABLES,
                         spills: &[],
                         abi: None,
-                        physical: None,
+                        final_lowering: false,
                         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
                         bigints: None,
                         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
@@ -375,93 +375,6 @@ fn check_emission(
                     );
                 }
             }
-        }
-    }
-}
-
-#[test]
-fn native_string_deref_follows_reborrows_across_exception_boundaries() {
-    use crate::analysis::valueflow::harness::{base_interns, REF_STRING, STRING};
-    use crate::jir::repr::Carrier;
-    use crate::jir::semantic::StandardOperation;
-    for carrier in [Carrier::HostString, Carrier::StringBuilder] {
-        for depth in [0, 1, 12] {
-            let mut interns = base_interns();
-            let ordinary = world();
-            for ty in [STR, STR_REF] {
-                interns
-                    .types
-                    .insert(ordinary.types.get(ty).unwrap().clone());
-            }
-            let mut b = FuncBuilder::new(item(1), signature(vec![STRING], STR_REF));
-            let value = b.param(STRING, NO_ORIGIN);
-            let entry = FuncBuilder::ENTRY;
-            let normal = b.block();
-            let cleanup = b.block();
-            let mut reference = b.op(
-                entry,
-                OpKind::BorrowView {
-                    root: Root::Value(value),
-                    path: vec![],
-                    mutable: false,
-                },
-                REF_STRING,
-                NO_ORIGIN,
-            );
-            for _ in 0..depth {
-                reference = b.op(entry, OpKind::Copy(reference), REF_STRING, NO_ORIGIN);
-                reference = b.op(entry, OpKind::Move(reference), REF_STRING, NO_ORIGIN);
-                reference = b.op(
-                    entry,
-                    OpKind::BorrowView {
-                        root: Root::Value(reference),
-                        path: vec![Proj::Deref],
-                        mutable: false,
-                    },
-                    REF_STRING,
-                    NO_ORIGIN,
-                );
-            }
-            let mut operation = call(&mut interns, "baseline_string", vec![reference]);
-            let OpKind::Call { semantic, .. } = &mut operation else {
-                unreachable!()
-            };
-            *semantic = CallSemantic::Standard(StandardOperation::StringAsStr);
-            let result = b.op(entry, operation, STR_REF, NO_ORIGIN);
-            b.terminate(
-                entry,
-                RTerm::Invoke {
-                    normal: (normal, vec![]),
-                    unwind: (cleanup, vec![]),
-                },
-            );
-            b.terminate(normal, RTerm::Return(Some(result)));
-            b.terminate(cleanup, RTerm::Throw(None));
-            let mut func = b.finish();
-            func.values[value.0 as usize].carrier = carrier;
-            let body = body_of(BodyKind::Function, func.sig.clone());
-            let input = if carrier == Carrier::HostString {
-                "text"
-            } else {
-                "{text,cap:32}"
-            };
-            let harness = format!(
-                r#"
-function baseline_string() {{ throw new Error('native value reached baseline String::deref'); }}
-for (const text of ['', 'plain', '\u00e9', '\ud83d\ude03']) {{
-  if (entry({input}) !== text) throw new Error('native string reborrow changed its value');
-}}
-console.log(4);
-"#
-            );
-            check_emission(
-                &interns,
-                &body,
-                &func,
-                &harness,
-                4,
-                &format!("native-reborrow-{carrier:?}-{depth}"),
-            );
         }
     }
 }

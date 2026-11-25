@@ -17,26 +17,138 @@
 use std::collections::BTreeSet;
 
 use crate::item::JsName;
+use crate::jir::interns::Interns;
 use crate::jir::repr::Carrier;
 use crate::jir::semantic::{BodySemantic, StandardOperation};
 use crate::jir::types::{
     AllocatorIdentity, EnumRepr, FieldKey, NominalAbi, NominalForm, PinnedBoundary,
     RepresentationCandidate, TypeDescriptor, TypeId, TypeKind, TypeTable,
 };
-use crate::jsast::{self, BinOp, Expr, Stmt, UnOp};
-use crate::lower::js::adapters::StringLayout;
+use crate::jsast::{self, BinOp, Expr, Stmt};
 use crate::ptr;
 
 use super::drop::element_drop_is_trivially_nonthrowing;
-use super::string::receiver;
 use super::{slot_type, type_get, unsigned_bits, LowerCx, SemanticDecline, SignatureSlot};
+
+fn receiver() -> Expr {
+    jsast::id("$native0")
+}
+
+/// Recorded member paths from a baseline `String` value to its `{ buf, off }` pointer and length.
+struct BaselineStringLayout {
+    ptr: Vec<String>,
+    len: Vec<String>,
+}
+
+impl BaselineStringLayout {
+    fn of(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<Self> {
+        let desc = table.get(ty)?;
+        if desc.meta.candidate != RepresentationCandidate::String
+            || desc.meta.allocator != AllocatorIdentity::Global
+        {
+            return None;
+        }
+        let vec_field = single_real_field(table, interns, ty)?;
+        let vector = table.get(vec_field.1)?;
+        let element_is_byte = match &vector.kind {
+            TypeKind::Adt { args, .. } => args.first().is_some_and(|e| table.byte_element(*e)),
+            _ => false,
+        };
+        if vector.meta.candidate != RepresentationCandidate::Vec || !element_is_byte {
+            return None;
+        }
+        let mut len = None;
+        let mut ptr = None;
+        walk_string_leaves(
+            table,
+            interns,
+            vec_field.1,
+            &[vec_field.0],
+            &mut |path, is_ptr| {
+                if is_ptr {
+                    ptr = Some(path.to_vec());
+                } else if path.len() == 2 {
+                    len = Some(path.to_vec());
+                }
+            },
+        )?;
+        Some(Self {
+            ptr: ptr?,
+            len: len?,
+        })
+    }
+
+    fn member(&self, base: Expr, path: &[String]) -> Expr {
+        path.iter()
+            .fold(base, |expr, key| jsast::member(expr, key.clone()))
+    }
+}
+
+fn struct_fields(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+) -> Option<Vec<(String, TypeId)>> {
+    let TypeKind::Adt { variants, .. } = &table.get(ty)?.kind else {
+        return None;
+    };
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    variant
+        .fields
+        .iter()
+        .map(|field| {
+            let key = match field.key {
+                FieldKey::Name(id) => interns.str(id)?.to_owned(),
+                FieldKey::Index(index) => format!("_{index}"),
+                FieldKey::Transparent => return None,
+            };
+            Some((key, field.ty))
+        })
+        .collect()
+}
+
+fn single_real_field(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<(String, TypeId)> {
+    let mut real = struct_fields(table, interns, ty)?
+        .into_iter()
+        .filter(|(_, field_ty)| !table.is_zst(*field_ty));
+    let first = real.next()?;
+    real.next().is_none().then_some(first)
+}
+
+fn walk_string_leaves(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    path: &[String],
+    visit: &mut impl FnMut(&[String], bool),
+) -> Option<()> {
+    if path.len() > 8 {
+        return None;
+    }
+    for (key, field_ty) in struct_fields(table, interns, ty)? {
+        if table.is_zst(field_ty) {
+            continue;
+        }
+        let mut at = path.to_vec();
+        at.push(key);
+        let peeled = table.peeled(field_ty);
+        match table.get(peeled).map(|d| &d.kind) {
+            Some(TypeKind::RawPointer { .. } | TypeKind::Reference { .. }) => visit(&at, true),
+            Some(TypeKind::Integer { signed: false, .. }) => visit(&at, false),
+            _ => walk_string_leaves(table, interns, field_ty, &at, visit)?,
+        }
+    }
+    Some(())
+}
 
 enum KeyKind {
     /// Primitive key (`bool`, `char`, integer <= 64 bits).
     Primitive,
     /// `&str` key (always a plain JS string in both UTF-16 and `js-str=bytes` modes).
     StrRef,
-    /// Canonical global `String` key (may arrive as `HostString`, `StringBuilder`, or `Baseline`).
+    /// Canonical global `String` key (`{ s, cap }` when `native_string_enabled`, else baseline).
     OwnedString,
 }
 
@@ -47,8 +159,8 @@ enum KeyLowering {
     SlotDeref,
     /// Argument is a universal native `{ s, cap }` `String` or `&String` (`$native1.s`).
     NativeString,
-    /// Argument is a `String` or `&String` whose carrier may be `HostString`, `StringBuilder`, or `Baseline`.
-    StringCoerce(StringLayout),
+    /// Argument is a baseline `Vec<u8>` `String` or `&String`.
+    BaselineString(BaselineStringLayout),
 }
 
 fn classify_key(table: &TypeTable, desc: &TypeDescriptor) -> Option<KeyKind> {
@@ -156,9 +268,9 @@ fn owned_key_lowering(
             if cx.native_string_enabled {
                 Ok(KeyLowering::NativeString)
             } else {
-                let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
-                    .map_err(|_| SemanticDecline::UnknownLayout)?;
-                Ok(KeyLowering::StringCoerce(layout))
+                let layout = BaselineStringLayout::of(cx.table, cx.interns, k_desc.id)
+                    .ok_or(SemanticDecline::UnknownLayout)?;
+                Ok(KeyLowering::BaselineString(layout))
             }
         }
         None => Err(SemanticDecline::WrongArgumentType(1)),
@@ -208,9 +320,9 @@ fn lookup_key_lowering(
                 if cx.native_string_enabled {
                     Ok(KeyLowering::NativeString)
                 } else {
-                    let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
-                        .map_err(|_| SemanticDecline::UnknownLayout)?;
-                    Ok(KeyLowering::StringCoerce(layout))
+                    let layout = BaselineStringLayout::of(cx.table, cx.interns, k_desc.id)
+                        .ok_or(SemanticDecline::UnknownLayout)?;
+                    Ok(KeyLowering::BaselineString(layout))
                 }
             } else {
                 Err(SemanticDecline::WrongArgumentType(1))
@@ -228,35 +340,17 @@ fn emit_key_expr(lowering: &KeyLowering, helpers: &mut BTreeSet<&'static str>) -
             jsast::index(jsast::member(arg.clone(), "buf"), jsast::member(arg, "off"))
         }
         KeyLowering::NativeString => jsast::member(arg, "s"),
-        KeyLowering::StringCoerce(layout) => {
+        KeyLowering::BaselineString(layout) => {
             helpers.insert("bytes_str");
             let ptr_expr = layout.member(arg.clone(), &layout.ptr);
-            let len_expr = layout.member(arg.clone(), &layout.len);
-            let baseline = jsast::rt_call(
+            let len_expr = layout.member(arg, &layout.len);
+            jsast::rt_call(
                 "bytes_str",
                 vec![
                     jsast::member(ptr_expr.clone(), "buf"),
                     jsast::member(ptr_expr, "off"),
                     len_expr,
                 ],
-            );
-            let builder_or_base = jsast::cond(
-                jsast::binary(
-                    BinOp::StrictNe,
-                    jsast::member(arg.clone(), "text"),
-                    jsast::undefined(),
-                ),
-                jsast::member(arg.clone(), "text"),
-                baseline,
-            );
-            jsast::cond(
-                jsast::binary(
-                    BinOp::StrictEq,
-                    jsast::unary(UnOp::TypeOf, arg.clone()),
-                    jsast::string("string"),
-                ),
-                arg,
-                builder_or_base,
             )
         }
     }
@@ -382,7 +476,7 @@ pub(super) fn legality_is_empty(cx: &LowerCx<'_>) -> Result<(), SemanticDecline>
 
 pub(super) fn legality_unit(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     map_kv(cx)?;
-    super::vec::legality_unit_return(cx)
+    super::legality_unit_return(cx)
 }
 
 pub(super) fn legality_contains_key(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {

@@ -101,9 +101,6 @@ pub(super) fn write_item(out: &mut String, jir: &LinkJir) {
         table: &interns.types,
         interns,
         element_glue: None,
-        element_glue_nonthrowing: false,
-        panic_impl: None,
-        panic_reads_info: false,
         native_string_enabled: false,
     };
     match semantic_ops::validate(&cx) {
@@ -258,7 +255,7 @@ mod tests {
             rows.iter()
                 .filter(|row| row["native_lowering"] == true)
                 .count(),
-            69
+            11
         );
         for (semantic, decline) in [
             (BodySemantic::Ordinary, "NotAStandardOperation"),
@@ -267,7 +264,7 @@ mod tests {
                 "UnsupportedOperation(VecSwap)",
             ),
             (
-                BodySemantic::Standard(StandardOperation::StringNew),
+                BodySemantic::Standard(StandardOperation::BTreeMapNew),
                 "ParameterCount { expected: 0, actual: 1 }",
             ),
         ] {

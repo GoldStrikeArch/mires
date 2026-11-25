@@ -56,31 +56,6 @@ const HASH_SEP: &str = "$h";
 /// The number of hex digits [`readable`] appends after [`HASH_SEP`].
 const HASH_DIGITS: usize = 16;
 
-/// The `prefix` [`Namer::synthetic_name`] is called with for a hoisted `#[track_caller]` location.
-pub(crate) const LOCATION_PREFIX: &str = "loc";
-
-/// The `prefix` [`Namer::synthetic_name`] is called with for a hoisted string literal.
-pub(crate) const STRING_PREFIX: &str = "s";
-
-/// Whether `name` is one of the hoisted constants [`crate::cgu::CguCx::hoist`] invents.
-///
-/// Such a name is `loc$h<16 hex digits>` or `s$h<16 hex digits>` exactly, and no item that has a
-/// `DefId` can be spelled that way: a derived name is its crate name *plus* at least one path
-/// segment before the hash, so its readable half can never be just `loc` or `s`. That is what lets
-/// `queue.rs` treat a read of one as a constant on the strength of its spelling alone.
-pub(crate) fn is_hoisted_const(name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix(LOCATION_PREFIX)
-        .or_else(|| name.strip_prefix(STRING_PREFIX))
-    else {
-        return false;
-    };
-    let Some(hash) = rest.strip_prefix(HASH_SEP) else {
-        return false;
-    };
-    hash.len() == HASH_DIGITS && hash.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 pub(crate) struct Namer<'tcx> {
     tcx: TyCtxt<'tcx>,
     style: NameStyle,
@@ -260,25 +235,6 @@ impl<'tcx> Namer<'tcx> {
     /// The name of a synthetic item that has no `DefId` and no type to describe it.
     pub(crate) fn synthetic_name(&self, prefix: &str, key: &str) -> JsName {
         JsName::new(readable(prefix, key))
-    }
-
-    /// The `__rt` member a foreign item is called through.
-    ///
-    /// The shim is hand written JavaScript, so the symbol has to be spelled exactly and has to be
-    /// a plain identifier; anything else is a hard error rather than a `__rt["weird name"]` call
-    /// nobody wrote a shim for.
-    pub(crate) fn rt_member(&self, def_id: DefId, name: &str) -> String {
-        if !jsast::is_plain_ident(name) {
-            self.tcx.dcx().span_err(
-                self.tcx.def_span(def_id),
-                format!(
-                    "`{name}` is not a valid JavaScript identifier, so it cannot name a \
-                     `__rt` member of the runtime shim"
-                ),
-            );
-            return jsast::sanitize_ident(name);
-        }
-        name.to_owned()
     }
 
     /// The property name of one field of a struct or enum variant.
@@ -527,21 +483,6 @@ mod tests {
                 !(name.starts_with('_') && name[1..].starts_with(|c: char| c.is_ascii_digit()))
             );
         }
-    }
-
-    #[test]
-    fn hoisted_constants_are_told_apart_from_derived_names() {
-        assert!(is_hoisted_const(&readable(
-            LOCATION_PREFIX,
-            "loc\u{1}a.rs\u{1}1\u{1}2"
-        )));
-        assert!(is_hoisted_const(&readable(STRING_PREFIX, "some string")));
-        // A derived name always carries a path segment after the crate name, so neither the
-        // shortest plausible collision nor a truncated hash passes.
-        assert!(!is_hoisted_const(&readable("loc::caller", "sym")));
-        assert!(!is_hoisted_const(&readable("s::t", "sym")));
-        assert!(!is_hoisted_const("loc$h0123"));
-        assert!(!is_hoisted_const("loc"));
     }
 
     #[test]

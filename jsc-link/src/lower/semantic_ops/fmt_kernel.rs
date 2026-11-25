@@ -44,6 +44,8 @@ use crate::jir::semantic::{
 use crate::jir::types::{RepresentationCandidate, TypeId, TypeKind, TypeTable};
 use crate::jsast::{self, BinOp, Expr, Stmt};
 
+use super::{type_get, SemanticDecline};
+
 /// The operations the kernel consumes or elides at a call site.
 pub(crate) fn is_format_machinery(operation: StandardOperation) -> bool {
     matches!(
@@ -57,18 +59,121 @@ pub(crate) fn is_format_machinery(operation: StandardOperation) -> bool {
     )
 }
 
-/// The constructor/consumer identities whose *unproven* appearance declines the item's format
-/// commit (v1: "a format-machinery call the pipeline did not prove must not emit generically").
-/// An unproven `String::write_fmt` call stays an ordinary call, exactly as v1 left it.
-fn declines_item(operation: StandardOperation) -> bool {
-    matches!(
-        operation,
-        StandardOperation::FormatArgsNew
-            | StandardOperation::FormatArgumentNewDisplay
-            | StandardOperation::FormatArgumentNewLowerHex
-            | StandardOperation::FormatArgumentNewUpperHex
-            | StandardOperation::FormatArgsToString
-    )
+/// Concatenate static template pieces with already-lowered argument texts.
+pub(crate) fn concat_format_pieces_with_bytes(
+    pieces: &[String],
+    texts: &[Expr],
+    byte_strings: bool,
+) -> Expr {
+    let mut parts = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        if !piece.is_empty() {
+            let lit = if byte_strings {
+                jsast::string(crate::lower::bstr::byte_string(piece))
+            } else {
+                jsast::string(piece)
+            };
+            parts.push(lit);
+        }
+        if let Some(text) = texts.get(index) {
+            parts.push(text.clone());
+        }
+    }
+    parts
+        .into_iter()
+        .reduce(|left, right| jsast::binary(BinOp::Add, left, right))
+        .unwrap_or_else(|| jsast::string(""))
+}
+
+/// Proves the return type is the canonical `Result<(), fmt::Error>` and spells its `Ok` value.
+pub(crate) fn write_ok_expr(
+    table: &TypeTable,
+    interns: &Interns,
+    result: TypeId,
+) -> Result<Expr, SemanticDecline> {
+    let (tag, key) = write_ok_variant(table, interns, result)?;
+    if let Some(expr) = crate::lower::js::value::enum_value(
+        table,
+        interns,
+        result,
+        0,
+        vec![(key.clone(), jsast::undefined())],
+    ) {
+        return Ok(expr);
+    }
+    Ok(jsast::object(vec![
+        ("TAG".to_owned(), jsast::string(&tag)),
+        (key, jsast::undefined()),
+    ]))
+}
+
+fn write_ok_variant(
+    table: &TypeTable,
+    interns: &Interns,
+    result_ty: TypeId,
+) -> Result<(String, String), SemanticDecline> {
+    let result = type_get(table, result_ty)?;
+    let TypeKind::Adt {
+        args,
+        form: crate::jir::types::NominalForm::Enum,
+        variants,
+        ..
+    } = &result.kind
+    else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    if args.len() != 2 || variants.len() != 2 {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let [ok, error] = variants.as_slice() else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    let (Some(ok_tag), Some(error_tag)) = (ok.physical_tag, error.physical_tag) else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    let unit = type_get(table, args[0])?;
+    let fmt_error = type_get(table, args[1])?;
+    let field_tys = |variant: &crate::jir::types::VariantDescriptor| -> Vec<TypeId> {
+        variant.fields.iter().map(|field| field.ty).collect()
+    };
+    if !ok.result_ok
+        || error.result_ok
+        || ok_tag.bits != 0
+        || error_tag.bits != 1
+        || ok_tag.bytes != error_tag.bytes
+        || field_tys(ok) != [args[0]]
+        || field_tys(error) != [args[1]]
+        || !matches!(&unit.kind, TypeKind::Tuple(fields) if fields.is_empty())
+        || !unit.layout.zst
+        || !matches!(
+            &fmt_error.kind,
+            TypeKind::Adt {
+                form: crate::jir::types::NominalForm::Struct,
+                variants,
+                ..
+            } if variants.len() == 1 && variants[0].fields.is_empty()
+        )
+        || !fmt_error.layout.zst
+        || !result.layout.sized
+        || result.layout.zst
+    {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let tag = interns
+        .str(ok.name)
+        .ok_or(SemanticDecline::WrongReturnType)?
+        .to_owned();
+    let key = match ok.fields[0].key {
+        crate::jir::types::FieldKey::Name(id) => interns
+            .str(id)
+            .ok_or(SemanticDecline::WrongReturnType)?
+            .to_owned(),
+        crate::jir::types::FieldKey::Index(index) => format!("_{index}"),
+        crate::jir::types::FieldKey::Transparent => {
+            return Err(SemanticDecline::WrongReturnType);
+        }
+    };
+    Ok((tag, key))
 }
 
 /// Which `core::fmt::rt::Argument::new_*` constructor built a placeholder argument.
@@ -178,7 +283,6 @@ fn required_runtime_helper(
         (ArgFormat::Display, DisplayKind::Integer { .. }) if !spec.is_default() => {
             Some("fmt_int_dec")
         }
-        (ArgFormat::Display, DisplayKind::Str) => Some("native_str_wf"),
         (ArgFormat::LowerHex | ArgFormat::UpperHex, DisplayKind::Integer { signed, bits }) => {
             if can_inline_unsigned_hex(signed, bits, spec) {
                 None
@@ -630,28 +734,12 @@ pub(crate) fn decode_template(bytes: &[u8]) -> Option<(Vec<String>, Vec<Placehol
 
 // -- plan-time recognition ---------------------------------------------------------------------
 
-/// Recognizes every proven format site of `func`. `resolve` answers the exact linked identity of
-/// a direct callee — the callee body's `BodySemantic::Standard` tag — and nothing else.
-///
-/// The decline-whole-item rule: if any identity-proven `format!` machinery call is not part of a
-/// proven site, the whole item's format commit declines (empty `sites`), so no site of it is
-/// ever inlined while an unproven call still reads the constructors.
-pub(crate) fn analyze(
+fn analyze_universal(
     func: &Func,
     table: &TypeTable,
     interns: &Interns,
     resolve: &dyn Fn(&ItemId) -> Option<StandardOperation>,
-) -> Analysis {
-    analyze_with(func, table, interns, resolve, false)
-}
-
-fn analyze_with(
-    func: &Func,
-    table: &TypeTable,
-    interns: &Interns,
-    resolve: &dyn Fn(&ItemId) -> Option<StandardOperation>,
-    allow_partial: bool,
-) -> Analysis {
+) -> Vec<Site> {
     let view = View::new(func, table, interns);
     let uses = use_counts(func);
     let used_once = |v: ValueId| uses.get(&v).copied().unwrap_or(0) == 1;
@@ -683,7 +771,6 @@ fn analyze_with(
     }
 
     let mut sites = Vec::new();
-    let mut proven: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (&position, &(operation, item)) in &machinery {
         let consumer_kind = match operation {
             StandardOperation::FormatArgsToString => 0,
@@ -717,42 +804,13 @@ fn analyze_with(
         };
         site.consumer = position;
         site.callees.insert(item);
-        proven.insert(position);
-        proven.insert(site.new_call);
-        proven.extend(site.display_calls.iter().copied());
         sites.push(site);
     }
-
-    // The decline-whole-item rule (required for B1 carrier planning), plus which machinery items
-    // the committed rewrite may stop referencing: those every identified call to which is proven.
-    let mut call_counts: BTreeMap<ItemId, (u32, u32)> = BTreeMap::new();
-    let mut declined = false;
-    for (position, (operation, item)) in &machinery {
-        let entry = call_counts.entry(*item).or_default();
-        entry.0 += 1;
-        if proven.contains(position) {
-            entry.1 += 1;
-        } else if !allow_partial && declines_item(*operation) {
-            declined = true;
-        }
-    }
-    if declined {
-        return Analysis::default();
-    }
-    // A machinery item mentioned other than by a proven direct call (a function constant, an
-    // intrinsic fallback) keeps its reference and its baseline meaning.
-    let machinery_items: BTreeSet<ItemId> = machinery.values().map(|(_, item)| *item).collect();
-    let named = named_outside_calls(func, &machinery_items);
-    let elidable = call_counts
-        .iter()
-        .filter(|(item, (all, ok))| all == ok && !named.contains(*item))
-        .map(|(item, _)| *item)
-        .collect();
-    Analysis { sites, elidable }
+    sites
 }
 
 /// Marks all proven `format!`/`write!` sites directly for universal `NativeString`
-/// (`heap.native_string_enabled`), independent of B1 `CandidateKind::String` regions.
+/// (`heap.native_string_enabled`).
 ///
 /// Under universal `NativeString` (`js-str=bytes` + `{ s, cap }`), every `String` stays
 /// `Carrier::Baseline` universally and every `&str` is already a UTF-8 byte string. Proven sites
@@ -789,13 +847,13 @@ pub(crate) fn commit_universal_native_string_sites(
         let Some(interns) = link_item.jir.interns() else {
             continue;
         };
-        let analysis = analyze_with(func, &interns.types, interns, &resolve, true);
-        if analysis.sites.is_empty() {
+        let sites = analyze_universal(func, &interns.types, interns, &resolve);
+        if sites.is_empty() {
             continue;
         }
         let mut candidate = func.clone();
         let mut applied_any = false;
-        for site in &analysis.sites {
+        for site in &sites {
             if candidate.values[site.args_value.0 as usize].carrier != Carrier::Baseline {
                 continue;
             }
@@ -806,7 +864,7 @@ pub(crate) fn commit_universal_native_string_sites(
             } = site.kind
             {
                 let res_ty = candidate.values[res.0 as usize].ty;
-                if super::fmt::write_ok_expr(&interns.types, interns, res_ty).is_err() {
+                if write_ok_expr(&interns.types, interns, res_ty).is_err() {
                     continue;
                 }
             }
@@ -848,50 +906,6 @@ fn use_counts(func: &Func) -> BTreeMap<ValueId, u32> {
         }
     }
     uses
-}
-
-/// The machinery items a non-call op names (a function constant): never elidable.
-fn named_outside_calls(func: &Func, machinery: &BTreeSet<ItemId>) -> BTreeSet<ItemId> {
-    fn tree(out: &mut BTreeSet<ItemId>, machinery: &BTreeSet<ItemId>, node: &ConstTree) {
-        match node {
-            ConstTree::Global {
-                target: crate::jir::semantic::GlobalReference::Function { item, .. },
-                ..
-            } if machinery.contains(item) => {
-                out.insert(*item);
-            }
-            ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => {
-                tree(out, machinery, inner)
-            }
-            ConstTree::Aggregate(elements) | ConstTree::Slice(elements) => {
-                for element in elements {
-                    tree(out, machinery, element);
-                }
-            }
-            ConstTree::Variant { fields, .. } => {
-                for field in fields {
-                    tree(out, machinery, field);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut named = BTreeSet::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            match &op.kind {
-                OpKind::Const(node) => tree(&mut named, machinery, node),
-                OpKind::Intrinsic {
-                    fallback: Some(fallback),
-                    ..
-                } if machinery.contains(&fallback.item) => {
-                    named.insert(fallback.item);
-                }
-                _ => {}
-            }
-        }
-    }
-    named
 }
 
 /// Proves one consumer's `Arguments` construction (v1 `native_format_text` +
@@ -1140,9 +1154,11 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
                 return Err(kernel_decline("marked format template arity"));
             }
             let byte_strings = cx.heap().native_string_enabled || crate::lower::bstr::enabled();
-            Ok(Some(Lowered::value(
-                super::fmt::concat_format_pieces_with_bytes(&pieces, &texts, byte_strings),
-            )))
+            Ok(Some(Lowered::value(concat_format_pieces_with_bytes(
+                &pieces,
+                &texts,
+                byte_strings,
+            ))))
         }
         StandardOperation::FormatArgsToString => {
             let [arguments] = args.as_slice() else {
@@ -1154,21 +1170,8 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             let result = op
                 .result
                 .ok_or_else(|| kernel_decline("marked format! has no destination"))?;
-            // Already the text the baseline `String` holds: every piece of it is well formed on
-            // its own (see `display_text`), so the concatenation is too.
             let text = cx.expr_of(*arguments)?;
             match cx.func.values[result.0 as usize].carrier {
-                Carrier::HostString => Ok(Some(Lowered::value(text))),
-                Carrier::StringBuilder => {
-                    // The exact-fit builder: the text measured once, for its length and its
-                    // capacity both.
-                    let (bind, name) = cx.temp(text);
-                    let (bind_len, length) = cx.temp(jsast::rt_call("str_len", vec![name.clone()]));
-                    Ok(Some(Lowered::Value(
-                        vec![bind, bind_len],
-                        super::string::exact_builder(name, length),
-                    )))
-                }
                 Carrier::Baseline if cx.heap().native_string_enabled => {
                     let (bind, name) = cx.temp(text);
                     Ok(Some(Lowered::Value(
@@ -1191,67 +1194,22 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             }
             let walk = cx.pointee_place(*receiver)?;
             let recv = cx.read_place(&walk.place);
-            if cx.heap().native_string_enabled {
-                let text = cx.expr_of(*arguments)?;
-                let stmts = vec![jsast::expr_stmt(jsast::compound_assign(
-                    BinOp::Add,
-                    jsast::member(recv, "s"),
-                    text,
-                ))];
-                return match op.result {
-                    None => Ok(Some(Lowered::Done(stmts))),
-                    Some(result) => {
-                        let ok = super::fmt::write_ok_expr(cx.table, cx.interns, cx.ty_of(result)?)
-                            .map_err(|_| {
-                                kernel_decline(
-                                    "marked write_fmt result is not Result<(), fmt::Error>",
-                                )
-                            })?;
-                        Ok(Some(Lowered::Value(stmts, ok)))
-                    }
-                };
+            if !cx.heap().native_string_enabled {
+                return Err(kernel_decline(
+                    "marked write_fmt requires universal native String",
+                ));
             }
-            // The receiver is a committed StringBuilder behind `&mut` (the plan's gate). The
-            // append is `String::push_str`'s: the formatted text (well formed piece by piece, see
-            // `display_text`), the required length is the cached length plus that text's (the
-            // only text measured), the capacity grows to cover it, and the cached length advances
-            // with the text.
-            // A format site's runtime members are the planner's to account (`representation`),
-            // so the set is only a sink here.
-            let mut helpers = BTreeSet::new();
-            let (bind_text, text) = cx.temp(cx.expr_of(*arguments)?);
-            let (bind_required, required) = cx.temp(jsast::binary(
+            let text = cx.expr_of(*arguments)?;
+            let stmts = vec![jsast::expr_stmt(jsast::compound_assign(
                 BinOp::Add,
-                super::string::builder_len(recv.clone(), &mut helpers),
-                jsast::rt_call("str_len", vec![text.clone()]),
-            ));
-            let mut stmts = vec![
-                bind_text,
-                bind_required,
-                jsast::if_(
-                    jsast::binary(
-                        BinOp::Lt,
-                        jsast::member(recv.clone(), "cap"),
-                        required.clone(),
-                    ),
-                    vec![jsast::assign_stmt(
-                        jsast::member(recv.clone(), "cap"),
-                        required.clone(),
-                    )],
-                ),
-                jsast::expr_stmt(jsast::compound_assign(
-                    BinOp::Add,
-                    jsast::member(recv.clone(), "text"),
-                    text,
-                )),
-                jsast::assign_stmt(jsast::member(recv.clone(), "len"), required),
-            ];
-            stmts.extend(super::string::builder_checked(recv, &mut helpers));
+                jsast::member(recv, "s"),
+                text,
+            ))];
             match op.result {
                 None => Ok(Some(Lowered::Done(stmts))),
                 Some(result) => {
-                    let ok = super::fmt::write_ok_expr(cx.table, cx.interns, cx.ty_of(result)?)
-                        .map_err(|_| {
+                    let ok =
+                        write_ok_expr(cx.table, cx.interns, cx.ty_of(result)?).map_err(|_| {
                             kernel_decline("marked write_fmt result is not Result<(), fmt::Error>")
                         })?;
                     Ok(Some(Lowered::Value(stmts, ok)))
@@ -1414,12 +1372,12 @@ fn format_text(
             }
         }
         // Under `js-str=bytes` / universal `NativeString`, every `&str` is already a well-formed
-        // UTF-8 byte string; in UTF-16 mode wrap in `__rt.native_str_wf` to normalize lone surrogates.
+        // UTF-8 byte string.
         (ArgFormat::Display, DisplayKind::Str) => {
             if byte_strings {
                 loaded
             } else {
-                super::string::well_formed(loaded, &mut BTreeSet::new())
+                return Err(kernel_decline("Str display requires byte-string mode"));
             }
         }
         (ArgFormat::Display, DisplayKind::F64) => match spec.precision {
