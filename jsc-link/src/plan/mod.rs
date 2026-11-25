@@ -18,4 +18,5 @@ pub mod mincut;
 pub mod physical;
 pub mod physical_cost;
 pub mod representation;
+pub mod soa_vec;
 pub mod versions;

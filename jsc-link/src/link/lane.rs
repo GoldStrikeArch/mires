@@ -1131,8 +1131,10 @@ fn run_with_opts(
     let mut plan_retries = 0;
     let mut enum_retries = 0u32;
     let mut ready_allowed = true;
+    let mut soa_allowed = true;
+    let mut active_soa_helpers: Vec<JsName> = Vec::new();
     let mut physical = planned_physical;
-    let (mut lowered, async_plan) = loop {
+    let (mut lowered, async_plan, final_soa_plan) = loop {
         let rewrite_scope = crate::profile::scope("lane.rewrite");
         if abi_applied {
             physical = crate::plan::physical::PhysicalPlan::of(
@@ -1154,10 +1156,33 @@ fn run_with_opts(
         // Phase B2.
         plan.rewrite(&mut funcs, &work_table);
         drop(rewrite_scope);
+        for helper in active_soa_helpers.drain(..) {
+            defined.remove(&helper);
+            live.remove(&helper);
+        }
+        let soa_plan = if soa_allowed && emitting_plans {
+            std::sync::Arc::new(crate::plan::soa_vec::plan(
+                &work_table,
+                &funcs,
+                &repr.bodies,
+                &live,
+                opts,
+                &ctx.heap,
+            ))
+        } else {
+            std::sync::Arc::new(crate::plan::soa_vec::SoaPlan::default())
+        };
+        active_soa_helpers = soa_plan.all_helper_names();
+        for helper in &active_soa_helpers {
+            defined.insert(helper.clone());
+            live.insert(helper.clone());
+        }
         // Phase C.
         let report_probe = (opts.optimizer == crate::opts::OptimizerMode::Report)
             .then_some((&planning_table, &planned_funcs));
         let (lowered, retry) = crate::profile::time("lane.C.lower_all", || {
+            let _soa_guard =
+                crate::plan::soa_vec::enter_active_plan(std::sync::Arc::clone(&soa_plan));
             lower_all(
                 &work_table,
                 &names,
@@ -1167,6 +1192,7 @@ fn run_with_opts(
                 &plan,
                 &repr,
                 &physical,
+                &soa_plan,
                 &defined,
                 &live,
                 fault,
@@ -1205,10 +1231,18 @@ fn run_with_opts(
             || (retry
                 && (!plan.is_empty()
                     || !repr.touched.is_empty()
-                    || !physical.ready_futures.is_empty()))
+                    || !physical.ready_futures.is_empty()
+                    || !soa_plan.is_empty()))
         {
             let _scope = crate::profile::scope("lane.retry");
             ready_allowed = false;
+            if !soa_plan.is_empty() {
+                soa_allowed = false;
+            }
+            for helper in active_soa_helpers.drain(..) {
+                defined.remove(&helper);
+                live.remove(&helper);
+            }
             // BOTH plans are emptied (D1): the retried run rebuilds pristine Funcs and rewrites
             // nothing, so nothing it touched can decline. Each keeps its refusal accounting, so
             // the sidecar still says what was considered on a run that kept none of it.
@@ -1293,7 +1327,7 @@ fn run_with_opts(
             ctx.heap = heap;
             continue;
         }
-        break (lowered, async_plan);
+        break (lowered, async_plan, soa_plan);
     };
 
     // The spill registers the plan needs are items like any other, and they have to be in the
@@ -1506,8 +1540,10 @@ fn run_with_opts(
         .collect();
     let existing: BTreeSet<JsName> = table.keys().cloned().collect();
     let helper_items = crate::lower::js::i64_pair::needed_helper_items(&referenced, &existing);
-    let added_items = added_items || !helper_items.is_empty();
-    for helper in helper_items {
+    let soa_helper_items =
+        crate::lower::js::soa::needed_helper_items(&final_soa_plan, &referenced, &existing);
+    let added_items = added_items || !helper_items.is_empty() || !soa_helper_items.is_empty();
+    for helper in helper_items.into_iter().chain(soa_helper_items) {
         if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(helper.name.clone()) {
             slot.insert(helper);
         }
@@ -2923,11 +2959,17 @@ fn lower_all(
     plan: &AbiPlan,
     repr: &crate::plan::representation::ReprOutcome,
     physical: &crate::plan::physical::PhysicalPlan,
+    soa: &crate::plan::soa_vec::SoaPlan,
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
     fault: Option<&str>,
     bigints: Option<&crate::lower::bigint::BigIntNames>,
 ) -> (Vec<Lowered>, bool) {
+    let _arena_guard = (ctx.opts.optimizer == crate::opts::OptimizerMode::On).then(|| {
+        let facts =
+            crate::analysis::arena::analyze(table, &funcs, &repr.bodies, live, ctx.opts, &ctx.heap);
+        crate::opt::range::enter_program_facts(std::sync::Arc::new(facts))
+    });
     let mut prepared_meta: BTreeMap<JsName, (OptStats, Option<String>)> = BTreeMap::new();
     let ascii = if crate::lower::bstr::enabled() {
         for name in names {
@@ -3106,7 +3148,8 @@ fn lower_all(
                 eprintln!("lane-retry: `{}` declined: {decline:?}", name.as_str());
             }
         }
-        retry |= (touched || !physical.ready_futures.is_empty())
+        let soa_touched = !soa.is_empty() && soa.item_may_touch_soa(item);
+        retry |= (touched || soa_touched || !physical.ready_futures.is_empty())
             && match &result {
                 Err(_) => true,
                 Ok(lowering) => refusal(

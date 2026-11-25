@@ -19,6 +19,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::analysis::arena::{ArenaFieldKind, ProgramBoundsFacts};
+use crate::analysis::heap::is_global_vec_ty;
 use crate::analysis::refs::{self, RefScan};
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
@@ -216,11 +218,86 @@ pub enum BoundsFact {
         /// non-strict (`<=`) requires `offset_index < offset_fact`.
         strict: bool,
     },
+    /// Symbolic bitmask bound: `index` is `x & mask`, where `mask == len - 1` (with `len >= 1`)
+    /// or `mask` is a constant strictly below `len`.
+    Bitmask {
+        /// The `BinaryOp::BitAnd` SSA value producing `index` (up to copy/same-width cast).
+        and_val: ValueId,
+        /// The mask operand of `and_val`.
+        mask_val: ValueId,
+        /// The length operand unified with `length` (either `mask_val = len_val - 1` with
+        /// `len_val >= 1`, or `mask_val < len_val`).
+        len_val: ValueId,
+        /// Optional dominating `(block, cond)` proving `len_val >= 1` when not self-evident from
+        /// `1 << k` or a positive constant / positive lower bound.
+        nonzero_site: Option<(RBlockId, ValueId)>,
+    },
+    /// Whole-program monotone-arena invariant proves `index < length` via [`ProgramBoundsFacts`].
+    MonotoneArena {
+        /// The arena element struct `DefinitionId` (must be certified in `ProgramBoundsFacts`).
+        elem_def: DefinitionId,
+        /// Optional sentinel that must be excluded at `block` by `sentinel_guard`.
+        sentinel: Option<u128>,
+        /// Dominating `(guard_block, guard_cond)` excluding `sentinel`, required when `sentinel`
+        /// is `Some`.
+        sentinel_guard: Option<(RBlockId, ValueId)>,
+        /// Exact provenance kind for independent verification.
+        source: ArenaIndexSource,
+    },
+    /// Local non-escaping bounded-element `Vec` invariant: `index` is `load_val - sub_offset`
+    /// where every element stored into `vec_root` is bounded by `length + sub_offset - 1`.
+    LocalBoundedVec {
+        /// The local `Vec<u32|usize, Global>` storage root (either a `CellId` or an unboxed SSA
+        /// `ValueId` created by a Vec constructor).
+        vec_root: LocalVecRoot,
+        /// The `OpKind::Deref` SSA value that loaded the element from the local `Vec`'s slice.
+        load_val: ValueId,
+        /// Constant subtracted from `load_val` (`0` for `< L`, `1` for `<= L` with `!= 0`, etc.).
+        sub_offset: u128,
+        /// Optional dominating `(guard_block, guard_cond)` ensuring `load_val >= sub_offset` when
+        /// `sub_offset > 0`.
+        guard: Option<(RBlockId, ValueId)>,
+    },
+}
+
+/// Storage root of a local non-escaping `Vec` certified by [`BoundsFact::LocalBoundedVec`].
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LocalVecRoot {
+    Cell(CellId),
+    Value(ValueId),
+}
+
+/// Provenance of an arena index verified by [`BoundsFact::MonotoneArena`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArenaIndexSource {
+    /// Loaded from proven scalar field `field` of `elem_def`.
+    Field(u32),
+    /// Loaded from proven `Vec<Idx>` field `field` of `elem_def`.
+    VecField(u32),
+    /// Entry parameter `idx_param` certified in `ProgramBoundsFacts::param_arena_indices`.
+    Param { idx_param: usize },
+    /// Return value of a direct call certified in `ProgramBoundsFacts::return_arena_index`.
+    CallReturn { callee: ItemId },
+    /// Element loaded from a `Vec` returned by `callee` certified in
+    /// `ProgramBoundsFacts::return_vec_elem_bound`.
+    ReturnVecElem { callee: ItemId },
+    /// Block parameter whose incoming edges carry valid indices of `elem_def`.
+    BlockParam { param: ValueId },
 }
 
 impl Witness {
     /// Re-derives this witness's claim against `func`, independently of the pass that made it.
     pub fn check(&self, func: &Func, table: &TypeTable) -> Result<(), String> {
+        self.check_with_context(func, table, None)
+    }
+
+    /// Re-derives this witness's claim with optional whole-program [`ProgramBoundsFacts`].
+    pub fn check_with_context(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        arena_facts: Option<&ProgramBoundsFacts>,
+    ) -> Result<(), String> {
         match self {
             Self::ConstFold {
                 op,
@@ -244,7 +321,7 @@ impl Witness {
                 index,
                 length,
                 fact,
-            } => check_bounds_removed(func, *block, *index, *length, fact),
+            } => check_bounds_removed(func, table, arena_facts, *block, *index, *length, fact),
             Self::AlignedPrefix {
                 left,
                 right,
@@ -289,9 +366,19 @@ impl Witness {
 
 /// Checks every witness; the first failure names the witness and the reason.
 pub fn check_all(witnesses: &[Witness], func: &Func, table: &TypeTable) -> Result<(), String> {
+    check_all_with_context(witnesses, func, table, None)
+}
+
+/// Checks every witness with optional whole-program [`ProgramBoundsFacts`].
+pub fn check_all_with_context(
+    witnesses: &[Witness],
+    func: &Func,
+    table: &TypeTable,
+    arena_facts: Option<&ProgramBoundsFacts>,
+) -> Result<(), String> {
     for witness in witnesses {
         witness
-            .check(func, table)
+            .check_with_context(func, table, arena_facts)
             .map_err(|why| format!("{witness:?}: {why}"))?;
     }
     Ok(())
@@ -431,6 +518,8 @@ fn check_carriers(func: &Func, table: &TypeTable) -> Result<(), String> {
 /// `BoundsRemoved`: re-runs dominance and the implying fact on the final `Func`.
 fn check_bounds_removed(
     func: &Func,
+    table: &TypeTable,
+    arena_facts: Option<&ProgramBoundsFacts>,
     block: RBlockId,
     index: ValueId,
     length: ValueId,
@@ -442,6 +531,80 @@ fn check_bounds_removed(
     if (index.0 as usize) >= func.values.len() || (length.0 as usize) >= func.values.len() {
         return Err("the assert's operands are gone".to_owned());
     }
+    let cond_present = |cond: ValueId| -> bool {
+        func.blocks.iter().any(|b| {
+            matches!(&b.term, RTerm::Switch { scrut, .. } if *scrut == cond)
+                || b.ops
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::Assert { cond: c, .. } if *c == cond))
+        })
+    };
+    let find_def = |v: ValueId| -> Option<&OpKind> {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .find(|op| op.result == Some(v))
+            .map(|op| &op.kind)
+    };
+    let peel_transparent = |mut v: ValueId| -> ValueId {
+        for _ in 0..8 {
+            match find_def(v) {
+                Some(OpKind::Copy(src) | OpKind::Move(src)) => v = *src,
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: src,
+                    from,
+                    to,
+                }) if matches!(
+                    (table.int_info(*from), table.int_info(*to)),
+                    (Some((false, a)), Some((false, b))) if a == b
+                ) =>
+                {
+                    v = *src;
+                }
+                None => {
+                    let mut rep: Option<ValueId> = None;
+                    let mut same = true;
+                    if let Some(blk) = func.blocks.iter().skip(1).find(|b| b.params.contains(&v)) {
+                        if let Some(pos) = blk.params.iter().position(|&p| p == v) {
+                            for pred in &func.blocks {
+                                for (target, args) in pred.term.edges() {
+                                    if target != blk.id {
+                                        continue;
+                                    }
+                                    let Some(&arg) = args.get(pos) else {
+                                        same = false;
+                                        break;
+                                    };
+                                    if arg == v {
+                                        continue;
+                                    }
+                                    match rep {
+                                        None => rep = Some(arg),
+                                        Some(prev) if prev == arg => {}
+                                        Some(_) => {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if same {
+                        if let Some(r) = rep {
+                            v = r;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        v
+    };
+
     match fact {
         BoundsFact::Numeric {
             index_hi,
@@ -476,19 +639,828 @@ fn check_bounds_removed(
                     fact_block.0, block.0
                 ));
             }
-            let present = func.blocks.iter().any(|b| {
-                matches!(&b.term, RTerm::Switch { scrut, .. } if scrut == cond)
-                    || b.ops
-                        .iter()
-                        .any(|op| matches!(&op.kind, OpKind::Assert { cond: c, .. } if c == cond))
-            });
-            if present {
+            if cond_present(*cond) {
                 Ok(())
             } else {
                 Err(format!("no switch or assert on v{} remains", cond.0))
             }
         }
+        BoundsFact::Bitmask {
+            and_val,
+            mask_val,
+            len_val,
+            nonzero_site,
+        } => {
+            if (and_val.0 as usize) >= func.values.len()
+                || (mask_val.0 as usize) >= func.values.len()
+                || (len_val.0 as usize) >= func.values.len()
+            {
+                return Err("bitmask witness operand is out of range".to_owned());
+            }
+            let p_idx = peel_transparent(index);
+            let p_and = peel_transparent(*and_val);
+            if p_idx != p_and {
+                return Err(format!(
+                    "index v{} does not peel to BitAnd v{}",
+                    index.0, and_val.0
+                ));
+            }
+            let Some(OpKind::Binary {
+                op: BinaryOp::BitAnd,
+                l,
+                r,
+                ty,
+            }) = find_def(p_and)
+            else {
+                return Err(format!("v{} is not a BinaryOp::BitAnd", p_and.0));
+            };
+            if !matches!(table.int_info(*ty), Some((false, _))) {
+                return Err("bitmask BitAnd operand type is not unsigned".to_owned());
+            }
+            let p_mask = peel_transparent(*mask_val);
+            if peel_transparent(*l) != p_mask && peel_transparent(*r) != p_mask {
+                return Err(format!(
+                    "mask v{} is not an operand of BitAnd v{}",
+                    mask_val.0, and_val.0
+                ));
+            }
+            if let Some((nz_blk, nz_cond)) = nonzero_site {
+                let doms = Dominators::of(func);
+                if !dominates(&doms, *nz_blk, block) {
+                    return Err(format!(
+                        "bitmask nonzero block {} does not dominate block {}",
+                        nz_blk.0, block.0
+                    ));
+                }
+                if !cond_present(*nz_cond) {
+                    return Err(format!(
+                        "bitmask nonzero guard v{} is no longer present",
+                        nz_cond.0
+                    ));
+                }
+            }
+            // Verify structural relationship:
+            // 1. `mask_val` is `len_val - 1` (with `len_val` structurally proven `>= 1`) or a
+            //    constant `< len_val`.
+            // 2. `len_val` matches the assert's `length` operand (directly, via Vec allocation /
+            //    `ReturnVecLen`, or via `1 << k` congruence).
+            let p_len = peel_transparent(*len_val);
+            let p_assert_len = peel_transparent(length);
+            let len_matches_assert = p_len == p_assert_len
+                || same_one_shl_term(func, table, p_len, p_assert_len)
+                || assert_len_matches_target(func, table, arena_facts, p_assert_len, p_len);
+            if !len_matches_assert {
+                return Err(format!(
+                    "bitmask len_val v{} does not match assert length v{}",
+                    len_val.0, length.0
+                ));
+            }
+            let len_proven_nonzero = nonzero_site.is_some()
+                || is_one_shl(func, table, p_len)
+                || matches!(
+                    find_def(p_len),
+                    Some(OpKind::Const(ConstTree::Scalar { bits, bytes })) if mask(*bits, *bytes) >= 1
+                )
+                || is_positive_doubling_param(func, table, p_len);
+            let sub_one_match = len_proven_nonzero
+                && match find_def(p_mask) {
+                    Some(OpKind::Binary {
+                        op: BinaryOp::Sub | BinaryOp::SubUnchecked,
+                        l: sub_l,
+                        r: sub_r,
+                        ..
+                    }) => {
+                        let is_one = matches!(
+                            find_def(peel_transparent(*sub_r)),
+                            Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+                        );
+                        if !is_one {
+                            false
+                        } else {
+                            let p_sub_l = peel_transparent(*sub_l);
+                            p_sub_l == p_len
+                                || same_one_shl_term(func, table, p_sub_l, p_len)
+                                || p_sub_l == p_assert_len
+                        }
+                    }
+                    _ => false,
+                };
+            let const_match = match (find_def(p_mask), find_def(p_len)) {
+                (
+                    Some(OpKind::Const(ConstTree::Scalar {
+                        bits: mb,
+                        bytes: mby,
+                    })),
+                    Some(OpKind::Const(ConstTree::Scalar {
+                        bits: lb,
+                        bytes: lby,
+                    })),
+                ) => mask(*mb, *mby) < mask(*lb, *lby),
+                (
+                    Some(OpKind::Const(ConstTree::Scalar { bits: 0, .. })),
+                    Some(OpKind::Binary {
+                        op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+                        l: shl_l,
+                        ..
+                    }),
+                ) => matches!(
+                    find_def(peel_transparent(*shl_l)),
+                    Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+                ),
+                _ => false,
+            };
+            if sub_one_match || const_match {
+                Ok(())
+            } else {
+                Err(format!(
+                    "mask v{} is not structurally proven below nonzero length v{}",
+                    mask_val.0, len_val.0
+                ))
+            }
+        }
+        BoundsFact::MonotoneArena {
+            elem_def,
+            sentinel,
+            sentinel_guard,
+            source,
+        } => {
+            let Some(facts) = arena_facts else {
+                return Err("MonotoneArena witness requires whole-program arena facts".to_owned());
+            };
+            if !matches!(
+                table.int_info(table.peeled(func.values[index.0 as usize].ty)),
+                Some((false, _))
+            ) {
+                return Err("MonotoneArena index is not an unsigned integer".to_owned());
+            }
+            if sentinel.is_some() {
+                let Some((gb, gc)) = sentinel_guard else {
+                    return Err("sentinel-tagged MonotoneArena witness missing guard".to_owned());
+                };
+                let doms = Dominators::of(func);
+                if !dominates(&doms, *gb, block) {
+                    return Err(format!(
+                        "sentinel guard block {} does not dominate block {}",
+                        gb.0, block.0
+                    ));
+                }
+                if !cond_present(*gc) {
+                    return Err(format!(
+                        "sentinel guard condition v{} is no longer present",
+                        gc.0
+                    ));
+                }
+            }
+            match source {
+                ArenaIndexSource::Field(f) => {
+                    let inv = facts
+                        .arenas
+                        .get(elem_def)
+                        .ok_or_else(|| format!("arena {elem_def:?} is not proven"))?;
+                    match inv.fields.get(f) {
+                        Some(ArenaFieldKind::AlwaysValid) => Ok(()),
+                        Some(ArenaFieldKind::ValidOrSentinel { sentinel: s }) => {
+                            if *sentinel == Some(*s) {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "field {f} requires sentinel {s} guard, got {sentinel:?}"
+                                ))
+                            }
+                        }
+                        _ => Err(format!("field {f} is not a proven scalar arena field")),
+                    }
+                }
+                ArenaIndexSource::VecField(f) => {
+                    let inv = facts
+                        .arenas
+                        .get(elem_def)
+                        .ok_or_else(|| format!("arena {elem_def:?} is not proven"))?;
+                    if matches!(inv.fields.get(f), Some(ArenaFieldKind::VecOfValidIndices)) {
+                        Ok(())
+                    } else {
+                        Err(format!("field {f} is not a proven VecOfValidIndices field"))
+                    }
+                }
+                ArenaIndexSource::Param { idx_param } => {
+                    let Some(list) = facts.param_arena_indices.get(&func.item) else {
+                        return Err("function has no certified ParamArenaIndex facts".to_owned());
+                    };
+                    let ok = list.iter().any(|p| {
+                        p.idx_param == *idx_param
+                            && p.elem_def == *elem_def
+                            && (p.sentinel.is_none() || p.sentinel == *sentinel)
+                    });
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "param {idx_param} is not certified for arena {elem_def:?}"
+                        ))
+                    }
+                }
+                ArenaIndexSource::CallReturn { callee } => {
+                    let Some(ret) = facts.return_arena_index.get(callee) else {
+                        return Err(format!(
+                            "callee {callee:?} has no certified ReturnArenaIndex"
+                        ));
+                    };
+                    if ret.elem_def == *elem_def
+                        && (ret.sentinel.is_none() || ret.sentinel == *sentinel)
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "callee {callee:?} return arena summary does not match witness"
+                        ))
+                    }
+                }
+                ArenaIndexSource::ReturnVecElem { callee } => {
+                    if facts.return_vec_elem_bound.contains_key(callee) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "callee {callee:?} has no certified ReturnVecElemBound"
+                        ))
+                    }
+                }
+                ArenaIndexSource::BlockParam { param } => {
+                    if !facts.arenas.contains_key(elem_def) {
+                        return Err(format!("arena {elem_def:?} is not proven"));
+                    }
+                    let is_bparam = func.blocks.iter().skip(1).any(|b| b.params.contains(param));
+                    if is_bparam {
+                        Ok(())
+                    } else {
+                        Err(format!("v{} is not a block parameter", param.0))
+                    }
+                }
+            }
+        }
+        BoundsFact::LocalBoundedVec {
+            vec_root,
+            load_val,
+            sub_offset,
+            guard,
+        } => {
+            match vec_root {
+                LocalVecRoot::Cell(cell) => {
+                    let Some(cdef) = func.cells.get(cell.0 as usize) else {
+                        return Err(format!("local vec cell {} is gone", cell.0));
+                    };
+                    if !is_global_vec_ty(table, cdef.ty) {
+                        return Err(format!("cell {} is not a Vec<T, Global>", cell.0));
+                    }
+                    let has_raw = func.blocks.iter().any(|b| {
+                        b.ops.iter().any(|op| {
+                            matches!(&op.kind, OpKind::RawView { root: Root::Cell(c), .. } if c == cell)
+                        })
+                    });
+                    if has_raw {
+                        return Err(format!("cell {} has an unsafe RawView", cell.0));
+                    }
+                }
+                LocalVecRoot::Value(val) => {
+                    let Some(vdef) = func.values.get(val.0 as usize) else {
+                        return Err(format!("local vec value v{} is gone", val.0));
+                    };
+                    if !is_global_vec_ty(table, vdef.ty) {
+                        return Err(format!("value v{} is not a Vec<T, Global>", val.0));
+                    }
+                    let has_raw = func.blocks.iter().any(|b| {
+                        b.ops.iter().any(|op| {
+                            matches!(&op.kind, OpKind::RawView { root: Root::Value(v), .. } if v == val)
+                        })
+                    });
+                    if has_raw {
+                        return Err(format!("value v{} has an unsafe RawView", val.0));
+                    }
+                }
+            }
+            if (load_val.0 as usize) >= func.values.len() {
+                return Err(format!("load_val v{} is out of range", load_val.0));
+            }
+            let p_load = peel_transparent(*load_val);
+            if !matches!(find_def(p_load), Some(OpKind::Deref(_))) {
+                return Err(format!("load_val v{} is not a Deref load", load_val.0));
+            }
+            let p_idx = peel_transparent(index);
+            if *sub_offset == 0 {
+                if p_idx != p_load {
+                    return Err(format!(
+                        "index v{} does not match load_val v{}",
+                        index.0, load_val.0
+                    ));
+                }
+            } else {
+                let sub_ok = matches!(
+                    find_def(p_idx),
+                    Some(OpKind::Binary {
+                        op: BinaryOp::Sub | BinaryOp::SubUnchecked,
+                        l,
+                        r,
+                        ..
+                    }) if peel_transparent(*l) == p_load
+                        && matches!(
+                            find_def(peel_transparent(*r)),
+                            Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
+                                if mask(*bits, *bytes) == *sub_offset
+                        )
+                );
+                if !sub_ok {
+                    return Err(format!(
+                        "index v{} is not load_val v{} - {sub_offset}",
+                        index.0, load_val.0
+                    ));
+                }
+                let Some((gb, gc)) = guard else {
+                    return Err("LocalBoundedVec with sub_offset > 0 requires guard".to_owned());
+                };
+                let doms = Dominators::of(func);
+                if !dominates(&doms, *gb, block) {
+                    return Err(format!(
+                        "LocalBoundedVec guard block {} does not dominate block {}",
+                        gb.0, block.0
+                    ));
+                }
+                if !cond_present(*gc) {
+                    return Err(format!(
+                        "LocalBoundedVec guard v{} is no longer present",
+                        gc.0
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Checks if `v` is `1 << k` (unsigned shift left of constant 1, always >= 1 in Rust).
+fn is_one_shl(func: &Func, table: &TypeTable, v: ValueId) -> bool {
+    let find_def = |x: ValueId| -> Option<&OpKind> {
+        func.blocks
+            .iter()
+            .flat_map(|blk| &blk.ops)
+            .find(|op| op.result == Some(x))
+            .map(|op| &op.kind)
+    };
+    let peel = |mut x: ValueId| -> ValueId {
+        for _ in 0..8 {
+            match find_def(x) {
+                Some(OpKind::Copy(s) | OpKind::Move(s)) => x = *s,
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: s,
+                    from,
+                    to,
+                }) if matches!(
+                    (table.int_info(*from), table.int_info(*to)),
+                    (Some((false, fa)), Some((false, fb))) if fa == fb
+                ) =>
+                {
+                    x = *s;
+                }
+                None => {
+                    // Peel a block parameter whose every non-self incoming edge carries the same
+                    // value (matching `range.rs::number_values`).
+                    let mut rep: Option<ValueId> = None;
+                    let mut same = true;
+                    if let Some(blk) = func.blocks.iter().skip(1).find(|b| b.params.contains(&x)) {
+                        if let Some(pos) = blk.params.iter().position(|&p| p == x) {
+                            for pred in &func.blocks {
+                                for (target, args) in pred.term.edges() {
+                                    if target != blk.id {
+                                        continue;
+                                    }
+                                    let Some(&arg) = args.get(pos) else {
+                                        same = false;
+                                        break;
+                                    };
+                                    if arg == x {
+                                        continue;
+                                    }
+                                    match rep {
+                                        None => rep = Some(arg),
+                                        Some(prev) if prev == arg => {}
+                                        Some(_) => {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if same {
+                        if let Some(r) = rep {
+                            x = r;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        x
+    };
+    matches!(
+        find_def(peel(v)),
+        Some(OpKind::Binary {
+            op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+            l,
+            ty,
+            ..
+        }) if matches!(table.int_info(*ty), Some((false, _)))
+            && matches!(
+                find_def(peel(*l)),
+                Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+            )
+    )
+}
+
+/// Checks if `v` is a loop parameter initialized to a constant >= 1 whose backedge only shifts
+/// left by 1 (non-overflowing power-of-two doubling loop such as `size = 1; while size < ... { size <<= 1; }`).
+fn is_positive_doubling_param(func: &Func, table: &TypeTable, v: ValueId) -> bool {
+    let find_def = |x: ValueId| -> Option<&OpKind> {
+        func.blocks
+            .iter()
+            .flat_map(|blk| &blk.ops)
+            .find(|op| op.result == Some(x))
+            .map(|op| &op.kind)
+    };
+    let Some(header) = func.blocks.iter().skip(1).find(|b| b.params.contains(&v)) else {
+        return false;
+    };
+    let Some(pos) = header.params.iter().position(|&p| p == v) else {
+        return false;
+    };
+    let mut has_pos_init = false;
+    let mut all_ok = true;
+    for b in &func.blocks {
+        for (target, args) in b.term.edges() {
+            if target != header.id {
+                continue;
+            }
+            let Some(&arg) = args.get(pos) else {
+                return false;
+            };
+            if arg == v {
+                continue;
+            }
+            match find_def(arg) {
+                Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
+                    if mask(*bits, *bytes) >= 1 =>
+                {
+                    has_pos_init = true;
+                }
+                Some(OpKind::Binary {
+                    op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+                    l,
+                    r,
+                    ty,
+                }) if matches!(table.int_info(*ty), Some((false, _)))
+                    && *l == v
+                    && matches!(
+                        find_def(*r),
+                        Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+                    ) => {}
+                _ => {
+                    all_ok = false;
+                }
+            }
+        }
+    }
+    has_pos_init && all_ok
+}
+
+/// Independently verifies that the assert's length operand `assert_len` resolves to `target_len`
+/// through `PtrMetadata`, `VecAsSlice`/`VecAsMutSlice`/`VecLen`, local `Vec` allocation ops
+/// (`NativeVecFromElemZeroed`/`VecFromElem`), or `ProgramBoundsFacts::return_vec_len`.
+fn assert_len_matches_target(
+    func: &Func,
+    table: &TypeTable,
+    arena_facts: Option<&ProgramBoundsFacts>,
+    assert_len: ValueId,
+    target_len: ValueId,
+) -> bool {
+    use crate::analysis::arena::ReturnVecLen;
+    use crate::jir::semantic::StandardOperation;
+    let find_def = |x: ValueId| -> Option<&OpKind> {
+        func.blocks
+            .iter()
+            .flat_map(|blk| &blk.ops)
+            .find(|op| op.result == Some(x))
+            .map(|op| &op.kind)
+    };
+    let peel = |mut x: ValueId| -> ValueId {
+        for _ in 0..8 {
+            match find_def(x) {
+                Some(OpKind::Copy(s) | OpKind::Move(s)) => x = *s,
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: s,
+                    from,
+                    to,
+                }) if matches!(
+                    (table.int_info(*from), table.int_info(*to)),
+                    (Some((false, fa)), Some((false, fb))) if fa == fb
+                ) =>
+                {
+                    x = *s;
+                }
+                None => {
+                    // Peel a block parameter whose every non-self incoming edge carries the same
+                    // value (matching `range.rs::number_values`).
+                    let mut rep: Option<ValueId> = None;
+                    let mut same = true;
+                    if let Some(blk) = func.blocks.iter().skip(1).find(|b| b.params.contains(&x)) {
+                        if let Some(pos) = blk.params.iter().position(|&p| p == x) {
+                            for pred in &func.blocks {
+                                for (target, args) in pred.term.edges() {
+                                    if target != blk.id {
+                                        continue;
+                                    }
+                                    let Some(&arg) = args.get(pos) else {
+                                        same = false;
+                                        break;
+                                    };
+                                    if arg == x {
+                                        continue;
+                                    }
+                                    match rep {
+                                        None => rep = Some(arg),
+                                        Some(prev) if prev == arg => {}
+                                        Some(_) => {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if same {
+                        if let Some(r) = rep {
+                            x = r;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        x
+    };
+    let same_val = |a: ValueId, b: ValueId| -> bool {
+        let pa = peel(a);
+        let pb = peel(b);
+        if pa == pb {
+            return true;
+        }
+        match (find_def(pa), find_def(pb)) {
+            (
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: va,
+                    from: fa,
+                    to: ta,
+                }),
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: vb,
+                    from: fb,
+                    to: tb,
+                }),
+            ) => {
+                peel(*va) == peel(*vb)
+                    && table.int_info(*fa) == table.int_info(*fb)
+                    && table.int_info(*ta) == table.int_info(*tb)
+            }
+            _ => false,
+        }
+    };
+    // Trace `assert_len` back to its underlying `Vec` value or `CellId`.
+    let mut cur = peel(assert_len);
+    for _ in 0..8 {
+        if cur == target_len || same_one_shl_term(func, table, cur, target_len) {
+            return true;
+        }
+        match find_def(cur) {
+            Some(OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v,
+                ..
+            }) => {
+                cur = peel(*v);
+            }
+            Some(OpKind::SliceView { len, .. }) => {
+                cur = peel(*len);
+            }
+            Some(OpKind::BorrowView {
+                root: Root::Value(v),
+                ..
+            }) => {
+                cur = peel(*v);
+            }
+            Some(OpKind::BorrowView {
+                root: Root::Cell(c),
+                path,
+                ..
+            }) if path.is_empty() => {
+                // Find the unique `CellStore` into `*c`.
+                let mut stores = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.ops)
+                    .filter_map(|op| match op.kind {
+                        OpKind::CellStore { cell, v } if cell == *c => Some(v),
+                        _ => None,
+                    });
+                let Some(init_v) = stores.next() else {
+                    return false;
+                };
+                if stores.next().is_some() {
+                    return false;
+                }
+                cur = peel(init_v);
+            }
+            Some(OpKind::CellLoad(c)) => {
+                let mut stores = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.ops)
+                    .filter_map(|op| match op.kind {
+                        OpKind::CellStore { cell, v } if cell == *c => Some(v),
+                        _ => None,
+                    });
+                let Some(init_v) = stores.next() else {
+                    return false;
+                };
+                if stores.next().is_some() {
+                    return false;
+                }
+                cur = peel(init_v);
+            }
+            Some(OpKind::Field { base, .. }) => {
+                cur = peel(*base);
+            }
+            Some(OpKind::Call {
+                callee,
+                semantic,
+                args,
+                ..
+            }) => match semantic {
+                CallSemantic::Standard(
+                    StandardOperation::VecAsSlice
+                    | StandardOperation::NativeVecAsSlice
+                    | StandardOperation::VecAsMutSlice
+                    | StandardOperation::NativeVecAsMutSlice
+                    | StandardOperation::VecLen
+                    | StandardOperation::VecClone,
+                ) if !args.is_empty() => {
+                    cur = peel(args[0]);
+                }
+                CallSemantic::Standard(StandardOperation::NativeVecFromElemZeroed)
+                    if !args.is_empty() =>
+                {
+                    cur = peel(args[0]);
+                }
+                CallSemantic::Standard(StandardOperation::VecFromElem) if args.len() >= 2 => {
+                    cur = peel(args[1]);
+                }
+                CallSemantic::Ordinary => {
+                    let Callee::Direct { item, .. } = callee else {
+                        return false;
+                    };
+                    let Some(summary) = arena_facts.and_then(|f| f.return_vec_len.get(item)) else {
+                        return false;
+                    };
+                    let resolved: &ReturnVecLen = match summary {
+                        ReturnVecLen::CondBoolParam {
+                            cond_param,
+                            when_true,
+                            when_false,
+                        } => {
+                            let Some(&av) = args.get(*cond_param) else {
+                                return false;
+                            };
+                            match find_def(peel(av)) {
+                                Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. })) => {
+                                    when_true.as_ref()
+                                }
+                                Some(OpKind::Const(ConstTree::Scalar { bits: 0, .. })) => {
+                                    when_false.as_ref()
+                                }
+                                _ => return false,
+                            }
+                        }
+                        other => other,
+                    };
+                    match resolved {
+                        ReturnVecLen::Param(k) => {
+                            if let Some(&ak) = args.get(*k) {
+                                cur = peel(ak);
+                            } else {
+                                return false;
+                            }
+                        }
+                        ReturnVecLen::OneShlParam { shift_param, .. } => {
+                            let Some(&ak) = args.get(*shift_param) else {
+                                return false;
+                            };
+                            let shift_p = peel(ak);
+                            return match find_def(target_len) {
+                                Some(OpKind::Binary {
+                                    op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+                                    l,
+                                    r,
+                                    ..
+                                }) => {
+                                    matches!(
+                                        find_def(peel(*l)),
+                                        Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+                                    ) && same_val(*r, shift_p)
+                                }
+                                _ => false,
+                            };
+                        }
+                        ReturnVecLen::Const(c) => {
+                            return matches!(
+                                find_def(target_len),
+                                Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
+                                    if mask(*bits, *bytes) == *c
+                            );
+                        }
+                        ReturnVecLen::ParamSliceLen(k) => {
+                            if let Some(&ak) = args.get(*k) {
+                                cur = peel(ak);
+                            } else {
+                                return false;
+                            }
+                        }
+                        ReturnVecLen::CondBoolParam { .. } => return false,
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    cur == target_len || same_one_shl_term(func, table, cur, target_len)
+}
+
+/// Checks if `a` and `b` both denote `1 << k` with the same peeled shift operand `k`.
+fn same_one_shl_term(func: &Func, table: &TypeTable, a: ValueId, b: ValueId) -> bool {
+    let find_def = |v: ValueId| -> Option<&OpKind> {
+        func.blocks
+            .iter()
+            .flat_map(|blk| &blk.ops)
+            .find(|op| op.result == Some(v))
+            .map(|op| &op.kind)
+    };
+    let peel = |mut v: ValueId| -> ValueId {
+        for _ in 0..8 {
+            match find_def(v) {
+                Some(OpKind::Copy(s) | OpKind::Move(s)) => v = *s,
+                Some(OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    v: s,
+                    from,
+                    to,
+                }) if matches!(
+                    (table.int_info(*from), table.int_info(*to)),
+                    (Some((false, fa)), Some((false, fb))) if fa == fb
+                ) =>
+                {
+                    v = *s;
+                }
+                _ => break,
+            }
+        }
+        v
+    };
+    let one_shl_arg = |v: ValueId| -> Option<ValueId> {
+        let OpKind::Binary {
+            op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+            l,
+            r,
+            ..
+        } = find_def(peel(v))?
+        else {
+            return None;
+        };
+        if matches!(
+            find_def(peel(*l)),
+            Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+        ) {
+            Some(peel(*r))
+        } else {
+            None
+        }
+    };
+    matches!((one_shl_arg(a), one_shl_arg(b)), (Some(ka), Some(kb)) if ka == kb)
 }
 
 /// Independently checks the one modular-arithmetic identity the range pass folds.
@@ -2339,5 +3311,173 @@ mod tests {
                 "witness allowlist missing `{sym}`"
             );
         }
+    }
+
+    #[test]
+    fn bitmask_monotone_arena_and_local_bounded_vec_witnesses_fail_closed() {
+        use crate::analysis::arena::{ArenaFieldKind, ArenaInvariant, ProgramBoundsFacts};
+
+        let mut tbl = TypeTable::new();
+        const U32: TypeId = TypeId(100);
+        tbl.insert(TypeDescriptor {
+            id: U32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                zst: false,
+                needs_drop: false,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: U32,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 55,
+            },
+            instantiation: 0,
+        };
+        let mut b = FuncBuilder::new(
+            item,
+            Signature {
+                abi: AbiSignature::default(),
+                arguments: vec![U32, U32],
+                result: U32,
+            },
+        );
+        let x = b.param(U32, OriginId(0));
+        let len = b.param(U32, OriginId(0));
+        let one = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            U32,
+            OriginId(0),
+        );
+        let mask = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Sub,
+                l: len,
+                r: one,
+                ty: U32,
+            },
+            U32,
+            OriginId(0),
+        );
+        let masked = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::BitAnd,
+                l: x,
+                r: mask,
+                ty: U32,
+            },
+            U32,
+            OriginId(0),
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(masked)));
+        let func = b.finish();
+
+        // 1. Bitmask with possibly-zero `len` and `nonzero_site: None` MUST fail closed.
+        let bad_bitmask = [Witness::BoundsRemoved {
+            block: FuncBuilder::ENTRY,
+            index: masked,
+            length: len,
+            fact: BoundsFact::Bitmask {
+                and_val: masked,
+                mask_val: mask,
+                len_val: len,
+                nonzero_site: None,
+            },
+        }];
+        assert!(check_all_with_context(&bad_bitmask, &func, &tbl, None).is_err());
+
+        // 2. MonotoneArena without whole-program facts MUST fail closed.
+        let node_def = DefinitionId {
+            crate_id: 7,
+            local_hash: 99,
+        };
+        let arena_w = [Witness::BoundsRemoved {
+            block: FuncBuilder::ENTRY,
+            index: x,
+            length: len,
+            fact: BoundsFact::MonotoneArena {
+                elem_def: node_def,
+                sentinel: None,
+                sentinel_guard: None,
+                source: ArenaIndexSource::Field(0),
+            },
+        }];
+        assert!(check_all_with_context(&arena_w, &func, &tbl, None).is_err());
+
+        // 3. MonotoneArena ValidOrSentinel without sentinel/guard MUST fail closed.
+        let mut facts = ProgramBoundsFacts::default();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            0,
+            ArenaFieldKind::ValidOrSentinel {
+                sentinel: u32::MAX as u128,
+            },
+        );
+        facts.arenas.insert(
+            node_def,
+            ArenaInvariant {
+                elem_def: node_def,
+                fields,
+                holder_fields: BTreeSet::new(),
+            },
+        );
+        assert!(check_all_with_context(&arena_w, &func, &tbl, Some(&facts)).is_err());
+        let arena_missing_guard = [Witness::BoundsRemoved {
+            block: FuncBuilder::ENTRY,
+            index: x,
+            length: len,
+            fact: BoundsFact::MonotoneArena {
+                elem_def: node_def,
+                sentinel: Some(u32::MAX as u128),
+                sentinel_guard: None,
+                source: ArenaIndexSource::Field(0),
+            },
+        }];
+        assert!(check_all_with_context(&arena_missing_guard, &func, &tbl, Some(&facts)).is_err());
+
+        // 4. LocalBoundedVec with non-Vec root / missing guard MUST fail closed.
+        let bad_local_vec = [Witness::BoundsRemoved {
+            block: FuncBuilder::ENTRY,
+            index: x,
+            length: len,
+            fact: BoundsFact::LocalBoundedVec {
+                vec_root: LocalVecRoot::Value(x),
+                load_val: x,
+                sub_offset: 1,
+                guard: None,
+            },
+        }];
+        assert!(check_all_with_context(&bad_local_vec, &func, &tbl, None).is_err());
     }
 }

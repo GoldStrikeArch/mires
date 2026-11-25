@@ -348,16 +348,30 @@ pub fn recursive_product_keys(
     interns: &Interns,
     shape: &RecursiveShape,
 ) -> Option<Vec<String>> {
-    let ProductNode::Product { ty, fields } = &shape.root else {
-        return None;
-    };
-    let mut keys = Vec::with_capacity(shape.fields() as usize);
-    for (field, node) in fields.iter().enumerate() {
-        let key = product_field_key(table, *ty, field as u32)?;
-        let key = field_key_name(interns, key)?;
-        keys.extend(std::iter::repeat_n(key, node.fields() as usize));
+    match &shape.root {
+        ProductNode::Leaf { components, .. } => {
+            let mut keys = Vec::with_capacity(components.len());
+            for component in components {
+                keys.push(match component {
+                    LaneComponent::Buffer => rcgjs_object::ptr::BUF.to_owned(),
+                    LaneComponent::Offset => rcgjs_object::ptr::OFF.to_owned(),
+                    LaneComponent::Length => rcgjs_object::ptr::LEN.to_owned(),
+                    LaneComponent::Value => return None,
+                });
+            }
+            Some(keys)
+        }
+        ProductNode::Product { ty, fields } => {
+            let mut keys = Vec::with_capacity(shape.fields() as usize);
+            for (field, node) in fields.iter().enumerate() {
+                let key = product_field_key(table, *ty, field as u32)?;
+                let key = field_key_name(interns, key)?;
+                keys.extend(std::iter::repeat_n(key, node.fields() as usize));
+            }
+            Some(keys)
+        }
+        ProductNode::Zst { .. } => None,
     }
-    Some(keys)
 }
 
 /// A canonical recursive product projected to its physical leaf lanes.
@@ -430,16 +444,21 @@ fn rebuild_product_node(
 ) -> Option<Expr> {
     match node {
         ProductNode::Zst { .. } => Some(jsast::undefined()),
-        ProductNode::Leaf { components, .. } => match components.as_slice() {
-            [LaneComponent::Value] => lanes.next(),
-            [LaneComponent::Buffer, LaneComponent::Offset] => {
-                Some(rcgjs_object::ptr::slot(lanes.next()?, lanes.next()?))
+        ProductNode::Leaf { components, .. } => {
+            match components.as_slice() {
+                [LaneComponent::Value] => lanes.next(),
+                [LaneComponent::Buffer, LaneComponent::Offset] => {
+                    Some(rcgjs_object::ptr::slot(lanes.next()?, lanes.next()?))
+                }
+                [LaneComponent::Buffer, LaneComponent::Offset, LaneComponent::Length] => Some(
+                    rcgjs_object::ptr::fat_slice(lanes.next()?, lanes.next()?, lanes.next()?),
+                ),
+                [LaneComponent::Buffer, LaneComponent::Length] => Some(
+                    rcgjs_object::ptr::fat_slice(lanes.next()?, jsast::num(0), lanes.next()?),
+                ),
+                _ => None,
             }
-            [LaneComponent::Buffer, LaneComponent::Offset, LaneComponent::Length] => Some(
-                rcgjs_object::ptr::fat_slice(lanes.next()?, lanes.next()?, lanes.next()?),
-            ),
-            _ => None,
-        },
+        }
         ProductNode::Product { ty, fields } => {
             let values = fields
                 .iter()

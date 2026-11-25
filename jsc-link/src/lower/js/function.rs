@@ -104,6 +104,8 @@ pub fn lower_with_ascii(
     // The parameter list (`base.rs::params`): `Func.params` in order — one per MIR argument, a
     // splatted tuple already as its arity, the caller `Location` last when the body tracks it.
     let slice_positions = physical.map_or_else(Vec::new, |sig| sig.slice_jir_positions());
+    let off_zero_slice_positions =
+        physical.map_or_else(Vec::new, |sig| sig.off_zero_slice_jir_positions());
     let byte_str_positions = physical.map_or_else(Vec::new, |sig| sig.byte_str_jir_positions());
     let tagged_positions = physical.map_or_else(Vec::new, |sig| sig.tagged_jir_positions());
     let recursive_positions = physical.map_or_else(Vec::new, |sig| sig.recursive_jir_positions());
@@ -153,7 +155,16 @@ pub fn lower_with_ascii(
             || byte_str_positions.iter().any(|&(pos, mode)| {
                 pos == position && mode == crate::plan::abi_flat::ByteStrParam::Sub
             });
-        if slice {
+        if off_zero_slice_positions.contains(&position) {
+            let buf = format!("{name}$buf");
+            let len = format!("{name}$len");
+            params.extend([buf.clone(), len.clone()]);
+            logical_param_names.push(name.to_owned());
+            cx.bind_expr(
+                *param,
+                ptr::fat_slice(jsast::id(buf), jsast::num(0), jsast::id(len)),
+            );
+        } else if slice {
             let buf = format!("{name}$buf");
             let off = format!("{name}$off");
             let len = format!("{name}$len");
@@ -370,6 +381,7 @@ pub fn lower_with_ascii(
         collapse_ephemeral_rt_box_deref(&mut body, &uninit_locals);
         eliminate_dead_local_writes(&mut body, &local_names);
         fuse_local_bytes_str_with(&mut body, &uninit_locals, cx.needs_byte_slice_ref());
+        fold_zero_offset_arith(&mut body, &uninit_locals);
         fold_offset_slot_derefs(&mut body, &uninit_locals);
         eliminate_dead_local_writes(&mut body, &local_names);
         fold_sfp_deref_only(&mut body, &uninit_locals);
@@ -684,6 +696,7 @@ fn finish(
                     _ => break,
                 }
             }
+            fold_zero_offset_arith(body, &uninit_locals);
             fold_offset_slot_derefs(body, &uninit_locals);
             eliminate_dead_local_writes(body, &local_names);
             fold_sfp_deref_only(body, &uninit_locals);
@@ -697,19 +710,30 @@ fn finish(
             );
             if let Stmt::FunctionDecl { params, body, .. } = &mut decl {
                 let mut local_names: HashSet<String> = params.iter().cloned().collect();
+                let mut uninit_locals: HashSet<String> = HashSet::new();
                 for stmt in body.iter() {
                     match stmt {
-                        Stmt::Let(n, _) | Stmt::Const(n, _) => {
+                        Stmt::Let(n, init) => {
+                            local_names.insert(n.clone());
+                            if init.is_none() {
+                                uninit_locals.insert(n.clone());
+                            }
+                        }
+                        Stmt::Const(n, _) => {
                             local_names.insert(n.clone());
                         }
                         Stmt::Lets(decls) => {
-                            for (n, _) in decls {
+                            for (n, init) in decls {
                                 local_names.insert(n.clone());
+                                if init.is_none() {
+                                    uninit_locals.insert(n.clone());
+                                }
                             }
                         }
                         _ => break,
                     }
                 }
+                fold_zero_offset_arith(body, &uninit_locals);
                 eliminate_dead_local_writes(body, &local_names);
             }
         }
@@ -2680,6 +2704,406 @@ fn unbox_single_slot_array_locals(body: &mut [Stmt], declarations: &mut [(String
             *init = None;
         }
     }
+}
+
+/// Simplifies zero-offset index arithmetic (`arr[0 + idx]` / `arr[idx + 0]` -> `arr[idx]`) and
+/// slot/slice literals (`{ buf: arr, off: 0 + idx [, len: n] }`) when `idx` is a proven non-string
+/// numeric offset expression, and propagates dominated single-assignment `+0` local variables
+/// (such as `v$buf = vec.buf, v$off = 0, v$len = vec.len; ... v$buf[v$off + i]`) to literal `0`.
+///
+/// Running this before `fold_offset_slot_derefs` and `cse_slice_loads` exposes `{ buf: arr, off: i }`
+/// slot derefs and `arr[i].prop` repeated slice loads for zero-offset specialized slice parameters
+/// (`off === 0`) and intra-procedural `Vec::as_slice` / `Vec::as_mut_slice` views.
+pub(super) fn fold_zero_offset_arith(body: &mut [Stmt], uninit_locals: &HashSet<String>) {
+    fn is_pos_zero(expr: &Expr) -> bool {
+        match expr {
+            Expr::Num(n) => *n == 0.0 && !n.is_sign_negative(),
+            Expr::RawNum(s) => s == "0",
+            _ => false,
+        }
+    }
+
+    #[derive(Default)]
+    struct ZeroWriteInfo {
+        writes: usize,
+        zero_writes: usize,
+        disqualified: bool,
+    }
+
+    fn scan_writes_expr(
+        expr: &Expr,
+        locals: &HashSet<String>,
+        in_closure: bool,
+        info: &mut HashMap<String, ZeroWriteInfo>,
+    ) {
+        match expr {
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Ident(name) = lhs.as_ref() {
+                    if locals.contains(name) {
+                        let e = info.entry(name.clone()).or_default();
+                        e.writes += 1;
+                        if in_closure {
+                            e.disqualified = true;
+                        } else if is_pos_zero(rhs) {
+                            e.zero_writes += 1;
+                        }
+                    }
+                } else {
+                    scan_writes_expr(lhs, locals, in_closure, info);
+                }
+                scan_writes_expr(rhs, locals, in_closure, info);
+            }
+            Expr::CompoundAssign(_, lhs, rhs) => {
+                if let Expr::Ident(name) = lhs.as_ref() {
+                    if locals.contains(name) {
+                        let e = info.entry(name.clone()).or_default();
+                        e.writes += 1;
+                        e.disqualified = true;
+                    }
+                } else {
+                    scan_writes_expr(lhs, locals, in_closure, info);
+                }
+                scan_writes_expr(rhs, locals, in_closure, info);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => scan_writes_expr(o, locals, in_closure, info),
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                scan_writes_expr(a, locals, in_closure, info);
+                scan_writes_expr(b, locals, in_closure, info);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_writes_expr(c, locals, in_closure, info);
+                for a in args {
+                    scan_writes_expr(a, locals, in_closure, info);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                scan_writes_expr(c, locals, in_closure, info);
+                scan_writes_expr(t, locals, in_closure, info);
+                scan_writes_expr(e, locals, in_closure, info);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_writes_expr(v, locals, in_closure, info);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    scan_writes_expr(item, locals, in_closure, info);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => scan_writes_expr(b, locals, true, info),
+            Expr::Arrow(_, ArrowBody::Block(stmts)) => scan_writes_stmts(stmts, locals, true, info),
+            _ => {}
+        }
+    }
+
+    fn scan_writes_stmts(
+        stmts: &[Stmt],
+        locals: &HashSet<String>,
+        in_closure: bool,
+        info: &mut HashMap<String, ZeroWriteInfo>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    scan_writes_expr(e, locals, in_closure, info);
+                }
+                Stmt::Const(name, e) => {
+                    if locals.contains(name) {
+                        info.entry(name.clone()).or_default().disqualified = true;
+                    }
+                    scan_writes_expr(e, locals, in_closure, info);
+                }
+                Stmt::Let(name, Some(e)) => {
+                    if locals.contains(name) {
+                        let entry = info.entry(name.clone()).or_default();
+                        entry.writes += 1;
+                        if in_closure {
+                            entry.disqualified = true;
+                        } else if is_pos_zero(e) {
+                            entry.zero_writes += 1;
+                        }
+                    }
+                    scan_writes_expr(e, locals, in_closure, info);
+                }
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(e) = init {
+                            if locals.contains(name) {
+                                let entry = info.entry(name.clone()).or_default();
+                                entry.writes += 1;
+                                if in_closure {
+                                    entry.disqualified = true;
+                                } else if is_pos_zero(e) {
+                                    entry.zero_writes += 1;
+                                }
+                            }
+                            scan_writes_expr(e, locals, in_closure, info);
+                        }
+                    }
+                }
+                Stmt::If(test, then_b, else_b) => {
+                    scan_writes_expr(test, locals, in_closure, info);
+                    scan_writes_stmts(then_b, locals, in_closure, info);
+                    if let Some(els) = else_b {
+                        scan_writes_stmts(els, locals, in_closure, info);
+                    }
+                }
+                Stmt::Switch(disc, cases) => {
+                    scan_writes_expr(disc, locals, in_closure, info);
+                    for case in cases {
+                        for t in &case.tests {
+                            scan_writes_expr(t, locals, in_closure, info);
+                        }
+                        scan_writes_stmts(&case.body, locals, in_closure, info);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_writes_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        locals,
+                        in_closure,
+                        info,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    scan_writes_stmts(b, locals, in_closure, info);
+                }
+                Stmt::FunctionDecl { body: b, .. } => {
+                    scan_writes_stmts(b, locals, true, info);
+                }
+                Stmt::While(test, b) => {
+                    scan_writes_expr(test, locals, in_closure, info);
+                    scan_writes_stmts(b, locals, in_closure, info);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    scan_writes_stmts(body, locals, in_closure, info);
+                    scan_writes_stmts(handler, locals, in_closure, info);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_numeric_offset_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Num(n) => n.is_finite() && !(*n == 0.0 && n.is_sign_negative()),
+            Expr::RawNum(_) | Expr::Ident(_) | Expr::Member(_, _) | Expr::Index(_, _) => true,
+            Expr::Unary(jsast::UnOp::BitNot, inner) => is_numeric_offset_expr(inner),
+            Expr::Unary(jsast::UnOp::Neg, inner) => {
+                !is_pos_zero(inner) && is_numeric_offset_expr(inner)
+            }
+            Expr::Binary(
+                jsast::BinOp::Add
+                | jsast::BinOp::Sub
+                | jsast::BinOp::Mul
+                | jsast::BinOp::Div
+                | jsast::BinOp::Rem
+                | jsast::BinOp::BitAnd
+                | jsast::BinOp::BitOr
+                | jsast::BinOp::BitXor
+                | jsast::BinOp::Shl
+                | jsast::BinOp::Shr
+                | jsast::BinOp::UShr,
+                l,
+                r,
+            ) => is_numeric_offset_expr(l) && is_numeric_offset_expr(r),
+            Expr::Cond(_, t, e) => is_numeric_offset_expr(t) && is_numeric_offset_expr(e),
+            Expr::Call(callee, args) => matches!(
+                callee.as_ref(),
+                Expr::Member(obj, prop)
+                    if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                        && ((prop == "imul" && args.len() == 2)
+                            || (prop == "clz32" && args.len() == 1))
+            ),
+            _ => false,
+        }
+    }
+
+    fn simplify_offset(expr: &mut Expr) {
+        if let Expr::Binary(jsast::BinOp::Add, l, r) = expr {
+            if is_pos_zero(l) && is_numeric_offset_expr(r) {
+                *expr = (**r).clone();
+            } else if is_pos_zero(r) && is_numeric_offset_expr(l) {
+                *expr = (**l).clone();
+            }
+        }
+    }
+
+    fn visit_expr(expr: &mut Expr, active_zeros: &HashSet<String>) {
+        if let Expr::Ident(name) = expr {
+            if active_zeros.contains(name) {
+                *expr = jsast::num(0.0);
+            }
+            return;
+        }
+        match expr {
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => visit_expr(obj, active_zeros),
+            Expr::Index(arr, idx) => {
+                visit_expr(arr, active_zeros);
+                visit_expr(idx, active_zeros);
+                simplify_offset(idx);
+            }
+            Expr::Call(callee, args) | Expr::New(callee, args) => {
+                visit_expr(callee, active_zeros);
+                for arg in args {
+                    visit_expr(arg, active_zeros);
+                }
+            }
+            Expr::Binary(_, l, r) => {
+                visit_expr(l, active_zeros);
+                visit_expr(r, active_zeros);
+            }
+            Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+                if !matches!(lhs.as_ref(), Expr::Ident(_)) {
+                    visit_expr(lhs, active_zeros);
+                }
+                visit_expr(rhs, active_zeros);
+            }
+            Expr::Cond(c, t, e) => {
+                visit_expr(c, active_zeros);
+                visit_expr(t, active_zeros);
+                visit_expr(e, active_zeros);
+            }
+            Expr::Object(entries) => {
+                for (_, val) in entries.iter_mut() {
+                    visit_expr(val, active_zeros);
+                }
+                let is_slot_or_slice =
+                    (entries.len() == 2 && entries[0].0 == "buf" && entries[1].0 == "off")
+                        || (entries.len() == 3
+                            && entries[0].0 == "buf"
+                            && entries[1].0 == "off"
+                            && entries[2].0 == "len");
+                if is_slot_or_slice {
+                    simplify_offset(&mut entries[1].1);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    visit_expr(item, active_zeros);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => visit_expr(b, &HashSet::new()),
+            Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+                let mut empty = HashSet::new();
+                visit_stmts(stmts, &HashSet::new(), &mut empty);
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_seq_stmt_expr(
+        expr: &mut Expr,
+        zero_candidates: &HashSet<String>,
+        active_zeros: &mut HashSet<String>,
+    ) {
+        if let Expr::Seq(items) = expr {
+            for item in items.iter_mut() {
+                visit_seq_stmt_expr(item, zero_candidates, active_zeros);
+            }
+            return;
+        }
+        visit_expr(expr, active_zeros);
+        if let Expr::Assign(lhs, rhs) = expr {
+            if let Expr::Ident(name) = lhs.as_ref() {
+                if zero_candidates.contains(name) && is_pos_zero(rhs) {
+                    active_zeros.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    fn visit_stmts(
+        stmts: &mut [Stmt],
+        zero_candidates: &HashSet<String>,
+        active_zeros: &mut HashSet<String>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e) => visit_seq_stmt_expr(e, zero_candidates, active_zeros),
+                Stmt::Throw(e) | Stmt::Const(_, e) | Stmt::Return(Some(e)) => {
+                    visit_expr(e, active_zeros);
+                }
+                Stmt::Let(name, Some(e)) => {
+                    visit_expr(e, active_zeros);
+                    if zero_candidates.contains(name) && is_pos_zero(e) {
+                        active_zeros.insert(name.clone());
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(e) = init {
+                            visit_expr(e, active_zeros);
+                            if zero_candidates.contains(name) && is_pos_zero(e) {
+                                active_zeros.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+                Stmt::If(test, then_b, else_b) => {
+                    visit_expr(test, active_zeros);
+                    let mut then_z = active_zeros.clone();
+                    visit_stmts(then_b, zero_candidates, &mut then_z);
+                    if let Some(els) = else_b {
+                        let mut else_z = active_zeros.clone();
+                        visit_stmts(els, zero_candidates, &mut else_z);
+                    }
+                }
+                Stmt::Switch(disc, cases) => {
+                    visit_expr(disc, active_zeros);
+                    for case in cases {
+                        for t in &mut case.tests {
+                            visit_expr(t, active_zeros);
+                        }
+                        let mut case_z = active_zeros.clone();
+                        visit_stmts(&mut case.body, zero_candidates, &mut case_z);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    let mut inner_z = active_zeros.clone();
+                    visit_stmts(
+                        std::slice::from_mut(inner.as_mut()),
+                        zero_candidates,
+                        &mut inner_z,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    let mut sub_z = active_zeros.clone();
+                    visit_stmts(b, zero_candidates, &mut sub_z);
+                }
+                Stmt::FunctionDecl { body: b, .. } => {
+                    let mut empty = HashSet::new();
+                    visit_stmts(b, &HashSet::new(), &mut empty);
+                }
+                Stmt::While(test, b) => {
+                    visit_expr(test, active_zeros);
+                    let mut sub_z = active_zeros.clone();
+                    visit_stmts(b, zero_candidates, &mut sub_z);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    let mut body_z = active_zeros.clone();
+                    visit_stmts(body, zero_candidates, &mut body_z);
+                    let mut handler_z = active_zeros.clone();
+                    visit_stmts(handler, zero_candidates, &mut handler_z);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let zero_candidates: HashSet<String> = if uninit_locals.is_empty() {
+        HashSet::new()
+    } else {
+        let mut info: HashMap<String, ZeroWriteInfo> = HashMap::new();
+        scan_writes_stmts(body, uninit_locals, false, &mut info);
+        info.into_iter()
+            .filter(|(_, w)| w.writes == 1 && w.zero_writes == 1 && !w.disqualified)
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let mut active_zeros = HashSet::new();
+    visit_stmts(body, &zero_candidates, &mut active_zeros);
 }
 
 /// Folds single-assignment local slot objects (`v = idx === 0 ? base : { buf: base.buf, off:
@@ -5338,5 +5762,119 @@ mod tests {
             printed.contains("__rt.box(other)"),
             "multi-use boxed slot must stay intact:\n{printed}"
         );
+    }
+
+    #[test]
+    fn fold_zero_offset_arith_simplifies_indexes_and_slot_literals() {
+        let mut body = vec![
+            // Single-assignment zero offset local inside a slice unpack sequence:
+            // `buf = v.buf, off = 0, len = v.len; loop { w = buf[off + i]; }`
+            Stmt::ExprStmt(Expr::Seq(vec![
+                Expr::Assign(
+                    Box::new(jsast::id("buf")),
+                    Box::new(jsast::member(jsast::id("v"), "buf")),
+                ),
+                Expr::Assign(Box::new(jsast::id("off")), Box::new(jsast::num(0.0))),
+                Expr::Assign(
+                    Box::new(jsast::id("len")),
+                    Box::new(jsast::member(jsast::id("v"), "len")),
+                ),
+            ])),
+            Stmt::LoopForever(
+                None,
+                vec![jsast::assign_stmt(
+                    jsast::id("w"),
+                    jsast::index(
+                        jsast::id("buf"),
+                        jsast::binary(jsast::BinOp::Add, jsast::id("off"), jsast::id("i")),
+                    ),
+                )],
+            ),
+            // Reassigned local `mut_off` MUST NOT fold.
+            jsast::assign_stmt(jsast::id("mut_off"), jsast::num(0.0)),
+            jsast::assign_stmt(jsast::id("mut_off"), jsast::num(2.0)),
+            jsast::assign_stmt(
+                jsast::id("m"),
+                jsast::index(
+                    jsast::id("buf"),
+                    jsast::binary(jsast::BinOp::Add, jsast::id("mut_off"), jsast::id("i")),
+                ),
+            ),
+            // Branch-only `branch_off = 0` MUST NOT leak out of the branch.
+            Stmt::If(
+                jsast::id("cond"),
+                vec![jsast::assign_stmt(jsast::id("branch_off"), jsast::num(0.0))],
+                None,
+            ),
+            jsast::assign_stmt(
+                jsast::id("b"),
+                jsast::index(
+                    jsast::id("buf"),
+                    jsast::binary(jsast::BinOp::Add, jsast::id("branch_off"), jsast::id("i")),
+                ),
+            ),
+            // `x = a[0 + i];` -> `x = a[i];`
+            jsast::assign_stmt(
+                jsast::id("x"),
+                jsast::index(
+                    jsast::id("a"),
+                    jsast::binary(jsast::BinOp::Add, jsast::num(0.0), jsast::id("i")),
+                ),
+            ),
+            // `y = a[0 + idx[k]];` -> `y = a[idx[k]];`
+            jsast::assign_stmt(
+                jsast::id("y"),
+                jsast::index(
+                    jsast::id("a"),
+                    jsast::binary(
+                        jsast::BinOp::Add,
+                        jsast::num(0.0),
+                        jsast::index(jsast::id("idx"), jsast::id("k")),
+                    ),
+                ),
+            ),
+            // `p = { buf: a, off: 0 + i };` -> `p = { buf: a, off: i };`
+            jsast::assign_stmt(
+                jsast::id("p"),
+                jsast::object_of(vec![
+                    ("buf", jsast::id("a")),
+                    (
+                        "off",
+                        jsast::binary(jsast::BinOp::Add, jsast::num(0.0), jsast::id("i")),
+                    ),
+                ]),
+            ),
+            // `z = 0 + s;` MUST NOT fold (could be string concatenation outside index/slot).
+            jsast::assign_stmt(
+                jsast::id("z"),
+                jsast::binary(jsast::BinOp::Add, jsast::num(0.0), jsast::id("s")),
+            ),
+        ];
+        let uninit: HashSet<String> = [
+            "buf",
+            "off",
+            "len",
+            "mut_off",
+            "branch_off",
+            "w",
+            "m",
+            "b",
+            "x",
+            "y",
+            "p",
+            "z",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        fold_zero_offset_arith(&mut body, &uninit);
+        let printed = jsast::stmt_to_string(&Stmt::Block(body));
+        assert!(printed.contains("w = buf[i];"), "{printed}");
+        assert!(printed.contains("m = buf[mut_off + i];"), "{printed}");
+        assert!(printed.contains("b = buf[branch_off + i];"), "{printed}");
+        assert!(printed.contains("x = a[i];"), "{printed}");
+        assert!(printed.contains("y = a[idx[k]];"), "{printed}");
+        assert!(printed.contains("p = { buf: a, off: i };"), "{printed}");
+        assert!(printed.contains("z = 0 + s;"), "{printed}");
     }
 }

@@ -28,6 +28,12 @@ pub const HELPER_MUL: &str = "$__mires_i64_mul";
 pub const HELPER_MUL_OVF: &str = "$__mires_i64_mul_ovf";
 pub const HELPER_DIV: &str = "$__mires_i64_div";
 pub const HELPER_DIVREM: &str = "$__mires_i64_divrem";
+pub const HELPER_SDIV: &str = "$__mires_i64_sdiv";
+pub const HELPER_UDIV: &str = "$__mires_i64_udiv";
+pub const HELPER_SREM: &str = "$__mires_i64_srem";
+pub const HELPER_UREM: &str = "$__mires_i64_urem";
+pub const HELPER_SDIVREM: &str = "$__mires_i64_sdivrem";
+pub const HELPER_UDIVREM: &str = "$__mires_i64_udivrem";
 pub const HELPER_F2I: &str = "$__mires_i64_f2i";
 pub const HELPER_F64_VIEW: &str = "$__mires_i64_f64_view";
 pub const HELPER_I32_VIEW: &str = "$__mires_i64_i32_view";
@@ -46,6 +52,12 @@ pub const HELPER_NAMES: &[&str] = &[
     HELPER_MUL_OVF,
     HELPER_DIV,
     HELPER_DIVREM,
+    HELPER_SDIV,
+    HELPER_UDIV,
+    HELPER_SREM,
+    HELPER_UREM,
+    HELPER_SDIVREM,
+    HELPER_UDIVREM,
     HELPER_F2I,
     HELPER_F64_VIEW,
     HELPER_I32_VIEW,
@@ -452,7 +464,9 @@ fn small_mul_const(lo: &Expr, hi: &Expr) -> Option<u32> {
     (c <= 0xffff).then_some(c)
 }
 
-/// Computes `(lo, hi)` for `Div` or `Rem` via `$__mires_i64_div`.
+/// Computes `(lo, hi)` for `Div` or `Rem`, folding constants and unsigned power-of-two divisors
+/// inline and otherwise dispatching to a monomorphic, V8-inlinable fast-path helper
+/// (`$__mires_i64_{sdiv,udiv,srem,urem}`).
 pub fn div_rem_pair(
     cx: &JsCx<'_>,
     stmts: &mut Vec<Stmt>,
@@ -461,17 +475,77 @@ pub fn div_rem_pair(
     (al, ah): (Expr, Expr),
     (bl, bh): (Expr, Expr),
 ) -> (Expr, Expr) {
-    let call = jsast::call(
-        jsast::id(HELPER_DIV),
-        vec![
-            al,
-            ah,
-            bl,
-            bh,
-            jsast::boolean(signed),
-            jsast::boolean(is_rem),
-        ],
-    );
+    if let (Some(blo), Some(bhi)) = (const_i32(&bl), const_i32(&bh)) {
+        let bv = u64::from(blo as u32) | (u64::from(bhi as u32) << 32);
+        if bv != 0 {
+            if let (Some(alo), Some(ahi)) = (const_i32(&al), const_i32(&ah)) {
+                let av = u64::from(alo as u32) | (u64::from(ahi as u32) << 32);
+                if !(signed && av == (i64::MIN as u64) && bv == u64::MAX) {
+                    let out = match (signed, is_rem) {
+                        (true, false) => ((av as i64) / (bv as i64)) as u64,
+                        (true, true) => ((av as i64) % (bv as i64)) as u64,
+                        (false, false) => av / bv,
+                        (false, true) => av % bv,
+                    };
+                    return literal_pair(u128::from(out));
+                }
+            }
+            if bv == 1 {
+                if is_rem {
+                    discard_effect(stmts, al);
+                    discard_effect(stmts, ah);
+                    return (jsast::num(0.0), jsast::num(0.0));
+                }
+                return (al, ah);
+            }
+            if !signed && bhi == 0 && (blo as u32).is_power_of_two() {
+                let b_u32 = blo as u32;
+                if is_rem {
+                    discard_effect(stmts, ah);
+                    let mask = jsast::num(f64::from((b_u32 - 1) as i32));
+                    let (lo, _) = bitwise_pair(
+                        JsBinOp::BitAnd,
+                        (al, jsast::num(0.0)),
+                        (mask, jsast::num(0.0)),
+                    );
+                    return (lo, jsast::num(0.0));
+                }
+                return shr_pair(
+                    cx,
+                    stmts,
+                    false,
+                    (al, ah),
+                    jsast::num(f64::from(b_u32.trailing_zeros())),
+                );
+            }
+            if !signed && blo == 0 && (bhi as u32).is_power_of_two() {
+                let bhi_u32 = bhi as u32;
+                if is_rem {
+                    let mask = jsast::num(f64::from((bhi_u32 - 1) as i32));
+                    let (hi, _) = bitwise_pair(
+                        JsBinOp::BitAnd,
+                        (ah, jsast::num(0.0)),
+                        (mask, jsast::num(0.0)),
+                    );
+                    return (al, hi);
+                }
+                return shr_pair(
+                    cx,
+                    stmts,
+                    false,
+                    (al, ah),
+                    jsast::num(f64::from(32 + bhi_u32.trailing_zeros())),
+                );
+            }
+        }
+    }
+    let helper = match (signed, is_rem) {
+        (true, false) => HELPER_SDIV,
+        (false, false) => HELPER_UDIV,
+        (true, true) => HELPER_SREM,
+        (false, true) => HELPER_UREM,
+    };
+    let call = jsast::call(jsast::id(helper), vec![al, ah, bl, bh]);
     let (bind, lo_var) = cx.temp(call);
     stmts.push(bind);
     (lo_var, jsast::id(HELPER_HI))
@@ -1460,6 +1534,16 @@ pub fn needed_helper_items(
             need.insert(*name);
         }
     }
+    if need.contains(HELPER_SDIV)
+        || need.contains(HELPER_UDIV)
+        || need.contains(HELPER_SREM)
+        || need.contains(HELPER_UREM)
+    {
+        need.insert(HELPER_DIV);
+    }
+    if need.contains(HELPER_SDIVREM) || need.contains(HELPER_UDIVREM) {
+        need.insert(HELPER_DIVREM);
+    }
     if need.contains(HELPER_MUL)
         || need.contains(HELPER_MUL_OVF)
         || need.contains(HELPER_DIV)
@@ -1509,6 +1593,12 @@ pub fn needed_helper_items(
         HELPER_MUL_OVF,
         HELPER_DIV,
         HELPER_DIVREM,
+        HELPER_SDIV,
+        HELPER_UDIV,
+        HELPER_SREM,
+        HELPER_UREM,
+        HELPER_SDIVREM,
+        HELPER_UDIVREM,
         HELPER_F2I,
         HELPER_F64_TO_BITS,
     ]
@@ -1519,7 +1609,7 @@ pub fn needed_helper_items(
         .into_iter()
         .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
         .collect();
-    let active_rem_writers: Vec<&'static str> = [HELPER_DIVREM]
+    let active_rem_writers: Vec<&'static str> = [HELPER_DIVREM, HELPER_SDIVREM, HELPER_UDIVREM]
         .into_iter()
         .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
         .collect();
@@ -1625,6 +1715,25 @@ pub fn needed_helper_items(
                        {HELPER_HI} = 0;\n    \
                        return rem ? (u % v) | 0 : ((u / v) >>> 0) | 0;\n  \
                      }}\n  \
+                     if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+                       const r = rem ? (al % bl) | 0 : (al / bl) | 0;\n    \
+                       {HELPER_HI} = r >> 31;\n    \
+                       return r;\n  \
+                     }}\n  \
+                     if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
+                       const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
+                       const q = Math.trunc(fa / fb);\n    \
+                       const v = rem ? fa - q * fb : q;\n    \
+                       {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
+                       return v | 0;\n  \
+                     }}\n  \
+                     if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
+                       const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
+                       const q = Math.floor(fa / fb);\n    \
+                       const v = rem ? fa - q * fb : q;\n    \
+                       {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
+                       return v | 0;\n  \
+                     }}\n  \
                      let negA = false, negB = false;\n  \
                      if (signed) {{\n    \
                        if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
@@ -1729,6 +1838,32 @@ pub fn needed_helper_items(
                        {HELPER_RH} = 0;\n    \
                        return q | 0;\n  \
                      }}\n  \
+                     if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+                       const q = (al / bl) | 0;\n    \
+                       const r = (al - Math.imul(q, bl)) | 0;\n    \
+                       {HELPER_HI} = q >> 31;\n    \
+                       {HELPER_RL} = r;\n    \
+                       {HELPER_RH} = r >> 31;\n    \
+                       return q;\n  \
+                     }}\n  \
+                     if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
+                       const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
+                       const q = Math.trunc(fa / fb);\n    \
+                       const r = fa - q * fb;\n    \
+                       {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
+                       {HELPER_RL} = r | 0;\n    \
+                       {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
+                       return q | 0;\n  \
+                     }}\n  \
+                     if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
+                       const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
+                       const q = Math.floor(fa / fb);\n    \
+                       const r = fa - q * fb;\n    \
+                       {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
+                       {HELPER_RL} = r | 0;\n    \
+                       {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
+                       return q | 0;\n  \
+                     }}\n  \
                      let negA = false, negB = false;\n  \
                      if (signed) {{\n    \
                        if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
@@ -1821,6 +1956,169 @@ pub fn needed_helper_items(
                      {HELPER_RL} = rlo;\n  \
                      {HELPER_RH} = rhi;\n  \
                      return qlo;\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_SDIV => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_DIV],
+                format!(
+                    "\nfunction {HELPER_SDIV}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+                       const m = ah >> 31;\n    \
+                       const sal = ((al ^ m) - m) | 0;\n    \
+                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+                       const qh = (sah / bl) >>> 0;\n    \
+                       const ql = (((sah - qh * bl) * 4294967296 + (sal >>> 0)) / bl) | 0;\n    \
+                       const lo = ((ql ^ m) - m) | 0;\n    \
+                       {HELPER_HI} = ((qh ^ m) + ((lo === 0 ? 1 : 0) & m)) | 0;\n    \
+                       return lo;\n  \
+                     }}\n  \
+                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+                       const q = (al / bl) | 0;\n    \
+                       {HELPER_HI} = q >> 31;\n    \
+                       return q;\n  \
+                     }}\n  \
+                     return {HELPER_DIV}(al, ah, bl, bh, true, false);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_UDIV => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_DIV],
+                format!(
+                    "\nfunction {HELPER_UDIV}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl !== 0) {{\n    \
+                       const v = bl >>> 0;\n    \
+                       if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) / v) | 0; }}\n    \
+                       if (v <= 2097152) {{\n      \
+                         const uh = ah >>> 0;\n      \
+                         const qh = (uh / v) >>> 0;\n      \
+                         {HELPER_HI} = qh | 0;\n      \
+                         return (((uh - qh * v) * 4294967296 + (al >>> 0)) / v) | 0;\n    \
+                       }}\n  \
+                     }}\n  \
+                     return {HELPER_DIV}(al, ah, bl, bh, false, false);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_SREM => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_DIV],
+                format!(
+                    "\nfunction {HELPER_SREM}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+                       const m = ah >> 31;\n    \
+                       const sal = ((al ^ m) - m) | 0;\n    \
+                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+                       const qh = (sah / bl) >>> 0;\n    \
+                       const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
+                       const r = (mid - ((mid / bl) >>> 0) * bl) | 0;\n    \
+                       const lo = ((r ^ m) - m) | 0;\n    \
+                       {HELPER_HI} = lo >> 31;\n    \
+                       return lo;\n  \
+                     }}\n  \
+                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+                       const r = (al % bl) | 0;\n    \
+                       {HELPER_HI} = r >> 31;\n    \
+                       return r;\n  \
+                     }}\n  \
+                     return {HELPER_DIV}(al, ah, bl, bh, true, true);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_UREM => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_DIV],
+                format!(
+                    "\nfunction {HELPER_UREM}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl !== 0) {{\n    \
+                       const v = bl >>> 0;\n    \
+                       if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) % v) | 0; }}\n    \
+                       if (v <= 2097152) {{\n      \
+                         const uh = ah >>> 0;\n      \
+                         const qh = (uh / v) >>> 0;\n      \
+                         const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
+                         {HELPER_HI} = 0;\n      \
+                         return (mid - ((mid / v) >>> 0) * v) | 0;\n    \
+                       }}\n  \
+                     }}\n  \
+                     return {HELPER_DIV}(al, ah, bl, bh, false, true);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_SDIVREM => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_RL, HELPER_RH, HELPER_DIVREM],
+                format!(
+                    "\nfunction {HELPER_SDIVREM}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+                       const m = ah >> 31;\n    \
+                       const sal = ((al ^ m) - m) | 0;\n    \
+                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+                       const qh = (sah / bl) >>> 0;\n    \
+                       const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
+                       const ql = (mid / bl) >>> 0;\n    \
+                       const r = (mid - ql * bl) | 0;\n    \
+                       const rlo = ((r ^ m) - m) | 0;\n    \
+                       const qlo = ((ql ^ m) - m) | 0;\n    \
+                       {HELPER_HI} = ((qh ^ m) + ((qlo === 0 ? 1 : 0) & m)) | 0;\n    \
+                       {HELPER_RL} = rlo;\n    \
+                       {HELPER_RH} = rlo >> 31;\n    \
+                       return qlo;\n  \
+                     }}\n  \
+                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+                       const q = (al / bl) | 0;\n    \
+                       const r = (al - Math.imul(q, bl)) | 0;\n    \
+                       {HELPER_HI} = q >> 31;\n    \
+                       {HELPER_RL} = r;\n    \
+                       {HELPER_RH} = r >> 31;\n    \
+                       return q;\n  \
+                     }}\n  \
+                     return {HELPER_DIVREM}(al, ah, bl, bh, true);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_UDIVREM => make(
+                name,
+                ItemKind::Fn,
+                &[HELPER_HI, HELPER_RL, HELPER_RH, HELPER_DIVREM],
+                format!(
+                    "\nfunction {HELPER_UDIVREM}(al, ah, bl, bh) {{\n  \
+                     if (bh === 0 && bl !== 0) {{\n    \
+                       const v = bl >>> 0;\n    \
+                       if ((v & (v - 1)) === 0) {{\n      \
+                         const s = 31 - Math.clz32(v);\n      \
+                         {HELPER_RL} = al & (v - 1);\n      \
+                         {HELPER_RH} = 0;\n      \
+                         {HELPER_HI} = (ah >>> s) | 0;\n      \
+                         return s === 0 ? al | 0 : (al >>> s) | (ah << (32 - s));\n    \
+                       }}\n    \
+                       if (ah === 0) {{\n      \
+                         const u = al >>> 0;\n      \
+                         const q = (u / v) >>> 0;\n      \
+                         {HELPER_HI} = 0;\n      \
+                         {HELPER_RL} = (u - q * v) | 0;\n      \
+                         {HELPER_RH} = 0;\n      \
+                         return q | 0;\n    \
+                       }}\n    \
+                       if (v <= 2097152) {{\n      \
+                         const uh = ah >>> 0;\n      \
+                         const qh = (uh / v) >>> 0;\n      \
+                         const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
+                         const ql = (mid / v) >>> 0;\n      \
+                         {HELPER_HI} = qh | 0;\n      \
+                         {HELPER_RL} = (mid - ql * v) | 0;\n      \
+                         {HELPER_RH} = 0;\n      \
+                         return ql | 0;\n    \
+                       }}\n  \
+                     }}\n  \
+                     return {HELPER_DIVREM}(al, ah, bl, bh, false);\n\
                      }}\n"
                 ),
             ),
@@ -2163,5 +2461,252 @@ mod tests {
         );
         assert!(jsast::expr_to_string(&or_lo).contains("bump(17)"));
         assert!(jsast::expr_to_string(&or_hi).contains("bump(18)"));
+    }
+
+    #[test]
+    fn div_rem_pair_folds_constants_and_pow2_and_dispatches_specialized_helpers() {
+        with_cx(|cx, stmts| {
+            // Compile-time constant fold
+            let (lo, hi) = div_rem_pair(
+                cx,
+                stmts,
+                true,
+                false,
+                literal_pair((-100i64) as u64 as u128),
+                literal_pair(7u128),
+            );
+            assert_eq!(const_i32(&lo), Some(-14));
+            assert_eq!(const_i32(&hi), Some(-1));
+
+            // Unsigned power-of-two div & rem strength-reduce inline (zero helper calls)
+            let (qlo, qhi) = div_rem_pair(
+                cx,
+                stmts,
+                false,
+                false,
+                (jsast::id("al"), jsast::id("ah")),
+                literal_pair(16u128),
+            );
+            assert!(!jsast::expr_to_string(&qlo).contains("$__mires_i64_"));
+            assert_eq!(jsast::expr_to_string(&qhi), "ah >>> 4");
+
+            let (rlo, rhi) = div_rem_pair(
+                cx,
+                stmts,
+                false,
+                true,
+                (jsast::id("al"), jsast::id("ah")),
+                literal_pair(16u128),
+            );
+            assert_eq!(jsast::expr_to_string(&rlo), "al & 15");
+            assert_eq!(jsast::expr_to_string(&rhi), "0");
+
+            // Dynamic divisor dispatches to monomorphic 4-arg helpers
+            stmts.clear();
+            let _ = div_rem_pair(
+                cx,
+                stmts,
+                true,
+                false,
+                (jsast::id("al"), jsast::id("ah")),
+                (jsast::id("bl"), jsast::id("bh")),
+            );
+            let s0 = jsast::stmt_to_string(&stmts[0]);
+            assert!(
+                s0.contains("$__mires_i64_sdiv(al, ah, bl, bh)"),
+                "expected specialized sdiv: {s0}"
+            );
+
+            stmts.clear();
+            let _ = div_rem_pair(
+                cx,
+                stmts,
+                false,
+                true,
+                (jsast::id("al"), jsast::id("ah")),
+                (jsast::id("bl"), jsast::id("bh")),
+            );
+            let s1 = jsast::stmt_to_string(&stmts[0]);
+            assert!(
+                s1.contains("$__mires_i64_urem(al, ah, bl, bh)"),
+                "expected specialized urem: {s1}"
+            );
+        });
+    }
+
+    #[test]
+    fn div_and_divrem_helpers_are_bit_exact_and_es2018_valid_in_node() {
+        let referenced: BTreeSet<JsName> = [
+            HELPER_DIV,
+            HELPER_DIVREM,
+            HELPER_SDIV,
+            HELPER_UDIV,
+            HELPER_SREM,
+            HELPER_UREM,
+            HELPER_SDIVREM,
+            HELPER_UDIVREM,
+        ]
+        .into_iter()
+        .map(|n| JsName::new(n.to_owned()))
+        .collect();
+        let items = needed_helper_items(&referenced, &BTreeSet::new());
+        let preamble: String = items
+            .iter()
+            .map(|it| it.js.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !preamble.contains("BigInt"),
+            "i64 div/divrem helpers must be BigInt-free:\n{preamble}"
+        );
+        // Verify co-location of shared statics with all specialized writers.
+        let hi = items
+            .iter()
+            .find(|it| it.name.as_str() == HELPER_HI)
+            .expect("HELPER_HI");
+        let hi_refs: BTreeSet<&str> = hi.refs.iter().map(|r| r.as_str()).collect();
+        for w in [
+            HELPER_DIV,
+            HELPER_DIVREM,
+            HELPER_SDIV,
+            HELPER_UDIV,
+            HELPER_SREM,
+            HELPER_UREM,
+            HELPER_SDIVREM,
+            HELPER_UDIVREM,
+        ] {
+            assert!(hi_refs.contains(w), "HELPER_HI missing writer ref {w}");
+        }
+        let rl = items
+            .iter()
+            .find(|it| it.name.as_str() == HELPER_RL)
+            .expect("HELPER_RL");
+        let rl_refs: BTreeSet<&str> = rl.refs.iter().map(|r| r.as_str()).collect();
+        for w in [HELPER_DIVREM, HELPER_SDIVREM, HELPER_UDIVREM] {
+            assert!(rl_refs.contains(w), "HELPER_RL missing writer ref {w}");
+        }
+
+        // Verify ES2018 syntax (no BigInt literals `123n`, no `??`, no `?.`) and exhaustive
+        // bit-exactness across all 8 helpers in Node.
+        assert!(
+            !preamble.contains("?.") && !preamble.contains("??"),
+            "helpers must remain ES2018 compatible"
+        );
+        let script = format!(
+            r#"{preamble}
+function checkI32(v, label) {{
+  if (typeof v !== "number" || (v | 0) !== v || Object.is(v, -0)) {{
+    throw new Error("non-normalized i32 for " + label + ": " + String(v));
+  }}
+}}
+function toPair(x) {{
+  return [Number(BigInt.asIntN(32, x)), Number(BigInt.asIntN(32, x >> 32n))];
+}}
+function fromPair(lo, hi, signed) {{
+  const h = signed ? BigInt(hi) : BigInt(hi >>> 0);
+  return (h << 32n) | BigInt(lo >>> 0);
+}}
+const signedEdges = [
+  0n, 1n, -1n, 2n, -2n, 3n, -3n, 7n, -7n, 10n, -10n, 16n, -16n, 255n, -255n, 256n, -256n,
+  2097151n, -2097151n, 2097152n, -2097152n, 2097153n, -2097153n,
+  0x7fffffffn, -0x7fffffffn, -0x80000000n, 0x80000000n, 0x80000001n, -0x80000001n,
+  0xffffffffn, -0xffffffffn, 0x100000000n, -0x100000000n, 0x100000001n, -0x100000001n,
+  (1n << 52n) - 1n, 1n << 52n, (1n << 53n) - 1n, 1n << 53n, (1n << 53n) + 1n,
+  -(1n << 53n), -((1n << 53n) - 1n), -((1n << 53n) + 1n),
+  0x4000000000000000n, -0x4000000000000000n,
+  0x7fffffffffffffffn, -0x7fffffffffffffffn, -0x8000000000000000n,
+];
+const unsignedEdges = [
+  0n, 1n, 2n, 3n, 4n, 7n, 8n, 10n, 16n, 32n, 36n, 255n, 256n,
+  2097151n, 2097152n, 2097153n,
+  0x7fffffffn, 0x80000000n, 0x80000001n, 0xffffffffn,
+  0x100000000n, 0x100000001n,
+  (1n << 52n) - 1n, (1n << 53n) - 1n, 1n << 53n, (1n << 53n) + 1n,
+  0x4000000000000001n, 0x8000000000000000n, 0x8000000000000001n,
+  0xfffffffffffffffen, 0xffffffffffffffffn,
+];
+for (let p = 0; p < 64; p++) unsignedEdges.push(1n << BigInt(p));
+
+function verifyCase(signed, a, b) {{
+  if (b === 0n) return;
+  if (signed && a === -0x8000000000000000n && b === -1n) return;
+  const [al, ah] = toPair(a);
+  const [bl, bh] = toPair(b);
+  const expQ = a / b;
+  const expR = a % b;
+
+  // 1. Generic HELPER_DIV
+  const qLo1 = $__mires_i64_div(al, ah, bl, bh, signed, false);
+  const qHi1 = $__mires_i64_hi;
+  checkI32(qLo1, "div qLo"); checkI32(qHi1, "div qHi");
+  if (fromPair(qLo1, qHi1, signed) !== expQ) {{
+    throw new Error(`div mismatch (${{signed}}) ${{a}} / ${{b}}: got ${{fromPair(qLo1, qHi1, signed)}} exp ${{expQ}}`);
+  }}
+  const rLo1 = $__mires_i64_div(al, ah, bl, bh, signed, true);
+  const rHi1 = $__mires_i64_hi;
+  checkI32(rLo1, "rem rLo"); checkI32(rHi1, "rem rHi");
+  if (fromPair(rLo1, rHi1, signed) !== expR) {{
+    throw new Error(`rem mismatch (${{signed}}) ${{a}} % ${{b}}: got ${{fromPair(rLo1, rHi1, signed)}} exp ${{expR}}`);
+  }}
+
+  // 2. Specialized sdiv/udiv & srem/urem
+  const qLo2 = signed ? $__mires_i64_sdiv(al, ah, bl, bh) : $__mires_i64_udiv(al, ah, bl, bh);
+  const qHi2 = $__mires_i64_hi;
+  checkI32(qLo2, "spec div qLo"); checkI32(qHi2, "spec div qHi");
+  if (fromPair(qLo2, qHi2, signed) !== expQ) {{
+    throw new Error(`spec div mismatch (${{signed}}) ${{a}} / ${{b}}: got ${{fromPair(qLo2, qHi2, signed)}} exp ${{expQ}}`);
+  }}
+  const rLo2 = signed ? $__mires_i64_srem(al, ah, bl, bh) : $__mires_i64_urem(al, ah, bl, bh);
+  const rHi2 = $__mires_i64_hi;
+  checkI32(rLo2, "spec rem rLo"); checkI32(rHi2, "spec rem rHi");
+  if (fromPair(rLo2, rHi2, signed) !== expR) {{
+    throw new Error(`spec rem mismatch (${{signed}}) ${{a}} % ${{b}}: got ${{fromPair(rLo2, rHi2, signed)}} exp ${{expR}}`);
+  }}
+
+  // 3. Generic HELPER_DIVREM & specialized sdivrem/udivrem
+  for (const [tag, fn] of [
+    ["divrem", (x, y, z, w) => $__mires_i64_divrem(x, y, z, w, signed)],
+    ["spec_divrem", signed ? $__mires_i64_sdivrem : $__mires_i64_udivrem],
+  ]) {{
+    const dql = fn(al, ah, bl, bh);
+    const dqh = $__mires_i64_hi, drl = $__mires_i64_rl, drh = $__mires_i64_rh;
+    checkI32(dql, tag + " ql"); checkI32(dqh, tag + " qh");
+    checkI32(drl, tag + " rl"); checkI32(drh, tag + " rh");
+    if (fromPair(dql, dqh, signed) !== expQ || fromPair(drl, drh, signed) !== expR) {{
+      throw new Error(`${{tag}} mismatch (${{signed}}) ${{a}} /% ${{b}}: got (${{fromPair(dql, dqh, signed)}}, ${{fromPair(drl, drh, signed)}}) exp (${{expQ}}, ${{expR}})`);
+    }}
+  }}
+}}
+
+for (const a of signedEdges) for (const b of signedEdges) verifyCase(true, a, b);
+for (const a of unsignedEdges) for (const b of unsignedEdges) verifyCase(false, a, b);
+
+// Deterministic pseudo-random fuzz across 32-bit, 53-bit, small-divisor, and full 64-bit regimes
+let s = 0x13579bdf;
+const rnd32 = () => (s = (Math.imul(s, 1664525) + 1013904223) | 0);
+for (let i = 0; i < 4000; i++) {{
+  const regime = i & 3;
+  let al = rnd32(), ah = rnd32(), bl = rnd32(), bh = rnd32();
+  if (regime === 0) {{ ah = al >> 31; bh = bl >> 31; }}
+  else if (regime === 1) {{ ah >>= 11; bh >>= 11; }}
+  else if (regime === 2) {{ bh = 0; bl = (bl & 0x1fffff) + 1; }}
+  const sa = fromPair(al, ah, true), sb = fromPair(bl, bh, true);
+  verifyCase(true, sa, sb);
+  const ua = fromPair(al, ah, false), ub = fromPair(bl, bh, false);
+  verifyCase(false, ua, ub);
+}}
+"#
+        );
+        let out = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("node must run i64 div/divrem verification");
+        assert!(
+            out.status.success(),
+            "i64 div/divrem Node verification failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

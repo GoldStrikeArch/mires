@@ -358,14 +358,16 @@ fn decide_for_plan(
 ) -> (bool, Option<String>, Option<&'static str>, u64) {
     let (mut accepted, mut reason, mut hotness_source, budget_consumed_bps) =
         decide(profile, before, after);
-    // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`)
-    // removes property loads (`s.buf[s.off + i]`) inside tight loops, flattening an `i64`/`u64`
-    // parameter or return (`(lo, hi)`) eliminates BigInt heap allocations, and `SentinelResult`
-    // eliminates `{ TAG, _0 }` wrapper allocations across recursive `Result<T, E>` call trees.
-    // Accept whenever it does not regress object allocations and stays within the speed budget.
+    // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`
+    // or `(buf, len)` when `off === 0` is proven whole-program) removes property loads
+    // (`s.buf[s.off + i]` -> `a[i]`) inside tight loops, flattening an `i64`/`u64` parameter or
+    // return (`(lo, hi)`) eliminates BigInt heap allocations, and `SentinelResult` eliminates
+    // `{ TAG, _0 }` wrapper allocations across recursive `Result<T, E>` call trees. Accept
+    // whenever it does not regress object allocations and stays within the speed budget.
     if !accepted
         && profile == Profile::ReleaseSpeed
         && (plan.has_slice_param()
+            || plan.has_off_zero_slice()
             || plan.has_i64_pair_abi()
             || plan.has_byte_str_abi()
             || plan.has_sentinel_result())

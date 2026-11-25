@@ -1264,6 +1264,12 @@ fn param_shape(types: &TypeTable, param: &FlatParam) -> ValueShape {
         ]);
     }
     if param.slice {
+        if param.is_off_zero_slice() {
+            return ValueShape::Product(vec![
+                LaneKind::Buffer,
+                lane_kind(types, param.field_tys[2]),
+            ]);
+        }
         return ValueShape::Product(vec![
             LaneKind::Buffer,
             lane_kind(types, param.field_tys[1]),
@@ -1890,6 +1896,81 @@ mod tests {
                 current: Some(0),
                 maximum: Some(3),
             })
+        );
+    }
+
+    #[test]
+    fn off_zero_slice_param_shape_omits_offset_lane() {
+        use crate::jir::types::{
+            IntFacts, IntRepr, JsFacts, LayoutFacts, TypeDescriptor, TypeMeta,
+        };
+
+        let u32_ty = TypeId(1);
+        let slice_ref_ty = TypeId(2);
+        let mut types = TypeTable::new();
+        types.insert(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: u32_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        let full = FlatParam {
+            ty: slice_ref_ty,
+            field_tys: vec![slice_ref_ty, u32_ty, u32_ty],
+            passed: vec![0, 1, 2],
+            by_ref: false,
+            mutable: false,
+            written: false,
+            slice: true,
+            byte_str: None,
+            i64_pair: false,
+            tagged: None,
+            recursive: None,
+        };
+        let mut off_zero = full.clone();
+        off_zero.set_off_zero_slice();
+
+        assert_eq!(
+            param_shape(&types, &full),
+            ValueShape::Product(vec![
+                LaneKind::Buffer,
+                LaneKind::Scalar(ScalarKind::Unsigned(32)),
+                LaneKind::Scalar(ScalarKind::Unsigned(32)),
+            ])
+        );
+        assert_eq!(
+            param_shape(&types, &off_zero),
+            ValueShape::Product(vec![
+                LaneKind::Buffer,
+                LaneKind::Scalar(ScalarKind::Unsigned(32)),
+            ])
         );
     }
 }

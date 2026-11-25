@@ -258,6 +258,12 @@ pub fn filter_live_for_repr(
         let func_opt = funcs.get(&name).and_then(|r| r.as_ref().ok());
         if let (Some(func), Some(interns)) = (func_opt, item.jir.interns()) {
             for callee in jir_callees(func, interns, skip_typed, skip_nstr, skip_nvec) {
+                if skip_nvec
+                    && is_global_vec_drop_glue(Some(item))
+                    && is_raw_vec_drop_glue(table.get(&callee))
+                {
+                    continue;
+                }
                 if live.contains(&callee)
                     && !is_skipped_hook(table.get(&callee))
                     && visited.insert(callee.clone())
@@ -1361,7 +1367,7 @@ fn is_raw_vec_drop_glue(item: Option<&LinkItem>) -> bool {
     item.debug_path.contains("raw_vec::RawVec") || item.name.as_str().contains("raw_vec$RawVec")
 }
 
-fn is_vec_len_field(table: &TypeTable, interns: &Interns, ty: TypeId, field: u32) -> bool {
+pub fn is_vec_len_field(table: &TypeTable, interns: &Interns, ty: TypeId, field: u32) -> bool {
     table
         .field(ty, None, field)
         .is_some_and(|f| matches!(f.key, FieldKey::Name(id) if interns.str(id) == Some("len")))

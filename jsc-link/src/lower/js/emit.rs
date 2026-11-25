@@ -1737,6 +1737,9 @@ impl<'a> JsCx<'a> {
                 if self.is_inline(result) {
                     return Ok(Vec::new());
                 }
+                if let Some(stmts) = self.try_scalarize_soa_view(op, result)? {
+                    return Ok(stmts);
+                }
                 if let (OpKind::Convert { v: src, .. }, Some(kind)) =
                     (&op.kind, self.dropped_string_kind(result))
                 {
@@ -2848,7 +2851,12 @@ impl<'a> JsCx<'a> {
             return Ok(expr);
         }
         match &op.kind {
-            OpKind::Const(tree) => self.const_expr(tree, result_ty),
+            OpKind::Const(tree) => {
+                if let Some(expr) = self.soa_const_expr(tree, result_ty)? {
+                    return Ok(expr);
+                }
+                self.const_expr(tree, result_ty)
+            }
             OpKind::Copy(v) => {
                 let value = self.expr_of(*v)?;
                 // A carried overflow pair is a scalar (`rvalue::carried_overflow_pairs`), and
@@ -3289,7 +3297,9 @@ impl<'a> JsCx<'a> {
                 // the mutation already happened where the object lives, and for a scalar one the
                 // value is unchanged — and `__rt.overwrite` implements a whole-aggregate write by
                 // clearing the target first, so spelling it would *erase* the object.
-                if self.stores_back(*pointer, *v) {
+                if self.stores_back(*pointer, *v)
+                    && (!self.is_soa_ptr(*pointer) || !self.value_has_set_field(*v))
+                {
                     return Ok(Vec::new());
                 }
                 let walk = self.pointee_place(*pointer)?;
@@ -3814,7 +3824,7 @@ impl<'a> JsCx<'a> {
                     | PointerForm::FatDyn
                     | PointerForm::FatTail
             )
-        );
+        ) || self.is_soa_ptr(v);
         if !repeatable {
             return Ok(false);
         }
@@ -3881,11 +3891,55 @@ impl<'a> JsCx<'a> {
         false
     }
 
+    fn value_has_set_field(&self, v: ValueId) -> bool {
+        let mut target = v;
+        for _ in 0..8 {
+            if self.func.blocks.iter().any(|b| {
+                b.ops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::SetField { base, .. } if base == target))
+            }) {
+                return true;
+            }
+            match self.def_of(target).map(|op| &op.kind) {
+                Some(OpKind::Move(inner) | OpKind::Copy(inner)) => target = *inner,
+                _ => break,
+            }
+        }
+        false
+    }
+
     /// The place a pointer value points at: the walked place itself for an inline synthetic view
     /// (`plan.rs`, "Synthetic views": a `BorrowView` consumed by exactly one `Deref`/`StoreThrough`
     /// is spelled as v1's read/write of the place, never as a pointer record), and the `Deref`
     /// of the pointer expression otherwise.
     pub(crate) fn pointee_place(&self, pointer: ValueId) -> Res<super::place::Walk> {
+        if let Some((buf, col, off)) = self.soa_bool_refs.borrow().get(&pointer).cloned() {
+            let ty = value::pointee_of(self.table, self.ty_of(pointer)?)
+                .ok_or_else(|| decline(OpClass::Place, "SoA bool view without pointee"))?;
+            return Ok(super::place::Walk {
+                place: super::place::JsPlace::SoaBool { buf, col, off },
+                ty,
+                identity: None,
+                object: false,
+                str_mutable: false,
+                str_from_mut: false,
+                smi_u32: false,
+            });
+        }
+        if let Some((buf, off)) = self.soa_refs.borrow().get(&pointer).cloned() {
+            let elem_ty = value::pointee_of(self.table, self.ty_of(pointer)?)
+                .ok_or_else(|| decline(OpClass::Place, "SoA element view without pointee"))?;
+            return Ok(super::place::Walk {
+                place: super::place::JsPlace::SoaElem { buf, off, elem_ty },
+                ty: elem_ty,
+                identity: None,
+                object: false,
+                str_mutable: false,
+                str_from_mut: false,
+                smi_u32: false,
+            });
+        }
         if self.is_inline(pointer) {
             if let Some(Op {
                 kind: OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. },
@@ -3895,7 +3949,7 @@ impl<'a> JsCx<'a> {
                 return self.walk_place(root, path);
             }
         }
-        if self.is_direct_ref_copy_cast(pointer) {
+        if self.is_direct_ref_copy_cast(pointer) && !self.is_soa_ptr(pointer) {
             let ty = self.ty_of(pointer)?;
             if let Some(pointee) = value::pointee_of(self.table, ty) {
                 let expr = self.expr_of(pointer)?;

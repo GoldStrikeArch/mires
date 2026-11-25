@@ -31,6 +31,7 @@ pub mod place;
 pub mod post_opt;
 pub mod ptr;
 pub mod rvalue;
+pub mod soa;
 pub mod template;
 pub mod unsize;
 pub mod value;
@@ -144,6 +145,12 @@ pub struct JsCx<'a> {
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
     /// Whole-program Tier A typed-heap and `_boxes` tracking plan (`analysis::heap`).
     pub heap: Option<&'a crate::analysis::heap::HeapPlan>,
+    /// Whole-program Structure-of-Arrays (SoA) plan for non-escaping `Vec<FlatStruct, Global>`.
+    pub soa: Option<std::sync::Arc<crate::plan::soa_vec::SoaPlan>>,
+    /// Scalarized local SoA element references (`&T` / `&mut T`): maps SSA value to `(buf, off)`.
+    pub(super) soa_refs: RefCell<BTreeMap<ValueId, (Expr, Expr)>>,
+    /// Scalarized local SoA `bool` field references (`&bool` / `&mut bool`): `(buf, col, off)`.
+    pub(super) soa_bool_refs: RefCell<BTreeMap<ValueId, (Expr, String, Expr)>>,
     /// Whether this function carries nested native Vec/String fields needing carrier-safe clone.
     pub nested_clone: crate::lower::NestedClone,
     /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
@@ -257,6 +264,9 @@ impl<'a> JsCx<'a> {
             hoists_bigints: false,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
             heap: None,
+            soa: crate::plan::soa_vec::current_plan(),
+            soa_refs: RefCell::new(BTreeMap::new()),
+            soa_bool_refs: RefCell::new(BTreeMap::new()),
             nested_clone: crate::lower::NestedClone::default(),
             ascii: None,
             instantiations: RefCell::new(BTreeMap::new()),
@@ -283,6 +293,12 @@ impl<'a> JsCx<'a> {
             unboxed_map_keys: std::cell::OnceCell::new(),
             strict_i32_u32: std::cell::OnceCell::new(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_soa(mut self, soa: Option<std::sync::Arc<crate::plan::soa_vec::SoaPlan>>) -> Self {
+        self.soa = soa;
+        self
     }
 
     pub fn is_smi_u32_field(&self, struct_ty: TypeId, field: u32) -> bool {

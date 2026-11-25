@@ -7480,28 +7480,28 @@ globalThis.__rt.slice_sort = (buf, off, len, isLess, cmpFn, isIndirect) => {
     }
     return;
   }
-  const refs = new Array(len);
   let a = new Array(len);
   if (isIndirect) {
-    for (let i = 0; i < len; i++) { a[i] = i; refs[i] = buf[off + i]; }
+    for (let i = 0; i < len; i++) a[i] = buf[off + i];
   } else {
-    for (let i = 0; i < len; i++) { a[i] = i; refs[i] = { buf: buf, off: off + i }; }
+    for (let i = 0; i < len; i++) a[i] = { buf: buf, off: off + i };
   }
+  let changed = false;
   const RUN = 16;
   for (let start = 0; start < len; start += RUN) {
     const end = start + RUN < len ? start + RUN : len;
     for (let i = start + 1; i < end; i++) {
-      const idx = a[i];
-      const ri = refs[idx];
+      const ri = a[i];
       let j = i - 1;
-      if (cmpFn(isLess, ri, refs[a[j]])) {
+      if (cmpFn(isLess, ri, a[j])) {
+        changed = true;
         a[j + 1] = a[j];
         j--;
-        while (j >= start && cmpFn(isLess, ri, refs[a[j]])) {
+        while (j >= start && cmpFn(isLess, ri, a[j])) {
           a[j + 1] = a[j];
           j--;
         }
-        a[j + 1] = idx;
+        a[j + 1] = ri;
       }
     }
   }
@@ -7514,9 +7514,10 @@ globalThis.__rt.slice_sort = (buf, off, len, isLess, cmpFn, isIndirect) => {
         let i = lo;
         let j = mid;
         let k = lo;
-        if (mid < hi && cmpFn(isLess, refs[a[mid]], refs[a[mid - 1]])) {
+        if (mid < hi && cmpFn(isLess, a[mid], a[mid - 1])) {
+          changed = true;
           while (i < mid && j < hi) {
-            b[k++] = cmpFn(isLess, refs[a[j]], refs[a[i]]) ? a[j++] : a[i++];
+            b[k++] = cmpFn(isLess, a[j], a[i]) ? a[j++] : a[i++];
           }
         }
         while (i < mid) b[k++] = a[i++];
@@ -7527,21 +7528,21 @@ globalThis.__rt.slice_sort = (buf, off, len, isLess, cmpFn, isIndirect) => {
       b = t;
     }
   }
-  let changed = false;
-  for (let i = 0; i < len; i++) {
-    if (a[i] !== i) { changed = true; break; }
-  }
   if (!changed) return;
-  const tmp = new Array(len);
-  for (let i = 0; i < len; i++) tmp[i] = buf[off + i];
-  const boxes = globalThis.__rt._boxes;
-  const track = boxes !== null && isIndirect && globalThis.__rt._blk_get(buf) !== undefined;
-  for (let i = 0; i < len; i++) {
-    const val = tmp[a[i]];
-    buf[off + i] = val;
-    if (track && val !== null && typeof val === "object") {
-      boxes.set(val, { buf: buf, off: off + i });
+  if (isIndirect) {
+    const boxes = globalThis.__rt._boxes;
+    const track = boxes !== null && globalThis.__rt._blk_get(buf) !== undefined;
+    for (let i = 0; i < len; i++) {
+      const val = a[i];
+      buf[off + i] = val;
+      if (track && val !== null && typeof val === "object") {
+        boxes.set(val, { buf: buf, off: off + i });
+      }
     }
+  } else {
+    const tmp = new Array(len);
+    for (let i = 0; i < len; i++) tmp[i] = buf[a[i].off];
+    for (let i = 0; i < len; i++) buf[off + i] = tmp[i];
   }
 };
 

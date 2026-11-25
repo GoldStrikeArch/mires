@@ -99,7 +99,12 @@ impl JsCx<'_> {
                 fallback,
                 args,
                 track_caller,
-            } => intrinsics::lower(self, op, *name, types, *fallback, args, *track_caller),
+            } => {
+                if let Some(lowered) = self.lower_soa_intrinsic(op, *name, types, args)? {
+                    return Ok(lowered);
+                }
+                intrinsics::lower(self, op, *name, types, *fallback, args, *track_caller)
+            }
             OpKind::Host { .. } => host::lower_host(self, op).map(Lowered::value),
             OpKind::Drop { root, path, glue } => self.lower_drop(root, path, *glue),
             _ => Err(decline(OpClass::Call, "not a call")),
@@ -189,6 +194,11 @@ impl JsCx<'_> {
             }
             if self.heap().native_vec_enabled {
                 if let Some(lowered) =
+                    self.lower_soa_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
+                {
+                    return Ok(lowered);
+                }
+                if let Some(lowered) =
                     self.lower_native_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
                 {
                     return Ok(lowered);
@@ -275,10 +285,16 @@ impl JsCx<'_> {
         if let CallSemantic::Standard(operation) = semantic {
             if self.heap().native_vec_enabled {
                 if operation.is_native_vec() {
+                    if let Some(lowered) = self.lower_soa_vec_call(op, *operation, args)? {
+                        return Ok(lowered);
+                    }
                     if let Some(lowered) = self.lower_native_vec_call(op, *operation, args)? {
                         return Ok(lowered);
                     }
                 } else if *operation == StandardOperation::VecResize {
+                    if let Some(lowered) = self.lower_soa_vec_resize(args)? {
+                        return Ok(lowered);
+                    }
                     if let Some(lowered) = self.lower_native_vec_resize(args)? {
                         return Ok(lowered);
                     }
@@ -3611,6 +3627,9 @@ impl JsCx<'_> {
         {
             return Ok(None);
         }
+        if let Some(lowered) = self.lower_soa_slice_reverse(is_reverse, args)? {
+            return Ok(Some(lowered));
+        }
 
         let table = self.table;
         let check_elem = |elem_ty: rcgjs_object::jir::types::TypeId| -> Option<bool> {
@@ -4188,6 +4207,13 @@ fn uninit_shell(
         ]));
     }
     if heap.native_vec_enabled && crate::analysis::heap::is_direct_global_vec_ty(table, peeled) {
+        if let Some(plan) = crate::plan::soa_vec::current_plan() {
+            if let Some(elem_ty) = crate::analysis::heap::global_vec_elem_ty(table, peeled) {
+                if let Some(layout) = plan.get(table, elem_ty) {
+                    return Some(super::soa::empty_vec_expr(layout));
+                }
+            }
+        }
         if let Some(empty) = value::empty_native_vec_expr_for_heap(table, peeled, heap) {
             return Some(empty);
         }

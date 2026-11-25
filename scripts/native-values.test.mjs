@@ -1463,3 +1463,78 @@ test("branchless _bstr_is_ascii and _bstr_is_ascii_range agree across all bounda
   assert.equal(ctx.__rt._bstr_is_ascii_range("\x80" + "a".repeat(200) + "\x80", 1, 200), true);
   assert.equal(ctx.__rt._bstr_is_ascii_range("a".repeat(100) + "\u0100" + "a".repeat(100), 1, 200), false);
 });
+
+test("slice_sort direct-value sort preserves stability, panic safety, and _boxes tracking", () => {
+  // 1. Stability on both small (insertion) and large (>16 merge) indirect slices with non-zero off.
+  for (const len of [0, 1, 2, 5, 16, 17, 45]) {
+    const pad = { k: -999, id: -1 };
+    const items = Array.from({ length: len }, (_, i) => ({ k: (len - i) % 5, id: i }));
+    const buf = [pad, ...items, pad];
+    rt.slice_sort(buf, 1, len, null, (_, a, b) => a.k < b.k, true);
+    assert.equal(buf[0], pad);
+    assert.equal(buf[len + 1], pad);
+    for (let i = 1; i < len; i++) {
+      const prev = buf[i];
+      const cur = buf[i + 1];
+      assert.ok(prev.k < cur.k || (prev.k === cur.k && prev.id < cur.id), `unstable at len=${len} i=${i}`);
+    }
+  }
+
+  // 2. Direct scalar slices (isIndirect = false) with subslice offset and already-sorted fast path.
+  const nums = [99, 5, 1, 4, 2, 3, 88];
+  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  assert.deepEqual(nums, [99, 1, 2, 3, 4, 5, 88]);
+  // Already-sorted re-run leaves buffer untouched.
+  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  assert.deepEqual(nums, [99, 1, 2, 3, 4, 5, 88]);
+
+  // 3. Exception safety: comparator throwing midway must not partially mutate `buf`.
+  const orig = [
+    { k: 3, id: 0 },
+    { k: 1, id: 1 },
+    { k: 2, id: 2 },
+    { k: 0, id: 3 },
+  ];
+  const snap = orig.slice();
+  let calls = 0;
+  assert.throws(() => {
+    rt.slice_sort(
+      orig,
+      0,
+      orig.length,
+      null,
+      (_, a, b) => {
+        if (++calls === 3) throw new Error("boom");
+        return a.k < b.k;
+      },
+      true,
+    );
+  }, /boom/);
+  assert.deepEqual(orig, snap);
+
+  // 4. Heap-allocated indirect slice updates `_boxes` after permutation.
+  const cloneObj = (o) => ({ k: o.k, id: o.id });
+  const raw = rt.alloc(32, 4);
+  const typed = rt.unscale(raw, 8, () => ({ k: 0, id: 0 }), cloneObj);
+  const objs = [
+    { k: 30, id: 0 },
+    { k: 10, id: 1 },
+    { k: 20, id: 2 },
+    { k: 10, id: 3 },
+  ];
+  for (let i = 0; i < 4; i++) rt._put(typed.buf, i, objs[i], true);
+  rt.slice_sort(typed.buf, 0, 4, null, (_, a, b) => a.k < b.k, true);
+  assert.deepEqual(
+    typed.buf.slice(0, 4).map((o) => [o.k, o.id]),
+    [
+      [10, 1],
+      [10, 3],
+      [20, 2],
+      [30, 0],
+    ],
+  );
+  for (let i = 0; i < 4; i++) {
+    assert.equal(rt.ptr_eq(typed.buf[i], { buf: typed.buf, off: i }), true);
+  }
+  rt.dealloc(raw, 32, 4);
+});

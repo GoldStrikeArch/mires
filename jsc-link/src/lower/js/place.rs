@@ -38,6 +38,15 @@ pub enum JsPlace {
     /// One byte element indexed out of a raw `*const [u8]` / `*mut [u8]` / `*const [i8]` /
     /// `*mut [i8]` slice when whole-program analysis sees potential wide-to-byte aliasing.
     ByteAt { buf: Expr, off: Expr, signed: bool },
+    /// An element of a Structure-of-Arrays (SoA) `Vec<T>` / `&[T]` / `&T`: `buf` is the
+    /// `{ f0: TA0, f1: TA1, ... }` columns object and `off` is the element index.
+    SoaElem {
+        buf: Expr,
+        off: Expr,
+        elem_ty: TypeId,
+    },
+    /// A `bool` field stored as `0`/`1` inside an SoA `Uint8Array` column.
+    SoaBool { buf: Expr, col: String, off: Expr },
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the pointer.
     Array(Expr, u64),
@@ -275,6 +284,33 @@ impl<'a> JsCx<'a> {
                         variant = None;
                         continue;
                     }
+                    if self.soa_layout(pointee).is_some() {
+                        let (buf, off) = if step == 0 {
+                            if let Root::Value(v) = root {
+                                if let Some(pair) = self.soa_refs.borrow().get(v).cloned() {
+                                    pair
+                                } else {
+                                    let value = self.read_place(&current);
+                                    self.soa_unpack_slot_expr_for_place(value)
+                                }
+                            } else {
+                                let value = self.read_place(&current);
+                                self.soa_unpack_slot_expr_for_place(value)
+                            }
+                        } else {
+                            let value = self.read_place(&current);
+                            self.soa_unpack_slot_expr_for_place(value)
+                        };
+                        current = JsPlace::SoaElem {
+                            buf,
+                            off,
+                            elem_ty: pointee,
+                        };
+                        object = false;
+                        ty = pointee;
+                        variant = None;
+                        continue;
+                    }
                     let value = self.read_place(&current);
                     let shape = table.peeled(pointee);
                     current = match value::kind(table, shape) {
@@ -350,6 +386,34 @@ impl<'a> JsCx<'a> {
                     object &= matches!(key, FieldKey::Transparent);
                     smi_u32 = variant.is_none() && self.is_smi_u32_field(ty, *field);
                     let field_ty = *field_ty;
+                    if let JsPlace::SoaElem { buf, off, elem_ty } = current {
+                        if table.is_zst(field_ty) {
+                            current = JsPlace::Unit(jsast::undefined());
+                        } else if let Some(col) =
+                            self.soa_layout(elem_ty).and_then(|l| l.field(*field))
+                        {
+                            if col.scalar.is_bool() {
+                                current = JsPlace::SoaBool {
+                                    buf,
+                                    col: col.col_name.clone(),
+                                    off,
+                                };
+                            } else {
+                                current = JsPlace::Var(jsast::index(
+                                    jsast::member(buf, col.col_name.clone()),
+                                    off,
+                                ));
+                            }
+                        } else {
+                            return Err(decline(
+                                OpClass::Place,
+                                format!("SoA field {field} missing from layout"),
+                            ));
+                        }
+                        ty = field_ty;
+                        variant = None;
+                        continue;
+                    }
                     if matches!(current, JsPlace::Unit(_)) {
                         // Still no storage, and still the same address.
                     } else if table.is_zst(field_ty)
@@ -404,6 +468,19 @@ impl<'a> JsCx<'a> {
                                         off: offset(ptr::slot_off(slot), index),
                                         signed,
                                     }
+                                } else if self.soa_slice_layout(ty).is_some() {
+                                    let (buf, base_off) = self.soa_unpack_slot_expr_for_place(base);
+                                    let total_off = if self.is_zero_slice_off(root, step, &base_off)
+                                    {
+                                        index
+                                    } else {
+                                        offset(base_off, index)
+                                    };
+                                    JsPlace::SoaElem {
+                                        buf,
+                                        off: total_off,
+                                        elem_ty: element,
+                                    }
                                 } else {
                                     JsPlace::Var(self.element_expr(ty, base, index))
                                 }
@@ -435,20 +512,67 @@ impl<'a> JsCx<'a> {
                             }
                             _ => {
                                 let base = self.read_place(&current);
-                                let index =
-                                    self.constant_index(ty, base.clone(), *idx_offset, *from_end);
-                                if let Some(signed) = carried_raw_byte_slice {
-                                    let (setup, slot) = self.reread(base, &[BUF, OFF]);
-                                    JsPlace::ByteAt {
-                                        buf: super::ptr::sequenced(
+                                if self.soa_slice_layout(ty).is_some() {
+                                    if *from_end {
+                                        let (setup, slot) =
+                                            self.reread(base, &[BUF, OFF, ptr::LEN]);
+                                        let buf = super::ptr::sequenced(
                                             setup,
                                             ptr::slot_buf(slot.clone()),
-                                        ),
-                                        off: offset(ptr::slot_off(slot), index),
-                                        signed,
+                                        );
+                                        let base_off = ptr::slot_off(slot.clone());
+                                        let index = jsast::binary(
+                                            BinOp::Sub,
+                                            ptr::slot_len(slot),
+                                            jsast::num(*idx_offset as f64),
+                                        );
+                                        let total_off =
+                                            if self.is_zero_slice_off(root, step, &base_off) {
+                                                index
+                                            } else {
+                                                offset(base_off, index)
+                                            };
+                                        JsPlace::SoaElem {
+                                            buf,
+                                            off: total_off,
+                                            elem_ty: element,
+                                        }
+                                    } else {
+                                        let (buf, base_off) =
+                                            self.soa_unpack_slot_expr_for_place(base);
+                                        let index = jsast::num(*idx_offset as f64);
+                                        let total_off =
+                                            if self.is_zero_slice_off(root, step, &base_off) {
+                                                index
+                                            } else {
+                                                offset(base_off, index)
+                                            };
+                                        JsPlace::SoaElem {
+                                            buf,
+                                            off: total_off,
+                                            elem_ty: element,
+                                        }
                                     }
                                 } else {
-                                    JsPlace::Var(self.element_expr(ty, base, index))
+                                    let index = self.constant_index(
+                                        ty,
+                                        base.clone(),
+                                        *idx_offset,
+                                        *from_end,
+                                    );
+                                    if let Some(signed) = carried_raw_byte_slice {
+                                        let (setup, slot) = self.reread(base, &[BUF, OFF]);
+                                        JsPlace::ByteAt {
+                                            buf: super::ptr::sequenced(
+                                                setup,
+                                                ptr::slot_buf(slot.clone()),
+                                            ),
+                                            off: offset(ptr::slot_off(slot), index),
+                                            signed,
+                                        }
+                                    } else {
+                                        JsPlace::Var(self.element_expr(ty, base, index))
+                                    }
                                 }
                             }
                         };
@@ -718,6 +842,17 @@ impl<'a> JsCx<'a> {
                 }
                 jsast::rt_call("read_byte_at", args)
             }
+            JsPlace::SoaElem { buf, off, elem_ty } => {
+                if let Some(layout) = self.soa_layout(*elem_ty) {
+                    self.soa_read_elem(layout, buf.clone(), off.clone())
+                } else {
+                    jsast::undefined()
+                }
+            }
+            JsPlace::SoaBool { buf, col, off } => super::soa::decode_bool(jsast::index(
+                jsast::member(buf.clone(), col.clone()),
+                off.clone(),
+            )),
             JsPlace::Array(pointer, width) => jsast::rt_call(
                 "read_array",
                 vec![pointer.clone(), jsast::num(*width as f64)],
@@ -750,9 +885,30 @@ impl<'a> JsCx<'a> {
             JsPlace::Slot {
                 pointer, indirect, ..
             } => {
-                let target = self.slot_element(pointer);
+                let mut target = self.slot_element(pointer);
+                let mut stmts = Vec::new();
+                loop {
+                    match target {
+                        Expr::Seq(mut items) => {
+                            if let Some(tail) = items.pop() {
+                                for setup in items {
+                                    stmts.push(jsast::expr_stmt(setup));
+                                }
+                                target = tail;
+                            } else {
+                                target = Expr::Seq(items);
+                                break;
+                            }
+                        }
+                        other => {
+                            target = other;
+                            break;
+                        }
+                    }
+                }
                 if indirect {
-                    self.write_indirect(ty, target, value)
+                    stmts.extend(self.write_indirect(ty, target, value)?);
+                    Ok(stmts)
                 } else {
                     if !is_lvalue(&target) {
                         return Err(decline(
@@ -760,13 +916,24 @@ impl<'a> JsCx<'a> {
                             "a write to a place whose expression is not assignable (an inlined value used as storage)",
                         ));
                     }
-                    Ok(vec![jsast::assign_stmt(target, value)])
+                    stmts.push(jsast::assign_stmt(target, value));
+                    Ok(stmts)
                 }
             }
             JsPlace::ByteAt { buf, off, .. } => Ok(vec![jsast::expr_stmt(jsast::rt_call(
                 "write_byte_at",
                 vec![buf, off, value],
             ))]),
+            JsPlace::SoaElem { buf, off, elem_ty } => {
+                let Some(layout) = self.soa_layout(elem_ty) else {
+                    return Err(decline(OpClass::Place, "SoA layout missing on write"));
+                };
+                self.soa_write_elem(layout, buf, off, value)
+            }
+            JsPlace::SoaBool { buf, col, off } => Ok(vec![jsast::assign_stmt(
+                jsast::index(jsast::member(buf, col), off),
+                super::soa::encode_bool(value),
+            )]),
             JsPlace::Array(pointer, _) => {
                 let mut args = vec![pointer, value];
                 if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, ty) {
@@ -863,6 +1030,12 @@ impl<'a> JsCx<'a> {
         if let JsPlace::Unit(address) = walk.place {
             return Ok(address);
         }
+        if let JsPlace::SoaElem { buf, off, .. } = walk.place {
+            return Ok(ptr::slot(buf, off));
+        }
+        if matches!(walk.place, JsPlace::SoaBool { .. }) {
+            return Err(decline(OpClass::Place, "escaping borrow of SoA bool field"));
+        }
         if self.table.is_indirect(walk.ty) {
             let value = self.read_place(&walk.place);
             if self.needs_byte_slice_ref() {
@@ -907,6 +1080,15 @@ impl<'a> JsCx<'a> {
         if let JsPlace::Unit(address) = walk.place {
             return Ok(address);
         }
+        if let JsPlace::SoaElem { buf, off, .. } = walk.place {
+            return Ok(ptr::slot(buf, off));
+        }
+        if matches!(walk.place, JsPlace::SoaBool { .. }) {
+            return Err(decline(
+                OpClass::Place,
+                "escaping raw pointer to SoA bool field",
+            ));
+        }
         if let JsPlace::Array(pointer, 0) = walk.place {
             let mut args = vec![pointer, jsast::num(0)];
             if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, walk.ty) {
@@ -943,6 +1125,11 @@ impl<'a> JsCx<'a> {
             JsPlace::Var(Expr::Member(base, name)) => Ok(ptr::slot(*base, jsast::string(name))),
             JsPlace::Slot { pointer, .. } | JsPlace::Array(pointer, _) => Ok(pointer),
             JsPlace::ByteAt { buf, off, .. } => Ok(ptr::slot(buf, off)),
+            JsPlace::SoaElem { buf, off, .. } => Ok(ptr::slot(buf, off)),
+            JsPlace::SoaBool { .. } => Err(decline(
+                OpClass::Place,
+                "escaping slot pointer to SoA bool field",
+            )),
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => Ok(address),
             JsPlace::Deref(value) | JsPlace::Var(value) => {
@@ -956,6 +1143,66 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
+    }
+
+    /// Whether `base_off` for an SoA slice indexing step is provably always `0`, allowing
+    /// `0 + index` to fold directly to `index`.
+    fn is_zero_slice_off(&self, root: &Root, step: usize, base_off: &Expr) -> bool {
+        if matches!(base_off, Expr::Num(n) if *n == 0.0)
+            || matches!(base_off, Expr::RawNum(s) if s == "0")
+        {
+            return true;
+        }
+        if step != 1 {
+            return false;
+        }
+        let Root::Value(slice_v) = root else {
+            return false;
+        };
+        if !self.plan.physical_slices.contains(slice_v) {
+            return false;
+        }
+        let Some(def) = self.def_of(*slice_v) else {
+            return false;
+        };
+        let is_vec_as_slice = matches!(
+            &def.kind,
+            rcgjs_object::jir::repr::OpKind::Call {
+                semantic: rcgjs_object::jir::semantic::CallSemantic::Standard(
+                    rcgjs_object::jir::semantic::StandardOperation::VecAsSlice
+                        | rcgjs_object::jir::semantic::StandardOperation::NativeVecAsSlice
+                        | rcgjs_object::jir::semantic::StandardOperation::NativeVecAsMutSlice,
+                ),
+                host: None,
+                ..
+            }
+        );
+        if !is_vec_as_slice {
+            return false;
+        }
+        let Some(slice_name) = self.plan.names.get(slice_v) else {
+            return false;
+        };
+        // Ensure no other SSA value was coalesced onto `slice_name` and no edge copy overwrites it.
+        if self
+            .plan
+            .names
+            .iter()
+            .any(|(v, n)| v != slice_v && n == slice_name)
+        {
+            return false;
+        }
+        for copies in self.plan.copies.values() {
+            for copy in copies {
+                if let crate::lower::plan::CopyOperand::Value(dst) = copy.dst {
+                    if dst == *slice_v || self.plan.names.get(&dst).is_some_and(|n| n == slice_name)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// The metadata half of a fat pointer (`place.rs::ptr_metadata`).

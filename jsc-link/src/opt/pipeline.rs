@@ -315,7 +315,9 @@ fn run(
     }
 
     if opts.analyzes(OptimizerPass::AstDce) && passes.range {
-        let range = range::run_with_interns(func, table, interns, &mut witnesses);
+        let range = range::with_current_program_facts(|arena_facts| {
+            range::run_with_interns_and_facts(func, table, interns, arena_facts, &mut witnesses)
+        });
         if range.changed() {
             stats.range_changed = true;
             stats.asserts_removed += range.asserts_removed;
@@ -404,7 +406,10 @@ fn checked(
             corrupt(witnesses, target.to_string_lossy().as_ref());
         }
     }
-    if witness::check_all(witnesses, func, table).is_err() {
+    let check_res = range::with_current_program_facts(|arena_facts| {
+        witness::check_all_with_context(witnesses, func, table, arena_facts)
+    });
+    if check_res.is_err() {
         stats.witnesses_failed += 1;
         return Err(Decline::Proof(ProofDecline::Witness));
     }

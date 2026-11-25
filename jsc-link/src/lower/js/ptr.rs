@@ -34,6 +34,9 @@ impl<'a> JsCx<'a> {
         if table.is_zst(pointee) {
             return jsast::undefined();
         }
+        if let Some(layout) = self.soa_layout(pointee) {
+            return self.soa_deref_read(layout, pointer);
+        }
         if let Some(TypeKind::Array { length, .. }) = value::kind(table, pointee) {
             if is_slot_pointee(table, pointee) {
                 return jsast::rt_call("read_array", vec![pointer, jsast::num(*length as f64)]);
@@ -63,6 +66,9 @@ impl<'a> JsCx<'a> {
         let table = self.table;
         if table.is_zst(pointee) {
             return Ok(vec![jsast::expr_stmt(value)]);
+        }
+        if let Some(layout) = self.soa_layout(pointee) {
+            return self.soa_deref_write(layout, pointer, value);
         }
         if !is_slot_pointee(table, pointee) {
             return self.write_indirect(pointee, pointer, value);
@@ -105,8 +111,29 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
-        let element = slot_element_unwrapped(self, pointer);
-        Ok(vec![jsast::assign_stmt(element, value)])
+        let mut element = slot_element_unwrapped(self, pointer);
+        let mut stmts = Vec::new();
+        loop {
+            match element {
+                Expr::Seq(mut items) => {
+                    if let Some(tail) = items.pop() {
+                        for setup in items {
+                            stmts.push(jsast::expr_stmt(setup));
+                        }
+                        element = tail;
+                    } else {
+                        element = Expr::Seq(items);
+                        break;
+                    }
+                }
+                other => {
+                    element = other;
+                    break;
+                }
+            }
+        }
+        stmts.push(jsast::assign_stmt(element, value));
+        Ok(stmts)
     }
 
     /// Overwrites an indirect object value in place without rebinding any parent property/slot.
@@ -610,6 +637,7 @@ impl<'a> JsCx<'a> {
             && !self.byte_views.raw_byte_derefs
             && self.byte_views.elide_scale_scalar
             && !heap.needs_box_tracking(self.table, pointee)
+            && self.soa_layout(pointee).is_none()
             && is_slot_pointee(self.table, pointee)
             && !matches!(
                 value::kind(self.table, pointee),
@@ -627,6 +655,9 @@ impl<'a> JsCx<'a> {
     ) -> Res<Vec<Stmt>> {
         if self.table.is_zst(pointee) {
             return Ok(Vec::new());
+        }
+        if let Some(layout) = self.soa_layout(pointee) {
+            return Ok(self.soa_ptr_copy(layout, dst, src_ref, jsast::num(1), true));
         }
         let mut stmts = Vec::new();
         let src_val = if self.table.needs_clone(pointee) {
@@ -661,6 +692,9 @@ impl<'a> JsCx<'a> {
     ) -> Vec<Stmt> {
         if self.table.is_zst(pointee) {
             return Vec::new();
+        }
+        if let Some(layout) = self.soa_layout(pointee) {
+            return self.soa_ptr_copy(layout, dst, src, count, count_is_one);
         }
         if (count_is_one || count == jsast::num(1)) && self.can_inline_copy_one(pointee) {
             let src_elem = slot_element_read(self, src);
@@ -708,6 +742,9 @@ impl<'a> JsCx<'a> {
 
     /// `&value as *const T` (`ptr.rs::ref_to_raw`).
     pub fn ref_to_raw(&self, pointee: TypeId, reference: Expr) -> Expr {
+        if self.soa_layout(pointee).is_some() {
+            return reference;
+        }
         if self.table.unsized_tail(pointee).is_some() {
             return jsast::rt_call("tail_raw", vec![reference]);
         }
@@ -723,6 +760,9 @@ impl<'a> JsCx<'a> {
 
     /// `&*raw` (`ptr.rs::raw_to_ref`).
     pub fn raw_to_ref(&self, pointee: TypeId, raw: Expr) -> Expr {
+        if self.soa_layout(pointee).is_some() {
+            return raw;
+        }
         if self.table.unsized_tail(pointee).is_some() {
             let heap = self.heap();
             if heap.typed_heap_enabled

@@ -953,14 +953,54 @@ fn parse_small_const_loop(stmts: &[Stmt], loop_idx: usize) -> Option<ParsedConst
 // 4. Dominated Redundant Guard Elimination & Constant-Table / Bitmask Bounds
 // =================================================================================================
 
+/// Pure expression equivalence key for dominated guard elimination (handles `g >>> 0`,
+/// `g | 0`, `a & b`, `a + c`, `a - c`, and `obj.prop` with sound invalidation).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PureKey {
+    Const(u32),
+    Ident(String),
+    UShr0(Box<PureKey>),
+    BitOr0(Box<PureKey>),
+    BitAnd(Box<PureKey>, Box<PureKey>),
+    AddConst(Box<PureKey>, u32),
+    SubConst(Box<PureKey>, u32),
+    Member(String, String),
+}
+
+impl PureKey {
+    fn mentions_ident(&self, ident: &str) -> bool {
+        match self {
+            Self::Const(_) => false,
+            Self::Ident(s) | Self::Member(s, _) => s == ident,
+            Self::UShr0(a) | Self::BitOr0(a) | Self::AddConst(a, _) | Self::SubConst(a, _) => {
+                a.mentions_ident(ident)
+            }
+            Self::BitAnd(a, b) => a.mentions_ident(ident) || b.mentions_ident(ident),
+        }
+    }
+
+    fn has_member(&self) -> bool {
+        match self {
+            Self::Const(_) | Self::Ident(_) => false,
+            Self::Member(_, _) => true,
+            Self::UShr0(a) | Self::BitOr0(a) | Self::AddConst(a, _) | Self::SubConst(a, _) => {
+                a.has_member()
+            }
+            Self::BitAnd(a, b) => a.has_member() || b.has_member(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct GuardEnv {
     known_true: HashSet<String>,
     known_false: HashSet<String>,
     /// Pairs `(idx_key, len_key)` proven `idx < len`.
-    known_lt: HashSet<(String, String)>,
+    known_lt: HashSet<(PureKey, PureKey)>,
     /// Maps bool var `H` -> `(idx_key, len_key)` when `H = idx < len`.
-    bool_lt_def: HashMap<String, (String, String)>,
+    bool_lt_def: HashMap<String, (PureKey, PureKey)>,
+    /// Maps local var `v` -> canonical pure expression (e.g. `t = g >>> 0` -> `UShr0(Ident("g"))`).
+    expr_alias: HashMap<String, PureKey>,
     /// Maps local var `v` -> proven non-negative integer upper bound `<= u32`.
     upper_bounds: HashMap<String, u32>,
 }
@@ -970,10 +1010,85 @@ impl GuardEnv {
         self.known_true.remove(ident);
         self.known_false.remove(ident);
         self.upper_bounds.remove(ident);
+        self.expr_alias.remove(ident);
+        self.expr_alias.retain(|_, k| !k.mentions_ident(ident));
         self.bool_lt_def.remove(ident);
         self.bool_lt_def
-            .retain(|_, (a, b)| a != ident && b != ident);
-        self.known_lt.retain(|(a, b)| a != ident && b != ident);
+            .retain(|_, (a, b)| !a.mentions_ident(ident) && !b.mentions_ident(ident));
+        self.known_lt
+            .retain(|(a, b)| !a.mentions_ident(ident) && !b.mentions_ident(ident));
+    }
+
+    /// Invalidates all keys that read heap properties (`Member(obj, prop)`), preserving pure
+    /// local scalar/cast equivalences like `t = g >>> 0; t < c` across slice/field mutations!
+    fn invalidate_members(&mut self) {
+        self.expr_alias.retain(|_, k| !k.has_member());
+        self.bool_lt_def
+            .retain(|_, (a, b)| !a.has_member() && !b.has_member());
+        self.known_lt
+            .retain(|(a, b)| !a.has_member() && !b.has_member());
+    }
+
+    fn resolve_key(&self, expr: &Expr) -> Option<PureKey> {
+        self.resolve_key_depth(expr, 0)
+    }
+
+    fn resolve_key_depth(&self, expr: &Expr, depth: u8) -> Option<PureKey> {
+        if depth >= 6 {
+            return None;
+        }
+        if let Some(c) = exact_u32(expr) {
+            return Some(PureKey::Const(c));
+        }
+        match expr {
+            Expr::Ident(id) => Some(
+                self.expr_alias
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| PureKey::Ident(id.clone())),
+            ),
+            Expr::Member(obj, prop) => match obj.as_ref() {
+                Expr::Ident(base) => Some(PureKey::Member(base.clone(), prop.clone())),
+                _ => None,
+            },
+            Expr::Binary(BinOp::UShr, l, r) if exact_u32(r) == Some(0) => {
+                let inner = self.resolve_key_depth(l, depth + 1)?;
+                // `UShr0(UShr0(x))` and `UShr0(Const(c))` are idempotent!
+                match inner {
+                    PureKey::Const(_) | PureKey::UShr0(_) => Some(inner),
+                    other => Some(PureKey::UShr0(Box::new(other))),
+                }
+            }
+            Expr::Binary(BinOp::BitOr, l, r) if exact_i32(r) == Some(0) => {
+                let inner = self.resolve_key_depth(l, depth + 1)?;
+                match inner {
+                    PureKey::BitOr0(_) => Some(inner),
+                    other => Some(PureKey::BitOr0(Box::new(other))),
+                }
+            }
+            Expr::Binary(BinOp::BitAnd, l, r) => {
+                let lk = self.resolve_key_depth(l, depth + 1)?;
+                let rk = self.resolve_key_depth(r, depth + 1)?;
+                Some(PureKey::BitAnd(Box::new(lk), Box::new(rk)))
+            }
+            Expr::Binary(BinOp::Add, l, r) => {
+                if let Some(c) = exact_u32(r) {
+                    let lk = self.resolve_key_depth(l, depth + 1)?;
+                    Some(PureKey::AddConst(Box::new(lk), c))
+                } else if let Some(c) = exact_u32(l) {
+                    let rk = self.resolve_key_depth(r, depth + 1)?;
+                    Some(PureKey::AddConst(Box::new(rk), c))
+                } else {
+                    None
+                }
+            }
+            Expr::Binary(BinOp::Sub, l, r) => {
+                let c = exact_u32(r)?;
+                let lk = self.resolve_key_depth(l, depth + 1)?;
+                Some(PureKey::SubConst(Box::new(lk), c))
+            }
+            _ => None,
+        }
     }
 
     fn record_cond_true(&mut self, cond: &Expr) {
@@ -982,9 +1097,9 @@ impl GuardEnv {
                 self.known_true.insert(h.clone());
                 if let Some((a, b)) = self.bool_lt_def.get(h).cloned() {
                     self.known_lt.insert((a.clone(), b.clone()));
-                    if let Ok(c) = b.parse::<u32>() {
-                        if c >= 1 {
-                            self.tighten_upper(&a, c - 1);
+                    if let (PureKey::Ident(var), PureKey::Const(c)) = (&a, &b) {
+                        if *c >= 1 {
+                            self.tighten_upper(var, c - 1);
                         }
                     }
                 }
@@ -995,7 +1110,7 @@ impl GuardEnv {
                 }
             }
             Expr::Binary(BinOp::Lt, l, r) => {
-                if let (Some(lk), Some(rk)) = (simple_cmp_key(l), simple_cmp_key(r)) {
+                if let (Some(lk), Some(rk)) = (self.resolve_key(l), self.resolve_key(r)) {
                     self.known_lt.insert((lk, rk));
                 }
                 if let (Expr::Ident(v), Some(c)) = (l.as_ref(), exact_u32(r)) {
@@ -1092,9 +1207,15 @@ impl GuardEnv {
             Expr::Bool(false) => true,
             Expr::Ident(b) => self.known_false.contains(b),
             Expr::Unary(UnOp::Not, inner) => match inner.as_ref() {
-                Expr::Ident(h) => self.known_true.contains(h),
+                Expr::Ident(h) => {
+                    self.known_true.contains(h)
+                        || self
+                            .bool_lt_def
+                            .get(h)
+                            .is_some_and(|pair| self.known_lt.contains(pair))
+                }
                 Expr::Binary(BinOp::Lt, l, r) => {
-                    if let (Some(lk), Some(rk)) = (simple_cmp_key(l), simple_cmp_key(r)) {
+                    if let (Some(lk), Some(rk)) = (self.resolve_key(l), self.resolve_key(r)) {
                         if self.known_lt.contains(&(lk, rk)) {
                             return true;
                         }
@@ -1113,22 +1234,73 @@ impl GuardEnv {
     }
 }
 
-fn simple_cmp_key(expr: &Expr) -> Option<String> {
-    if let Some(c) = exact_u32(expr) {
-        return Some(c.to_string());
-    }
-    match expr {
-        Expr::Ident(id) => Some(id.clone()),
-        _ => None,
-    }
-}
-
 pub(super) fn eliminate_dominated_guards(stmts: &mut Vec<Stmt>) {
     if stmts_have_mutating_nested_fn(stmts) {
         return;
     }
     let mut env = GuardEnv::default();
     elim_guards_in_block(stmts, &mut env);
+}
+
+fn apply_guard_expr_step(expr: &Expr, env: &mut GuardEnv) {
+    match expr {
+        Expr::Seq(items) => {
+            for item in items {
+                apply_guard_expr_step(item, env);
+            }
+        }
+        Expr::Assign(lhs, rhs) => {
+            if expr_has_non_panic_call(rhs) || expr_has_non_panic_call(lhs) {
+                env.invalidate_members();
+            }
+            if let Expr::Ident(dst) = lhs.as_ref() {
+                let dst = dst.clone();
+                let ub = env.expr_upper_bound(rhs);
+                let lt_pair = match rhs.as_ref() {
+                    Expr::Binary(BinOp::Lt, l, r) => env.resolve_key(l).zip(env.resolve_key(r)),
+                    _ => None,
+                };
+                let alias_key = env.resolve_key(rhs);
+                let mut rhs_written = HashSet::new();
+                collect_written_idents_expr(rhs, &mut rhs_written);
+                for w in rhs_written {
+                    env.invalidate(&w);
+                }
+                env.invalidate(&dst);
+                if let Some(hi) = ub {
+                    env.upper_bounds.insert(dst.clone(), hi);
+                }
+                if let Some((a, b)) = lt_pair {
+                    if !a.mentions_ident(&dst) && !b.mentions_ident(&dst) {
+                        env.bool_lt_def.insert(dst.clone(), (a, b));
+                    }
+                }
+                if let Some(ak) = alias_key {
+                    if !ak.mentions_ident(&dst) {
+                        env.expr_alias.insert(dst, ak);
+                    }
+                }
+            } else {
+                env.invalidate_members();
+                let mut written = HashSet::new();
+                collect_written_idents_expr(lhs, &mut written);
+                collect_written_idents_expr(rhs, &mut written);
+                for w in written {
+                    env.invalidate(&w);
+                }
+            }
+        }
+        other => {
+            if expr_has_non_panic_call(other) {
+                env.invalidate_members();
+            }
+            let mut written = HashSet::new();
+            collect_written_idents_expr(other, &mut written);
+            for w in written {
+                env.invalidate(&w);
+            }
+        }
+    }
 }
 
 fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
@@ -1149,47 +1321,19 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
         }
 
         match &mut stmts[i] {
-            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                if let Expr::Ident(dst) = lhs.as_ref() {
-                    let dst = dst.clone();
-                    let ub = env.expr_upper_bound(rhs);
-                    let lt_pair = match rhs.as_ref() {
-                        Expr::Binary(BinOp::Lt, l, r) => simple_cmp_key(l).zip(simple_cmp_key(r)),
-                        _ => None,
-                    };
-                    let mut rhs_written = HashSet::new();
-                    collect_written_idents_expr(rhs, &mut rhs_written);
-                    for w in rhs_written {
-                        env.invalidate(&w);
-                    }
-                    env.invalidate(&dst);
-                    if let Some(hi) = ub {
-                        env.upper_bounds.insert(dst.clone(), hi);
-                    }
-                    if let Some((a, b)) = lt_pair {
-                        if a != dst && b != dst {
-                            env.bool_lt_def.insert(dst, (a, b));
-                        }
-                    }
-                } else {
-                    let mut written = HashSet::new();
-                    collect_written_idents_expr(lhs, &mut written);
-                    collect_written_idents_expr(rhs, &mut written);
-                    for w in written {
-                        env.invalidate(&w);
-                    }
-                }
-            }
             Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
-                let mut written = HashSet::new();
-                collect_written_idents_expr(e, &mut written);
-                for w in written {
-                    env.invalidate(&w);
-                }
+                apply_guard_expr_step(e, env);
             }
             Stmt::Let(n, init) => {
                 let n = n.clone();
+                let mut alias_key = None;
+                let mut ub = None;
                 if let Some(e) = init {
+                    if expr_has_non_panic_call(e) {
+                        env.invalidate_members();
+                    }
+                    ub = env.expr_upper_bound(e);
+                    alias_key = env.resolve_key(e);
                     let mut written = HashSet::new();
                     collect_written_idents_expr(e, &mut written);
                     for w in written {
@@ -1197,21 +1341,45 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                     }
                 }
                 env.invalidate(&n);
+                if let Some(hi) = ub {
+                    env.upper_bounds.insert(n.clone(), hi);
+                }
+                if let Some(ak) = alias_key {
+                    if !ak.mentions_ident(&n) {
+                        env.expr_alias.insert(n, ak);
+                    }
+                }
             }
             Stmt::Const(n, e) => {
                 let n = n.clone();
+                if expr_has_non_panic_call(e) {
+                    env.invalidate_members();
+                }
+                let ub = env.expr_upper_bound(e);
+                let alias_key = env.resolve_key(e);
                 let mut written = HashSet::new();
                 collect_written_idents_expr(e, &mut written);
                 for w in written {
                     env.invalidate(&w);
                 }
                 env.invalidate(&n);
+                if let Some(hi) = ub {
+                    env.upper_bounds.insert(n.clone(), hi);
+                }
+                if let Some(ak) = alias_key {
+                    if !ak.mentions_ident(&n) {
+                        env.expr_alias.insert(n, ak);
+                    }
+                }
             }
             Stmt::Lets(decls) => {
                 let mut written = HashSet::new();
                 for (n, init) in decls {
                     written.insert(n.clone());
                     if let Some(e) = init {
+                        if expr_has_non_panic_call(e) {
+                            env.invalidate_members();
+                        }
                         collect_written_idents_expr(e, &mut written);
                     }
                 }
@@ -1220,6 +1388,9 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                 }
             }
             Stmt::If(cond, then_b, else_b) => {
+                if expr_has_non_panic_call(cond) {
+                    env.invalidate_members();
+                }
                 let mut cond_written = HashSet::new();
                 collect_written_idents_expr(cond, &mut cond_written);
                 for w in cond_written {
@@ -1231,6 +1402,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                 elim_guards_in_block(then_b, &mut then_env);
 
                 if let Some(eb) = else_b {
+                    let else_diverges = stmts_definitely_diverge(eb);
                     let mut else_env = env.clone();
                     if let Expr::Unary(UnOp::Not, inner) = cond {
                         else_env.record_cond_true(inner);
@@ -1238,11 +1410,18 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                         else_env.known_false.insert(b.clone());
                     }
                     elim_guards_in_block(eb, &mut else_env);
-                    let mut written = HashSet::new();
-                    collect_written_idents_stmts(then_b, &mut written, true);
-                    collect_written_idents_stmts(eb, &mut written, true);
-                    for w in written {
-                        env.invalidate(&w);
+                    if else_diverges && !then_diverges {
+                        *env = then_env;
+                    } else if then_diverges && !else_diverges {
+                        *env = else_env;
+                    } else {
+                        env.invalidate_members();
+                        let mut written = HashSet::new();
+                        collect_written_idents_stmts(then_b, &mut written, true);
+                        collect_written_idents_stmts(eb, &mut written, true);
+                        for w in written {
+                            env.invalidate(&w);
+                        }
                     }
                 } else if then_diverges {
                     // Cold diverging guard `if (cond) { panic; }` fell through: `!cond` holds!
@@ -1252,6 +1431,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                         env.known_false.insert(b.clone());
                     }
                 } else {
+                    env.invalidate_members();
                     let mut written = HashSet::new();
                     collect_written_idents_stmts(then_b, &mut written, true);
                     for w in written {
@@ -1260,6 +1440,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                 }
             }
             Stmt::Switch(disc, cases) => {
+                env.invalidate_members();
                 let mut written = HashSet::new();
                 collect_written_idents_expr(disc, &mut written);
                 for w in &written {
@@ -1275,6 +1456,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                 }
             }
             Stmt::LoopForever(_, b) => {
+                env.invalidate_members();
                 let mut written = HashSet::new();
                 collect_written_idents_stmts(b, &mut written, true);
                 for w in written {
@@ -1284,6 +1466,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                 elim_guards_in_block(b, &mut b_env);
             }
             Stmt::While(cond, b) => {
+                env.invalidate_members();
                 let mut written = HashSet::new();
                 collect_written_idents_expr(cond, &mut written);
                 collect_written_idents_stmts(b, &mut written, true);
@@ -1299,6 +1482,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
             }
             Stmt::Labeled(_, inner) => match inner.as_mut() {
                 Stmt::Block(b) => {
+                    env.invalidate_members();
                     let mut written = HashSet::new();
                     collect_written_idents_stmts(b, &mut written, false);
                     let mut b_env = env.clone();
@@ -1308,6 +1492,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                     }
                 }
                 Stmt::LoopForever(_, b) => {
+                    env.invalidate_members();
                     let mut written = HashSet::new();
                     collect_written_idents_stmts(b, &mut written, true);
                     for w in written {
@@ -1317,6 +1502,7 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
                     elim_guards_in_block(b, &mut b_env);
                 }
                 Stmt::While(cond, b) => {
+                    env.invalidate_members();
                     let mut written = HashSet::new();
                     collect_written_idents_expr(cond, &mut written);
                     collect_written_idents_stmts(b, &mut written, true);
@@ -7843,6 +8029,115 @@ mod tests {
             sn.matches("a + b >>> 0").count(),
             4,
             "all four non-bit32-consumed locals must preserve >>> 0: {sn}"
+        );
+    }
+
+    #[test]
+    fn dominated_guard_eliminates_cast_wrapped_and_seq_checks_and_respects_reassignment() {
+        let panic_throw = |idx: &str, len: &str| {
+            Stmt::Throw(Expr::Call(
+                Box::new(jsast::id("core$panicking$panic_bounds_check$h1")),
+                vec![jsast::id(idx), jsast::id(len), jsast::id("$hc_1")],
+            ))
+        };
+        let bounds_if = |idx: &str, len: &str| {
+            Stmt::If(
+                Expr::Unary(
+                    UnOp::Not,
+                    Box::new(Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id(idx)),
+                        Box::new(jsast::id(len)),
+                    )),
+                ),
+                vec![panic_throw(idx, len)],
+                None,
+            )
+        };
+        let ushr0 = |name: &str| {
+            Expr::Binary(
+                BinOp::UShr,
+                Box::new(jsast::id(name)),
+                Box::new(Expr::Num(0.0)),
+            )
+        };
+
+        // Positive 1: `t = g >>> 0; if (!(t < c)) throw ...; a[t].prev = 1; j = g >>> 0; if (!(j < c)) throw ...;`
+        let mut stmts = vec![
+            jsast::assign_stmt(jsast::id("t"), ushr0("g")),
+            bounds_if("t", "c"),
+            jsast::assign_stmt(
+                Expr::Member(
+                    Box::new(jsast::index(jsast::id("a"), jsast::id("t"))),
+                    "prev".to_owned(),
+                ),
+                Expr::Num(1.0),
+            ),
+            jsast::assign_stmt(jsast::id("j"), ushr0("g")),
+            bounds_if("j", "c"),
+        ];
+        super::eliminate_dominated_guards(&mut stmts);
+        let out: String = stmts.iter().map(jsast::stmt_to_string).collect();
+        assert_eq!(
+            out.matches("panic_bounds_check").count(),
+            1,
+            "cast-wrapped duplicate check across field store must be eliminated: {out}"
+        );
+
+        // Positive 2: `Expr::Seq` slice unpacking `dL = c9, dM = cu` propagates length alias!
+        let mut seq_stmts = vec![
+            Stmt::ExprStmt(Expr::Seq(vec![
+                Expr::Assign(Box::new(jsast::id("dL")), Box::new(jsast::id("c9"))),
+                Expr::Assign(Box::new(jsast::id("dM")), Box::new(jsast::id("cu"))),
+            ])),
+            bounds_if("x", "dM"),
+            bounds_if("x", "cu"),
+        ];
+        super::eliminate_dominated_guards(&mut seq_stmts);
+        let seq_out: String = seq_stmts.iter().map(jsast::stmt_to_string).collect();
+        assert_eq!(
+            seq_out.matches("panic_bounds_check").count(),
+            1,
+            "Expr::Seq alias `dM = cu` must allow eliminating dominated `x < cu` check: {seq_out}"
+        );
+
+        // Negative 1: reassigning `g` between checks MUST preserve the second check!
+        let mut neg_g = vec![
+            jsast::assign_stmt(jsast::id("t"), ushr0("g")),
+            bounds_if("t", "c"),
+            jsast::assign_stmt(
+                jsast::id("g"),
+                Expr::Binary(
+                    BinOp::Add,
+                    Box::new(jsast::id("g")),
+                    Box::new(Expr::Num(1.0)),
+                ),
+            ),
+            jsast::assign_stmt(jsast::id("j"), ushr0("g")),
+            bounds_if("j", "c"),
+        ];
+        super::eliminate_dominated_guards(&mut neg_g);
+        let ng_out: String = neg_g.iter().map(jsast::stmt_to_string).collect();
+        assert_eq!(
+            ng_out.matches("panic_bounds_check").count(),
+            2,
+            "reassigning `g` must invalidate dominated check: {ng_out}"
+        );
+
+        // Negative 2: reassigning `c` between checks MUST preserve the second check!
+        let mut neg_c = vec![
+            jsast::assign_stmt(jsast::id("t"), ushr0("g")),
+            bounds_if("t", "c"),
+            jsast::assign_stmt(jsast::id("c"), jsast::id("other")),
+            jsast::assign_stmt(jsast::id("j"), ushr0("g")),
+            bounds_if("j", "c"),
+        ];
+        super::eliminate_dominated_guards(&mut neg_c);
+        let nc_out: String = neg_c.iter().map(jsast::stmt_to_string).collect();
+        assert_eq!(
+            nc_out.matches("panic_bounds_check").count(),
+            2,
+            "reassigning `c` must invalidate dominated check: {nc_out}"
         );
     }
 }

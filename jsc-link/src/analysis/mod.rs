@@ -5,6 +5,7 @@
 //! (`crate::plan`) reads them too, and a plan runs before any pass does.
 
 pub mod alloc_sites;
+pub mod arena;
 pub mod ascii;
 pub mod byte_views;
 pub mod callgraph;

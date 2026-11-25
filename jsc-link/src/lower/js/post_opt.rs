@@ -39,12 +39,12 @@ pub(super) fn run_speed_post_opts_with_mode(
 
     // 1. Fold constant expressions, constant array indexing (`[1][0]`), single-assign literal
     //    propagation (`ah = 14`, `E = "children"`, `k = "Some"`), and constant switches.
-    fold_constants_and_switches(body, &uninit_locals);
+    fold_constants_and_switches(body, &uninit_locals, &local_names);
 
     // 1b. Fast-path dead-`lo` `$__mires_i64_f64_to_bits(x)` sign-bit tests (`f64::is_sign_negative`
     //     in `f64::min`/`f64::max`), then re-fold any exposed constant branches (`c === 1`).
     if fast_path_f64_sign_bit(body) {
-        fold_constants_and_switches(body, &uninit_locals);
+        fold_constants_and_switches(body, &uninit_locals, &local_names);
     }
 
     // 1c. Fold IEEE-754 `Math.max` / `Math.min` labeled-block idioms (`d3-hierarchy`).
@@ -62,7 +62,7 @@ pub(super) fn run_speed_post_opts_with_mode(
     //    exposed constant arithmetic (`Math.imul`, `% 10`, `+ 1`) and dead bounds guards.
     if allow_duplicating && loop_opt::unroll_small_const_loops(body) {
         prop_straight_line_lits(body, &local_names);
-        fold_constants_and_switches(body, &uninit_locals);
+        fold_constants_and_switches(body, &uninit_locals, &local_names);
     }
 
     // 5. Eliminate redundant dominated panic guards (`if (!aD)`, `if (!H)`, `if (bi)`) and
@@ -106,6 +106,13 @@ pub(super) fn run_speed_post_opts_with_mode(
     //     bit-exact 32-bit loop-carried registers (`x + z >>> 0` -> `x + z | 0`, `compress256`).
     loop_opt::smi_ize_counted_loop_steps(body);
     loop_opt::demote_bitexact_u32_wraps(body, params);
+
+    // 6f. Fold Rust `ToInt32` labeled-block diamonds (`earcut` `zorder` in `earcut_linked` and
+    //     `is_ear_hashed_sl`) to `dst = src | 0` (or `dst = src >>> 0`) when all intermediate
+    //     temporaries written in the slow path are dead after the block.
+    if !local_names.contains("Math") {
+        fold_to_int32_diamonds(body, &local_names);
+    }
 
     // 7. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE.
     if !local_names.contains("Reflect") {
@@ -292,13 +299,33 @@ fn is_bool_expr(expr: &Expr) -> bool {
 }
 
 pub(super) fn is_already_i32_expr(expr: &Expr) -> bool {
+    if is_proven_nonneg_i31(expr) {
+        return true;
+    }
     match expr {
+        Expr::Num(n) => {
+            n.is_finite()
+                && n.fract() == 0.0
+                && !(*n == 0.0 && n.is_sign_negative())
+                && (-2147483648.0..=2147483647.0).contains(n)
+        }
+        Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+            Expr::Num(n) => {
+                let v = -*n;
+                v.is_finite()
+                    && v.fract() == 0.0
+                    && *n != 0.0
+                    && (-2147483648.0..=2147483647.0).contains(&v)
+            }
+            _ => false,
+        },
         Expr::Unary(UnOp::BitNot, _) => true,
         Expr::Binary(
             BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Shl | BinOp::Shr,
             _,
             _,
         ) => true,
+        Expr::Cond(_, t, e) => is_already_i32_expr(t) && is_already_i32_expr(e),
         Expr::Call(callee, args) if args.len() == 2 => matches!(
             callee.as_ref(),
             Expr::Member(obj, prop)
@@ -406,6 +433,44 @@ fn strip_zero_ushr(expr: &Expr) -> Expr {
     }
 }
 
+/// Unwraps double negation `!!x -> x` in contexts that implicitly apply `ToBoolean`
+/// (`if (cond)`, `while (cond)`, `cond ? a : b`).
+fn unwrap_double_not_cond(cond: &mut Expr) -> bool {
+    let mut changed = false;
+    while let Expr::Unary(UnOp::Not, inner) = cond {
+        if let Expr::Unary(UnOp::Not, inner2) = inner.as_ref() {
+            *cond = (**inner2).clone();
+            changed = true;
+        } else {
+            break;
+        }
+    }
+    changed
+}
+
+/// Folds subexpressions of an assignment LHS without turning the LHS itself into a non-lvalue
+/// (e.g. never collapsing `[a, b][0] = v` into `a = v` or `({ a }).a = v` into `a = v`).
+fn fold_lvalue_expr(lhs: &mut Expr) -> bool {
+    match lhs {
+        Expr::Member(obj, _) => fold_expr(obj),
+        Expr::Index(arr, idx) => {
+            let mut changed = fold_expr(arr);
+            changed |= fold_expr(idx);
+            if let Expr::Binary(BinOp::Add, il, ir) = idx.as_ref() {
+                if is_pos_zero(il) && is_numeric_index_subexpr(ir) {
+                    **idx = (**ir).clone();
+                    changed = true;
+                } else if is_pos_zero(ir) && is_numeric_index_subexpr(il) {
+                    **idx = (**il).clone();
+                    changed = true;
+                }
+            }
+            changed
+        }
+        other => fold_expr(other),
+    }
+}
+
 fn fold_expr(expr: &mut Expr) -> bool {
     let mut changed = false;
     match expr {
@@ -421,12 +486,17 @@ fn fold_expr(expr: &mut Expr) -> bool {
             }
         }
         Expr::Unary(_, inner) => changed |= fold_expr(inner),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+        Expr::Binary(_, l, r) => {
             changed |= fold_expr(l);
+            changed |= fold_expr(r);
+        }
+        Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+            changed |= fold_lvalue_expr(l);
             changed |= fold_expr(r);
         }
         Expr::Cond(c, t, e) => {
             changed |= fold_expr(c);
+            changed |= unwrap_double_not_cond(c);
             changed |= fold_expr(t);
             changed |= fold_expr(e);
         }
@@ -442,8 +512,9 @@ fn fold_expr(expr: &mut Expr) -> bool {
         }
         Expr::Arrow(_, ArrowBody::Expr(b)) => changed |= fold_expr(b),
         Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+            let empty = HashSet::new();
             for s in stmts {
-                changed |= fold_stmt(s);
+                changed |= fold_stmt(s, &empty);
             }
         }
         _ => {}
@@ -478,7 +549,8 @@ fn fold_expr(expr: &mut Expr) -> bool {
                 None
             }
         }
-        // `[c0, c1, ...][k]` where every element is a pure literal -> `c_k`, and
+        // `[e0, e1, ...][k]` -> `e_k` when every discarded element `j != k` is side-effect-free
+        // (collapses `[1][0]`, `[void 0, y][1]` in `minisearch`, `[U, $r1][0]` in `marked`), and
         // `arr[0 + idx]` / `arr[idx + 0]` -> `arr[idx]` for numeric index subexpressions.
         Expr::Index(arr, idx) => {
             if let Expr::Binary(BinOp::Add, il, ir) = idx.as_ref() {
@@ -492,7 +564,12 @@ fn fold_expr(expr: &mut Expr) -> bool {
             }
             if let (Expr::Array(items), Some(k)) = (arr.as_ref(), exact_u32(idx)) {
                 let k = k as usize;
-                if k < items.len() && items.iter().all(|it| SimpleLit::from_expr(it).is_some()) {
+                if k < items.len()
+                    && items
+                        .iter()
+                        .enumerate()
+                        .all(|(j, it)| j == k || !loop_opt::expr_has_side_effect(it))
+                {
                     Some(items[k].clone())
                 } else {
                     None
@@ -625,6 +702,18 @@ fn fold_expr(expr: &mut Expr) -> bool {
                 }
                 _ => None,
             },
+            BinOp::And => match (l.as_ref(), r.as_ref()) {
+                (Expr::Bool(true), _) => Some((**r).clone()),
+                (Expr::Bool(false), _) => Some(Expr::Bool(false)),
+                (_, Expr::Bool(true)) if is_bool_expr(l) => Some((**l).clone()),
+                _ => None,
+            },
+            BinOp::Or => match (l.as_ref(), r.as_ref()) {
+                (Expr::Bool(false), _) => Some((**r).clone()),
+                (Expr::Bool(true), _) => Some(Expr::Bool(true)),
+                (_, Expr::Bool(false)) if is_bool_expr(l) => Some((**l).clone()),
+                _ => None,
+            },
             BinOp::BitOr => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(num_expr_i32(a | b)),
                 (None, Some(0)) if is_already_i32_expr(l) => Some((**l).clone()),
@@ -637,6 +726,16 @@ fn fold_expr(expr: &mut Expr) -> bool {
                             Expr::Binary(BinOp::BitOr, inner.clone(), Box::new(Expr::Num(0.0)))
                         })
                     }
+                    Expr::Binary(BinOp::Sub, zero, rhs)
+                        if is_pos_zero(zero)
+                            && !matches!(rhs.as_ref(), Expr::Unary(UnOp::Neg, _)) =>
+                    {
+                        Some(Expr::Binary(
+                            BinOp::BitOr,
+                            Box::new(Expr::Unary(UnOp::Neg, rhs.clone())),
+                            Box::new(Expr::Num(0.0)),
+                        ))
+                    }
                     _ => None,
                 },
                 (Some(0), None) => match r.as_ref() {
@@ -646,6 +745,16 @@ fn fold_expr(expr: &mut Expr) -> bool {
                         } else {
                             Expr::Binary(BinOp::BitOr, inner.clone(), Box::new(Expr::Num(0.0)))
                         })
+                    }
+                    Expr::Binary(BinOp::Sub, zero, rhs)
+                        if is_pos_zero(zero)
+                            && !matches!(rhs.as_ref(), Expr::Unary(UnOp::Neg, _)) =>
+                    {
+                        Some(Expr::Binary(
+                            BinOp::BitOr,
+                            Box::new(Expr::Unary(UnOp::Neg, rhs.clone())),
+                            Box::new(Expr::Num(0.0)),
+                        ))
                     }
                     _ => None,
                 },
@@ -875,7 +984,7 @@ fn try_fold_constant_switch(disc: &Expr, cases: &[jsast::SwitchCase]) -> Option<
     Some(collected)
 }
 
-fn fold_stmt(stmt: &mut Stmt) -> bool {
+fn fold_stmt(stmt: &mut Stmt, local_names: &HashSet<String>) -> bool {
     let mut changed = false;
     match stmt {
         Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) | Stmt::Let(_, Some(e)) => {
@@ -891,9 +1000,10 @@ fn fold_stmt(stmt: &mut Stmt) -> bool {
         }
         Stmt::If(cond, then_b, else_b) => {
             changed |= fold_expr(cond);
-            changed |= fold_stmt_list(then_b);
+            changed |= unwrap_double_not_cond(cond);
+            changed |= fold_stmt_list(then_b, local_names);
             if let Some(eb) = else_b {
-                changed |= fold_stmt_list(eb);
+                changed |= fold_stmt_list(eb, local_names);
             }
         }
         Stmt::Switch(disc, cases) => {
@@ -902,30 +1012,50 @@ fn fold_stmt(stmt: &mut Stmt) -> bool {
                 for t in &mut c.tests {
                     changed |= fold_expr(t);
                 }
-                changed |= fold_stmt_list(&mut c.body);
+                changed |= fold_stmt_list(&mut c.body, local_names);
             }
         }
-        Stmt::Labeled(_, inner) => changed |= fold_stmt(inner),
-        Stmt::LoopForever(_, b) | Stmt::Block(b) => changed |= fold_stmt_list(b),
+        Stmt::Labeled(_, inner) => changed |= fold_stmt(inner, local_names),
+        Stmt::LoopForever(_, b) | Stmt::Block(b) => changed |= fold_stmt_list(b, local_names),
         Stmt::While(t, b) => {
             changed |= fold_expr(t);
-            changed |= fold_stmt_list(b);
+            changed |= unwrap_double_not_cond(t);
+            changed |= fold_stmt_list(b, local_names);
         }
         Stmt::TryCatch { body, handler, .. } => {
-            changed |= fold_stmt_list(body);
-            changed |= fold_stmt_list(handler);
+            changed |= fold_stmt_list(body, local_names);
+            changed |= fold_stmt_list(handler, local_names);
         }
         _ => {}
     }
     changed
 }
 
-fn fold_stmt_list(stmts: &mut Vec<Stmt>) -> bool {
+fn negate_bool_cond(cond: &Expr) -> Expr {
+    match cond {
+        Expr::Unary(UnOp::Not, inner) => (**inner).clone(),
+        other => Expr::Unary(UnOp::Not, Box::new(other.clone())),
+    }
+}
+
+fn fold_stmt_list(stmts: &mut Vec<Stmt>, local_names: &HashSet<String>) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < stmts.len() {
-        changed |= fold_stmt(&mut stmts[i]);
+        changed |= fold_stmt(&mut stmts[i], local_names);
         match &stmts[i] {
+            // Eliminate no-op local self-assignments `x = x;` (exposes empty `then`/`else` arms
+            // such as `if (F < y) { F = F; } else F = y;` in `earcut`).
+            Stmt::ExprStmt(Expr::Assign(lhs, rhs))
+                if matches!(
+                    (lhs.as_ref(), rhs.as_ref()),
+                    (Expr::Ident(a), Expr::Ident(b)) if a == b && local_names.contains(a)
+                ) =>
+            {
+                stmts.remove(i);
+                changed = true;
+                continue;
+            }
             Stmt::Switch(disc, cases) => {
                 if let Some(inlined) = try_fold_constant_switch(disc, cases) {
                     let count = inlined.len();
@@ -945,6 +1075,34 @@ fn fold_stmt_list(stmts: &mut Vec<Stmt>) -> bool {
                 stmts.splice(i..=i, replacement);
                 changed = true;
                 i += count;
+                continue;
+            }
+            Stmt::If(cond, then_b, else_b)
+                if then_b.is_empty() && else_b.as_ref().is_none_or(Vec::is_empty) =>
+            {
+                if loop_opt::expr_has_side_effect(cond) {
+                    stmts[i] = Stmt::ExprStmt(cond.clone());
+                    changed = true;
+                    i += 1;
+                } else {
+                    stmts.remove(i);
+                    changed = true;
+                }
+                continue;
+            }
+            Stmt::If(cond, then_b, Some(else_b)) if then_b.is_empty() && !else_b.is_empty() => {
+                let mut neg = negate_bool_cond(cond);
+                fold_expr(&mut neg);
+                unwrap_double_not_cond(&mut neg);
+                stmts[i] = Stmt::If(neg, else_b.clone(), None);
+                changed = true;
+                continue;
+            }
+            Stmt::If(_, _, Some(else_b)) if else_b.is_empty() => {
+                if let Stmt::If(_, _, eb) = &mut stmts[i] {
+                    *eb = None;
+                }
+                changed = true;
                 continue;
             }
             _ => {}
@@ -1423,9 +1581,13 @@ fn prop_local_lits_in_block(
     changed
 }
 
-fn fold_constants_and_switches(body: &mut Vec<Stmt>, uninit_locals: &HashSet<String>) {
+fn fold_constants_and_switches(
+    body: &mut Vec<Stmt>,
+    uninit_locals: &HashSet<String>,
+    local_names: &HashSet<String>,
+) {
     for _ in 0..3 {
-        let mut changed = fold_stmt_list(body);
+        let mut changed = fold_stmt_list(body, local_names);
         if !uninit_locals.is_empty() {
             let mut usage = HashMap::new();
             scan_const_usage_stmts(body, uninit_locals, false, &mut usage);
@@ -1461,7 +1623,7 @@ fn prop_straight_line_lits(body: &mut [Stmt], local_names: &HashSet<String>) {
                     env.remove(id);
                 } else {
                     subst_env_expr(lhs, env);
-                    fold_expr(lhs);
+                    fold_lvalue_expr(lhs);
                 }
             }
             Expr::CompoundAssign(_, lhs, rhs) => {
@@ -1471,7 +1633,7 @@ fn prop_straight_line_lits(body: &mut [Stmt], local_names: &HashSet<String>) {
                     env.remove(id);
                 } else {
                     subst_env_expr(lhs, env);
-                    fold_expr(lhs);
+                    fold_lvalue_expr(lhs);
                 }
             }
             Expr::Unary(_, e) | Expr::Member(e, _) => subst_env_expr(e, env),
@@ -2031,12 +2193,18 @@ fn match_i64_div_at(stmts: &[Stmt], idx: usize) -> Option<I64DivCall> {
     let Expr::Call(callee, args) = rhs.as_ref() else {
         return None;
     };
-    if !matches!(callee.as_ref(), Expr::Ident(id) if id == i64_pair::HELPER_DIV) || args.len() != 6
-    {
-        return None;
-    }
-    let (Expr::Bool(signed), Expr::Bool(rem)) = (&args[4], &args[5]) else {
-        return None;
+    let (signed, rem) = match callee.as_ref() {
+        Expr::Ident(id) if id == i64_pair::HELPER_DIV && args.len() == 6 => {
+            let (Expr::Bool(signed), Expr::Bool(rem)) = (&args[4], &args[5]) else {
+                return None;
+            };
+            (*signed, *rem)
+        }
+        Expr::Ident(id) if id == i64_pair::HELPER_SDIV && args.len() == 4 => (true, false),
+        Expr::Ident(id) if id == i64_pair::HELPER_UDIV && args.len() == 4 => (false, false),
+        Expr::Ident(id) if id == i64_pair::HELPER_SREM && args.len() == 4 => (true, true),
+        Expr::Ident(id) if id == i64_pair::HELPER_UREM && args.len() == 4 => (false, true),
+        _ => return None,
     };
     if !is_pure_atom(&args[0])
         || !is_pure_atom(&args[1])
@@ -2062,8 +2230,8 @@ fn match_i64_div_at(stmts: &[Stmt], idx: usize) -> Option<I64DivCall> {
         ah: args[1].clone(),
         bl: args[2].clone(),
         bh: args[3].clone(),
-        signed: *signed,
-        rem: *rem,
+        signed,
+        rem,
         span,
     })
 }
@@ -2284,14 +2452,18 @@ fn fuse_i64_div_rem(
             .as_ref()
             .map(|_| alloc_fresh_local(local_names, extra_decls, "$dr_hi"));
 
+        let divrem_helper = if first.signed {
+            i64_pair::HELPER_SDIVREM
+        } else {
+            i64_pair::HELPER_UDIVREM
+        };
         let divrem_call = jsast::call(
-            jsast::id(i64_pair::HELPER_DIVREM),
+            jsast::id(divrem_helper),
             vec![
                 first.al.clone(),
                 first.ah.clone(),
                 first.bl.clone(),
                 first.bh.clone(),
-                Expr::Bool(first.signed),
             ],
         );
 
@@ -2353,6 +2525,632 @@ fn fuse_i64_div_rem(
         stmts.splice(i..i + first.span, first_repl);
         i += first_new_len;
     }
+}
+
+// =============================================================================================
+// 3b. `ToInt32` / `ToUint32` labeled-block diamond folding (`earcut` zorder)
+// =============================================================================================
+
+/// Matches `var | 0` (or `0 | var`) returning `Some((var, false))`, or `var >>> 0` (or
+/// `(var | 0) >>> 0`) returning `Some((var, true))`.
+fn match_ident_bit32_wrap(expr: &Expr) -> Option<(&str, bool)> {
+    match expr {
+        Expr::Binary(BinOp::BitOr, l, r) => {
+            if exact_i32(r) == Some(0) {
+                if let Expr::Ident(id) = l.as_ref() {
+                    return Some((id.as_str(), false));
+                }
+            }
+            if exact_i32(l) == Some(0) {
+                if let Expr::Ident(id) = r.as_ref() {
+                    return Some((id.as_str(), false));
+                }
+            }
+            None
+        }
+        Expr::Binary(BinOp::UShr, l, r) if exact_i32(r) == Some(0) => match l.as_ref() {
+            Expr::Ident(id) => Some((id.as_str(), true)),
+            Expr::Binary(BinOp::BitOr, il, ir) => {
+                if exact_i32(ir) == Some(0) {
+                    if let Expr::Ident(id) = il.as_ref() {
+                        return Some((id.as_str(), true));
+                    }
+                }
+                if exact_i32(il) == Some(0) {
+                    if let Expr::Ident(id) = ir.as_ref() {
+                        return Some((id.as_str(), true));
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Matches `src >= -2147483648 && src <= 2147483647` (in either conjunct/operand order).
+fn match_i32_range_guard(expr: &Expr) -> Option<&str> {
+    fn match_lo(e: &Expr) -> Option<&str> {
+        let Expr::Binary(op, a, b) = e else {
+            return None;
+        };
+        match op {
+            BinOp::Ge if exact_f64_lit(b) == Some(-2147483648.0) => match a.as_ref() {
+                Expr::Ident(id) => Some(id.as_str()),
+                _ => None,
+            },
+            BinOp::Le if exact_f64_lit(a) == Some(-2147483648.0) => match b.as_ref() {
+                Expr::Ident(id) => Some(id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn match_hi(e: &Expr) -> Option<&str> {
+        let Expr::Binary(op, a, b) = e else {
+            return None;
+        };
+        match op {
+            BinOp::Le if exact_f64_lit(b) == Some(2147483647.0) => match a.as_ref() {
+                Expr::Ident(id) => Some(id.as_str()),
+                _ => None,
+            },
+            BinOp::Ge if exact_f64_lit(a) == Some(2147483647.0) => match b.as_ref() {
+                Expr::Ident(id) => Some(id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let Expr::Binary(BinOp::And, l, r) = expr else {
+        return None;
+    };
+    if let (Some(a), Some(b)) = (match_lo(l), match_hi(r)) {
+        if a == b {
+            return Some(a);
+        }
+    }
+    if let (Some(a), Some(b)) = (match_hi(l), match_lo(r)) {
+        if a == b {
+            return Some(a);
+        }
+    }
+    None
+}
+
+fn match_math_abs_call(expr: &Expr) -> Option<&str> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let Expr::Member(obj, prop) = callee.as_ref() else {
+        return None;
+    };
+    if prop != "abs" || !matches!(obj.as_ref(), Expr::Ident(m) if m == "Math") {
+        return None;
+    }
+    match &args[0] {
+        Expr::Ident(id) => Some(id.as_str()),
+        _ => None,
+    }
+}
+
+/// Matches `rem_var >= 4294967295 ? 4294967295 : (rem_var > 0 ? rem_var (| 0 | >>> 0) : 0)`.
+fn match_u32_clamp_ternary(expr: &Expr, rem_var: &str) -> bool {
+    let Expr::Cond(c1, t1, e1) = expr else {
+        return false;
+    };
+    let ge_max = match c1.as_ref() {
+        Expr::Binary(BinOp::Ge, a, b) => {
+            matches!(a.as_ref(), Expr::Ident(id) if id == rem_var)
+                && exact_f64_lit(b) == Some(4294967295.0)
+        }
+        Expr::Binary(BinOp::Le, a, b) => {
+            exact_f64_lit(a) == Some(4294967295.0)
+                && matches!(b.as_ref(), Expr::Ident(id) if id == rem_var)
+        }
+        _ => false,
+    };
+    if !ge_max || exact_f64_lit(t1) != Some(4294967295.0) {
+        return false;
+    }
+    let Expr::Cond(c2, t2, e2) = e1.as_ref() else {
+        return false;
+    };
+    let gt_zero = match c2.as_ref() {
+        Expr::Binary(BinOp::Gt, a, b) => {
+            matches!(a.as_ref(), Expr::Ident(id) if id == rem_var) && exact_f64_lit(b) == Some(0.0)
+        }
+        Expr::Binary(BinOp::Lt, a, b) => {
+            exact_f64_lit(a) == Some(0.0) && matches!(b.as_ref(), Expr::Ident(id) if id == rem_var)
+        }
+        _ => false,
+    };
+    if !gt_zero || !is_pos_zero(e2) {
+        return false;
+    }
+    matches!(match_ident_bit32_wrap(t2), Some((v, _)) if v == rem_var)
+}
+
+/// Matches `(0 - mag) | 0`, `(-mag) | 0`, `(0 - mag) >>> 0`, or `(-mag) >>> 0`.
+/// Returns `Some(is_unsigned)` on match.
+fn match_neg_bit32(expr: &Expr, mag_var: &str) -> Option<bool> {
+    let (inner, unsigned) = match expr {
+        Expr::Binary(BinOp::BitOr, l, r) if exact_i32(r) == Some(0) => (l.as_ref(), false),
+        Expr::Binary(BinOp::BitOr, l, r) if exact_i32(l) == Some(0) => (r.as_ref(), false),
+        Expr::Binary(BinOp::UShr, l, r) if exact_i32(r) == Some(0) => (l.as_ref(), true),
+        _ => return None,
+    };
+    let is_neg_mag = match inner {
+        Expr::Unary(UnOp::Neg, x) => matches!(x.as_ref(), Expr::Ident(id) if id == mag_var),
+        Expr::Binary(BinOp::Sub, z, x) => {
+            is_pos_zero(z) && matches!(x.as_ref(), Expr::Ident(id) if id == mag_var)
+        }
+        _ => false,
+    };
+    is_neg_mag.then_some(unsigned)
+}
+
+fn match_lt_zero(expr: &Expr, src: &str) -> bool {
+    match expr {
+        Expr::Binary(BinOp::Lt, a, b) => {
+            matches!(a.as_ref(), Expr::Ident(id) if id == src) && exact_f64_lit(b) == Some(0.0)
+        }
+        Expr::Binary(BinOp::Gt, a, b) => {
+            exact_f64_lit(a) == Some(0.0) && matches!(b.as_ref(), Expr::Ident(id) if id == src)
+        }
+        _ => false,
+    }
+}
+
+/// Recognizes a Rust `ToInt32`/`ToUint32` labeled-block diamond:
+/// ```js
+/// d: {
+///   if (m >= -2147483648 && m <= 2147483647) { k = m | 0; break d; }
+///   j = Math.abs(m);
+///   k = (j = j % 4294967296, j >= 4294967295 ? 4294967295 : j > 0 ? j | 0 : 0);
+///   if (m < 0) { m = -k | 0; m = m | 0; } else m = k | 0;
+///   k = m;
+/// }
+/// ```
+/// Because `4294967296 = 2^32` is an exact power of two in IEEE-754 binary64, this diamond is
+/// bit-identical to `k = m | 0` (or `k = m >>> 0` when both fast and slow paths emit `>>> 0`) for
+/// every IEEE-754 `f64` value (NaN, `±0`, `±Infinity`, subnormals, large floats, integers).
+/// Returns `(dst, src, unsigned_dst)` if the labeled block matches structurally.
+fn match_to_int32_diamond(stmt: &Stmt) -> Option<(String, String, bool)> {
+    let Stmt::Labeled(label, inner) = stmt else {
+        return None;
+    };
+    let Stmt::Block(block) = inner.as_ref() else {
+        return None;
+    };
+    if block.len() < 3 || block.len() > 6 {
+        return None;
+    }
+
+    // 1. Fast path: `if (src >= -2147483648 && src <= 2147483647) { dst = src (| 0 | >>> 0); break label; }`
+    let Stmt::If(guard, fast_then, None) = &block[0] else {
+        return None;
+    };
+    let src = match_i32_range_guard(guard)?.to_owned();
+    if fast_then.len() != 2 {
+        return None;
+    }
+    let Stmt::ExprStmt(Expr::Assign(fast_lhs, fast_rhs)) = &fast_then[0] else {
+        return None;
+    };
+    let Expr::Ident(dst) = fast_lhs.as_ref() else {
+        return None;
+    };
+    let (wrap_src, fast_unsigned) = match_ident_bit32_wrap(fast_rhs)?;
+    if wrap_src != src {
+        return None;
+    }
+    if !matches!(&fast_then[1], Stmt::Break(Some(b)) if b == label) {
+        return None;
+    }
+
+    // 2. Magnitude reduction: optional `abs_var = Math.abs(src);`, `% 4294967296`, and u32 clamp.
+    let mut idx = 1usize;
+    let mut abs_var: Option<String> = None;
+    if let Some(Stmt::ExprStmt(Expr::Assign(lhs, rhs))) = block.get(idx) {
+        if let (Expr::Ident(a_name), Some(arg)) = (lhs.as_ref(), match_math_abs_call(rhs)) {
+            if arg == src && a_name != &src {
+                abs_var = Some(a_name.clone());
+                idx += 1;
+            }
+        }
+    }
+
+    let is_mod_2p32 = |e: &Expr| -> bool {
+        let Expr::Binary(BinOp::Rem, l, r) = e else {
+            return false;
+        };
+        if exact_f64_lit(r) != Some(4294967296.0) {
+            return false;
+        }
+        match (&abs_var, l.as_ref()) {
+            (Some(a), Expr::Ident(id)) => id == a,
+            (None, other) => match_math_abs_call(other) == Some(src.as_str()),
+            _ => false,
+        }
+    };
+
+    // Match either:
+    //   `mag_var = (rem_var = <abs> % 4294967296, clamp(rem_var));`
+    // or separate statements:
+    //   `rem_var = <abs> % 4294967296; mag_var = clamp(rem_var);`
+    let mag_var: String = match block.get(idx)? {
+        Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+            let Expr::Ident(lhs_name) = lhs.as_ref() else {
+                return None;
+            };
+            if let Expr::Seq(items) = rhs.as_ref() {
+                if items.len() != 2 {
+                    return None;
+                }
+                let Expr::Assign(rl, rr) = &items[0] else {
+                    return None;
+                };
+                let Expr::Ident(rem_name) = rl.as_ref() else {
+                    return None;
+                };
+                if rem_name == &src || lhs_name == &src || !is_mod_2p32(rr) {
+                    return None;
+                }
+                if !match_u32_clamp_ternary(&items[1], rem_name) {
+                    return None;
+                }
+                idx += 1;
+                lhs_name.clone()
+            } else if is_mod_2p32(rhs) {
+                let rem_name = lhs_name.clone();
+                if rem_name == src {
+                    return None;
+                }
+                idx += 1;
+                let Stmt::ExprStmt(Expr::Assign(ml, mr)) = block.get(idx)? else {
+                    return None;
+                };
+                let Expr::Ident(m_name) = ml.as_ref() else {
+                    return None;
+                };
+                if m_name == &src || !match_u32_clamp_ternary(mr, &rem_name) {
+                    return None;
+                }
+                idx += 1;
+                m_name.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // 3. Sign application: `if (src < 0) { ... } else { res = mag | 0; }`
+    let Stmt::If(sign_cond, neg_b, Some(pos_b)) = block.get(idx)? else {
+        return None;
+    };
+    if !match_lt_zero(sign_cond, &src) || pos_b.len() != 1 {
+        return None;
+    }
+    let Stmt::ExprStmt(Expr::Assign(pl, pr)) = &pos_b[0] else {
+        return None;
+    };
+    let Expr::Ident(res_var) = pl.as_ref() else {
+        return None;
+    };
+    let (pos_mag, pos_unsigned) = match_ident_bit32_wrap(pr)?;
+    if pos_mag != mag_var {
+        return None;
+    }
+
+    let neg_unsigned = match neg_b.as_slice() {
+        [Stmt::ExprStmt(Expr::Assign(nl, nr))] => {
+            let Expr::Ident(n_dst) = nl.as_ref() else {
+                return None;
+            };
+            if n_dst != res_var {
+                return None;
+            }
+            match_neg_bit32(nr, &mag_var)?
+        }
+        [Stmt::ExprStmt(Expr::Assign(n1l, n1r)), Stmt::ExprStmt(Expr::Assign(n2l, n2r))] => {
+            let (Expr::Ident(neg_tmp), Expr::Ident(n2_dst)) = (n1l.as_ref(), n2l.as_ref()) else {
+                return None;
+            };
+            if n2_dst != res_var {
+                return None;
+            }
+            let first_unsigned = match_neg_bit32(n1r, &mag_var)?;
+            match n2r.as_ref() {
+                Expr::Ident(v) if v == neg_tmp => first_unsigned,
+                other => {
+                    let (v, u) = match_ident_bit32_wrap(other)?;
+                    if v != neg_tmp {
+                        return None;
+                    }
+                    u
+                }
+            }
+        }
+        _ => return None,
+    };
+    idx += 1;
+
+    // 4. Final assignment to `dst` (optional if `res_var == dst` with matching signedness).
+    if idx == block.len() {
+        if res_var == dst && neg_unsigned == fast_unsigned && pos_unsigned == fast_unsigned {
+            return Some((dst.clone(), src, fast_unsigned));
+        }
+        return None;
+    }
+    if idx + 1 != block.len() {
+        return None;
+    }
+    let Stmt::ExprStmt(Expr::Assign(fl, fr)) = &block[idx] else {
+        return None;
+    };
+    if !matches!(fl.as_ref(), Expr::Ident(id) if id == dst) {
+        return None;
+    }
+    let final_ok = match fr.as_ref() {
+        Expr::Ident(v) => {
+            v == res_var && neg_unsigned == fast_unsigned && pos_unsigned == fast_unsigned
+        }
+        other => {
+            matches!(match_ident_bit32_wrap(other), Some((v, u)) if v == res_var && u == fast_unsigned)
+        }
+    };
+    final_ok.then_some((dst.clone(), src, fast_unsigned))
+}
+
+fn stmt_may_throw(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Throw(_) => true,
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Let(_, Some(e)) | Stmt::Const(_, e) => {
+            loop_opt::expr_has_side_effect(e)
+        }
+        Stmt::Lets(decls) => decls
+            .iter()
+            .filter_map(|(_, init)| init.as_ref())
+            .any(loop_opt::expr_has_side_effect),
+        Stmt::If(c, t, e) => {
+            loop_opt::expr_has_side_effect(c)
+                || t.iter().any(stmt_may_throw)
+                || e.as_ref().is_some_and(|eb| eb.iter().any(stmt_may_throw))
+        }
+        Stmt::Block(b) | Stmt::LoopForever(_, b) => b.iter().any(stmt_may_throw),
+        Stmt::While(c, b) => loop_opt::expr_has_side_effect(c) || b.iter().any(stmt_may_throw),
+        Stmt::Labeled(_, inner) => stmt_may_throw(inner),
+        Stmt::Switch(..) | Stmt::TryCatch { .. } => true,
+        _ => false,
+    }
+}
+
+/// Returns `true` iff `var` is guaranteed to be overwritten (or the function exits) before any
+/// subsequent read along `trailing`.
+fn is_definitely_dead_in_trailing(
+    var: &str,
+    trailing: &[Stmt],
+    at_fn_top_level: bool,
+    in_try: bool,
+) -> bool {
+    for stmt in trailing {
+        if let Stmt::ExprStmt(Expr::Assign(lhs, rhs)) = stmt {
+            if count_ident_reads_expr(rhs, var) > 0 {
+                return false;
+            }
+            if matches!(lhs.as_ref(), Expr::Ident(id) if id == var) {
+                return true;
+            }
+            if count_ident_reads_expr(lhs, var) > 0 {
+                return false;
+            }
+            if in_try
+                && (loop_opt::expr_has_side_effect(lhs) || loop_opt::expr_has_side_effect(rhs))
+            {
+                return false;
+            }
+            continue;
+        }
+        if let Stmt::Return(opt_e) = stmt {
+            return opt_e
+                .as_ref()
+                .is_none_or(|e| count_ident_reads_expr(e, var) == 0);
+        }
+        if let Stmt::Throw(e) = stmt {
+            if in_try {
+                return false;
+            }
+            return count_ident_reads_expr(e, var) == 0;
+        }
+        if count_ident_reads_stmts(std::slice::from_ref(stmt), var) > 0
+            || stmt_may_exit_non_throw(stmt)
+            || (in_try && stmt_may_throw(stmt))
+        {
+            return false;
+        }
+    }
+    at_fn_top_level && !in_try
+}
+
+fn fold_to_int32_diamonds_stmts(
+    stmts: &mut [Stmt],
+    local_names: &HashSet<String>,
+    total_reads: &mut HashMap<String, usize>,
+    closure_vars: &HashSet<String>,
+    at_fn_top_level: bool,
+    in_try: bool,
+) {
+    // Recurse into nested control flow first.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::If(_, t, e) => {
+                fold_to_int32_diamonds_stmts(
+                    t,
+                    local_names,
+                    total_reads,
+                    closure_vars,
+                    false,
+                    in_try,
+                );
+                if let Some(el) = e {
+                    fold_to_int32_diamonds_stmts(
+                        el,
+                        local_names,
+                        total_reads,
+                        closure_vars,
+                        false,
+                        in_try,
+                    );
+                }
+            }
+            Stmt::Block(b) => {
+                fold_to_int32_diamonds_stmts(
+                    b,
+                    local_names,
+                    total_reads,
+                    closure_vars,
+                    at_fn_top_level,
+                    in_try,
+                );
+            }
+            Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                fold_to_int32_diamonds_stmts(
+                    b,
+                    local_names,
+                    total_reads,
+                    closure_vars,
+                    false,
+                    in_try,
+                );
+            }
+            Stmt::Labeled(_, inner) => {
+                if let Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) = inner.as_mut()
+                {
+                    fold_to_int32_diamonds_stmts(
+                        b,
+                        local_names,
+                        total_reads,
+                        closure_vars,
+                        false,
+                        in_try,
+                    );
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    fold_to_int32_diamonds_stmts(
+                        &mut c.body,
+                        local_names,
+                        total_reads,
+                        closure_vars,
+                        false,
+                        in_try,
+                    );
+                }
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                fold_to_int32_diamonds_stmts(
+                    body,
+                    local_names,
+                    total_reads,
+                    closure_vars,
+                    false,
+                    true,
+                );
+                fold_to_int32_diamonds_stmts(
+                    handler,
+                    local_names,
+                    total_reads,
+                    closure_vars,
+                    false,
+                    in_try,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Walk back-to-front so folding a later diamond removes its slow-path reads of reused scratch
+    // locals before checking whether an earlier diamond's clobbered scratch locals are dead.
+    for i in (0..stmts.len()).rev() {
+        let Some((dst, src, unsigned_dst)) = match_to_int32_diamond(&stmts[i]) else {
+            continue;
+        };
+        let Stmt::Labeled(_, inner) = &stmts[i] else {
+            continue;
+        };
+        let Stmt::Block(block) = inner.as_ref() else {
+            continue;
+        };
+        let mut slow_writes: HashSet<String> = HashSet::new();
+        collect_assigned_idents_stmts(&block[1..], &mut slow_writes);
+        slow_writes.remove(&dst);
+
+        let mut block_reads: HashMap<String, usize> = HashMap::new();
+        tally_ident_reads_stmt(&stmts[i], &mut block_reads);
+
+        let trailing = &stmts[i + 1..];
+        let all_dead = slow_writes.iter().all(|v| {
+            if !local_names.contains(v) || closure_vars.contains(v) {
+                return false;
+            }
+            let tot = total_reads.get(v).copied().unwrap_or(0);
+            let blk = block_reads.get(v).copied().unwrap_or(0);
+            if tot <= blk {
+                return true;
+            }
+            is_definitely_dead_in_trailing(v, trailing, at_fn_top_level, in_try)
+        });
+        if !all_dead {
+            continue;
+        }
+
+        // Update read counts to reflect replacing the diamond with `dst = src (| 0 | >>> 0);`.
+        for (var, cnt) in block_reads {
+            if let Some(entry) = total_reads.get_mut(&var) {
+                *entry = entry.saturating_sub(cnt);
+            }
+        }
+        *total_reads.entry(src.clone()).or_insert(0) += 1;
+
+        let op = if unsigned_dst {
+            BinOp::UShr
+        } else {
+            BinOp::BitOr
+        };
+        stmts[i] = jsast::assign_stmt(
+            jsast::id(dst),
+            Expr::Binary(op, Box::new(jsast::id(src)), Box::new(Expr::Num(0.0))),
+        );
+    }
+}
+
+fn fold_to_int32_diamonds(body: &mut [Stmt], local_names: &HashSet<String>) {
+    let mut total_reads: HashMap<String, usize> = HashMap::new();
+    for stmt in body.iter() {
+        tally_ident_reads_stmt(stmt, &mut total_reads);
+    }
+    let mut usage: HashMap<String, LocalConstUsage> = HashMap::new();
+    scan_const_usage_stmts(body, local_names, false, &mut usage);
+    let closure_vars: HashSet<String> = usage
+        .into_iter()
+        .filter(|(_, u)| u.in_closure)
+        .map(|(n, _)| n)
+        .collect();
+    fold_to_int32_diamonds_stmts(
+        body,
+        local_names,
+        &mut total_reads,
+        &closure_vars,
+        true,
+        false,
+    );
 }
 
 /// Fast-paths dead-`lo` `$__mires_i64_f64_to_bits(x)` sign-bit tests
@@ -7158,12 +7956,113 @@ mod tests {
         run_speed_post_opts(&mut decl);
         let printed = jsast::stmt_to_string(&decl);
         assert!(
-            printed.contains(i64_pair::HELPER_DIVREM),
-            "expected divrem: {printed}"
+            printed.contains(i64_pair::HELPER_UDIVREM),
+            "expected specialized udivrem: {printed}"
         );
         assert!(
             !printed.contains("$__mires_i64_div("),
             "expected both div calls fused: {printed}"
+        );
+    }
+
+    #[test]
+    fn fuses_specialized_i64_srem_sdiv_and_urem_udiv() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "f".to_owned(),
+            params: vec![
+                "al".to_owned(),
+                "ah".to_owned(),
+                "bl".to_owned(),
+                "bh".to_owned(),
+            ],
+            body: vec![
+                jsast::lets(vec![
+                    ("rl".to_owned(), None),
+                    ("rh".to_owned(), None),
+                    ("ql".to_owned(), None),
+                    ("qh".to_owned(), None),
+                    ("url".to_owned(), None),
+                    ("urh".to_owned(), None),
+                    ("uql".to_owned(), None),
+                    ("uqh".to_owned(), None),
+                ]),
+                jsast::assign_stmt(
+                    jsast::id("rl"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_SREM),
+                        vec![
+                            jsast::id("al"),
+                            jsast::id("ah"),
+                            jsast::id("bl"),
+                            jsast::id("bh"),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("rh"), jsast::id(i64_pair::HELPER_HI)),
+                jsast::assign_stmt(
+                    jsast::id("ql"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_SDIV),
+                        vec![
+                            jsast::id("al"),
+                            jsast::id("ah"),
+                            jsast::id("bl"),
+                            jsast::id("bh"),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("qh"), jsast::id(i64_pair::HELPER_HI)),
+                jsast::assign_stmt(
+                    jsast::id("uql"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_UDIV),
+                        vec![
+                            jsast::id("al"),
+                            jsast::id("ah"),
+                            jsast::id("bl"),
+                            jsast::id("bh"),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("uqh"), jsast::id(i64_pair::HELPER_HI)),
+                jsast::assign_stmt(
+                    jsast::id("url"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_UREM),
+                        vec![
+                            jsast::id("al"),
+                            jsast::id("ah"),
+                            jsast::id("bl"),
+                            jsast::id("bh"),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("urh"), jsast::id(i64_pair::HELPER_HI)),
+                Stmt::Return(Some(Expr::Array(vec![
+                    jsast::id("rl"),
+                    jsast::id("rh"),
+                    jsast::id("ql"),
+                    jsast::id("qh"),
+                    jsast::id("url"),
+                    jsast::id("urh"),
+                    jsast::id("uql"),
+                    jsast::id("uqh"),
+                ]))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains(i64_pair::HELPER_SDIVREM)
+                && printed.contains(i64_pair::HELPER_UDIVREM),
+            "expected specialized sdivrem & udivrem: {printed}"
+        );
+        assert!(
+            !printed.contains(&format!("{}(", i64_pair::HELPER_SREM))
+                && !printed.contains(&format!("{}(", i64_pair::HELPER_SDIV))
+                && !printed.contains(&format!("{}(", i64_pair::HELPER_UREM))
+                && !printed.contains(&format!("{}(", i64_pair::HELPER_UDIV)),
+            "expected all 4 specialized calls fused: {printed}"
         );
     }
 
@@ -8790,5 +9689,540 @@ mod tests {
                 vec![]
             )))]
         ));
+    }
+
+    /// Helper building the exact Rust `f64 -> i32/u32` `ToInt32` labeled-block diamond emitted
+    /// in `earcut` (`earcut_linked` and `is_ear_hashed_sl`).
+    #[allow(clippy::too_many_arguments)]
+    fn make_to_int32_diamond(
+        label: &str,
+        src: &str,
+        dst: &str,
+        abs_var: &str,
+        rem_var: &str,
+        mag_var: &str,
+        neg_var: &str,
+        res_var: &str,
+        modulus: f64,
+        unsigned_dst: bool,
+    ) -> Stmt {
+        let wrap_op = if unsigned_dst {
+            BinOp::UShr
+        } else {
+            BinOp::BitOr
+        };
+        let wrap =
+            |v: &str| Expr::Binary(wrap_op, Box::new(jsast::id(v)), Box::new(Expr::Num(0.0)));
+        Stmt::Labeled(
+            label.to_owned(),
+            Box::new(Stmt::Block(vec![
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::And,
+                        Box::new(Expr::Binary(
+                            BinOp::Ge,
+                            Box::new(jsast::id(src)),
+                            Box::new(Expr::Unary(UnOp::Neg, Box::new(Expr::Num(2147483648.0)))),
+                        )),
+                        Box::new(Expr::Binary(
+                            BinOp::Le,
+                            Box::new(jsast::id(src)),
+                            Box::new(Expr::Num(2147483647.0)),
+                        )),
+                    ),
+                    vec![
+                        jsast::assign_stmt(jsast::id(dst), wrap(src)),
+                        Stmt::Break(Some(label.to_owned())),
+                    ],
+                    None,
+                ),
+                jsast::assign_stmt(
+                    jsast::id(abs_var),
+                    jsast::method_call(jsast::id("Math"), "abs", vec![jsast::id(src)]),
+                ),
+                jsast::assign_stmt(
+                    jsast::id(mag_var),
+                    Expr::Seq(vec![
+                        Expr::Assign(
+                            Box::new(jsast::id(rem_var)),
+                            Box::new(Expr::Binary(
+                                BinOp::Rem,
+                                Box::new(jsast::id(abs_var)),
+                                Box::new(Expr::Num(modulus)),
+                            )),
+                        ),
+                        Expr::Cond(
+                            Box::new(Expr::Binary(
+                                BinOp::Ge,
+                                Box::new(jsast::id(rem_var)),
+                                Box::new(Expr::Num(4294967295.0)),
+                            )),
+                            Box::new(Expr::Num(4294967295.0)),
+                            Box::new(Expr::Cond(
+                                Box::new(Expr::Binary(
+                                    BinOp::Gt,
+                                    Box::new(jsast::id(rem_var)),
+                                    Box::new(Expr::Num(0.0)),
+                                )),
+                                Box::new(Expr::Binary(
+                                    BinOp::UShr,
+                                    Box::new(jsast::id(rem_var)),
+                                    Box::new(Expr::Num(0.0)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            )),
+                        ),
+                    ]),
+                ),
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id(src)),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id(neg_var),
+                            Expr::Binary(
+                                BinOp::BitOr,
+                                Box::new(Expr::Binary(
+                                    BinOp::Sub,
+                                    Box::new(Expr::Num(0.0)),
+                                    Box::new(jsast::id(mag_var)),
+                                )),
+                                Box::new(Expr::Num(0.0)),
+                            ),
+                        ),
+                        jsast::assign_stmt(jsast::id(res_var), wrap(neg_var)),
+                    ],
+                    Some(vec![jsast::assign_stmt(jsast::id(res_var), wrap(mag_var))]),
+                ),
+                jsast::assign_stmt(jsast::id(dst), jsast::id(res_var)),
+            ])),
+        )
+    }
+
+    #[test]
+    fn folds_to_int32_diamonds_signed_unsigned_and_back_to_back_reused_locals() {
+        // 1. Disjoint locals (`is_ear_hashed_sl` shape) + unsigned `>>> 0` variant.
+        let mut decl = Stmt::FunctionDecl {
+            name: "zorder_disjoint".to_owned(),
+            params: vec!["u".to_owned(), "w".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("S".to_owned(), None),
+                    ("U".to_owned(), None),
+                    ("aS".to_owned(), None),
+                    ("aL".to_owned(), None),
+                    ("E".to_owned(), None),
+                    ("aT".to_owned(), None),
+                    ("as_".to_owned(), None),
+                    ("bS".to_owned(), None),
+                    ("bL".to_owned(), None),
+                    ("F".to_owned(), None),
+                    ("bT".to_owned(), None),
+                    ("bs_".to_owned(), None),
+                ]),
+                make_to_int32_diamond(
+                    "j",
+                    "u",
+                    "S",
+                    "aS",
+                    "E",
+                    "aL",
+                    "aT",
+                    "as_",
+                    4294967296.0,
+                    false,
+                ),
+                make_to_int32_diamond(
+                    "a",
+                    "w",
+                    "U",
+                    "bS",
+                    "F",
+                    "bL",
+                    "bT",
+                    "bs_",
+                    4294967296.0,
+                    true,
+                ),
+                Stmt::Return(Some(Expr::Array(vec![jsast::id("S"), jsast::id("U")]))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            !printed.contains("4294967296") && !printed.contains("Math.abs"),
+            "expected both signed & unsigned ToInt32 diamonds folded: {printed}"
+        );
+        assert!(
+            printed.contains("S = u | 0;") && printed.contains("U = w >>> 0;"),
+            "expected exact `S = u | 0` and `U = w >>> 0`: {printed}"
+        );
+
+        // 2. Coalesced back-to-back shape (`earcut_linked`): first diamond clobbers `m` & `j`,
+        //    second diamond reads `g` and clobbers `m` & `g`, then both `g` & `m` are overwritten
+        //    before any subsequent read.
+        let mut coalesced = Stmt::FunctionDecl {
+            name: "zorder_coalesced".to_owned(),
+            params: vec!["x".to_owned(), "y".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("m".to_owned(), None),
+                    ("g".to_owned(), None),
+                    ("k".to_owned(), None),
+                    ("h".to_owned(), None),
+                    ("j".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("m"), jsast::id("x")),
+                jsast::assign_stmt(jsast::id("g"), jsast::id("y")),
+                make_to_int32_diamond("d", "m", "k", "j", "j", "k", "m", "m", 4294967296.0, false),
+                make_to_int32_diamond("l", "g", "h", "m", "m", "h", "g", "g", 4294967296.0, false),
+                jsast::assign_stmt(
+                    jsast::id("g"),
+                    Expr::Binary(
+                        BinOp::BitAnd,
+                        Box::new(jsast::id("k")),
+                        Box::new(Expr::Num(255.0)),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("m"),
+                    Expr::Binary(
+                        BinOp::BitAnd,
+                        Box::new(jsast::id("h")),
+                        Box::new(Expr::Num(255.0)),
+                    ),
+                ),
+                Stmt::Return(Some(Expr::Binary(
+                    BinOp::BitOr,
+                    Box::new(jsast::id("g")),
+                    Box::new(jsast::id("m")),
+                ))),
+            ],
+        };
+        run_speed_post_opts(&mut coalesced);
+        let coalesced_js = jsast::stmt_to_string(&coalesced);
+        assert!(
+            !coalesced_js.contains("4294967296") && !coalesced_js.contains("Math.abs"),
+            "expected back-to-back coalesced ToInt32 diamonds folded: {coalesced_js}"
+        );
+        assert!(
+            coalesced_js.contains("k = m | 0;") && coalesced_js.contains("h = g | 0;"),
+            "expected `k = m | 0` and `h = g | 0`: {coalesced_js}"
+        );
+    }
+
+    #[test]
+    fn rejects_unsound_to_int32_diamonds_live_clobber_shadowed_math_wrong_mod() {
+        // 1. Live temp `j` read after the block MUST NOT fold.
+        let mut live_temp = Stmt::FunctionDecl {
+            name: "live_temp".to_owned(),
+            params: vec!["m".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("k".to_owned(), None),
+                    ("j".to_owned(), None),
+                    ("n".to_owned(), None),
+                    ("r".to_owned(), None),
+                ]),
+                make_to_int32_diamond("d", "m", "k", "j", "j", "k", "n", "r", 4294967296.0, false),
+                Stmt::Return(Some(Expr::Array(vec![jsast::id("k"), jsast::id("j")]))),
+            ],
+        };
+        run_speed_post_opts(&mut live_temp);
+        let s1 = jsast::stmt_to_string(&live_temp);
+        assert!(
+            s1.contains("4294967296"),
+            "live temp `j` must prevent folding: {s1}"
+        );
+
+        // 2. Live clobbered `src` (`m`) read after the block MUST NOT fold.
+        let mut live_src = Stmt::FunctionDecl {
+            name: "live_src".to_owned(),
+            params: vec!["m".to_owned()],
+            body: vec![
+                jsast::lets(vec![("k".to_owned(), None), ("j".to_owned(), None)]),
+                make_to_int32_diamond("d", "m", "k", "j", "j", "k", "m", "m", 4294967296.0, false),
+                Stmt::Return(Some(Expr::Array(vec![jsast::id("k"), jsast::id("m")]))),
+            ],
+        };
+        run_speed_post_opts(&mut live_src);
+        let s2 = jsast::stmt_to_string(&live_src);
+        assert!(
+            s2.contains("4294967296"),
+            "live clobbered `m` must prevent folding: {s2}"
+        );
+
+        // 3. Shadowed `Math` parameter MUST NOT fold.
+        let mut shadowed_math = Stmt::FunctionDecl {
+            name: "shadowed_math".to_owned(),
+            params: vec!["Math".to_owned(), "u".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("S".to_owned(), None),
+                    ("aS".to_owned(), None),
+                    ("aL".to_owned(), None),
+                    ("E".to_owned(), None),
+                    ("aT".to_owned(), None),
+                    ("as_".to_owned(), None),
+                ]),
+                make_to_int32_diamond(
+                    "j",
+                    "u",
+                    "S",
+                    "aS",
+                    "E",
+                    "aL",
+                    "aT",
+                    "as_",
+                    4294967296.0,
+                    false,
+                ),
+                Stmt::Return(Some(jsast::id("S"))),
+            ],
+        };
+        run_speed_post_opts(&mut shadowed_math);
+        let s3 = jsast::stmt_to_string(&shadowed_math);
+        assert!(
+            s3.contains("4294967296"),
+            "shadowed Math must prevent folding: {s3}"
+        );
+
+        // 4. Wrong modulus (`4294967295` instead of `4294967296`) MUST NOT fold.
+        let mut wrong_mod = Stmt::FunctionDecl {
+            name: "wrong_mod".to_owned(),
+            params: vec!["u".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("S".to_owned(), None),
+                    ("aS".to_owned(), None),
+                    ("aL".to_owned(), None),
+                    ("E".to_owned(), None),
+                    ("aT".to_owned(), None),
+                    ("as_".to_owned(), None),
+                ]),
+                make_to_int32_diamond(
+                    "j",
+                    "u",
+                    "S",
+                    "aS",
+                    "E",
+                    "aL",
+                    "aT",
+                    "as_",
+                    4294967295.0,
+                    false,
+                ),
+                Stmt::Return(Some(jsast::id("S"))),
+            ],
+        };
+        run_speed_post_opts(&mut wrong_mod);
+        let s4 = jsast::stmt_to_string(&wrong_mod);
+        assert!(
+            s4.contains("4294967295"),
+            "wrong modulus must prevent folding: {s4}"
+        );
+    }
+
+    #[test]
+    fn algebraic_post_opts_i32_cond_array_index_neg_bool_and_self_assign() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "cleanups".to_owned(),
+            params: vec![
+                "x".to_owned(),
+                "y".to_owned(),
+                "n".to_owned(),
+                "f".to_owned(),
+            ],
+            body: vec![
+                jsast::lets(vec![
+                    ("c1".to_owned(), None),
+                    ("c2".to_owned(), None),
+                    ("c3".to_owned(), None),
+                    ("c4".to_owned(), None),
+                    ("c5".to_owned(), None),
+                    ("c6".to_owned(), None),
+                    ("c7".to_owned(), None),
+                    ("c8".to_owned(), None),
+                    ("F".to_owned(), None),
+                ]),
+                // 1. `(x <= -2147483648 ? -2147483648 : x >= 2147483647 ? 2147483647 : x | 0) | 0`
+                //    drops outer redundant `| 0`.
+                jsast::assign_stmt(
+                    jsast::id("c1"),
+                    Expr::Binary(
+                        BinOp::BitOr,
+                        Box::new(Expr::Cond(
+                            Box::new(Expr::Binary(
+                                BinOp::Le,
+                                Box::new(jsast::id("x")),
+                                Box::new(Expr::Unary(UnOp::Neg, Box::new(Expr::Num(2147483648.0)))),
+                            )),
+                            Box::new(Expr::Unary(UnOp::Neg, Box::new(Expr::Num(2147483648.0)))),
+                            Box::new(Expr::Cond(
+                                Box::new(Expr::Binary(
+                                    BinOp::Ge,
+                                    Box::new(jsast::id("x")),
+                                    Box::new(Expr::Num(2147483647.0)),
+                                )),
+                                Box::new(Expr::Num(2147483647.0)),
+                                Box::new(Expr::Binary(
+                                    BinOp::BitOr,
+                                    Box::new(jsast::id("x")),
+                                    Box::new(Expr::Num(0.0)),
+                                )),
+                            )),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                // 2. `(x >>> 12) | 0` -> `x >>> 12` (proven nonneg i31)
+                jsast::assign_stmt(
+                    jsast::id("c2"),
+                    Expr::Binary(
+                        BinOp::BitOr,
+                        Box::new(Expr::Binary(
+                            BinOp::UShr,
+                            Box::new(jsast::id("x")),
+                            Box::new(Expr::Num(12.0)),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                // 3. `(0 - y) | 0` -> `-y | 0`
+                jsast::assign_stmt(
+                    jsast::id("c3"),
+                    Expr::Binary(
+                        BinOp::BitOr,
+                        Box::new(Expr::Binary(
+                            BinOp::Sub,
+                            Box::new(Expr::Num(0.0)),
+                            Box::new(jsast::id("y")),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                // 4. `[void 0, y][1]` -> `y`, while `[f(), y][1]` MUST NOT fold (impure discarded elem)
+                //    and `[c4, y][0] = 7` MUST NOT turn LHS into non-lvalue/direct `c4 = 7`.
+                jsast::assign_stmt(
+                    jsast::id("c4"),
+                    jsast::index(
+                        Expr::Array(vec![Expr::Undefined, jsast::id("y")]),
+                        Expr::Num(1.0),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("c5"),
+                    jsast::index(
+                        Expr::Array(vec![jsast::call(jsast::id("f"), vec![]), jsast::id("y")]),
+                        Expr::Num(1.0),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::index(
+                        Expr::Array(vec![jsast::id("c4"), jsast::id("y")]),
+                        Expr::Num(0.0),
+                    ),
+                    Expr::Num(7.0),
+                ),
+                // 5. `(x === 1) && true` -> `x === 1`; non-bool `n && true` MUST NOT fold.
+                jsast::assign_stmt(
+                    jsast::id("c6"),
+                    Expr::Binary(
+                        BinOp::And,
+                        Box::new(Expr::Binary(
+                            BinOp::StrictEq,
+                            Box::new(jsast::id("x")),
+                            Box::new(Expr::Num(1.0)),
+                        )),
+                        Box::new(Expr::Bool(true)),
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("c7"),
+                    Expr::Binary(
+                        BinOp::And,
+                        Box::new(jsast::id("n")),
+                        Box::new(Expr::Bool(true)),
+                    ),
+                ),
+                // 6. `if (!!x) { c8 = 1; }` -> `if (x) { c8 = 1; }`
+                Stmt::If(
+                    Expr::Unary(
+                        UnOp::Not,
+                        Box::new(Expr::Unary(UnOp::Not, Box::new(jsast::id("x")))),
+                    ),
+                    vec![jsast::assign_stmt(jsast::id("c8"), Expr::Num(1.0))],
+                    None,
+                ),
+                // 7. `if (F < y) { F = F; } else { F = y; }` -> `if (!(F < y)) { F = y; }`
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("F")),
+                        Box::new(jsast::id("y")),
+                    ),
+                    vec![jsast::assign_stmt(jsast::id("F"), jsast::id("F"))],
+                    Some(vec![jsast::assign_stmt(jsast::id("F"), jsast::id("y"))]),
+                ),
+                Stmt::Return(Some(Expr::Array(vec![
+                    jsast::id("c1"),
+                    jsast::id("c2"),
+                    jsast::id("c3"),
+                    jsast::id("c4"),
+                    jsast::id("c5"),
+                    jsast::id("c6"),
+                    jsast::id("c7"),
+                    jsast::id("c8"),
+                    jsast::id("F"),
+                ]))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains(
+                "c1 = x <= -2147483648 ? -2147483648 : x >= 2147483647 ? 2147483647 : x | 0;"
+            ),
+            "expected outer `| 0` dropped on i32 ternary: {printed}"
+        );
+        assert!(
+            printed.contains("c2 = x >>> 12;"),
+            "expected `(x >>> 12) | 0` folded to `x >>> 12`: {printed}"
+        );
+        assert!(
+            printed.contains("c3 = -y | 0;"),
+            "expected `(0 - y) | 0` folded to `-y | 0`: {printed}"
+        );
+        assert!(
+            printed.contains("c4 = y;"),
+            "expected `[void 0, y][1]` folded to `y`: {printed}"
+        );
+        assert!(
+            printed.contains("c5 = [f(), y][1];"),
+            "impure discarded element must prevent array index folding: {printed}"
+        );
+        assert!(
+            printed.contains("[c4, y][0] = 7;"),
+            "assignment LHS array index must NOT fold: {printed}"
+        );
+        assert!(
+            printed.contains("c6 = x === 1;"),
+            "expected `bool && true` folded: {printed}"
+        );
+        assert!(
+            printed.contains("c7 = n && true;"),
+            "non-bool `n && true` must NOT fold: {printed}"
+        );
+        assert!(
+            printed.contains("if (x)") && !printed.contains("!!x"),
+            "expected `if (!!x)` unwrapped to `if (x)`: {printed}"
+        );
+        assert!(
+            printed.contains("if (!(F < y))") && !printed.contains("F = F"),
+            "expected self-assign removed and empty-then `if` inverted: {printed}"
+        );
     }
 }

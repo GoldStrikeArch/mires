@@ -171,6 +171,19 @@ impl FlatParam {
             && types.is_some_and(|types| is_mut_enum_ty(types, self.ty))
     }
 
+    /// Whether this parameter is a zero-offset specialized slice (`off === 0`), carried as 2 JS
+    /// parameters `(buf, len)` with `off` reconstructed as constant `0` in the callee.
+    pub fn is_off_zero_slice(&self) -> bool {
+        self.slice && self.passed.as_slice() == [0, 2]
+    }
+
+    /// Marks this slice parameter as zero-offset (`off === 0`), dropping lane 1 (`off`) from
+    /// `passed`.
+    pub(crate) fn set_off_zero_slice(&mut self) {
+        debug_assert!(self.slice);
+        self.passed = vec![0, 2];
+    }
+
     /// How many JavaScript parameters the flat parameter takes.
     pub fn fields(&self) -> u32 {
         if let Some(bs) = self.byte_str {
@@ -453,19 +466,48 @@ impl FlatSig {
             .collect()
     }
 
-    /// Positions of slice values after aggregate parameters have already expanded in JIR-R.
-    /// Phase C uses these positions to expand only the remaining semantic slice value.
+    /// Positions of 3-lane `(buf, off, len)` slice values after aggregate parameters have already
+    /// expanded in JIR-R. Phase C uses these positions to expand only canonical 3-lane slices;
+    /// zero-offset 2-lane slices (`is_off_zero_slice`) expand through [`Self::off_zero_slice_jir_positions`]
+    /// in the callee and [`Self::recursive_jir_positions`] at direct call sites.
     pub(crate) fn slice_jir_positions(&self) -> Vec<usize> {
         let mut positions = Vec::new();
         let mut cursor = 0;
         for param in &self.params {
             match param {
-                Some(param) if param.slice => {
+                Some(param) if param.slice && !param.is_off_zero_slice() => {
                     positions.push(cursor);
                     cursor += 1;
                 }
                 Some(param)
-                    if param.byte_str.is_some()
+                    if param.slice
+                        || param.byte_str.is_some()
+                        || param.i64_pair
+                        || param.tagged.is_some()
+                        || param.recursive.is_some() =>
+                {
+                    cursor += 1
+                }
+                Some(param) => cursor += param.fields() as usize,
+                None => cursor += 1,
+            }
+        }
+        positions
+    }
+
+    /// Positions of zero-offset 2-lane `(buf, len)` slice values in JIR parameter numbering.
+    pub(crate) fn off_zero_slice_jir_positions(&self) -> Vec<usize> {
+        let mut positions = Vec::new();
+        let mut cursor = 0;
+        for param in &self.params {
+            match param {
+                Some(param) if param.is_off_zero_slice() => {
+                    positions.push(cursor);
+                    cursor += 1;
+                }
+                Some(param)
+                    if param.slice
+                        || param.byte_str.is_some()
                         || param.i64_pair
                         || param.tagged.is_some()
                         || param.recursive.is_some() =>
@@ -534,6 +576,8 @@ impl FlatSig {
     }
 
     /// Recursive products also remain one semantic JIR value and expand only in JavaScript.
+    /// Zero-offset 2-lane slices (`is_off_zero_slice`) expose their `[Buffer, Length]` leaf shape
+    /// here so direct call lowering emits `(buf, len)` with `reread` evaluation protection.
     pub(crate) fn recursive_jir_positions(&self) -> Vec<(usize, RecursiveShape)> {
         let mut positions = Vec::new();
         let mut cursor = 0;
@@ -546,6 +590,20 @@ impl FlatSig {
                             .recursive
                             .clone()
                             .expect("checked recursive parameter"),
+                    ));
+                    cursor += 1;
+                }
+                Some(param) if param.is_off_zero_slice() => {
+                    positions.push((
+                        cursor,
+                        RecursiveShape {
+                            ty: param.ty,
+                            root: ProductNode::Leaf {
+                                ty: param.ty,
+                                components: vec![LaneComponent::Buffer, LaneComponent::Length],
+                            },
+                            fields: Vec::new(),
+                        },
                     ));
                     cursor += 1;
                 }
@@ -656,11 +714,34 @@ impl AbiPlan {
         self.flat.is_empty()
     }
 
-    /// Whether any flattened signature in this plan scalarizes a slice parameter (`buf`, `off`, `len`).
+    /// Whether any flattened signature in this plan scalarizes a slice parameter (`buf`, `off`, `len`
+    /// or zero-offset `buf`, `len`).
     pub(crate) fn has_slice_param(&self) -> bool {
         self.flat
             .values()
             .any(|sig| sig.params.iter().flatten().any(|p| p.slice))
+    }
+
+    /// Whether any flattened signature in this plan specializes a slice parameter (top-level or
+    /// recursive product leaf) to zero-offset `(buf, len)`.
+    pub(crate) fn has_off_zero_slice(&self) -> bool {
+        fn node_has_off_zero(node: &ProductNode) -> bool {
+            match node {
+                ProductNode::Zst { .. } => false,
+                ProductNode::Leaf { components, .. } => {
+                    components.as_slice() == [LaneComponent::Buffer, LaneComponent::Length]
+                }
+                ProductNode::Product { fields, .. } => fields.iter().any(node_has_off_zero),
+            }
+        }
+        self.flat.values().any(|sig| {
+            sig.params.iter().flatten().any(|p| {
+                p.is_off_zero_slice()
+                    || p.recursive
+                        .as_ref()
+                        .is_some_and(|r| node_has_off_zero(&r.root))
+            })
+        })
     }
 
     /// Whether any flattened signature in this plan specializes a read-only byte-string `&[u8]`.
@@ -1909,6 +1990,24 @@ pub fn plan_excluding(
         &mut plan,
     );
 
+    // Phase 3C: Whole-program zero-offset slice specialization (`off === 0`) under `ReleaseSpeed`.
+    // Runs after `bstr_abi::augment_plan` so read-only `&[u8]` byte-string parameters stay
+    // mutually exclusive (`slice == false`) and any remaining flattened slice parameter (or
+    // recursive product slice leaf) whose direct callers all prove `off === 0` drops its `off`
+    // parameter lane and reconstructs `off = 0` in the callee.
+    if speed_profile {
+        specialize_zero_offset_slices(
+            table,
+            funcs,
+            excluded,
+            &scan.named,
+            &ineligible,
+            &pinned_by_tracked_caller,
+            !opts.chunks.is_empty(),
+            &mut plan,
+        );
+    }
+
     // A private body begins as a clone of its canonical source, including every direct call the
     // source makes. Those calls have already been reshaped by `rewrite_calls`; give the clone the
     // same retargets so the expanded arguments reach the matching private callees rather than a
@@ -1952,6 +2051,1037 @@ pub fn plan_excluding(
         };
     }
     plan
+}
+
+/// Identifies one slice position eligible for whole-program zero-offset (`off === 0`)
+/// specialization (`[Buffer, Offset, Length]` -> `[Buffer, Length]`).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SliceSlot {
+    /// A top-level `FlatParam { slice: true }` parameter.
+    Top(usize),
+    /// A direct slice leaf field `field_idx` inside a `FlatParam { recursive: Some(Product) }`.
+    RecursiveField(usize, usize),
+}
+
+struct OffZeroBody<'a> {
+    item: ItemId,
+    trust_own_params: bool,
+    func: &'a Func,
+    types: &'a TypeTable,
+    calls: Vec<(ItemId, Vec<ValueId>)>,
+    pure_cell_stores: BTreeMap<CellId, Vec<ValueId>>,
+    block_param_incomings: BTreeMap<ValueId, Vec<ValueId>>,
+    value_defs: BTreeMap<ValueId, (usize, usize)>,
+    param_indices: BTreeMap<ValueId, usize>,
+    mutated_values: BTreeSet<ValueId>,
+    tracked_slices: Vec<ValueId>,
+    tracked_ptrs: Vec<ValueId>,
+    ret_candidate: bool,
+    returns: Vec<ValueId>,
+}
+
+fn slice_element_ty(types: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    let pointee = match types.get(types.peeled(ty)).map(|d| &d.kind) {
+        Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
+            *pointee
+        }
+        _ => return None,
+    };
+    match types.get(types.peeled(pointee)).map(|d| &d.kind) {
+        Some(TypeKind::Slice(element)) => Some(*element),
+        _ => None,
+    }
+}
+
+fn array_ref_element_ty(types: &TypeTable, ty: TypeId) -> Option<(TypeId, bool)> {
+    let (pointee, is_raw) = match types.get(types.peeled(ty)).map(|d| &d.kind) {
+        Some(TypeKind::Reference { pointee, .. }) => (*pointee, false),
+        Some(TypeKind::RawPointer { pointee, .. }) => (*pointee, true),
+        _ => return None,
+    };
+    match types.get(types.peeled(pointee)).map(|d| &d.kind) {
+        Some(TypeKind::Array { element, .. }) => Some((*element, is_raw)),
+        _ => None,
+    }
+}
+
+fn ptr_pointee_ty(types: &TypeTable, ty: TypeId) -> Option<(TypeId, bool)> {
+    match types.get(types.peeled(ty)).map(|d| &d.kind) {
+        Some(TypeKind::Reference { pointee, .. }) => Some((*pointee, false)),
+        Some(TypeKind::RawPointer { pointee, .. }) => Some((*pointee, true)),
+        _ => None,
+    }
+}
+
+fn build_off_zero_body<'a>(
+    name: &JsName,
+    item: ItemId,
+    trust_own_params: bool,
+    ret_allowed: bool,
+    func: &'a Func,
+    types: &'a TypeTable,
+    plan: &AbiPlan,
+) -> OffZeroBody<'a> {
+    let mut calls = Vec::new();
+    let mut value_defs = BTreeMap::new();
+    let mut mutated_values = BTreeSet::new();
+    let mut cell_stores: BTreeMap<CellId, Vec<ValueId>> = BTreeMap::new();
+    let mut bad_cells: BTreeSet<CellId> = BTreeSet::new();
+    let mut block_index: BTreeMap<RBlockId, usize> = BTreeMap::new();
+    let mut returns = Vec::new();
+    let mut has_void_return = false;
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        block_index.insert(block.id, bi);
+        for (oi, op) in block.ops.iter().enumerate() {
+            if let Some(res) = op.result {
+                value_defs.insert(res, (bi, oi));
+            }
+            match &op.kind {
+                OpKind::Call {
+                    callee: Callee::Direct { item: callee, .. },
+                    function: None,
+                    args,
+                    host: None,
+                    ..
+                } => {
+                    let target = plan
+                        .site_retargets
+                        .get(&(name.clone(), block.id, oi))
+                        .copied()
+                        .unwrap_or(*callee);
+                    calls.push((target, args.clone()));
+                }
+                OpKind::CellStore { cell, v } => {
+                    cell_stores.entry(*cell).or_default().push(*v);
+                }
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path,
+                    mutable: true,
+                } if path.is_empty() => {
+                    bad_cells.insert(*cell);
+                }
+                OpKind::RawView {
+                    root: Root::Cell(cell),
+                    path,
+                    ..
+                } if path.is_empty() => {
+                    bad_cells.insert(*cell);
+                }
+                OpKind::SetField { base, .. } | OpKind::SetDiscriminant { base, .. } => {
+                    mutated_values.insert(*base);
+                }
+                OpKind::BorrowView {
+                    root: Root::Value(v),
+                    mutable: true,
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Value(v),
+                    ..
+                } => {
+                    mutated_values.insert(*v);
+                }
+                _ => {}
+            }
+        }
+        match block.term {
+            RTerm::Return(Some(v)) => returns.push(v),
+            RTerm::Return(None) => has_void_return = true,
+            _ => {}
+        }
+    }
+
+    let pure_cell_stores: BTreeMap<CellId, Vec<ValueId>> = cell_stores
+        .into_iter()
+        .filter(|(cell, stores)| !bad_cells.contains(cell) && !stores.is_empty())
+        .collect();
+
+    let mut block_param_incomings: BTreeMap<ValueId, Vec<ValueId>> = BTreeMap::new();
+    for block in &func.blocks {
+        if block.id != RBlockId(0) {
+            for &param in &block.params {
+                block_param_incomings.entry(param).or_default();
+            }
+        }
+    }
+    for block in &func.blocks {
+        for (target, args) in block.term.edges() {
+            if target == RBlockId(0) {
+                continue;
+            }
+            let Some(&bi) = block_index.get(&target) else {
+                continue;
+            };
+            for (pos, &param) in func.blocks[bi].params.iter().enumerate() {
+                if let Some(&arg) = args.get(pos) {
+                    block_param_incomings.entry(param).or_default().push(arg);
+                }
+            }
+        }
+    }
+
+    let param_indices: BTreeMap<ValueId, usize> = func
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v, i))
+        .collect();
+
+    let mut tracked_slices = Vec::new();
+    let mut tracked_ptrs = Vec::new();
+    for (idx, def) in func.values.iter().enumerate() {
+        if def.carrier != Carrier::Baseline {
+            continue;
+        }
+        let v = ValueId(idx as u32);
+        if slice_element_ty(types, def.ty).is_some() {
+            tracked_slices.push(v);
+        } else if ptr_pointee_ty(types, def.ty).is_some() {
+            tracked_ptrs.push(v);
+        }
+    }
+
+    let ret_candidate = ret_allowed
+        && !has_void_return
+        && !returns.is_empty()
+        && slice_element_ty(types, func.sig.result).is_some();
+
+    OffZeroBody {
+        item,
+        trust_own_params,
+        func,
+        types,
+        calls,
+        pure_cell_stores,
+        block_param_incomings,
+        value_defs,
+        param_indices,
+        mutated_values,
+        tracked_slices,
+        tracked_ptrs,
+        ret_candidate,
+        returns,
+    }
+}
+
+fn borrowed_vec_is_slice_view(body: &OffZeroBody<'_>, mut v: ValueId) -> bool {
+    for _ in 0..=body.func.values.len().min(64) {
+        if body
+            .func
+            .values
+            .get(v.0 as usize)
+            .is_some_and(|d| d.carrier == Carrier::SliceView)
+        {
+            return true;
+        }
+        let Some(&(bi, oi)) = body.value_defs.get(&v) else {
+            return false;
+        };
+        match &body.func.blocks[bi].ops[oi].kind {
+            OpKind::Copy(src) | OpKind::Move(src) => v = *src,
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                ..
+            } if path.is_empty() || path.as_slice() == [Proj::Deref] => v = *src,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_const_zero_scalar(body: &OffZeroBody<'_>, mut v: ValueId) -> bool {
+    for _ in 0..8 {
+        let Some(&(bi, oi)) = body.value_defs.get(&v) else {
+            return false;
+        };
+        match &body.func.blocks[bi].ops[oi].kind {
+            OpKind::Const(ConstTree::Scalar { bits: 0, .. }) => return true,
+            OpKind::Copy(src) | OpKind::Move(src) => v = *src,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn arg_recursive_field_is_zero(
+    body: &OffZeroBody<'_>,
+    mut v: ValueId,
+    field_idx: usize,
+    slice_zero: &BTreeSet<ValueId>,
+    param_zero: &BTreeSet<(ItemId, SliceSlot)>,
+) -> bool {
+    for _ in 0..16 {
+        if body.mutated_values.contains(&v) {
+            return false;
+        }
+        if let Some(&p) = body.param_indices.get(&v) {
+            return body.trust_own_params
+                && param_zero.contains(&(body.item, SliceSlot::RecursiveField(p, field_idx)));
+        }
+        let Some(&(bi, oi)) = body.value_defs.get(&v) else {
+            return false;
+        };
+        match &body.func.blocks[bi].ops[oi].kind {
+            OpKind::Copy(src) | OpKind::Move(src) => v = *src,
+            OpKind::Aggregate {
+                variant: 0, fields, ..
+            } => {
+                return fields
+                    .get(field_idx)
+                    .is_some_and(|f| slice_zero.contains(f));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn value_is_zero_offset_slice(
+    body: &OffZeroBody<'_>,
+    v: ValueId,
+    slice_zero: &BTreeSet<ValueId>,
+    ptr_zero: &BTreeSet<ValueId>,
+    param_zero: &BTreeSet<(ItemId, SliceSlot)>,
+    ret_zero: &BTreeSet<ItemId>,
+) -> bool {
+    use crate::jir::semantic::{CallSemantic, CastKind, StandardOperation};
+
+    if let Some(&p) = body.param_indices.get(&v) {
+        return body.trust_own_params && param_zero.contains(&(body.item, SliceSlot::Top(p)));
+    }
+    if let Some(incomings) = body.block_param_incomings.get(&v) {
+        return !incomings.is_empty() && incomings.iter().all(|inc| slice_zero.contains(inc));
+    }
+    let Some(&(bi, oi)) = body.value_defs.get(&v) else {
+        return false;
+    };
+    let op = &body.func.blocks[bi].ops[oi];
+    let types = body.types;
+    let v_ty = body.func.values[v.0 as usize].ty;
+
+    match &op.kind {
+        OpKind::Copy(src) | OpKind::Move(src) => slice_zero.contains(src),
+        OpKind::Const(tree) => match tree {
+            ConstTree::Slice(_) | ConstTree::SliceAddress { .. } => true,
+            ConstTree::Reference(inner) => matches!(inner.as_ref(), ConstTree::Slice(_)),
+            ConstTree::StaticSlice { start: 0, .. } => true,
+            _ => false,
+        },
+        OpKind::CellLoad(cell) => body
+            .pure_cell_stores
+            .get(cell)
+            .is_some_and(|stores| stores.iter().all(|s| slice_zero.contains(s))),
+        OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+            let whole_or_prefix0 = matches!(
+                path.as_slice(),
+                [Proj::Deref] | [Proj::Deref, Proj::Subslice { from: 0, .. }]
+            );
+            if !whole_or_prefix0 {
+                return false;
+            }
+            match root {
+                Root::Value(src) => {
+                    body.func
+                        .ty(*src)
+                        .is_some_and(|t| slice_element_ty(types, t).is_some())
+                        && slice_zero.contains(src)
+                }
+                Root::Cell(cell) => {
+                    body.func
+                        .cells
+                        .get(cell.0 as usize)
+                        .is_some_and(|c| slice_element_ty(types, c.ty).is_some())
+                        && body
+                            .pure_cell_stores
+                            .get(cell)
+                            .is_some_and(|stores| stores.iter().all(|s| slice_zero.contains(s)))
+                }
+            }
+        }
+        OpKind::Cast {
+            kind,
+            v: src,
+            from,
+            to,
+        } => match kind {
+            CastKind::Subtype => {
+                slice_element_ty(types, *from).is_some() && slice_zero.contains(src)
+            }
+            CastKind::PointerCoercion => {
+                if let (Some((arr_elem, is_raw)), Some(slice_elem)) = (
+                    array_ref_element_ty(types, *from),
+                    slice_element_ty(types, *to),
+                ) {
+                    if types.peeled(arr_elem) == types.peeled(slice_elem) {
+                        return !is_raw || types.is_zst(arr_elem) || ptr_zero.contains(src);
+                    }
+                }
+                if let (Some(fe), Some(te)) =
+                    (slice_element_ty(types, *from), slice_element_ty(types, *to))
+                {
+                    return types.peeled(fe) == types.peeled(te) && slice_zero.contains(src);
+                }
+                false
+            }
+            CastKind::PtrToPtr => {
+                if let (Some(fe), Some(te)) =
+                    (slice_element_ty(types, *from), slice_element_ty(types, *to))
+                {
+                    return types.peeled(fe) == types.peeled(te) && slice_zero.contains(src);
+                }
+                false
+            }
+            _ => false,
+        },
+        OpKind::SliceView { ptr, .. } => {
+            let Some(slice_elem) = slice_element_ty(types, v_ty) else {
+                return false;
+            };
+            if types.is_zst(slice_elem) {
+                return true;
+            }
+            let Some(ptr_ty) = body.func.ty(*ptr) else {
+                return false;
+            };
+            if types.pointer_form(ptr_ty) == Some(PointerForm::Thin)
+                && array_ref_element_ty(types, ptr_ty)
+                    .is_some_and(|(ae, _)| types.peeled(ae) == types.peeled(slice_elem))
+            {
+                return true;
+            }
+            if matches!(
+                types.get(types.peeled(slice_elem)).map(|d| &d.kind),
+                Some(TypeKind::Array { .. })
+            ) {
+                return false;
+            }
+            let same_elem_ptr = ptr_pointee_ty(types, ptr_ty)
+                .is_some_and(|(tp, _)| types.peeled(tp) == types.peeled(slice_elem))
+                && ptr_zero.contains(ptr);
+            let same_elem_slice = slice_element_ty(types, ptr_ty)
+                .is_some_and(|se| types.peeled(se) == types.peeled(slice_elem))
+                && slice_zero.contains(ptr);
+            same_elem_ptr || same_elem_slice
+        }
+        OpKind::Call {
+            callee,
+            function: None,
+            args,
+            semantic,
+            host: None,
+            ..
+        } => match semantic {
+            CallSemantic::Standard(
+                StandardOperation::NativeVecAsSlice | StandardOperation::NativeVecAsMutSlice,
+            ) => true,
+            CallSemantic::Standard(
+                StandardOperation::VecAsSlice | StandardOperation::VecAsMutSlice,
+            ) => args
+                .first()
+                .is_some_and(|a| !borrowed_vec_is_slice_view(body, *a)),
+            CallSemantic::Ordinary => match callee {
+                Callee::Direct { item, .. } => ret_zero.contains(item),
+                _ => false,
+            },
+            _ => false,
+        },
+        OpKind::Field {
+            base,
+            variant: None,
+            field,
+        } => arg_recursive_field_is_zero(body, *base, *field as usize, slice_zero, param_zero),
+        _ => false,
+    }
+}
+
+fn value_is_zero_offset_ptr(
+    body: &OffZeroBody<'_>,
+    v: ValueId,
+    slice_zero: &BTreeSet<ValueId>,
+    ptr_zero: &BTreeSet<ValueId>,
+) -> bool {
+    use crate::jir::semantic::{
+        BinaryOp, CallSemantic, CastKind, GlobalReference, StandardOperation,
+    };
+
+    if let Some(incomings) = body.block_param_incomings.get(&v) {
+        return !incomings.is_empty() && incomings.iter().all(|inc| ptr_zero.contains(inc));
+    }
+    let Some(&(bi, oi)) = body.value_defs.get(&v) else {
+        return false;
+    };
+    let op = &body.func.blocks[bi].ops[oi];
+    let types = body.types;
+
+    match &op.kind {
+        OpKind::Copy(src) | OpKind::Move(src) => ptr_zero.contains(src),
+        OpKind::Const(ConstTree::Address(_)) => true,
+        OpKind::Const(ConstTree::Global {
+            target: GlobalReference::Static { .. },
+            offset: 0,
+        }) => true,
+        OpKind::Call {
+            semantic:
+                CallSemantic::Standard(
+                    StandardOperation::NativeVecAsPtr | StandardOperation::NativeVecAsMutPtr,
+                ),
+            host: None,
+            ..
+        } => true,
+        OpKind::Cast {
+            kind,
+            v: src,
+            from,
+            to,
+        } => match kind {
+            CastKind::Subtype => ptr_zero.contains(src),
+            CastKind::PtrToPtr | CastKind::PointerCoercion => {
+                // `slice::as_ptr` / `slice::as_mut_ptr`: `*const [T] -> *const T`.
+                if let (Some(se), Some((tp, _))) =
+                    (slice_element_ty(types, *from), ptr_pointee_ty(types, *to))
+                {
+                    if types.peeled(se) == types.peeled(tp) {
+                        return slice_zero.contains(src);
+                    }
+                }
+                // `ArrayToPointer`: `*const [T; N] -> *const T` (`rvalue.rs:1619`).
+                if matches!(kind, CastKind::PointerCoercion) {
+                    if let (Some((ae, true)), Some((tp, true))) = (
+                        array_ref_element_ty(types, *from),
+                        ptr_pointee_ty(types, *to),
+                    ) {
+                        if types.peeled(ae) == types.peeled(tp) {
+                            return true;
+                        }
+                    }
+                }
+                // Same non-str/non-slice pointee cast (`*mut T -> *const T`, `&T -> *const T`).
+                if let (Some((fp, _)), Some((tp, _))) =
+                    (ptr_pointee_ty(types, *from), ptr_pointee_ty(types, *to))
+                {
+                    let fp_p = types.peeled(fp);
+                    let tp_p = types.peeled(tp);
+                    if fp_p == tp_p
+                        && !matches!(
+                            types.get(fp_p).map(|d| &d.kind),
+                            Some(TypeKind::Str | TypeKind::Slice(_))
+                        )
+                    {
+                        return ptr_zero.contains(src);
+                    }
+                }
+                false
+            }
+            _ => false,
+        },
+        OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+            match (root, path.as_slice()) {
+                (Root::Cell(_), []) => true,
+                (Root::Value(val), []) => body.func.ty(*val).is_some_and(|t| {
+                    matches!(
+                        types.get(types.peeled(t)).map(|d| &d.kind),
+                        Some(TypeKind::Array { .. })
+                    )
+                }),
+                (
+                    Root::Cell(c),
+                    [Proj::ConstantIndex {
+                        offset: 0,
+                        from_end: false,
+                        ..
+                    }],
+                ) => body.func.cells.get(c.0 as usize).is_some_and(|cell| {
+                    matches!(
+                        types.get(types.peeled(cell.ty)).map(|d| &d.kind),
+                        Some(TypeKind::Array { .. })
+                    )
+                }),
+                (
+                    Root::Value(src),
+                    [Proj::Deref, Proj::ConstantIndex {
+                        offset: 0,
+                        from_end: false,
+                        ..
+                    }],
+                ) => body.func.ty(*src).is_some_and(|t| {
+                    (types.pointer_form(t) == Some(PointerForm::Thin)
+                        && array_ref_element_ty(types, t).is_some())
+                        || (slice_element_ty(types, t).is_some() && slice_zero.contains(src))
+                }),
+                (Root::Value(src), [Proj::Deref]) => {
+                    body.func.ty(*src).is_some_and(|t| {
+                        ptr_pointee_ty(types, t).is_some() && slice_element_ty(types, t).is_none()
+                    }) && ptr_zero.contains(src)
+                }
+                _ => false,
+            }
+        }
+        OpKind::Binary {
+            op: BinaryOp::Offset,
+            l,
+            r,
+            ..
+        } => is_const_zero_scalar(body, *r) && ptr_zero.contains(l),
+        _ => false,
+    }
+}
+
+/// Whole-program greatest fixpoint proving which flattened slice parameters (and direct slice
+/// leaves inside `RecursiveShape` parameters) are provably called exclusively with `off === 0`.
+///
+/// Mutates surviving `FlatParam { slice: true }` entries via [`FlatParam::set_off_zero_slice`]
+/// (2 JS parameters `(buf, len)`) and surviving `ProductNode::Leaf` entries from
+/// `[Buffer, Offset, Length]` to `[Buffer, Length]`, refreshing `plan.decisions`.
+#[allow(clippy::too_many_arguments)]
+fn specialize_zero_offset_slices(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    excluded: &BTreeSet<ItemId>,
+    non_call_named: &BTreeSet<ItemId>,
+    ineligible: &BTreeSet<ItemId>,
+    pinned_by_tracked_caller: &BTreeSet<ItemId>,
+    chunked: bool,
+    plan: &mut AbiPlan,
+) {
+    if plan.flat.is_empty() {
+        return;
+    }
+
+    // Prune provably unreachable dead bodies (e.g. internal helpers whose sole call site was
+    // already inlined before `abi_flat`, so they remain in `funcs` with zero JIR callers and would
+    // otherwise poison live callees they used to call). Any body that is exported/rooted/fixed,
+    // named by a declined item or JIR non-call reference (`non_call_named`), excluded, or special
+    // runtime glue seeds reachability along direct JIR calls. When a synthetic unit test has no
+    // roots at all, conservatively keep all bodies.
+    let reachable: Option<BTreeSet<ItemId>> = if chunked {
+        None
+    } else {
+        let mut roots: BTreeSet<ItemId> = BTreeSet::new();
+        let mut edges: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
+        for (name, entry) in funcs {
+            let Ok(func) = entry else { continue };
+            let link_item = table.get(name);
+            let semantic = link_item
+                .and_then(|it| it.jir.body.as_ref())
+                .map(|b| b.semantic);
+            let is_special_runtime = matches!(
+                semantic,
+                Some(BodySemantic::DropGlue(_) | BodySemantic::PanicImpl)
+            ) || matches!(
+                semantic,
+                Some(BodySemantic::Standard(op))
+                    if crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
+                        || crate::lower::semantic_ops::num::is_float_from_str(op)
+                        || matches!(
+                            op,
+                            crate::jir::semantic::StandardOperation::SliceSort
+                                | crate::jir::semantic::StandardOperation::SliceSortCmp
+                        )
+                        || op.is_typed_heap()
+            );
+            if link_item.is_none_or(|it| it.linkage != Linkage::internal())
+                || non_call_named.contains(&func.item)
+                || excluded.contains(&func.item)
+                || is_special_runtime
+            {
+                roots.insert(func.item);
+            }
+            let callee_list = edges.entry(func.item).or_default();
+            for block in &func.blocks {
+                for (oi, op) in block.ops.iter().enumerate() {
+                    if let OpKind::Call {
+                        callee: Callee::Direct { item, .. },
+                        function: None,
+                        host: None,
+                        ..
+                    } = &op.kind
+                    {
+                        callee_list.push(*item);
+                        if let Some(&retarget) =
+                            plan.site_retargets.get(&(name.clone(), block.id, oi))
+                        {
+                            callee_list.push(retarget);
+                        }
+                    }
+                }
+            }
+        }
+        for (clone_name, source_name) in &plan.clones {
+            let Some(Ok(func)) = funcs.get(source_name) else {
+                continue;
+            };
+            let clone_item = plan
+                .synthetic_items
+                .get(clone_name)
+                .copied()
+                .unwrap_or(func.item);
+            if clone_item != func.item {
+                edges.entry(func.item).or_default().push(clone_item);
+                let src_edges = edges.get(&func.item).cloned().unwrap_or_default();
+                edges.entry(clone_item).or_default().extend(src_edges);
+            }
+        }
+        if roots.is_empty() {
+            None
+        } else {
+            let mut seen = roots.clone();
+            let mut work: Vec<ItemId> = roots.into_iter().collect();
+            while let Some(cur) = work.pop() {
+                if let Some(nexts) = edges.get(&cur) {
+                    for &next in nexts {
+                        if seen.insert(next) {
+                            work.push(next);
+                        }
+                    }
+                }
+            }
+            Some(seen)
+        }
+    };
+
+    let mut bodies: Vec<OffZeroBody<'_>> = Vec::new();
+    let mut untrusted_callees: BTreeSet<ItemId> = BTreeSet::new();
+    let mut entry_targeted_items: BTreeSet<ItemId> = BTreeSet::new();
+    let mut callee_has_sites: BTreeSet<ItemId> = BTreeSet::new();
+
+    for (name, entry) in funcs {
+        let Ok(func) = entry else { continue };
+        if let Some(reach) = &reachable {
+            if !reach.contains(&func.item) {
+                continue;
+            }
+        }
+        let Some(types) = type_table(table, name) else {
+            for block in &func.blocks {
+                for (oi, op) in block.ops.iter().enumerate() {
+                    if let OpKind::Call {
+                        callee: Callee::Direct { item, .. },
+                        function: None,
+                        host: None,
+                        ..
+                    } = &op.kind
+                    {
+                        let target = plan
+                            .site_retargets
+                            .get(&(name.clone(), block.id, oi))
+                            .copied()
+                            .unwrap_or(*item);
+                        untrusted_callees.insert(target);
+                    }
+                }
+            }
+            continue;
+        };
+        let entry_targeted = func
+            .blocks
+            .iter()
+            .any(|b| b.term.successors().contains(&RBlockId(0)));
+        if entry_targeted && plan.names.get(&func.item) == Some(name) {
+            entry_targeted_items.insert(func.item);
+        }
+        let link_item = table.get(name);
+        let semantic = link_item
+            .and_then(|it| it.jir.body.as_ref())
+            .map(|b| b.semantic);
+        let in_place_flat =
+            plan.flat.contains_key(&func.item) && plan.names.get(&func.item) == Some(name);
+        let internal_non_flat = !plan.flat.contains_key(&func.item)
+            && !pinned_by_tracked_caller.contains(&func.item)
+            && refuses(
+                link_item.map(|it| &it.linkage),
+                semantic,
+                func,
+                chunked,
+                ineligible,
+            )
+            .is_none();
+        let trust_own_params = !entry_targeted && (in_place_flat || internal_non_flat);
+        let ret_allowed = !excluded.contains(&func.item)
+            && matches!(semantic, Some(BodySemantic::Ordinary))
+            && !plan.clones.values().any(|src| src == name);
+        let body = build_off_zero_body(
+            name,
+            func.item,
+            trust_own_params,
+            ret_allowed,
+            func,
+            types,
+            plan,
+        );
+        for (callee, _) in &body.calls {
+            callee_has_sites.insert(*callee);
+        }
+        bodies.push(body);
+    }
+
+    for (clone_name, source_name) in &plan.clones {
+        let Some(Ok(func)) = funcs.get(source_name) else {
+            continue;
+        };
+        let Some(types) = type_table(table, source_name) else {
+            continue;
+        };
+        let clone_item = plan
+            .synthetic_items
+            .get(clone_name)
+            .copied()
+            .unwrap_or(func.item);
+        if let Some(reach) = &reachable {
+            if !reach.contains(&clone_item) && !reach.contains(&func.item) {
+                continue;
+            }
+        }
+        let entry_targeted = func
+            .blocks
+            .iter()
+            .any(|b| b.term.successors().contains(&RBlockId(0)));
+        if entry_targeted {
+            entry_targeted_items.insert(clone_item);
+        }
+        let trust_own_params = !entry_targeted && plan.names.get(&clone_item) == Some(clone_name);
+        let body = build_off_zero_body(
+            clone_name,
+            clone_item,
+            trust_own_params,
+            false,
+            func,
+            types,
+            plan,
+        );
+        for (callee, _) in &body.calls {
+            callee_has_sites.insert(*callee);
+        }
+        bodies.push(body);
+    }
+
+    // Seed optimistic greatest-fixpoint sets.
+    let mut param_zero: BTreeSet<(ItemId, SliceSlot)> = BTreeSet::new();
+    for (&item, sig) in &plan.flat {
+        if !callee_has_sites.contains(&item)
+            || untrusted_callees.contains(&item)
+            || entry_targeted_items.contains(&item)
+        {
+            continue;
+        }
+        for (pos, param_opt) in sig.params.iter().enumerate() {
+            let Some(param) = param_opt else { continue };
+            if param.slice && !param.is_off_zero_slice() {
+                param_zero.insert((item, SliceSlot::Top(pos)));
+            } else if let Some(rec) = &param.recursive {
+                if let ProductNode::Product { fields, .. } = &rec.root {
+                    for (fi, node) in fields.iter().enumerate() {
+                        if matches!(
+                            node,
+                            ProductNode::Leaf { components, .. }
+                                if components.as_slice()
+                                    == [
+                                        LaneComponent::Buffer,
+                                        LaneComponent::Offset,
+                                        LaneComponent::Length,
+                                    ]
+                        ) {
+                            param_zero.insert((item, SliceSlot::RecursiveField(pos, fi)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if param_zero.is_empty() {
+        return;
+    }
+
+    // Also seed trusted internal non-flat forwarders so `entry -> forwarder -> flat_callee`
+    // propagates `off === 0` across unflattened internal helpers.
+    for body in &bodies {
+        if plan.flat.contains_key(&body.item)
+            || !body.trust_own_params
+            || !callee_has_sites.contains(&body.item)
+            || untrusted_callees.contains(&body.item)
+        {
+            continue;
+        }
+        for (pos, &p) in body.func.params.iter().enumerate() {
+            let def = body.func.values[p.0 as usize];
+            if def.carrier == Carrier::Baseline && slice_element_ty(body.types, def.ty).is_some() {
+                param_zero.insert((body.item, SliceSlot::Top(pos)));
+            }
+        }
+    }
+
+    let mut ret_zero: BTreeSet<ItemId> = bodies
+        .iter()
+        .filter(|b| b.ret_candidate)
+        .map(|b| b.item)
+        .collect();
+
+    // Reverse dependency map: `callee_item -> body indices` that either implement or call it.
+    let mut item_dependents: BTreeMap<ItemId, Vec<usize>> = BTreeMap::new();
+    let mut relevant: Vec<bool> = vec![false; bodies.len()];
+    for (bi, body) in bodies.iter().enumerate() {
+        if body.trust_own_params || body.ret_candidate {
+            item_dependents.entry(body.item).or_default().push(bi);
+            relevant[bi] = true;
+        }
+        for &(callee, _) in &body.calls {
+            if param_zero
+                .range((callee, SliceSlot::Top(0))..)
+                .next()
+                .is_some_and(|(id, _)| *id == callee)
+                || ret_zero.contains(&callee)
+            {
+                item_dependents.entry(callee).or_default().push(bi);
+                relevant[bi] = true;
+            }
+        }
+    }
+    for deps in item_dependents.values_mut() {
+        deps.sort_unstable();
+        deps.dedup();
+    }
+
+    let mut dirty: Vec<bool> = relevant;
+    loop {
+        let mut next_dirty = vec![false; bodies.len()];
+        let mut any_changed = false;
+
+        for (bi, body) in bodies.iter().enumerate() {
+            if !dirty[bi] {
+                continue;
+            }
+            // Local greatest fixpoint over tracked slice and pointer values in `body`.
+            let mut slice_zero: BTreeSet<ValueId> = body.tracked_slices.iter().copied().collect();
+            let mut ptr_zero: BTreeSet<ValueId> = body.tracked_ptrs.iter().copied().collect();
+            loop {
+                let before_s = slice_zero.len();
+                let before_p = ptr_zero.len();
+                let cur_s = slice_zero.clone();
+                let cur_p = ptr_zero.clone();
+                slice_zero.retain(|&v| {
+                    value_is_zero_offset_slice(body, v, &cur_s, &cur_p, &param_zero, &ret_zero)
+                });
+                ptr_zero.retain(|&v| value_is_zero_offset_ptr(body, v, &slice_zero, &cur_p));
+                if slice_zero.len() == before_s && ptr_zero.len() == before_p {
+                    break;
+                }
+            }
+
+            let mut changed_items: Vec<ItemId> = Vec::new();
+            if body.ret_candidate
+                && ret_zero.contains(&body.item)
+                && !body.returns.iter().all(|v| slice_zero.contains(v))
+            {
+                ret_zero.remove(&body.item);
+                changed_items.push(body.item);
+            }
+
+            for (callee, args) in &body.calls {
+                let slots: Vec<SliceSlot> = param_zero
+                    .range((*callee, SliceSlot::Top(0))..)
+                    .take_while(|(id, _)| id == callee)
+                    .map(|(_, slot)| *slot)
+                    .collect();
+                for slot in slots {
+                    let ok = match slot {
+                        SliceSlot::Top(pos) => {
+                            args.get(pos).is_some_and(|arg| slice_zero.contains(arg))
+                        }
+                        SliceSlot::RecursiveField(pos, field_idx) => {
+                            args.get(pos).is_some_and(|arg| {
+                                arg_recursive_field_is_zero(
+                                    body,
+                                    *arg,
+                                    field_idx,
+                                    &slice_zero,
+                                    &param_zero,
+                                )
+                            })
+                        }
+                    };
+                    if !ok {
+                        param_zero.remove(&(*callee, slot));
+                        changed_items.push(*callee);
+                    }
+                }
+            }
+
+            if !changed_items.is_empty() {
+                any_changed = true;
+                for item in changed_items {
+                    if let Some(deps) = item_dependents.get(&item) {
+                        for &dep_bi in deps {
+                            next_dirty[dep_bi] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_changed {
+            break;
+        }
+        dirty = next_dirty;
+    }
+
+    // Apply surviving zero-offset specializations to `plan.flat` and refresh `plan.decisions`.
+    let synth_set: BTreeSet<ItemId> = plan.synthetic_items.values().copied().collect();
+    let flat_keys: BTreeSet<ItemId> = plan.flat.keys().copied().collect();
+    let mut updated_decisions: Vec<(JsName, FlatSig)> = Vec::new();
+    for (&item, sig) in &mut plan.flat {
+        let mut updated = false;
+        for (pos, param_opt) in sig.params.iter_mut().enumerate() {
+            let Some(param) = param_opt else { continue };
+            if param.slice && param_zero.contains(&(item, SliceSlot::Top(pos))) {
+                param.set_off_zero_slice();
+                updated = true;
+            } else if let Some(rec) = param.recursive.as_mut() {
+                if let ProductNode::Product { fields, .. } = &mut rec.root {
+                    let mut rec_changed = false;
+                    for (fi, node) in fields.iter_mut().enumerate() {
+                        if param_zero.contains(&(item, SliceSlot::RecursiveField(pos, fi))) {
+                            if let ProductNode::Leaf { components, .. } = node {
+                                if components.as_slice()
+                                    == [
+                                        LaneComponent::Buffer,
+                                        LaneComponent::Offset,
+                                        LaneComponent::Length,
+                                    ]
+                                {
+                                    *components =
+                                        vec![LaneComponent::Buffer, LaneComponent::Length];
+                                    rec_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if rec_changed {
+                        param.field_tys = rec.lane_types();
+                        param.passed = (0..param.field_tys.len() as u32).collect();
+                        updated = true;
+                    }
+                }
+            }
+        }
+        if updated {
+            if let Some(target) = plan.names.get(&item) {
+                let source = plan.clones.get(target).unwrap_or(target);
+                let skip_decision = synth_set.contains(&item)
+                    && funcs
+                        .get(source)
+                        .and_then(|r| r.as_ref().ok())
+                        .is_some_and(|f| flat_keys.contains(&f.item));
+                if !skip_decision {
+                    updated_decisions.push((source.clone(), sig.clone()));
+                }
+            }
+        }
+    }
+    for (source, sig) in updated_decisions {
+        plan.select_with_types(&source, &sig, type_table(table, &source));
+    }
 }
 
 /// Maps the compiler-wide decline vocabulary onto the physical report's terminal-state contract.
@@ -7679,5 +8809,910 @@ mod tests {
             .push(("extra".to_owned(), "entry".to_owned()));
         let chunked_plan = plan_excluding(&table, &funcs, &chunked_opts, &BTreeSet::new());
         assert!(!chunked_plan.has_sentinel_result());
+    }
+
+    #[test]
+    fn zero_offset_slice_specialization_positive_and_negative_cases() {
+        use crate::jir::semantic::{
+            BasicBlock, BinaryOp, BlockId, Body, BodyKind, CallSemantic, CastKind, GlobalReference,
+            StandardOperation, Terminator, UnaryOp,
+        };
+        use crate::jir::summary::{
+            Availability, ItemClass, ItemSummary, PhysicalSummary, SemanticKey,
+        };
+        use crate::jir::types::{IntFacts, IntRepr};
+        use std::sync::Arc;
+
+        const SLICE_U32: TypeId = TypeId(10);
+        const REF_SLICE_U32: TypeId = TypeId(11);
+        const ARR4_U32: TypeId = TypeId(12);
+        const REF_ARR4_U32: TypeId = TypeId(13);
+        const PTR_U32: TypeId = TypeId(14);
+        const VEC_U32: TypeId = TypeId(15);
+        const REF_VEC_U32: TypeId = TypeId(16);
+        const UNIT: TypeId = TypeId(17);
+
+        let mut interns = Interns::default();
+        let s_leaf = interns.intern_str("leaf");
+        let s_mid = interns.intern_str("mid");
+        let s_rec = interns.intern_str("rec");
+        let s_mixed = interns.intern_str("mixed");
+        let s_ptr_off = interns.intern_str("ptr_off");
+        let s_exp_rec = interns.intern_str("exp_rec");
+        let s_static_ok = interns.intern_str("static_ok");
+        let s_static_bad = interns.intern_str("static_bad");
+        let s_vec_as_slice = interns.intern_str("vec_as_slice");
+        let s_static_arr = interns.intern_str("STATIC_ARR");
+        let s_entry = interns.intern_str("entry");
+
+        let js_facts = |peeled: TypeId,
+                        int: Option<IntFacts>,
+                        is_indirect: bool,
+                        needs_clone: bool,
+                        pointer_form: Option<PointerForm>| JsFacts {
+            int,
+            is_indirect,
+            needs_clone,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+
+        let scalar_u32 = TypeDescriptor {
+            id: U32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(
+                U32,
+                Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                false,
+                false,
+                None,
+            ),
+        };
+        let unit_desc = TypeDescriptor {
+            id: UNIT,
+            name: None,
+            kind: TypeKind::Tuple(Vec::new()),
+            layout: LayoutFacts {
+                size: Some(0),
+                align: Some(1),
+                sized: true,
+                zst: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(UNIT, None, false, false, None),
+        };
+        let slice_desc = TypeDescriptor {
+            id: SLICE_U32,
+            name: None,
+            kind: TypeKind::Slice(U32),
+            layout: LayoutFacts {
+                sized: false,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(SLICE_U32, None, true, false, None),
+        };
+        let ref_slice_desc = TypeDescriptor {
+            id: REF_SLICE_U32,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: SLICE_U32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                size: Some(8),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(
+                REF_SLICE_U32,
+                None,
+                false,
+                false,
+                Some(PointerForm::FatSlice),
+            ),
+        };
+        let arr_desc = TypeDescriptor {
+            id: ARR4_U32,
+            name: None,
+            kind: TypeKind::Array {
+                element: U32,
+                length: 4,
+            },
+            layout: LayoutFacts {
+                size: Some(16),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(ARR4_U32, None, true, true, None),
+        };
+        let ref_arr_desc = TypeDescriptor {
+            id: REF_ARR4_U32,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: ARR4_U32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(REF_ARR4_U32, None, false, false, Some(PointerForm::Thin)),
+        };
+        let ptr_u32_desc = TypeDescriptor {
+            id: PTR_U32,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: U32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(PTR_U32, None, false, false, Some(PointerForm::Slot)),
+        };
+        let vec_desc = TypeDescriptor {
+            id: VEC_U32,
+            name: None,
+            kind: TypeKind::Opaque,
+            layout: LayoutFacts {
+                size: Some(12),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(VEC_U32, None, true, false, None),
+        };
+        let ref_vec_desc = TypeDescriptor {
+            id: REF_VEC_U32,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: VEC_U32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                align: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(REF_VEC_U32, None, false, false, Some(PointerForm::Thin)),
+        };
+        for d in [
+            scalar_u32,
+            unit_desc,
+            slice_desc,
+            ref_slice_desc,
+            arr_desc,
+            ref_arr_desc,
+            ptr_u32_desc,
+            vec_desc,
+            ref_vec_desc,
+        ] {
+            interns.types.insert(d);
+        }
+        let shared = Arc::new(interns);
+
+        let build_len_fn = |id: ItemId| {
+            let mut b = FuncBuilder::new(id, signature(vec![REF_SLICE_U32], U32));
+            let s = b.param(REF_SLICE_U32, NO_ORIGIN);
+            let len = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Unary {
+                    op: UnaryOp::PtrMetadata,
+                    v: s,
+                    ty: REF_SLICE_U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(len)));
+            b.finish()
+        };
+
+        let leaf_id = item(100);
+        let mid_id = item(101);
+        let rec_id = item(102);
+        let mixed_id = item(103);
+        let ptr_off_id = item(104);
+        let uncalled_id = item(105);
+        let exp_rec_id = item(106);
+        let static_ok_id = item(107);
+        let static_bad_id = item(108);
+        let vec_as_slice_id = item(109);
+        let entry_id = item(110);
+        let dead_inlined_id = item(111);
+
+        let leaf_fn = build_len_fn(leaf_id);
+        let mixed_fn = build_len_fn(mixed_id);
+        let ptr_off_fn = build_len_fn(ptr_off_id);
+        let uncalled_fn = build_len_fn(uncalled_id);
+        let static_ok_fn = build_len_fn(static_ok_id);
+        let static_bad_fn = build_len_fn(static_bad_id);
+
+        // Unreachable dead helper (as left behind after JIR inlining): internal linkage, zero JIR
+        // callers, still forwards its own slice param to `leaf`. Must NOT poison `leaf`!
+        let dead_inlined_fn = {
+            let mut b = FuncBuilder::new(dead_inlined_id, signature(vec![REF_SLICE_U32], U32));
+            let s = b.param(REF_SLICE_U32, NO_ORIGIN);
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: leaf_id,
+                        link_name: s_leaf,
+                    },
+                    function: None,
+                    args: vec![s],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(r)));
+            b.finish()
+        };
+
+        // `mid(s)` forwards `s` to `leaf(s)` and `rec(s)`.
+        let mid_fn = {
+            let mut b = FuncBuilder::new(mid_id, signature(vec![REF_SLICE_U32], U32));
+            let s = b.param(REF_SLICE_U32, NO_ORIGIN);
+            let _ = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: leaf_id,
+                        link_name: s_leaf,
+                    },
+                    function: None,
+                    args: vec![s],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: rec_id,
+                        link_name: s_rec,
+                    },
+                    function: None,
+                    args: vec![s],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(r)));
+            b.finish()
+        };
+
+        // `rec(s)` recursively forwards prefix subslice `&s[..2]` (`from: 0`) to `rec` and `s` to `leaf`.
+        let rec_fn = {
+            let mut b = FuncBuilder::new(rec_id, signature(vec![REF_SLICE_U32], U32));
+            let s = b.param(REF_SLICE_U32, NO_ORIGIN);
+            let prefix = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::BorrowView {
+                    root: Root::Value(s),
+                    path: vec![
+                        Proj::Deref,
+                        Proj::Subslice {
+                            from: 0,
+                            to: 2,
+                            from_end: false,
+                        },
+                    ],
+                    mutable: false,
+                },
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: rec_id,
+                        link_name: s_rec,
+                    },
+                    function: None,
+                    args: vec![prefix],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: leaf_id,
+                        link_name: s_leaf,
+                    },
+                    function: None,
+                    args: vec![s],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(r)));
+            b.finish()
+        };
+
+        // `exp_rec(s)` is exported and self-recursive: its canonical entry can pass non-zero `off`.
+        let exp_rec_fn = {
+            let mut b = FuncBuilder::new(exp_rec_id, signature(vec![REF_SLICE_U32], U32));
+            let s = b.param(REF_SLICE_U32, NO_ORIGIN);
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: exp_rec_id,
+                        link_name: s_exp_rec,
+                    },
+                    function: None,
+                    args: vec![s],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(r)));
+            b.finish()
+        };
+
+        // `entry(v: &Vec<u32>, arr: &[u32; 4])`: exercises all positive and negative call patterns.
+        let entry_fn = {
+            let mut b = FuncBuilder::new(entry_id, signature(vec![REF_VEC_U32, REF_ARR4_U32], U32));
+            let v = b.param(REF_VEC_U32, NO_ORIGIN);
+            let arr = b.param(REF_ARR4_U32, NO_ORIGIN);
+            let e = FuncBuilder::ENTRY;
+            let vec_sl = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: vec_as_slice_id,
+                        link_name: s_vec_as_slice,
+                    },
+                    function: None,
+                    args: vec![v],
+                    track_caller: None,
+                    semantic: CallSemantic::Standard(StandardOperation::NativeVecAsSlice),
+                    host: None,
+                },
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let arr_sl = b.op(
+                e,
+                OpKind::Cast {
+                    kind: CastKind::PointerCoercion,
+                    v: arr,
+                    from: REF_ARR4_U32,
+                    to: REF_SLICE_U32,
+                },
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let const_sl = b.op(
+                e,
+                OpKind::Const(ConstTree::Slice(vec![ConstTree::Scalar {
+                    bits: 1,
+                    bytes: 4,
+                }])),
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            // Positive calls into `mid` (all zero-offset).
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: mid_id,
+                        link_name: s_mid,
+                    },
+                    function: None,
+                    args: vec![vec_sl],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: mid_id,
+                        link_name: s_mid,
+                    },
+                    function: None,
+                    args: vec![arr_sl],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: mid_id,
+                        link_name: s_mid,
+                    },
+                    function: None,
+                    args: vec![const_sl],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            // Mixed caller: `vec_sl` (off 0) + `&vec_sl[1..3]` (non-zero off) -> `mixed` stays 3-arg.
+            let sub_nonzero = b.op(
+                e,
+                OpKind::BorrowView {
+                    root: Root::Value(vec_sl),
+                    path: vec![
+                        Proj::Deref,
+                        Proj::Subslice {
+                            from: 1,
+                            to: 3,
+                            from_end: false,
+                        },
+                    ],
+                    mutable: false,
+                },
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: mixed_id,
+                        link_name: s_mixed,
+                    },
+                    function: None,
+                    args: vec![vec_sl],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: mixed_id,
+                        link_name: s_mixed,
+                    },
+                    function: None,
+                    args: vec![sub_nonzero],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            // `PtrAdd` (`BinaryOp::Offset`) with offset 1 -> `SliceView` -> `ptr_off` stays 3-arg.
+            let base_ptr = b.op(
+                e,
+                OpKind::Cast {
+                    kind: CastKind::PtrToPtr,
+                    v: vec_sl,
+                    from: REF_SLICE_U32,
+                    to: PTR_U32,
+                },
+                PTR_U32,
+                NO_ORIGIN,
+            );
+            let one = b.op(
+                e,
+                OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+                U32,
+                NO_ORIGIN,
+            );
+            let bumped = b.op(
+                e,
+                OpKind::Binary {
+                    op: BinaryOp::Offset,
+                    l: base_ptr,
+                    r: one,
+                    ty: PTR_U32,
+                },
+                PTR_U32,
+                NO_ORIGIN,
+            );
+            let off_view = b.op(
+                e,
+                OpKind::SliceView {
+                    ptr: bumped,
+                    len: one,
+                },
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: ptr_off_id,
+                        link_name: s_ptr_off,
+                    },
+                    function: None,
+                    args: vec![off_view],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            // Exported self-recursive callee called with `vec_sl`.
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: exp_rec_id,
+                        link_name: s_exp_rec,
+                    },
+                    function: None,
+                    args: vec![vec_sl],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            // `StaticSlice { start: 0 }` vs `StaticSlice { start: 2 }`.
+            let static_ref = GlobalReference::Static {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 999,
+                },
+                link_name: s_static_arr,
+            };
+            let st0 = b.op(
+                e,
+                OpKind::Const(ConstTree::StaticSlice {
+                    target: static_ref,
+                    path: Vec::new(),
+                    start: 0,
+                    length: 4,
+                }),
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let st2 = b.op(
+                e,
+                OpKind::Const(ConstTree::StaticSlice {
+                    target: static_ref,
+                    path: Vec::new(),
+                    start: 2,
+                    length: 2,
+                }),
+                REF_SLICE_U32,
+                NO_ORIGIN,
+            );
+            let _ = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: static_ok_id,
+                        link_name: s_static_ok,
+                    },
+                    function: None,
+                    args: vec![st0],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let r = b.op(
+                e,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: static_bad_id,
+                        link_name: s_static_bad,
+                    },
+                    function: None,
+                    args: vec![st2],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(e, RTerm::Return(Some(r)));
+            b.finish()
+        };
+
+        let make_link_item =
+            |name: &str, id: ItemId, sig: Signature, exported: bool, refs: &[&str]| {
+                let mut it = link_item(name, refs);
+                if exported {
+                    it.linkage = Linkage::exported(name.to_owned());
+                }
+                let body = Body {
+                    item: id,
+                    kind: BodyKind::Function,
+                    semantic: BodySemantic::Ordinary,
+                    signature: sig,
+                    locals: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        cleanup: false,
+                        statements: Vec::new(),
+                        terminator: Terminator::Return,
+                    }],
+                };
+                let hash = crate::jir::summary::semantic_hash(&body, &shared);
+                let physical = PhysicalSummary::of(&body, &shared.types, hash);
+                it.jir.body = Some(body);
+                it.jir.summary = Some(ItemSummary {
+                    key: SemanticKey {
+                        link_name: name.to_owned(),
+                        item: Some(id),
+                    },
+                    body_hash: None,
+                    semantic_hash: Some(hash),
+                    availability: Availability::Available,
+                    deps: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    abi: None,
+                    physical,
+                    kind: ItemKind::Fn,
+                    linkage: it.linkage.clone(),
+                    order: None,
+                    dts: false,
+                    fallback: rcgjs_object::object::BlobRef {
+                        offset: 0,
+                        clen: 0,
+                        ulen: 0,
+                    },
+                    body: None,
+                    origin: None,
+                    estimated_bytes: 0,
+                    class: ItemClass::AGGREGATE,
+                });
+                it.jir.use_shared_interns(shared.clone());
+                it
+            };
+
+        let _ = s_entry;
+        let table = BTreeMap::from([
+            (
+                JsName::new("leaf".to_owned()),
+                make_link_item("leaf", leaf_id, leaf_fn.sig.clone(), false, &[]),
+            ),
+            (
+                JsName::new("mid".to_owned()),
+                make_link_item("mid", mid_id, mid_fn.sig.clone(), false, &["leaf", "rec"]),
+            ),
+            (
+                JsName::new("rec".to_owned()),
+                make_link_item("rec", rec_id, rec_fn.sig.clone(), false, &["rec", "leaf"]),
+            ),
+            (
+                JsName::new("mixed".to_owned()),
+                make_link_item("mixed", mixed_id, mixed_fn.sig.clone(), false, &[]),
+            ),
+            (
+                JsName::new("ptr_off".to_owned()),
+                make_link_item("ptr_off", ptr_off_id, ptr_off_fn.sig.clone(), false, &[]),
+            ),
+            (
+                JsName::new("uncalled".to_owned()),
+                make_link_item("uncalled", uncalled_id, uncalled_fn.sig.clone(), false, &[]),
+            ),
+            (
+                JsName::new("exp_rec".to_owned()),
+                make_link_item(
+                    "exp_rec",
+                    exp_rec_id,
+                    exp_rec_fn.sig.clone(),
+                    true,
+                    &["exp_rec"],
+                ),
+            ),
+            (
+                JsName::new("static_ok".to_owned()),
+                make_link_item(
+                    "static_ok",
+                    static_ok_id,
+                    static_ok_fn.sig.clone(),
+                    false,
+                    &[],
+                ),
+            ),
+            (
+                JsName::new("static_bad".to_owned()),
+                make_link_item(
+                    "static_bad",
+                    static_bad_id,
+                    static_bad_fn.sig.clone(),
+                    false,
+                    &[],
+                ),
+            ),
+            (
+                JsName::new("dead_inlined".to_owned()),
+                make_link_item(
+                    "dead_inlined",
+                    dead_inlined_id,
+                    dead_inlined_fn.sig.clone(),
+                    false,
+                    &["leaf"],
+                ),
+            ),
+            (
+                JsName::new("entry".to_owned()),
+                make_link_item(
+                    "entry",
+                    entry_id,
+                    entry_fn.sig.clone(),
+                    true,
+                    &[
+                        "mid",
+                        "mixed",
+                        "ptr_off",
+                        "exp_rec",
+                        "static_ok",
+                        "static_bad",
+                        "vec_as_slice",
+                        // Stale baseline ref to an already-inlined helper (just like `earcut_linked`
+                        // referencing inlined `cure_local_intersections_sl`):
+                        "dead_inlined",
+                    ],
+                ),
+            ),
+        ]);
+        let funcs = BTreeMap::from([
+            (JsName::new("leaf".to_owned()), Ok(leaf_fn)),
+            (JsName::new("mid".to_owned()), Ok(mid_fn)),
+            (JsName::new("rec".to_owned()), Ok(rec_fn)),
+            (JsName::new("mixed".to_owned()), Ok(mixed_fn)),
+            (JsName::new("ptr_off".to_owned()), Ok(ptr_off_fn)),
+            (JsName::new("uncalled".to_owned()), Ok(uncalled_fn)),
+            (JsName::new("exp_rec".to_owned()), Ok(exp_rec_fn)),
+            (JsName::new("static_ok".to_owned()), Ok(static_ok_fn)),
+            (JsName::new("static_bad".to_owned()), Ok(static_bad_fn)),
+            (JsName::new("dead_inlined".to_owned()), Ok(dead_inlined_fn)),
+            (JsName::new("entry".to_owned()), Ok(entry_fn)),
+        ]);
+
+        let speed_opts = Opts {
+            optimizer: crate::opts::OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            flat_abi: true,
+            ..Opts::default()
+        };
+        let plan = plan_excluding(&table, &funcs, &speed_opts, &BTreeSet::new());
+
+        // Positive cases: `mid`, `rec`, `leaf`, `static_ok` -> 2-arg zero-offset slices.
+        for (label, id) in [
+            ("mid", mid_id),
+            ("rec", rec_id),
+            ("leaf", leaf_id),
+            ("static_ok", static_ok_id),
+        ] {
+            let sig = plan
+                .call_signature(id)
+                .unwrap_or_else(|| panic!("{label} must be flattened"));
+            let p = sig.params[0].as_ref().expect("slice param");
+            assert!(p.is_off_zero_slice(), "{label} must be off_zero: {p:?}");
+            assert_eq!(p.fields(), 2, "{label} must take 2 JS params");
+            assert!(sig.slice_jir_positions().is_empty());
+            assert_eq!(sig.off_zero_slice_jir_positions(), vec![0]);
+            assert_eq!(sig.recursive_jir_positions().len(), 1);
+            assert_eq!(
+                plan.decisions
+                    .get(&JsName::new(label.to_owned()))
+                    .and_then(|d| d.shape.as_deref()),
+                Some("slice(2)"),
+                "{label} decision shape must be slice(2)"
+            );
+        }
+
+        // Negative cases: `mixed`, `ptr_off`, `uncalled`, `exp_rec`, `static_bad` -> stay 3-arg!
+        for (label, id) in [
+            ("mixed", mixed_id),
+            ("ptr_off", ptr_off_id),
+            ("uncalled", uncalled_id),
+            ("exp_rec", exp_rec_id),
+            ("static_bad", static_bad_id),
+        ] {
+            let sig = plan
+                .call_signature(id)
+                .unwrap_or_else(|| panic!("{label} must still be 3-arg flattened"));
+            let p = sig.params[0].as_ref().expect("slice param");
+            assert!(
+                !p.is_off_zero_slice(),
+                "{label} MUST NOT be off_zero: {p:?}"
+            );
+            assert_eq!(p.fields(), 3, "{label} must keep 3 JS params");
+            assert_eq!(sig.slice_jir_positions(), vec![0]);
+            assert!(sig.off_zero_slice_jir_positions().is_empty());
+            assert!(sig.recursive_jir_positions().is_empty());
+        }
+
+        // ReleaseBalanced keeps canonical 3-arg slice shape (preserves balanced gate invariants).
+        let bal_opts = Opts {
+            optimizer: crate::opts::OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseBalanced),
+            flat_abi: true,
+            ..Opts::default()
+        };
+        let bal_plan = plan_excluding(&table, &funcs, &bal_opts, &BTreeSet::new());
+        assert!(!bal_plan.has_off_zero_slice());
+        assert_eq!(
+            bal_plan.call_signature(leaf_id).expect("leaf").params[0]
+                .as_ref()
+                .expect("slice")
+                .fields(),
+            3
+        );
     }
 }
