@@ -1,16 +1,6 @@
 # mires — standalone Rust-to-JavaScript compiler
 
-`mires` compiles monomorphized Rust MIR, including real `core` and `alloc`, into JavaScript. This workspace now contains the recovered **v2 producer / semantic-object / independent-linker architecture**, rather than the earlier text-first backend.
-
-This is a working development reconstruction based on the coherent September 7 v2 snapshot, with selected later safety and packaging requirements restored. **It is not a byte-exact October dev13 recovery or a production-qualified release.** The remaining optimization and semantic gaps are listed in [the restoration record](docs/V2-RESTORATION.md) and [current verification results](VERDICT.md). Historical archived verdicts are kept separately.
-
-## Current optimization-restoration checkpoint
-
-Main includes the next-generation qualification repairs and selected Round 3 optimizer work. See [the current restoration assessment](RESTORATION-STATUS.md), [current evidence](docs/main-restoration-status-2026-11-17.json), and [the full project history](current_state.md). OSS bundle sizes are close to the recorded October waypoint; semantic gaps and qualification hardening remain. The rejected Round 3 runtime fast paths are not included. This is not production admission.
-
-## Preserved restoration work
-
-The source, pending patches and verifier programs from both restoration rounds are preserved in [the research archive](research/v2-restoration/rounds-1-2/README.md). Read [WORKTREE-CLEANUP-HANDOFF.md](WORKTREE-CLEANUP-HANDOFF.md) before removing old worktrees. It distinguishes public reconstruction patches from private raw evidence and records the fresh combined-main checks.
+`mires` compiles monomorphized Rust MIR, including real `core` and `alloc`, into JavaScript using a JIR-only semantic-object producer and independent whole-program linker/optimizer (`rustc_codegen_mires` + `jsc-link`).
 
 ## Compile and run Rust
 
@@ -41,8 +31,7 @@ The example's stable `build.rs` uses `mires_build::BuildConfig` to compile a sep
 
 | Directory | Role |
 | --- | --- |
-| `backend/` | `rustc_codegen_mires`: rustc-facing semantic producer |
-| `rustc-cleanup/` | Hash-verified adaptations of the pinned rustc drop/coroutine passes |
+| `backend/` | `rustc_codegen_mires`: rustc-facing JIR semantic producer |
 | `rcgjs-object/` | Rustc-independent object format, semantic IR, identities, origins, contracts |
 | `jsc-link/` | Independent linker, SSA, analyses, optimizer, representation/ABI planner, JavaScript emission |
 | `structurizer/` | Control-flow graph to structured JavaScript |
@@ -50,17 +39,13 @@ The example's stable `build.rs` uses `mires_build::BuildConfig` to compile a sep
 | `mires-js/` | General host values, JavaScript bindings, collections and future interoperation |
 | `js-extern-macro/`, `js-macro/` | Typed external bindings and explicit JavaScript expressions |
 | `runtime/` | Canonical runtime, extracted per artifact |
-| `view-abi/`, `view-async/` | Retained small compatibility ABI/executor crates; no Topcoat framework dependency |
 | `scripts/`, `examples/` | Build drivers, compiler fixtures and standalone examples |
-| `experiments/` | Recovered OSS reference, Rust ports and reduced workload corpus |
-| `experiments-pro/` | Private recovered Pro reference, Rust ports and historical tools; ignored by Git |
-| `recovery/v2/` | Unmodified snapshots, content-addressed variants, evidence and recovery manifests |
+| `experiments/` | OSS benchmarks, library matrix, and comparator ports |
+| `experiments-pro/` | Private Pro benchmarks and ports; ignored by Git |
 
-Legacy template-marker lowering remains internally for compatibility with recovered code; the Topcoat UI implementation and framework crates are not workspace members or dependencies. Removing all legacy marker support is separate from restoring a verified generic compiler.
+## Profiles and unwind semantics
 
-## Profiles and cleanup
-
-`release-size`, `release-balanced`, and `release-speed` select the JIR lane and optimizer with an ES2018 syntax ceiling. The default `JSC_PANIC=unwind` mode uses `mires32-unwind` and rustc optimized-MIR cleanup edges; its driver appends `js-cleanup=off` to disable the older reconstruction bridge, **not to disable host-exception cleanup**. `JSC_PANIC=abort` selects the legacy target/pipeline, where the release profiles enable the reconstruction bridge; explicitly disabling that bridge in abort mode changes host-exception cleanup behavior. Rust panics still abort. See [the contract](CONTRACT.md) for ABI refusals and limits. ES2018 is a syntax ceiling, not a guarantee that every reached runtime capability exists in every ES2018 engine. Independent pruning checks currently require `RCGJS_WITNESS_CHECK=1` for a release linker; default enforcement remains open.
+`release-size`, `release-balanced`, and `release-speed` select the JIR lane and optimizer with an ES2018 syntax ceiling. `mires` runs strictly in `JSC_PANIC=unwind` mode (`targets/mires32-unwind.json`) so rustc's own MIR unwind edges carry host-exception cleanup (`js-cleanup=off`). Rust panics still abort. See [CONTRACT.md](CONTRACT.md), [JIR.md](JIR.md), and [OPTIMIZER.md](OPTIMIZER.md) for ABI rules and limits. Set `RCGJS_WITNESS_CHECK=1` to enable independent optimization-witness verification.
 
 The primitive build drivers remain available:
 

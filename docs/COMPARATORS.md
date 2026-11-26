@@ -4,13 +4,7 @@
 
 On 2026-11-08, all seven archived non-Rust implementations were restored for both FingerprintJS OSS and Fingerprint Pro: **14 fresh builds pass**. All current offline checks pass. This is a restored and runnable comparison suite, not a completed browser-equivalence or runtime-performance study.
 
-The current Rust compiler source was not changed by this restoration: 246 files under its compiler/runtime crates and patches match their pre-restoration hashes. No commit or push was made. Original archives and the prior v2 recovery remain untouched.
-
-Machine-readable summaries:
-
-- [Restoration and check status](comparator-restoration-status.json)
-- [Observed toolchains and configured pins](comparator-toolchains.json)
-- [Original restored source hashes](comparator-restored-sources.json)
+The current Rust compiler source was not changed by this restoration: 246 files under its compiler/runtime crates and patches match their pre-restoration hashes. Original archives remain untouched.
 
 ## Source layout
 
