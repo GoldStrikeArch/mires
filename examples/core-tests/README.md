@@ -1,227 +1,144 @@
 # The `core` test suite
 
-These are ordinary `#![no_std]` crates. There is no `mini_core`, no `#![no_core]` and no hand
-written lang item: every one of them is compiled against the **real `library/core`**, itself built
-by this backend.
+These tests are ordinary `#![no_std]` crates compiled against the real `library/core` and `library/alloc` built by `rustc_codegen_mires`, with no `mini_core`, `#![no_core]`, or hand-written lang items.
 
-```
-./scripts/build_sysroot.sh      # ~1 minute, once
+```sh
+./scripts/build_sysroot.sh      # ~1 minute, once per option key
 ./scripts/test.sh               # runs examples/tests/ and then this suite
-./scripts/test.sh 04_iter_range # one test
+./scripts/test.sh 04_iter_range # run a single test
 ```
 
-`scripts/build_sysroot.sh` copies `rust-src` into `build/stdlib/`, applies `patches/`, compiles
-`core` and `compiler_builtins` with `-Zcodegen-backend`, and installs the two rlibs into
-`build/sysroot/`. `scripts/compile_core.sh` then compiles a test with `--sysroot build/sysroot
---crate-type cdylib`, which routes through `CodegenBackend::link` — whole-program dead code
-elimination, and a zombie report for anything reachable that the backend cannot express.
+`scripts/build_sysroot.sh` copies `rust-src` into a keyed directory under `build/sysroot-cache/`, applies `patches/*.patch` (plus `patches/unwind/*.patch` in the default unwind mode), compiles `core`, `compiler_builtins`, and `alloc` with `-Zcodegen-backend`, and installs the resulting rlibs into the keyed sysroot. `scripts/compile_core.sh` then builds each test with `--crate-type cdylib`, invoking `jsc-link` for whole-program dead-code elimination and reachability-gated zombie checks.
 
-Each test has a `.expected` (exact stdout), a `.maxbytes` (a size budget, to catch a lost DCE) and,
-for `10_panic` and every `guard_*` test, an `.expect_abort` marker meaning the program must exit
-non-zero. Expectations were validated by transplanting each test onto `std` and running it
-natively; the only deliberate divergences are the two places where the answer depends on the
-pointer width (see `06_num`'s `usize::BITS` and `07_mem`'s `size_of::<&i32>()`, which are 32 and 4
-on `wasm32-unknown-unknown` and 64 and 8 on a 64 bit host).
+Each test has an `.expected` file (exact stdout), a `.maxbytes` budget (to catch regressions in dead-code elimination), and—for `10_panic` and the `guard_*` tests—an `.expect_abort` marker requiring a non-zero exit. Expected outputs were checked by running the tests natively against `std`; the only intentional differences are the two 32-bit pointer-width checks (`06_num`'s `usize::BITS == 32` and `07_mem`'s `size_of::<&i32>() == 4`, matching `targets/mires32-unwind.json` and `wasm32-unknown-unknown` against 64-bit hosts).
 
-## What is in
+## Test catalog
 
-| test | covers |
-|---|---|
-| `01_option` | predicates, `unwrap`/`unwrap_or`/`unwrap_or_else`/`unwrap_or_default`, `map`/`and_then`/`filter`/`or`/`map_or`, `?`, `take`/`replace`/`as_mut`/`flatten`, `PartialEq`, the `Option<&T>` and `Option<bool>` niches |
-| `02_result` | `is_ok`/`is_err`, `unwrap_or*`, `map`/`map_err`/`and_then`, `ok`/`err`, `?` through a custom error enum, `Result<T, ()>` |
-| `03_cmp` | `Ordering` on every primitive, `reverse`/`then`/`is_lt`, `min`/`max`/`clamp`, derived `PartialOrd`/`Ord` on a struct and an enum, a hand written `Ord`, a generic function over `Ord` |
-| `04_iter_range` | `for`, `..=`, `step_by`, `rev`, `sum`/`product`/`count`/`fold`/`max`/`min`/`last`/`nth`, `map`/`filter`/`skip`/`take`/`take_while`/`skip_while`/`filter_map`/`chain`/`zip`/`enumerate`, `any`/`all`/`find`/`position`, `next` by hand, a `u64` range, `Range` as a value |
-| `05_slice_index` | array → slice coercion, `len`/`is_empty`, indexing (constant and computed), `get`/`get_mut`/`first`/`last`/`last_mut`, mutation through `&mut [T]`, slice patterns including `rest @ ..`, arrays of structs, 2-D arrays |
-| `06_num` | the type constants, `wrapping_*`/`checked_*`/`overflowing_*`/`saturating_*`, `count_ones`/`leading_zeros`/`swap_bytes`/`rotate_left`, `abs`/`signum`/`pow`/`next_power_of_two`, `div_euclid`/`rem_euclid`, the whole cast matrix across the number/`BigInt` boundary, saturating float→int, `NonZero::new` |
-| `07_mem` | `size_of`/`align_of`, `replace`/`take`/`swap`/`drop`/`forget`/`ManuallyDrop`, `Drop` order for locals, fields, early returns and moves |
-| `08_dyn` | `&dyn`/`&mut dyn`, overridden and default methods, a supertrait, `dyn` in a struct field and in an array, `&mut dyn FnMut` |
-| `09_closure` | `Fn`/`FnMut`/`FnOnce`, captures by reference and by value, `impl Fn` returns, `fn` pointers from items and from non-capturing closures, closures through `core`'s combinators |
-| `10_panic` | `Option::unwrap` on `None` → `core::panicking::panic` → this crate's `#[panic_handler]`, with the `#[track_caller]` `Location` pointing at the caller, then a non-zero exit |
-| `11_fmt` | `write!` against the real `core::fmt`: the format string template, `Display` for the integers, `str` and `char`, width, fill and radix in `Formatter`, explicit argument indices, and `Arguments::as_str` |
-| `12_slice_iter` | `iter()`/`iter_mut()`/`for x in &xs`, `rev`/`nth`/`position`/`find`/`enumerate`/`zip`/`map().sum()`/`last`/`min`/`max`/`fold`, `len`/`as_slice` on a partly consumed iterator, `split_at`, subslices, and elements that are structs or zero sized |
-| `13_sort` | `sort_unstable`/`sort_unstable_by`/`sort_unstable_by_key` on `[i32]`, `[u64]` and a struct at lengths 0, 1, 2, 16 and 40, plus `swap`, `reverse`, `contains`, `binary_search`, `copy_from_slice`, `starts_with`/`ends_with`, `fill` |
-| `14_str` | `len`/`is_empty` on ASCII and non-ASCII, `as_bytes` and indexing it, `bytes()`, `chars()`, `char_indices()`, `==`/`!=`/`<`/`cmp`, `starts_with`/`ends_with`, `contains`, `find(char)` and `find(&str)`, `&s[a..b]` and `get(a..b)`, `trim`, `split(char)`, `from_utf8`, `escape_ascii`/`escape_debug`, `char::len_utf8` |
-| `15_ptr` | `null`/`is_null`, `without_provenance` and the `addr` round trip, `ptr::eq` of two raws to one object, `offset`/`add`/`sub`/`offset_from`, `read`/`write`, `read_unaligned`/`write_unaligned`, `byte_add`/`byte_offset`/`byte_sub` over byte and non-byte pointees, `copy` overlapping both ways, `copy_nonoverlapping`, `write_bytes`, `swap`, `&raw` of a struct field, the `*const T` → `*const u8` chain, `from_le_bytes`/`to_le_bytes` at 32 and 64 bits, and `[u8; N]`/`[i32; N]` equality |
-| `19_float_fmt` | `Display`/`LowerExp` for `f32`/`f64`: precision, width, fill, sign, the `f64::MAX`/`f64::MIN_POSITIVE` long forms, `NaN`/`inf`/`-0`, `{:?}` on a `char`, and `str::parse::<f64>()` back |
-| `20_alloc_box` | `Box` in the four shapes it comes in -- a scalar, a struct written through, a trait object and a boxed slice -- and the drop that runs the pointee's glue and frees the block |
-| `21_vec` | `Vec` over the retype: `push` growth and the in-place `realloc`, the zeroed block `vec![0; n]` asks for, the borrow as an ordinary `&[T]`, with both a scalar element and an aggregate one |
-| `22_string` | `String`, which is a `Vec<u8>` and nothing else: building one byte by byte and piece by piece, and the decode to `&str` that only happens on a deref |
-| `23_format` | `format!`, which is `core::fmt` writing into a heap block that grows under it: width, fill and precision against an allocating sink, plus the host string builder `prelude::JsStr` wraps |
-| `24_enum_repr` | `core`'s own enums at every representation: `Ordering` and `mem::Alignment` fieldless with an integer `repr`, `Option<T>`'s niches for a `&T`, a `NonZero` or a `char`, the whole-value writes `take`/`replace`/`insert` make through a `&mut Option<T>`, and `mem::discriminant` |
-| `25_array_ref` | `&*p` where the pointee is `[E; N]`, from a plain slot, from the window an `as *mut [E; N]` cast produces and from a slice record -- `itoa::Buffer`'s shape, which is why `serde_json` could parse integers but not print them |
-| `26_async` | the coroutine state machine as an enum: the state index as tag, saved locals keyed by `CoroutineSavedLocal` so one survives a suspension, construction and state change. No executor; `block_on` polls by hand |
-| `27_dangling` | the pointer a collection holds before it has ever allocated: `NonNull::dangling()` built into a slice, so a `for` over a `Vec` that has never been pushed to runs |
-| `28_array_into_iter` | `for x in arr` by value: `array::IntoIter` through `PolymorphicIter`'s unsized tail, so a pointer to a struct with a trailing slice is `{ ptr, meta }`, from both alive ends and with a `Drop` element |
-| `29_rc` | `Rc` and `Arc`, both halves. Sized: the strong and weak counts, `get_mut` gated on uniqueness, `ptr_eq` on one block and on two, a `Weak` that does not keep its value alive, the payload glue that runs when the LAST owner goes, `Rc<RefCell<T>>` written through a clone. Unsized: `Rc<[u8]>`, `Rc<[u32]>`, `Rc<[String]>` through the `from_iter` path, an element with a `Drop`, `Arc<[T]>` and an empty tail |
-| `30_hashmap` | `mires_js::collections::{HashMap, HashSet}`: every key class including the BigInt widths and the `str` class, `insert` returning the old value, a struct value written through `get_mut`, `remove`, snapshot iteration, and set dedup |
-| `102_str_lines` | `str::Lines`, `split_once`, CRLF handling, and one-, two-, three-, and four-byte `char` search and suffix matching through safe scalar byte views, without the impossible conversion, slice-index, aligned-word, or forward `Map` graphs |
-| `104_exact_typed_vec` | exact/reserved `Vec<u32>` planning: width-aware cast capacity, straight-line push length proofs, capacity-observation and retained-view declines, explicit `Uint32Array` selection, logical capacity, and scalar slice consumers |
-| `105_slice_iterator_cursor` | checked cursor lowering for exact `Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>` loops across empty, short, exact, overlong, dynamic, and early-break cases; signed/wider elements, reversed adapter order, and observed iterator state decline |
-| `114_zst_aggregate_drops` | arrays and slices of zero-sized elements keep their `undefined` storage while every element is dropped exactly once: locals, returns, by-value and by-reference parameters, `&mut [Z]`, `move` closures, `Vec<[Z; N]>`, `[[u8; 0]; N]`, zero-length arrays, partial moves, replacement, and a `[Z; 2000]` that `.absent` keeps from being materialized; `scripts/cleanup-smoke.sh` drives its host-throw path |
-| `115_zst_element_pointers` | every pointer to a zero-sized element is its container's one address: `&a[i]`, `a.as_ptr()`, `s.as_ptr()`, `s.first()`, an iterator's item, `add`/`wrapping_add`, a `from_raw_parts` round trip and a `Vec<Z>`'s dangling pointer agree under `ptr::eq`, `addr_eq` and `as usize`; none is null and a 64-byte-aligned zero-sized element is aligned |
-| `guard_as_chunks` | a gap that is a run time guard rather than a zombie: `as_chunks` aborts the program instead of answering |
-| `guard_heap_retype` | reading one heap block at two element sizes once something has been written at the first: `__rt.unscale` throws rather than hand back a wrong number |
-| `guard_map_key` | a gap that is a **type** error: an aggregate cannot be a host `Map` key, and the sealed `MapKey` trait says so at the call site |
-| `guard_rc_str` | the boundary of the unsized heap tail: a slice tail is a run of elements the block can hold and a `str` tail is not, so `Rc<str>` is reported rather than answered |
-| `guard_use_after_free` | a cast through a pointer into a block that has been freed: `dealloc` poisons the block and remembers it, and the next cast says so |
-| `guard_zeroed_retype` | a zeroed block retyped to something whose zero has no spelling here: a fat pointer, because there is no buffer for an all-zero `&[T]` to name |
+| Test | Coverage |
+| --- | --- |
+| `01_option` | Predicates, `unwrap`/`unwrap_or`/`unwrap_or_else`/`unwrap_or_default`, `map`/`and_then`/`filter`/`or`/`map_or`, `?`, `take`/`replace`/`as_mut`/`flatten`, `PartialEq`, and `Option<&T>` / `Option<bool>` niches |
+| `02_result` | `is_ok`/`is_err`, `unwrap_or*`, `map`/`map_err`/`and_then`, `ok`/`err`, `?` with a custom error enum, `Result<T, ()>` |
+| `03_cmp` | `Ordering` on primitives, `reverse`/`then`/`is_lt`, `min`/`max`/`clamp`, derived `PartialOrd`/`Ord` on structs and enums, hand-written `Ord`, generic functions over `Ord` |
+| `04_iter_range` | `for`, `..=`, `step_by`, `rev`, `sum`/`product`/`count`/`fold`/`max`/`min`/`last`/`nth`, `map`/`filter`/`skip`/`take`/`take_while`/`skip_while`/`filter_map`/`chain`/`zip`/`enumerate`, `any`/`all`/`find`/`position`, manual `next`, `u64` ranges, `Range` as a value |
+| `05_slice_index` | Array-to-slice coercion, `len`/`is_empty`, constant and computed indexing, `get`/`get_mut`/`first`/`last`/`last_mut`, mutation through `&mut [T]`, slice patterns including `rest @ ..`, arrays of structs, 2-D arrays |
+| `06_num` | Type constants, `wrapping_*`/`checked_*`/`overflowing_*`/`saturating_*`, `count_ones`/`leading_zeros`/`swap_bytes`/`rotate_left`, `abs`/`signum`/`pow`/`next_power_of_two`, `div_euclid`/`rem_euclid`, the full Number/`BigInt` cast matrix, saturating float-to-int, `NonZero::new` |
+| `07_mem` | `size_of`/`align_of`, `replace`/`take`/`swap`/`drop`/`forget`/`ManuallyDrop`, `Drop` order for locals, fields, early returns, and moves |
+| `08_dyn` | `&dyn`/`&mut dyn`, overridden and default methods, supertraits, `dyn` in struct fields and arrays, `&mut dyn FnMut` |
+| `09_closure` | `Fn`/`FnMut`/`FnOnce`, captures by reference and by value, `impl Fn` returns, `fn` pointers from items and non-capturing closures, closures inside `core` combinators |
+| `10_panic` | `Option::unwrap` on `None` -> `core::panicking::panic` -> the crate's `#[panic_handler]` with `#[track_caller]` `Location`, followed by a non-zero exit |
+| `11_fmt` | `write!` against `core::fmt`: format templates, `Display` for integers, `str`, and `char`, width/fill/radix in `Formatter`, explicit argument indices, and `Arguments::as_str` |
+| `12_slice_iter` | `iter()`/`iter_mut()`/`for x in &xs`, `rev`/`nth`/`position`/`find`/`enumerate`/`zip`/`map().sum()`/`last`/`min`/`max`/`fold`, `len`/`as_slice` on partially consumed iterators, `split_at`, subslices, struct and zero-sized elements |
+| `13_sort` | `sort_unstable`/`sort_unstable_by`/`sort_unstable_by_key` on `[i32]`, `[u64]`, and structs at lengths 0, 1, 2, 16, and 40, plus `swap`, `reverse`, `contains`, `binary_search`, `copy_from_slice`, `starts_with`/`ends_with`, `fill` |
+| `14_str` | `len`/`is_empty` on ASCII and non-ASCII, `as_bytes` and indexing, `bytes()`, `chars()`, `char_indices()`, `==`/`!=`/`<`/`cmp`, `starts_with`/`ends_with`, `contains`, `find(char)` and `find(&str)`, `&s[a..b]` and `get(a..b)`, `trim`, `split(char)`, `from_utf8`, `escape_ascii`/`escape_debug`, `char::len_utf8` |
+| `15_ptr` | `null`/`is_null`, `without_provenance` and `addr` round trips, `ptr::eq` on aliases, `offset`/`add`/`sub`/`offset_from`, `read`/`write`, `read_unaligned`/`write_unaligned`, `byte_add`/`byte_offset`/`byte_sub` over byte and non-byte pointees, overlapping `copy`, `copy_nonoverlapping`, `write_bytes`, `swap`, `&raw` on struct fields, `*const T` -> `*const u8` chains, 32- and 64-bit `from_le_bytes`/`to_le_bytes`, `[u8; N]`/`[i32; N]` equality |
+| `19_float_fmt` | `Display`/`LowerExp` for `f32`/`f64`: precision, width, fill, sign, long forms of `f64::MAX`/`f64::MIN_POSITIVE`, `NaN`/`inf`/`-0`, `{:?}` on `char`, and `str::parse::<f64>()` |
+| `20_alloc_box` | `Box` across all four shapes (scalar, mutated struct, trait object, boxed slice) and `Drop` running pointee glue before freeing |
+| `21_vec` | `Vec` growth via `push`, in-place `realloc`, zeroed allocation via `vec![0; n]`, borrowing as `&[T]` for scalar and aggregate elements |
+| `22_string` | `String` backed by `Vec<u8>`: byte-by-byte and piece-by-piece construction, decoding to `&str` on deref |
+| `23_format` | `format!` streaming `core::fmt` into a growing heap buffer (width, fill, precision) plus the host string builder wrapped by `prelude::JsStr` |
+| `24_enum_repr` | `core` enums across representations: fieldless `#[repr(int)]` (`Ordering`, `mem::Alignment`), `Option<T>` niches (`&T`, `NonZero`, `char`), whole-value writes (`take`/`replace`/`insert` through `&mut Option<T>`), `mem::discriminant` |
+| `25_array_ref` | `&*p` for `[E; N]` pointees from a plain slot, an `as *mut [E; N]` window, and a slice record (matching `itoa::Buffer`, needed by `serde_json` integer formatting) |
+| `26_async` | Coroutine state machines as enums: state discriminant tag, saved locals via `CoroutineSavedLocal`, construction, and manual polling via `block_on` |
+| `27_dangling` | `NonNull::dangling()` wrapped in a slice so iterating an unallocated `Vec` works cleanly |
+| `28_array_into_iter` | By-value `for x in arr` via `array::IntoIter` and `PolymorphicIter`'s unsized tail (`{ ptr, meta }`), from both ends and with `Drop` elements |
+| `29_rc` | `Rc` and `Arc` for sized types (strong/weak counts, `get_mut`, `ptr_eq`, `Weak`, payload drop on final owner, `Rc<RefCell<T>>`) and unsized slices (`Rc<[u8]>`, `Rc<[u32]>`, `Rc<[String]>` via `from_iter`, `Drop` elements, `Arc<[T]>`, empty tail) |
+| `30_hashmap` | `mires_js::collections::{HashMap, HashSet}`: all key classes including `BigInt` widths and `str`, `insert` returning previous values, struct mutation through `get_mut`, `remove`, snapshot iteration, set deduplication |
+| `102_str_lines` | `str::Lines`, `split_once`, CRLF handling, and 1–4 byte `char` search and suffix matching via scalar byte views, rejecting impossible conversion, slice-index, aligned-word, and forward `Map` paths |
+| `104_exact_typed_vec` | Exact/reserved `Vec<u32>` storage planning: width-aware cast capacity, straight-line push length proofs, capacity-observation and retained-view declines, `Uint32Array` selection, logical capacity, scalar slice consumers |
+| `105_slice_iterator_cursor` | Checked cursor lowering for `Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>` loops (empty, short, exact, overlong, dynamic, early-break), plus decline cases for signed/wider elements, reversed adapters, and observed iterator state |
+| `114_zst_aggregate_drops` | Arrays and slices of zero-sized elements keep `undefined` storage while dropping each element once (locals, returns, parameters, `&mut [Z]`, `move` closures, `Vec<[Z; N]>`, `[[u8; 0]; N]`, zero-length arrays, partial moves, replacement, and unmaterialized `[Z; 2000]`); `scripts/cleanup-smoke.sh` tests host-throw cleanup |
+| `115_zst_element_pointers` | All pointers to zero-sized elements share the container's single address (`&a[i]`, `a.as_ptr()`, `s.as_ptr()`, `s.first()`, iterator items, `add`/`wrapping_add`, `from_raw_parts`, `Vec<Z>` dangling pointer) under `ptr::eq`, `addr_eq`, and `as usize`, staying non-null and aligned (including 64-byte-aligned ZSTs) |
+| `guard_as_chunks` | Verifies that `as_chunks` aborts at runtime via a guard instead of silently returning wrong elements |
+| `guard_heap_retype` | Reading a written heap block at a second element size triggers `__rt.unscale` to throw |
+| `guard_map_key` | Compile-time type error via the sealed `MapKey` trait when an aggregate is used as a host `Map` key |
+| `guard_rc_str` | Unsized heap tail boundary: slice tails work, while `Rc<str>` fails loudly |
+| `guard_use_after_free` | `dealloc` poisons freed blocks so subsequent pointer casts fail explicitly |
+| `guard_zeroed_retype` | Retyping a zeroed allocation to a type with no valid all-zero JS form (such as a fat pointer `&[T]`) throws |
 
-`30_hashmap` and `guard_map_key` are the only tests that link a crate beyond `core` and `alloc`.
-`scripts/test.sh` builds `mires-js` through the backend into an rlib and offers it to every test
-with `--extern`; a test that never names it links nothing. `std`'s `HashMap` is out for the reason
-`CONTRACT.md`'s "Host collections" gives: `hashbrown` reads one allocation at two element
-granularities, which is the refusal `guard_heap_retype` pins. The host has a hash table, and that is
-the one these use.
+`30_hashmap` and `guard_map_key` are the only tests here that link an extra crate beyond `core` and `alloc`. `scripts/test.sh` builds `mires-js` into an rlib and passes it via `--extern`; tests that do not reference it link nothing from it. `std`/`hashbrown` `HashMap` cannot run on the JS heap model because `hashbrown` reads one allocation at two element granularities (the exact boundary pinned by `guard_heap_retype`; see `CONTRACT.md`, "Host collections"), so `mires-js` wraps JavaScript's native `Map` and `Set`.
 
-`12_slice_iter`, `14_str` and `15_ptr` are the stage 1.5 suite. Before the `{buf, off}` pointer
-model all three were impossible: `[T]::iter` is a pair of raw pointers walked with `add` and
-subtracted with `offset_from`, `str` is a byte buffer as soon as `core` touches it, and
-`core::ptr` is the thing itself. A pointer is now a **slot** — a JavaScript container plus a key
-into it, with the offset counted in elements — so a dereference is an assignable place, an offset
-is a new record, and all of it has an exact JavaScript form. `CONTRACT.md` has the model;
-`15_ptr` is its unit test.
+`12_slice_iter`, `14_str`, and `15_ptr` exercise the `{ buf, off }` pointer model. A pointer is a slot—a JS container plus an element-indexed key—so dereferencing produces an assignable place and pointer arithmetic returns a new slot (`CONTRACT.md` specifies the model; `15_ptr` tests its primitives). `14_str` also guards against an early bug where `*const u8` taken from a `&str` produced the string itself, causing `s.as_bytes().len()` to return `undefined`.
 
-The regression that section exists for is `s.as_bytes().len()`. It used to return `undefined`: a
-`*const u8` taken from a string was the string itself, and the slice built from it had no length.
-It was the only silent miscompile the spike ever had, and `14_str` pins it.
+### Cyclic statics and chunk splitting
 
-### Statics that refer to each other, and chunks
+| Test | Coverage |
+| --- | --- |
+| `260_static_cycles` | Self-referential and mutually recursive statics initialize cleanly and preserve identity: pairs, 3-node rings, self-references, external pointers into cycles, leaf statics, hoisted long strings, static slices/arrays of references, reference-only boxed statics, and `const` tables naming cycle members |
+| `261_static_cycle_cells` | Cycles with interior mutability: `AtomicU32` fields, `Cell`s in cyclic `static mut` pairs via raw pointers, and self-referential `static mut`s where writes through one path read back through another |
+| `262_chunk_owned_statics` | Three-way chunk split: chunk-owned statics naming a shared static, chunk-owned statics naming another chunk's entry point, interior-mutable shared statics written from two chunks |
+| `263_chunk_three_owners` | Three-way splits in both declaration orders: chains from chunk-owned to shared statics, cross-chunk static edges, shared statics naming a chunk entry point, hoisted strings in chunk-owned statics |
+| `264_chunk_static_cycles` | Two-way split: shared static cycles mutated across chunks, single-chunk cycles and self-references, cycles naming another chunk's entry point |
+| `265_chunk_static_entries` | Four-way split with two `static` entry points whose imports form a DAG |
+| `266_chunk_static_entry_refusals` | Linker refusals for invalid splits: a `static` entry point mutually referencing a shared binding, and a split dividing a static cycle; splitting by functions alone succeeds |
+| `267_static_cycle_arrays` | Cyclic array statics behave as real arrays: `.slice()` value copies, by-value passes, arrays of structs, runtime subslices, reversed iteration, `map`, 40-element tables, grids, static slices, and ZST statics |
+| `268_static_cycle_proto_key` | `.expect_fail`: rejects a cyclic static containing a `__proto__` field at link time, since two-step initialization would drop it |
 
-| test | covers |
-|---|---|
-| `260_static_cycles` | statics that name each other initialize and keep their identity: two nodes, a ring of three, a self reference, statics outside a cycle pointing into it, members holding a leaf static and hoisted long strings, cycles through a static slice of references, an array of references and a reference-only (boxed) static, and a `const` table naming cycle members |
-| `261_static_cycle_cells` | the same with interior mutability: an `AtomicU32` in each member, `Cell`s in two `static mut`s that point at each other through raw pointers, and a `static mut` pointing at itself; writes through one path read back through the other |
-| `262_chunk_owned_statics` | split three ways: statics a chunk owns that name a shared static (from two chunks), a chunk-owned static naming another chunk's entry point, an interior-mutable shared static written from two chunks |
-| `263_chunk_three_owners` | split three ways, in both declaration orders: chains of chunk-owned statics into shared ones, a static only one chunk reads that names one only another reads, a shared static naming a chunk's entry point, hoisted strings in chunk-owned statics |
-| `264_chunk_static_cycles` | split two ways: a cycle the shared chunk owns written from one chunk and read from the other, a cycle and a self reference one chunk owns, a cycle whose members name the other chunk's entry point |
-| `265_chunk_static_entries` | split four ways with two `static`s as entry points whose imports run one way: one names a shared binding, the shared chunk names the other |
-| `266_chunk_static_entry_refusals` | splits the link step refuses: a `static` entry point that names a shared binding while a shared binding names it (the two files would import each other), and one that would split a cycle of statics; split by its functions only, it runs |
-| `267_static_cycle_arrays` | array statics in cycles are real arrays: copied by value (`.slice()`), passed by value, a copy of an array of structs, a subslice at a run time offset, a reversed walk, `map`; a 40-element table, a grid, a static slice, zero-sized statics |
-| `268_static_cycle_proto_key` | `.expect_fail`: a cycle of statics with a field named `__proto__` is refused at link time, because the two-step initialization would lose it |
+Tests with a `.chunks` companion file are also built split by `scripts/chunk-test.sh`. Each line lists `chunk:entry` pairs passed as `js-chunk=` options; every split runs entries in the order of the first line (matching `rust_entry`), so a single `.expected` file covers both unsplit and split builds. A `run:` line specifies which entries to invoke (static entries are exported, not called), and a `refuse: <pairs> -- <text>` line asserts that linking fails with `<text>` in stderr. `scripts/check.sh` runs this suite. See `CONTRACT.md` ("Statics that refer to each other", "Who owns what", and "Around a cycle of imports, only functions") for the formal rules.
 
-A test with a `.chunks` file is also built split by `scripts/chunk-test.sh`: each line is one build,
-the `chunk:entry` pairs handed to the compiler as `js-chunk=` options in that order, and every build
-runs the entries in the order of the first line, which is the order `rust_entry` calls them. So one
-`.expected` holds for the unsplit program and for every split of it. A `run:` line names the
-entries to call instead (a `static` entry is exported, not called), and a
-`refuse: <pairs> -- <text>` line is a split that must fail to link with `<text>` in the output.
-`scripts/check.sh` runs the suite. `CONTRACT.md`, "Statics that refer to each other", "Who owns
-what" and "Around a cycle of imports, only functions", has the rules these pin.
+## Known limits and why
 
-## What is out, and why
+Each limit below stems from either a deliberate representation constraint or a specific missing piece.
 
-Everything below has one cause or the other. They are not arbitrary gaps; each is a consequence of
-a documented decision or of a specific unfinished piece, and each has a specific thing that would
-remove it.
+### 1. Reinterpreting a buffer at another element granularity
 
-### 1. Reinterpreting a buffer at another granularity
+A slot can re-index a buffer, but it cannot synthesize elements of a different size. Viewing `[i32]` as `[[i32; 2]]` or raw `usize` words expects elements that do not exist in the JS array, and static types do not distinguish an owned `[E; N]` slot from a cast window over another buffer. Runtime checks in `__rt.chunk_slice` and `__rt.unscale` throw instead of returning corrupt values:
 
-A slot can re-key a buffer, but it cannot invent elements. Reading a `[i32]` as `[[i32; 2]]`, or as
-the `usize`s the machine would see, asks for elements that are not there — and nothing in the
-*type* says whether a pointer to `[E; N]` is a real slot or a window an earlier cast produced over
-somebody else's buffer. So the question is asked when the program runs, and `__rt.chunk_slice` or
-`__rt.unscale` throws:
+- `as_chunks`, `array_chunks`, `chunks_exact`, and `align_to` abort (`guard_as_chunks`).
+- `memrchr`'s word-at-a-time path goes through `align_to`, so `rfind(char)` hits this guard. Forward `memchr` uses the scalar path in the patched sysroot, so `str::find(char)` and `split(char)` work at any length; `find(&str)` and `contains` use `StrSearcher`, which compares slices (`14_str`).
+- Pointer casts between pointees whose sizes differ (when neither is 1 byte) are rejected as zombies naming both types (`examples/tests/zombie_reachable.rs`).
 
-* `as_chunks`, `array_chunks`, `chunks_exact`, `align_to`. `guard_as_chunks` pins the abort.
-* through `align_to`, `memrchr`'s word-at-a-time path: `rfind(char)` still cannot answer. Forward
-  `memchr` is scalar in the custom sysroot, so `str::find(char)` and `split(char)` work at every
-  haystack length. `find(&str)` and `contains` are not subject to the word path either: they run the
-  two-way `StrSearcher`, which compares slices. `14_str` covers the forward forms.
-* a pointer cast between two pointees that are neither the same size nor a byte. This one *is* a
-  zombie, reported at the cast with both types named; `examples/tests/zombie_reachable.rs` pins it.
+`ptr_mask` is permanently unsupported because JS pointer addresses are synthetic IDs, not memory addresses with manipulable low bits.
 
-`ptr_mask` is out permanently and for a different reason: it asks for the bits of an address, and
-an address here is a synthetic number rather than something a buffer is stored at.
+### 2. Formatting and sysroot patches
 
-### 2. Formatting, past the part `11_fmt` covers
+`write!` and `Display` work across integers, strings, chars, and floats (`11_fmt`, `19_float_fmt`, including non-exponential `f64::MAX`/`f64::MIN_POSITIVE`, `NaN`/`inf`/`-0`, `{:?}` on `char`, and `str::parse::<f64>()`).
 
-`write!` works, and so do the `Display` impls behind it — including the **floats**, which `19_float_fmt`
-covers end to end against a native transplant: the full `Display`/`LowerExp` surface, `f64::MAX` and
-`f64::MIN_POSITIVE` printed without an exponent, the non-finite spellings, and `str::parse::<f64>()`
-back the other way.
+`Debug` as a trait bound remains unsupported:
 
-What is still out is `Debug` **as a bound**:
+- `#[derive(Debug)]` and `Result::unwrap`/`Result::expect` coerce `E: Debug` to `&dyn Debug`, pulling every reachable `Debug` implementation into the build. Use `.ok().unwrap()`, `unwrap_or*`, or `match` instead.
 
-* `#[derive(Debug)]`, and `Result::unwrap`/`Result::expect`, whose `E: Debug` bound coerces to a
-  `&dyn Debug` and drags every `Debug` impl in the program into reachability. Use `.ok().unwrap()`,
-  `unwrap_or*` or a `match`.
+Concrete `{:?}` on `char` works because `char::escape_debug` casts a buffer of one-byte `AsciiChar` enum values to `str`, and slices of one-byte enums decode directly to JS strings (`CONTRACT.md`, "`str` is a hybrid"; pinned at small scale by `examples/tests/16_byte_enum_str.rs`). That also unblocked `&s[a..b]`, `contains`, and `find(&str)` (`14_str`).
 
-`{:?}` on a concrete type is *in* — `19_float_fmt` formats `char`s with it. That is what unblocked
-the rest of this section: `char`'s `Debug` escapes through a buffer of `AsciiChar` and calls
-`as_str` on it, and a slice of any one-byte element now decodes to the string its bytes spell
-(`CONTRACT.md`, "`str` is a hybrid"). `AsciiChar` is a fieldless one-byte enum, so it is
-`{ $t: n }` here and the decoder reads the tag; `examples/tests/16_byte_enum_str.rs` pins that cast
-at mini_core scale, where it is one line rather than a dozen frames down inside `core`.
+Several sysroot patches in `patches/` keep common `core` paths free of unreachable formatting or word-alignment machinery:
 
-So **`&s[a..b]`, `contains` and `find` with a `&str` pattern all work now**, and `14_str` exercises
-them. All three reach `str::slice_error_fail`, which is why they were out: slicing can panic, the
-panic names the offending `char`, and naming a `char` needed that cast. `str::get(a..b)` is still
-there too, because the `None` cases have no panicking spelling.
+- `0001-panic-without-formatting.patch` replaces runtime formatting in `const_panic!`, `panic_bounds_check`, `panic_display`, `assert_failed`, and `str::slice_error_fail_rt` with fixed strings so bounds checks, `clamp`, `assert!`, and string slicing work without dragging in `core::fmt` or Unicode tables (`54_str_index_no_fmt`).
+- `0004-char-searcher-byte-length.patch` casts `char::encode_utf8`'s length directly to `u8` (always `1..=4`) instead of keeping an unreachable `TryInto::expect` error path (`102_str_lines`).
+- `0005-scalar-memchr.patch` keeps forward `memchr` on its safe scalar scan instead of the aligned-word path (reverse `memrchr` is untouched).
+- `0006-char-searcher-nonpanicking-needle.patch` compares `CharSearcher` candidates and `char` suffixes through checked views with explicit length guards, avoiding unreachable `slice_index_fail` graphs.
+- `0007-lines-direct-split.patch` drives `SplitInclusive` directly in `Lines::next` with safe byte checks for `CR? LF`, eliminating the forward `Map::next` adapter while preserving `Lines`' public representation and reverse iteration.
+- `0012-char-searcher-scalar-prefix.patch` matches the 0–3 bytes preceding the final UTF-8 byte directly in forward `CharSearcher` instead of routing single-char searches through generic slice equality.
 
-`patches/0001-panic-without-formatting.patch` is still applied, and still does exactly what it did:
-the runtime arm of `core`'s `const_panic!`, `panic_bounds_check`, `panic_display` and
-`assert_failed` panic with a fixed string rather than a formatted one, so bounds-checked indexing,
-`clamp`, `Option::expect`, `assert!` and `unreachable!` all work with a less specific message.
-`str::slice_error_fail_rt` is the same kind of stub: `&s[a..b]` still panics off a char
-boundary, but it does not format the offending `char`. `54_str_index_no_fmt` is the receipt
-that `fmt` and Unicode tables stay unreachable from indexing and `contains` alone.
+Additional patches in `patches/` (`0002`, `0003`, `0013`–`0023`) and `patches/unwind/` support the allocator, native string/vector markers, diagnostic items, and `-Cpanic=unwind` personality/nounwind annotations.
 
-`patches/0004-char-searcher-byte-length.patch` is narrower: `CharSearcher` stores the length returned by `char::encode_utf8` in a `u8`. Because the caller supplies a four-byte array, that length is always in `1..=4`; the patch uses the exact cast directly instead of retaining an impossible `TryInto::try_into().expect(...)` error path. `102_str_lines` covers every UTF-8 width and its `.absent` file rejects the conversion error, its message, and `core::fmt::write` in the output.
+### 3. Unfinished items
 
-`patches/0005-scalar-memchr.patch` keeps forward byte search on the existing safe scalar implementation. Native Rust profits from aligned word loads, but a byte slice here is a JavaScript array and the same path expands into pointer retyping, alignment, bounds, and panic machinery before returning to a scalar scan. `102_str_lines` exercises a haystack past the old threshold and rejects `memchr_aligned` in the emitted program. Reverse `memrchr` remains unchanged.
+Two gaps have known implementations waiting to be finished:
 
-`patches/0006-char-searcher-nonpanicking-needle.patch` compares a `CharSearcher` candidate with checked views of its four-byte encoded needle and implements `char` suffix matching with an explicit length guard plus checked string views. Both ranges are established by the searcher before the comparison, so retaining `slice_index_fail` only adds an unreachable panic graph. The no-inline suffix helper in `102_str_lines` exercises every UTF-8 width plus mismatch and too-short cases at run time, and its `.absent` file rejects that graph.
+- `NonNull::dangling()` (`transmute::<Alignment, NonNull<T>>`): `Alignment` converts to an integer discriminant, while the pointer-direction transmute and `Option<NonZero<usize>>` niche required by `NonNull::addr` are still incomplete (`15_ptr` uses `without_provenance(align_of::<T>())`).
+- `Ipv6Addr` parsing and formatting, which reinterprets `[u16; 8]` as `[u8; 16]` (hitting the granularity boundary in section 1).
 
-`patches/0007-lines-direct-split.patch` keeps `Lines`' public `Map`-based representation, clone/debug behavior, and reverse iterator intact. Only `Lines::next` drives its contained `SplitInclusive` state directly and trims the fixed ASCII `CR? LF` ending with safe byte checks and checked string views. The fixture's long LF/CRLF input pins the behavior and rejects the otherwise retained forward `Map::next` adapter.
+#### Zombie census
 
-`patches/0012-char-searcher-scalar-prefix.patch` uses the final UTF-8 byte already found by forward `CharSearcher` and compares only the preceding zero to three bytes. Exact one- through four-byte slice patterns keep every access checked while removing generic slice equality from the single-character search graph. `102_str_lines` includes same-final-byte false candidates at every multibyte width, the repeated-byte U+A041 case that can produce an interior false hit, and negative matches.
+Exact counts of remaining zombies in the built `core` and `alloc` rlibs live in one place: `CONTRACT.md` ("The zombie census in `core` and `alloc`"). None of the surviving entries is reachable from string handling, formatting, or slice operations, and `u8 as char` is lowered directly in `rvalue.rs` and `intrinsics.rs`.
 
-### 3. Unfinished, rather than decided
+### 4. Other unsupported features
 
-These have a known cause and no design reason to stay:
+- Allocations with non-slice unsized tails (`Rc<str>`, `Arc<dyn Trait>`, `core::ffi::CStr`, `core::wtf8::Wtf8`), plus `Rc::into_raw`/`from_raw` (which step backwards across the header with `byte_sub`). A heap block holds one uniform element type, so `Rc<[T]>`, `Arc<[T]>`, `Box`, `Vec`, `String`, and `format!` work (`20_alloc_box`–`23_format`, `29_rc`), whereas a header plus a JS string does not (`guard_rc_str`).
+- Writing through `&mut str` (JS strings are immutable).
+- `raw_eq` on aggregates other than scalar arrays, and `write_bytes` on aggregates.
+- `TypeId` equality (no stable byte layout).
+- `f16` and `f128` (absent from JavaScript).
+- `simd_*` intrinsics (lowered as zombies).
+- Multi-threaded atomics (atomic intrinsics lower to plain single-threaded operations).
+- `PanicInfo::message()` (returns `fmt::Arguments`; `prelude.rs` reads `location()` instead).
 
-* `NonNull::dangling()`, which is `transmute::<Alignment, NonNull<T>>`. `Alignment` now converts to
-  an *integer* (it is a fieldless enum with a direct tag, so its value is its discriminant), but the
-  pointer direction and the `Option<NonZero<usize>>` niche that `NonNull::addr` needs are still
-  missing. `15_ptr` builds the same pointer with `without_provenance(align_of::<T>())` instead.
-* `Ipv6Addr`, which parses and prints through a `[u16; 8]`/`[u8; 16]` reinterpretation — the
-  boundary in section 1, reached by a type rather than by a slice method.
+## How unsupported constructs are reported
 
-#### The zombie census
+Unsupported operations fail in two explicit ways:
 
-The count is measured rather than remembered: the item tables are decoded out of the `core` and
-`alloc` rlibs the sysroot was built from, which is where a zombie is recorded. It lives in exactly
-one place, `CONTRACT.md`'s "The zombie census in `core` and `alloc`", which tables every survivor
-with its group and the reason it stays. This page does not restate those numbers, so it cannot
-drift from them; every group in that table is a boundary named on this page.
+1. **Reachability-gated zombies (link time).** When the backend cannot lower an expression, it emits `__rt.js_abort(...)` as a placeholder and records a zombie on the item. `jsc-link` reports an error only if the item is reachable from an entry point, printing the full call chain:
 
-There are **no `u8 as char` zombies**: that arm is answered in `rvalue.rs` and `intrinsics.rs`.
-Nothing on the census is reachable from string handling, formatting or slices.
-
-### 4. Everything else
-
-* an allocation whose pointee has a trailing unsized field that is **not a slice**: `Rc<str>` and
-  `Arc<dyn Trait>`, and `core::ffi::CStr` and `core::wtf8::Wtf8` for the same reason. A block is
-  laid out as one element type, so a header plus a run of elements fits and a header plus a
-  JavaScript string does not (`guard_rc_str`). `Rc::into_raw`/`from_raw` are out with them: their
-  `byte_sub` steps backwards across the header. `Rc<[T]>` and `Arc<[T]>` are in, and so are `Box`,
-  `Vec`, `String` and `format!` (`20_alloc_box` through `23_format`, `29_rc`).
-* writing through a `&mut str`, which has no mutable JavaScript form.
-* `raw_eq` on an aggregate that is not an array of scalars, and `write_bytes` on any aggregate.
-* `TypeId` equality: the backend has no stable byte representation for it.
-* `f16` / `f128`: JavaScript has neither.
-* SIMD: every `simd_*` intrinsic is a zombie.
-* atomics with real concurrency: the atomic intrinsics lower to plain single-threaded operations.
-* `PanicInfo::message()`: it is a `fmt::Arguments`, and the handler in `prelude.rs` reads
-  `location()` instead, which is a plain struct.
-
-## How a gap reports itself
-
-Nothing here fails silently. An expression the backend cannot lower becomes a *zombie*: the item is
-still emitted, with a `__rt.js_abort(...)` in place of that expression, and the link step reports it
-only if the whole-program walk finds it reachable — with the chain that made it reachable:
-
-```
+```text
 error: core/src/ascii/ascii_char.rs:1186:23: rustc_codegen_js cannot cast a pointer to
        `[ascii::ascii_char::AsciiChar]` into a pointer to `str`
   = note: in `<escape::EscapeIterInner<N, escape::MaybeEscaped> as fmt::Display>::fmt`
@@ -234,14 +151,4 @@ error: core/src/ascii/ascii_char.rs:1186:23: rustc_codegen_js cannot cast a poin
   = note: required by `rust_entry`
 ```
 
-That is `"hello".contains("ell")`, in full: a substring search slices, slicing can panic, the panic
-formats a `char`, and formatting a `char` reinterprets a buffer of `AsciiChar` as a `str`.
-
-That chain is the reason the boundaries above are stated as precisely as they are: each one was read
-straight off a report like this.
-
-The second shape is the run time guard. A few questions cannot be answered when an item is lowered
-because the type does not carry the answer — whether a buffer holds the elements a cast asks for,
-whether a byte count is a whole number of them — so the check moves into `__rt` and throws. Those
-are listed in `CONTRACT.md` under "Still not supported", and `guard_as_chunks` is the test that
-keeps one of them loud.
+2. **Runtime guards.** Checks that depend on runtime buffer metadata—such as whether a buffer holds elements of the requested size or whether a byte count is an exact multiple of the element size—live in `__rt` and throw when violated. These cases are listed in `CONTRACT.md` ("Still not supported") and pinned by the `guard_*` tests.

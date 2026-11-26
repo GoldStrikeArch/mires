@@ -1,74 +1,54 @@
-# Restored compiler-comparison implementations
+# Other-language comparators
 
-## Current status
+This repository includes eight non-Rust compiler families ported to the same FingerprintJS workloads so Mires output can be checked and measured alongside existing compile-to-JS toolchains. Each family has a public OSS port under `experiments/fingerprintjs-<family>/` and a private Pro port under `experiments-pro/fp-pro-<family>/` (ignored by Git).
 
-On 2026-11-08, all seven archived non-Rust implementations were restored for both FingerprintJS OSS and Fingerprint Pro: **14 fresh builds pass**. All current offline checks pass. This is a restored and runnable comparison suite, not a completed browser-equivalence or runtime-performance study.
+Offline builds and checks cover deterministic kernels, seed boundaries, package shapes, and static transfer sizes. They are not a full multi-browser equivalence or execution-time study. Archived `STATUS.md`, `VERDICT.md`, and older comparison tables inside individual port directories are historical snapshots and should not be read as fresh runs.
 
-The current Rust compiler source was not changed by this restoration: 246 files under its compiler/runtime crates and patches match their pre-restoration hashes. Original archives remain untouched.
+## Families and toolchains
 
-## Source layout
-
-Each family has an OSS directory `experiments/fingerprintjs-<family>/` and a Pro directory `experiments-pro/fp-pro-<family>/`.
-
-| Family | Compiler used | OSS variants restored and built | Pro build |
+| Family | Compiler toolchain | OSS variants | Pro build |
 | --- | --- | --- | --- |
-| `rescript` | ReScript 12.3.0 | Default ReScript + Rollup/Terser output | Pass |
-| `melange` | Melange 7.0.1-53, OCaml 5.3.0 | Default Melange + Rollup/Terser output | Pass |
-| `jsoo` | js_of_ocaml 6.4.1, OCaml 5.3.0 | Whole-program `--opt=3`, plus retained runtime attribution | Pass |
-| `scalajs` | Scala 3.8.4, Scala.js 1.22.0, Scala CLI 1.18.0 | `fast/` and `full/` | Pass, release linker |
-| `dart` | Dart SDK 3.13.7, dart2js | `o1/` and `o2/` | Pass, `-O2` |
-| `kotlin` | Kotlin Toolchain 0.12.0; Gradle 9.4.1 / Kotlin plugin 2.4.10 | `readable/`, `proxy-production/`, `production/` | Pass, Toolchain JS application |
-| `elm` | Elm 0.19.2 | `standard/` and compiler-aware-minified `production/` | Pass |
-| `gopherjs` | GopherJS 1.21.0, Go 1.21.13 | Default: `gopherjs build -m` + Terser (added 2026-11-18) | See [GopherJS](#gopherjs-added-2026-11-18) |
+| `rescript` | ReScript 12.3.0 | Default ReScript + Rollup/Terser | Default |
+| `melange` | Melange 7.0.1-53, OCaml 5.3.0 | Default Melange + Rollup/Terser | Default |
+| `jsoo` | js_of_ocaml 6.4.1, OCaml 5.3.0 | Whole-program `--opt=3` with runtime attribution | Default |
+| `scalajs` | Scala 3.8.4, Scala.js 1.22.0, Scala CLI 1.18.0 | `fast/` and `full/` | Release linker |
+| `dart` | Dart SDK 3.13.7, `dart2js` | `o1/` and `o2/` | `-O2` |
+| `kotlin` | Kotlin Toolchain 0.12.0; Gradle 9.4.1 / Kotlin plugin 2.4.10 | `readable/`, `proxy-production/`, `production/` | Toolchain JS application |
+| `elm` | Elm 0.19.2 | `standard/` and compiler-aware-minified `production/` | Default |
+| `gopherjs` | GopherJS 1.21.0, Go 1.21.13 | `gopherjs build -m` + Terser | See [GopherJS](#gopherjs) |
 
-The family name `dart` means Dart-to-JavaScript, not Dart-to-Wasm. The `jsoo` family is js_of_ocaml, distinct from Melange. The `gopherjs` family is Go compiled by GopherJS, not Go's own `GOOS=js GOARCH=wasm` target.
+`dart` compiles Dart to JavaScript via `dart2js` (not Dart-to-Wasm). `jsoo` is `js_of_ocaml`, separate from Melange. `gopherjs` compiles Go with GopherJS (not `GOOS=js GOARCH=wasm`).
 
-The original source archive is `experiments-2026-09-05/p14-prebuilt-current/source/source.tar.gz`, SHA-256 `3aca257b220d0bbdb2940aba9c2b4f86456097d3c531266547aeb0f6451f437d`. It supplied 1,155 files across the 14 ports. A further 34 files under `experiments/fingerprintjs-compare/` restore shared comparison support and historical records.
+## Setup and reproduction
 
-The source versions are historical. The current build tools and narrow implementation corrections are described below. Do not treat the archived STATUS/VERDICT files or old comparison tables as fresh results; those documents now carry a historical-record notice.
-
-## Install and reproduce
-
-Run from the repository root. Root npm dependencies are pinned in `package-lock.json`; compiler caches and generated output are ignored by Git.
+Run these commands from the repository root. Root npm dependencies are pinned in `package-lock.json`, and compiler caches and generated artifacts are gitignored.
 
 ```sh
 npm ci
 
-# macOS prerequisites used for the OCaml and Scala families:
+# macOS prerequisites for the OCaml and Scala families:
 brew install opam scala-cli
 
-# Local OCaml switch; does not change the user's default opam switch or shell startup files.
+# Local OCaml switch under .toolchains/opam (leaves your default opam switch untouched).
 npm run setup:comparators:ocaml
 
-# Local Go 1.21.13 + GopherJS 1.21.0 under .toolchains/go; does not use or change the system Go.
+# Local Go 1.21.13 + GopherJS 1.21.0 under .toolchains/go (leaves system Go untouched).
 npm run setup:comparators:go
 
-# The OSS TypeScript reference must exist before packaging/comparing its ports.
+# Build the OSS TypeScript reference before packaging or checking ports.
 npm run build:oss-reference
 
-# Build all eight families, OSS and Pro.
+# Build all eight families (OSS and Pro).
 npm run build:comparators
 
-# Exact built-artifact checks, deterministic kernels, numerical boundaries, and Pro validation.
+# Run artifact, deterministic kernel, numerical boundary, and Pro validation checks.
 npm run check:comparators
 
-# Static transfer sizes, not execution-time measurements.
+# Record static transfer sizes (raw, gzip-9, Brotli-11).
 node experiments/tools/measure-comparators.mjs
 ```
 
-Dart must be available on PATH; this machine already had Dart 3.13.7. The archived projects require SDK `^3.13.0`. `DART` can name another compatible executable, but record that change as a new toolchain configuration.
-
-`experiments/tools/kotlin` is the version-pinned Kotlin Toolchain 0.12.0 bootstrap wrapper, copied with its original checksums and copyright. It downloads its own compiler/JDK dependencies as needed. The OSS production builder downloads Gradle 9.4.1 and verifies the archive against its published SHA-256 before unpacking it. Existing archives and generated outputs are not a substitute for a successful current build.
-
-**Kotlin production determinism (2026-11-19).** The Kotlin/JS 2.4.10 IR compiler orders the supertypes in `initMetadataForClass(...)` by iterating identity-hashed sets. So the Gradle production emit could flip the order of two interface lists between builds: `[Collection, KtSet]` vs `[KtSet, Collection]` for `AbstractMutableSet` and `HashSet`. The size stayed the same.
-
-`gradle-production/gradle.properties` now runs the compiler in-process with a constant JVM identity hash (`-XX:+UnlockExperimentalVMOptions -XX:hashCode=2`). This changes no compiler setting and patches no emit; it only fixes which of the compiler's own orders is produced.
-
-With the setting, three clean builds were byte-identical, and the OSS and Pro Kotlin checks pass 12/12. Against the Nov-8 artifact, the production output differs only in those two reordered lists: raw bytes are unchanged and gzip-9 moved by +1 byte (29,232). The Toolchain variants and the Pro port were already stable: unchanged across clean builds and identical to their recorded artifacts. The library matrix's Kotlin template uses the same setting.
-
-Scala's project directives pin Scala 3.8.4 and Scala.js 1.22.0 even though the installed Scala CLI's default Scala version is newer. Record the CLI version separately from the language/linker versions. Dependency downloads use the central Maven repository by default through the common runner.
-
-### Run a smaller selection
+### Running a subset
 
 ```sh
 python3 experiments/tools/run-comparator-builds.py \
@@ -81,94 +61,78 @@ python3 experiments/tools/run-comparator-builds.py \
   --languages melange,jsoo --suite pro
 ```
 
-Supported family names are `rescript,melange,jsoo,scalajs,dart,kotlin,elm,gopherjs`. The suite is `oss`, `pro`, or `all`. A build timeout defaults to 1,200 seconds per port and can be set with `--timeout`. Timed-out builds fail; old output is not accepted as a pass.
+Valid family names are `rescript`, `melange`, `jsoo`, `scalajs`, `dart`, `kotlin`, `elm`, and `gopherjs`. `--suite` accepts `oss`, `pro`, or `all`. The per-port build timeout defaults to 1,200 seconds (`--timeout` overrides it); a timed-out build fails without reusing prior output.
 
-Individual port builders also work from their directories using `npm run build`. Use the common runner when results need build receipts and source/artifact identities.
+Individual port directories also support `npm run build`, though the common runner is required when you need build receipts and input/artifact digests.
 
-### OCaml isolation and reproducibility
+## Toolchain notes
 
-The setup script uses `.toolchains/opam`, switch `mires-comparators`, OCaml 5.3.0, Dune 3.24.2, Melange 7.0.1-53, js_of_ocaml 6.4.1, and Lwt 6.1.2. `experiments/ocaml-comparators.export` records the complete installed package solution and is imported by subsequent setup runs.
+### Dart
 
-`MIRES_OPAM_ROOT`, `MIRES_OPAM_SWITCH`, and `MIRES_BUILD_JOBS` permit explicit overrides. The checked setup was also rerun successfully against the exported solution.
+Dart must be on `PATH`; the ports target SDK `^3.13.0` (tested with 3.13.7). Set `DART` to point at another compatible binary if needed, and record the version change when comparing results.
 
-Dune's automatic CPU/job detection crashed on this Mac. Explicit `DUNE_JOBS=4` avoids that path and is set by the setup/common runner and direct OCaml builders. The failed initial installation/build logs are retained. The workaround does not disable opam's sandbox and does not change compiler semantics.
+### Kotlin/JS
 
-### GopherJS (added 2026-11-18)
+`experiments/tools/kotlin` is a version-pinned Kotlin Toolchain 0.12.0 bootstrap wrapper that fetches its own compiler and JDK dependencies. The OSS production build downloads Gradle 9.4.1 and verifies its SHA-256 before unpacking.
 
-GopherJS is the eighth family, added after the restoration as a new port rather than a restored one. Its OSS port is `experiments/fingerprintjs-gopherjs/` and its Pro port is `experiments-pro/fp-pro-gopherjs/`.
+**Deterministic production builds.** The Kotlin/JS 2.4.10 IR compiler orders supertypes inside `initMetadataForClass(...)` by iterating identity-hashed sets, which could swap `[Collection, KtSet]` and `[KtSet, Collection]` for `AbstractMutableSet` and `HashSet` across clean builds. `gradle-production/gradle.properties` runs the compiler in-process with `-XX:+UnlockExperimentalVMOptions -XX:hashCode=2`. That JVM flag changes no compiler options and patches no output; it only pins the iteration order so clean builds are byte-identical. The library matrix's Kotlin template uses the same setting.
 
-The toolchain is GopherJS 1.21.0, the latest release (2026-06-26). It compiles Go 1.21 and needs a Go 1.21 distribution for the standard library (`GOPHERJS_GOROOT`), so the setup script installs Go 1.21.13 next to it under `.toolchains/go`. The system Go is never used. The Go archive is verified against its go.dev SHA-256. GopherJS and its module dependencies are verified by the Go checksum database. `MIRES_GO_ROOT` overrides the location.
+### Scala.js
 
-On current macOS, Go 1.21's internal linker produces binaries without `LC_UUID`. dyld refuses such a binary when it links system frameworks ("missing LC_UUID load command"); GopherJS links CoreFoundation and Security, while a pure-Go binary still runs. Go fixed this only from 1.22. The script therefore links GopherJS with the system linker (`-linkmode=external`) and re-signs it ad hoc, because Go rewrites the binary after the linker's signature. This changes how the GopherJS tool itself is linked, not the JavaScript it emits.
+Project directives pin Scala 3.8.4 and Scala.js 1.22.0 even if the installed Scala CLI defaults to a newer Scala version. Record the CLI version separately from the language and linker versions. Dependency downloads use Maven Central by default.
 
-GopherJS has no optimisation levels beyond `-m`, so each port has one variant: the root `dist/`, which is also the production row. It cannot emit ES modules. The program fills GopherJS's `js.Module.exports`, and the build script wraps the emit in a function that binds `window` and `module`, then re-exports through the ESM / IIFE facade, much as for js_of_ocaml.
+### OCaml (`melange` and `jsoo`)
 
-**Emit policy (both ports).** The GopherJS emit ships untouched; only the packaging needed to load it is added. As a result, importing either port has GopherJS's runtime side effects, which each port documents:
+`npm run setup:comparators:ocaml` creates a local opam root at `.toolchains/opam` with switch `mires-comparators` containing OCaml 5.3.0, Dune 3.24.2, Melange 7.0.1-53, js_of_ocaml 6.4.1, and Lwt 6.1.2. The full package solution is checked in at `experiments/ocaml-comparators.export` and imported by setup runs. Override locations or parallelism with `MIRES_OPAM_ROOT`, `MIRES_OPAM_SWITCH`, and `MIRES_BUILD_JOBS`.
+
+Dune's automatic CPU detection crashed on macOS during setup, so the setup script, common runner, and OCaml port builders pass `DUNE_JOBS=4` explicitly. This keeps opam sandboxing enabled and leaves compiler behavior unchanged.
+
+### GopherJS
+
+GopherJS ports live at `experiments/fingerprintjs-gopherjs/` (OSS) and `experiments-pro/fp-pro-gopherjs/` (Pro).
+
+`npm run setup:comparators:go` installs GopherJS 1.21.0 alongside Go 1.21.13 (`GOPHERJS_GOROOT`) under `.toolchains/go` and sets `GOCACHE=.toolchains/go/cache`, leaving any system Go installation and cache untouched. The Go tarball is verified against its go.dev SHA-256, and GopherJS dependencies are verified against the Go checksum database. Override the root with `MIRES_GO_ROOT`.
+
+On current macOS, Go 1.21's internal linker omits the `LC_UUID` load command, which causes `dyld` to refuse binaries linked against CoreFoundation and Security (as GopherJS is; fixed in Go 1.22). Setup therefore links the GopherJS binary with `-linkmode=external` and re-signs it ad hoc after Go rewrites the binary. That changes only how the tool binary itself is linked, leaving emitted JavaScript untouched.
+
+GopherJS offers only `-m` for minification, so each port has a single `dist/` output that serves as its production row. Because GopherJS does not emit ES modules, each program populates `js.Module.exports` and the build script wraps it in a loader binding `window` and `module` before re-exporting through an ESM/IIFE facade (matching `jsoo`).
+
+**Emit policy and side effects.** GopherJS output ships unmodified except for the module loader wrapper (and, in the Pro build, renaming reused `s` loop labels apart to avoid a Rollup 3.30 tree-shaking bug where an inner function reusing a label drops the outer label—zero added minified bytes). Importing either GopherJS port therefore carries GopherJS's runtime side effects:
+
 - `globalThis.fs` is defined;
-- `Error.stackTraceLimit` becomes `Infinity`;
-- if a page-global `require` exists, it is called with `fs` and `util`.
+- `Error.stackTraceLimit` is set to `Infinity`;
+- if a page-global `require` exists, it is called with `"fs"` and `"util"`.
 
-The one transformation is in the Pro build: it renames GopherJS's reused `s` loop labels apart. That works around Rollup 3.30's tree-shaking, which drops an outer label when a nested function reuses its name. It is a pure renaming and adds 0 bytes to the minified output.
+**Port summary and verified checks.** Both ports use idiomatic `uint64` Murmur hashing and JS Promises, `MessageChannel`, and timers (no goroutines), with zero embedded JavaScript (`eval`, `Function`, or product `.js` code; Pro has only a 12-line re-export wrapper):
 
-Go builds use `GOCACHE=.toolchains/go/cache`, so the user's global Go build cache is not used.
+- OSS: 3,644 lines of Go (`package main`). Passed package checks (3/3), kernels (58/58), seeds (477/477), strict static audit, SSR-safe import, and Chrome 158 / Firefox 160 differentials (0 normalized differences).
+- Pro: 6,467 lines of Go across 22 files. Passed package checks (5/5), validation (all five error codes), ownership check (`target=6489 js=13 embedded=0`), SSR-safe import, and Chrome 158 / Firefox 160 strict differentials (0 differences across 144/144 and 145/145 fields).
 
-**Results (2026-11-18), independently verified.** Two Go ports were written:
+Known coverage limits for GopherJS: Safari WebDriver was not run (requires enabling Safari's "Allow Remote Automation"); one timing-sensitive Pro signal was intermittently flaky under heavy host load on Firefox (passing 5/5 and 4/4 when idle); one Pro browser signal is stubbed on WebKit and Android (matching the Scala and Rust Pro ports; see `experiments-pro/fp-pro-gopherjs/VERDICT.md`). Remaining out-of-contract deviations documented in each port's `NOTES.md`/`VERDICT.md` are error-message wording, constructible async exports, accepting BigInt seeds, null-argument error classes, and the import side effects listed above.
 
-| Port | Size | Structure | Embedded JavaScript |
-| --- | --- | --- | --- |
-| OSS | 3,644 lines of Go | `package main` | None: no `eval`, no `Function`, no product `.js` |
-| Pro | 6,467 lines of Go, 22 files | — | None (`maxEmbeddedJsLines: 0`; the only `.js` is a 12-line re-export) |
+Reference static sizes measured with `measure-comparators.mjs` (Node zlib, main module):
 
-Both use idiomatic `uint64` Murmur. All async work runs on JS Promises, `MessageChannel` and timers; neither uses goroutines.
-
-Checks that passed:
-- Fresh runner builds of both ports, deterministic: the clean-room toolchain and repeated builds give byte-identical `dist/`.
-- OSS: package 3/3, kernels 58/58, seeds 477/477, on both the minified and the readable ESM.
-- Pro: package 5/5, validation PASS (all five error codes), and ownership `PASS target=6489 js=13 embedded=0`.
-- SSR-safe import for both.
-- Chrome 158 and Firefox 160:
-  - the OSS differential, plus `run-feature-parity`, shows 0 normalized differences;
-  - the Pro strict differential shows 0 differences, 0 missing signals and 0 value mismatches, with 144/144 and 145/145 fields.
-- The strict OSS static audit gives contract PASS, strict PASS and 0 metadata differences.
-- `check-comparators.py --suite all`: 67/67 across all eight families.
-
-Not covered:
-- **Safari** was not run: WebDriver needs Safari's "Allow Remote Automation" setting, which is off on this machine.
-- **One timing-sensitive Pro signal is flaky on Firefox.** In one window GopherJS passed 4 of 10 attempts and the interleaved Scala.js control 3 of 5, which is consistent with host load (inferred, not measured). Both a later idle window (5/5) and the final build (4/4) passed.
-- **One Pro browser signal is stubbed on WebKit and Android**, as in the Scala and Rust Pro ports. A Chrome/Firefox differential cannot see this. Details are in the private `experiments-pro/fp-pro-gopherjs/VERDICT.md`.
-
-Each port's `NOTES.md` / `VERDICT.md` lists its remaining observable deviations, all outside the checked contract:
-- error-message wording;
-- constructible async exports;
-- a BigInt seed being accepted;
-- null-argument error classes;
-- the import side effects above.
-
-Sizes, by the same method as `measure-comparators.mjs` (Node zlib), main module:
-
-| Suite | Artifact | Bytes | gzip-9 | Brotli-11 |
+| Suite | Artifact | Raw bytes | gzip-9 | Brotli-11 |
 | --- | --- | ---: | ---: | ---: |
 | OSS | GopherJS `fp.esm.min.js` | 201,379 | 57,352 | 47,866 |
-| OSS | GopherJS runtime floor (one-export empty program, `fp.min.js` shape) | 42,619 | 14,111 | 12,707 |
-| OSS | TypeScript oracle `fp.min.js`, for scale | 36,746 | 16,344 | 14,239 |
+| OSS | GopherJS runtime floor (single-export empty program) | 42,619 | 14,111 | 12,707 |
+| OSS | TypeScript oracle `fp.min.js` (for scale) | 36,746 | 16,344 | 14,239 |
 | Pro | GopherJS `fp.esm.min.js` | 298,020 | 79,614 | 63,897 |
 
-Among the OSS production rows, only Scala.js `full` (229,475 / 68,148) is larger than GopherJS. js_of_ocaml (136,633 / 48,435) and Dart `-O2` (152,185 / 52,634) are the nearest. Among the Pro rows, GopherJS is about the size of Scala.js (296,145 / 84,827) and the largest raw.
+In the OSS `-m` output, the prelude accounts for ~42 KB and program code ~127 KB, with the `strings` package (and its `internal/abi` / `internal/reflectlite` transitive dependencies) adding ~62 KB.
 
-Of the OSS `-m` output, the prelude is about 42 KB and the program 127 KB. The `strings` package and what it links (`internal/abi`, `internal/reflectlite`) add about 62 KB. These are static sizes, not a qualified ranking.
+**Reproduced GopherJS and Rollup defects.** Each of these was isolated with a minimal repro on this toolchain:
 
-**GopherJS defects found** (each reproduced with a minimal program built by this toolchain; candidates for upstream reports):
-- `math.Trunc` goes through a 32-bit integer path: `Trunc(4294967295) == 1`, `Trunc(2**53) == 0`. Also, `Modf(-0.5)` returns +0 as the integer part.
-- A lone high surrogate in a JS → Go string conversion swallows the next code unit (`"\ud800 x"` → U+2420, the space lost). At the end of a string it produces invalid UTF-8.
-- A JS `throw null` passes through Go `defer` / `recover()` unseen: `recover()` returns nil and the function returns zero values.
+- `math.Trunc` routes through a 32-bit integer conversion: `Trunc(4294967295) == 1` and `Trunc(2**53) == 0`. `Modf(-0.5)` returns `+0` as its integer part.
+- A lone high surrogate in a JS-to-Go string conversion swallows the following code unit (`"\ud800 x"` becomes U+2420, dropping the space), and a trailing lone high surrogate yields invalid UTF-8.
+- A JS `throw null` passes through Go `defer` / `recover()` unseen (`recover()` returns `nil` and the function returns zero values).
+- Rollup 3.30's tree-shaking drops an outer loop label reused by a nested function (`export function f(a){ s: while(true){ if(a) break s; return function(){ s: while(true){ if(a) break s; return } } } }`), which is why the Pro build renames GopherJS's labels apart.
 
-Rollup 3.30's tree-shaking drops an outer label that a nested function reuses (minimal repro: `export function f(a){ s: while(true){ if(a) break s; return function(){ s: while(true){ if(a) break s; return } } } }`). The Pro build renames GopherJS's labels apart for this reason.
+## Production artifacts to compare
 
-## Which output to compare
+Several builders leave a readable or development variant at the root `dist/` path. Compare production rows using the specific paths below:
 
-Some archived builders deliberately retain their readable/development variant as the root `dist/` alias. Do not accidentally compare it against another compiler's production variant.
-
-| Family | Main OSS production-comparison candidate |
+| Family | OSS production candidate |
 | --- | --- |
 | ReScript | `dist/fp.esm.min.js` |
 | Melange | `dist/fp.esm.min.js` |
@@ -179,69 +143,53 @@ Some archived builders deliberately retain their readable/development variant as
 | Elm | `dist/production/fp.esm.min.js` |
 | GopherJS | `dist/fp.esm.min.js` |
 
-Scala's root alias is fast-link; Dart's is `-O1`; Kotlin's is the toolchain/readable variant; Elm's is the standard-minifier variant. Their additional variants are all built and checked. The Kotlin packaging proxy is not presented as the Gradle optimizing compiler.
+Scala's root `dist/` alias is `fast-link`, Dart's is `-O1`, Kotlin's is the readable Toolchain variant, and Elm's is the standard-minifier variant. The Kotlin packaging proxy is a wrapper artifact and should not be compared as the Gradle optimizing build.
 
-The Pro packages live under their own `dist/` directories. Their archived implementation scopes and configurations are not automatically equivalent to the later Rust Pro implementation. Current passing checks do not establish universal cross-language product parity.
+Pro packages live under their own `dist/` directories. Archived Pro port scopes and configurations are not automatically equivalent to the Rust Pro port, so passing offline checks do not imply universal feature parity across languages.
 
-## Fresh checks performed
+## What the offline checks verify
 
-The final build receipts bind authored port inputs and selected shared build inputs before and after compilation, plus every delivered artifact's digest. All 14 builds had unchanged inputs. The checker rehashes all listed artifacts before using them. A negative control changed an expected artifact digest in a temporary receipt: checking failed with `artifact-identity-mismatch`, and the original receipt was restored. No actual package artifact was altered by that test.
+Build receipts hash each port's inputs before and after compilation along with every output artifact's digest. `check-comparators.py` rehashes every listed artifact before testing it and rejects any mismatch with `artifact-identity-mismatch`.
 
-The final offline run passes **62 check commands** across **16 OSS artifact variants and seven Pro artifacts**. Default aliases are included, so this is seven OSS implementations, not 16 independent implementations.
+For each OSS variant (including default aliases), the checker runs:
 
-For each OSS artifact variant:
+- 58 comparisons against the built TypeScript reference covering Murmur hashing (Unicode, lengths, seeds), component hashing, and debug serialization;
+- 477 seed-boundary comparisons covering signed/unsigned edges, fractional and non-finite inputs, wrapping, large integers, and pseudo-random seeds across nine inputs;
+- package checks covering ESM syntax, importing without browser globals, exported symbol names, and declaration-file checksums.
 
-- 58 comparisons against the exact built TypeScript reference: Murmur hashing over Unicode/length/seed cases, component hashing, and debug serialization.
-- 477 seed-boundary comparisons: signed/unsigned boundaries, fractional and non-finite inputs, wrapping, large integers, and deterministic pseudo-random seeds over nine inputs.
-- Packaged module syntax, import without browser globals, export names, and declaration-file checksum.
+For each Pro port, the checker tests readable and minified ESM imports, the eight public export names, the copied `.d.ts` contract, worker dependency closure, and five invalid-start configurations against a fake worker. It does not run real browser collection, real workers, or network requests. Because `.d.ts` files are copied contracts, a matching checksum verifies the file text and does not prove that inferred types match runtime behavior.
 
-That is 928 standard comparisons plus 7,632 seed comparisons: **8,560 deterministic reference comparisons** across aliases and variants, all passing.
+## Port fixes
 
-For every Pro port, the checks cover ordinary/minified ESM imports, the exact eight public export names, copied declaration contract, worker dependency closure, and five invalid-start-configuration cases using a fake worker. They do not call valid collection, start real workers, or send requests. In total, the package checker records 83 passing assertions across OSS/Pro artifacts.
+The fixes below were made inside the non-Rust language ports (`mires` itself was unchanged), keeping the original reference expectations intact:
 
-Declarations in these ports are copied contracts. A matching checksum does not prove inferred declarations match every language implementation behavior.
+- **Scala.js seed wrapping:** `Double.toInt` saturated values above `i32::MAX`, failing seed `0xffffffff`. Replaced with truncation, modulo `2^32` wrapping, and signed mapping in both OSS and Pro's embedded OSS Scala code.
+- **Kotlin seed wrapping:** Applied the same wrapping fix to Kotlin's OSS and embedded Pro seed conversion.
+- **Dart non-finite seeds:** Calling `.toInt()` on `NaN` or infinities threw in the OSS adapter; non-finite numeric seeds now normalize to zero before conversion.
+- **Elm fractional seeds:** Fractional seeds failed Elm's integer decoder and collapsed to zero. The JS-to-Elm bridge now coerces seeds to 32-bit integers before crossing into Elm while leaving the Elm hashing logic untouched.
+- **Build portability:** Updated root npm dependency resolution, local opam switch selection, version-pinned tool wrappers, and Kotlin 0.12's module output discovery (picking the application module instead of the first `.mjs` file).
 
-## Repairs made during restoration
+## Receipts, sizing, and caveats
 
-All compiler source repairs here are in the language ports, not in `mires`.
-
-**Scala.js seed wrapping.** The archived `Double.toInt` seed conversion saturated values above the signed range; seed `0xffffffff` failed all 12 original string vectors. The replacement truncates, wraps modulo 2^32, and maps into the signed range before conversion. Both OSS and Pro's embedded OSS Scala source were corrected.
-
-**Kotlin seed wrapping.** The analogous Kotlin conversion had the same boundary problem. Both OSS and embedded Pro source now preserve the reference's wrapping behavior.
-
-**Dart non-finite seeds.** Calling `.toInt()` on non-finite numeric seeds threw in the exported OSS adapter. It now normalizes those values to zero before conversion.
-
-**Elm port protocol.** Fractional seeds failed the integer decoder and became zero. The existing JavaScript-to-Elm bridge now explicitly coerces the seed to its 32-bit integer representation; the hashing algorithm remains Elm.
-
-The original expectations were not relaxed. Failed receipts are retained under `build/comparators/attempts/scala-seed-before/` and `build/comparators/attempts/numeric-boundaries-before/`.
-
-Build portability repairs include root npm dependency lookup, local OCaml switch selection, version-pinned tool entry points, and Kotlin 0.12's moved output location. Kotlin entry discovery now selects the actual application module rather than the first arbitrary `.mjs` file. Original numeric implementation files remain recoverable from the archive and original-hash manifest.
-
-## Results, sizing, and evidence
-
-Current outputs:
+Running the build, check, and size scripts writes receipts under `build/comparators/`:
 
 ```text
 build/comparators/*.build.json
 build/comparators/*.package.json
 build/comparators/*.kernels.json
 build/comparators/*.seeds.json
-build/comparators/checks-all-rescript-melange-jsoo-scalajs-dart-kotlin-elm.json
+build/comparators/checks-all-*.json
 build/comparators/sizes.json
 build/comparators/logs/
 build/comparators/attempts/
 ```
 
-The size report contains 23 package/profile rows. It records raw, gzip, and Brotli bytes using the recorded Node compression versions, compressing separately fetched resources separately. A worker importing the main module does not incur a second copy of the main transfer in that graph, but its main dependency is not omitted. The ReScript Pro worker is separately bundled and counted as such.
+`sizes.json` records raw, gzip-9, and Brotli-11 sizes using Node's `zlib`, compressing separately fetched resources individually. A worker that imports the main module does not double-count the main module transfer, while a separately bundled worker (such as ReScript Pro's) is counted as its own transfer.
 
-These static sizes are not a qualified language ranking. Do not combine them with old system-gzip measurements, unrelated runtime timings, or different upstream versions without labeling those differences.
+Treat static sizes as raw data, not a ranked comparison across languages. Do not mix these numbers with system-`gzip` figures, unrelated timing runs, or different upstream package versions without labeling the difference. Note also that the Elm OSS port includes a substantial handwritten JavaScript host and is not a pure-Elm bundle.
 
-No three-browser differential matrix or quiet-machine timing protocol was run. Browser collection, async lifecycle, full source ownership, failure branches, and the Pro implementation-completeness gaps still require their own qualification. The Elm OSS implementation explicitly contains a substantial JavaScript host and must not be advertised as an all-Elm implementation.
+## Private files and npm advisories
 
-## Privacy, dependencies, and backups
+`experiments-pro/` is gitignored and holds the private Pro reference and historical Pro ports.
 
-`experiments-pro/` remains ignored by Git. It contains the private retained Pro reference, partial original source, and historical ports. The Pro reference module still matches SHA-256 `40c43c3afde41f9dbc3b15ac9f11dd4d3593fe4522f37ae22b04de6ea95144f9`. Nothing was published.
-
-The existing pinned packaging dependencies report seven npm audit findings: two low, two moderate, and three high. The report is saved at `build/comparators/npm-audit.json`. A breaking automatic dependency upgrade was not mixed into the restored benchmark baseline. Use the local suite with trusted inputs; resolving those packaging dependency advisories is separate maintenance work requiring a rebuild/recheck.
-
-The pre-restoration configuration and compiler identity were backed up under `/Users/mikhail.pertsev/mires-recovery-backups/comparators-20261108T032853Z/`. Final source/evidence archives are recorded there separately for public OSS tooling and private Pro material. These are same-device backups, not protection against loss of the machine.
+The pinned packaging dependencies in `package-lock.json` carry seven known npm audit advisories (two low, two moderate, three high; recorded in `build/comparators/npm-audit.json`). Updating them is tracked separately from the pinned comparator baseline; run these local build tools only on trusted inputs.

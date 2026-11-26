@@ -1,17 +1,36 @@
-# Standalone Rust-to-JavaScript experiments
+# Experiments
 
-These are restored Rust workloads and the OSS reference, not recovered October performance results. Install tools at the repository root with `npm ci --ignore-scripts`.
+This directory holds the FingerprintJS workloads, the multi-library compiler matrix, and the non-Rust comparator ports. Install root Node dependencies once from the repository root with `npm ci --ignore-scripts`.
+
+## Rust FingerprintJS and corpus builds
+
+Mires v5 uses unwind mode by default, where `rustc` preserves cleanup edges natively, so pass `--cleanup off` alongside `--lane jir`:
 
 ```sh
 npm run build:oss-reference
-node experiments/fingerprintjs-rust-compact/tools/build.mjs --profile release-balanced --optimizer on --lane jir --cleanup on --scheduler boundary --output experiments/fingerprintjs-rust-compact/dist/mires-v2
-node experiments/fingerprintjs-rust/tools/build.mjs --profile release-balanced --optimizer on --lane jir --cleanup on --scheduler boundary --output experiments/fingerprintjs-rust/dist/mires-v2
+node experiments/fingerprintjs-rust-compact/tools/build.mjs \
+  --profile release-size --optimizer on --lane jir --cleanup off --scheduler boundary \
+  --output experiments/fingerprintjs-rust-compact/dist/mires-v5
+node experiments/fingerprintjs-rust/tools/build.mjs \
+  --profile release-size --optimizer on --lane jir --cleanup off --scheduler boundary \
+  --output experiments/fingerprintjs-rust/dist/mires-v5
 npm run build:corpus
 npm run test:corpus
 ```
 
-Use explicit `--cleanup off` only for a labeled diagnostic comparison. All runtime/reference comparisons must name the built artifacts; archived reports describe their own historical inputs. Fingerprint Pro is restored separately under `experiments-pro/` and kept private. Other-language ports have not been restored.
+Always label comparisons with the exact built artifacts and compiler options; older `STATUS.md` and `VERDICT.md` files inside port directories record historical runs. Fingerprint Pro lives in `experiments-pro/` and is kept private (gitignored).
 
-## Restored other-language ports
+## Library matrix
 
-All eight non-Rust OSS comparator families (GopherJS was added on 2026-11-18) build in the standalone checkout. Run `npm run build:comparators -- --suite oss` and `npm run check:comparators -- --suite oss` from the repository root. See [the current guide](../docs/COMPARATORS.md). Old `STATUS.md` files and archived matrices are historical, not current qualification.
+[`library-matrix/README.md`](library-matrix/README.md) documents the 15-library (+ Explorer, `pilot`, and `floor`) cross-language parity, size, and timing harness covering Mires and the eight other compile-to-JS languages.
+
+## Other-language comparators
+
+All eight non-Rust OSS comparator families (`rescript`, `melange`, `jsoo`, `scalajs`, `dart`, `kotlin`, `elm`, and `gopherjs`) build from this checkout:
+
+```sh
+npm run build:comparators -- --suite oss
+npm run check:comparators -- --suite oss
+```
+
+See [docs/COMPARATORS.md](../docs/COMPARATORS.md) for toolchain setup, production artifact paths, and known compiler caveats.

@@ -1,36 +1,23 @@
-> Recovery baseline: this document was imported from the September 7 v2 snapshot.
-> It describes historical mechanisms and limits, not completed October recovery or production qualification.
-> See `docs/V2-RESTORATION.md` and the current `VERDICT.md`.
+# Compiler interface contract
 
-# Spike interface contract
-
-Every component (backend, mini_core, tests, shim, scripts, demo) is built by a different
-agent in parallel. This file is the single source of truth for the interfaces between them.
-Do not deviate from it; if something proves impossible, note it in your report instead of
-silently changing the contract.
-
-Full plan: /Users/mpl4/.claude/plans/buzzing-wondering-pillow.md
-Reference cg_clif clone (read-only):
-/private/tmp/claude-501/-Users-mpl4-Desktop-workspace-OSS-topcoat/61e61eec-1ccc-45c3-838d-971b5be2d33f/scratchpad/compilers/rustc_codegen_cranelift
+This document is the technical reference for the interfaces between `rustc_codegen_mires`, `jsc-link`, `rcgjs-object`, `runtime/shim.js`, `mires-js`, the test harnesses, and the build scripts. Early sections describe the original `#![no_core]` test conventions; later sections record the value model, pointer slots, allocator, modules, chunks, coroutines, host callbacks, `#[js_extern]`, and `js!{}` specifications.
 
 ## Toolchain
 
-`nightly-2026-07-27` pinned by ./rust-toolchain.toml (components rust-src, rustc-dev,
-llvm-tools). Being installed at spike start; may still be downloading — poll
-`rustup run nightly-2026-07-27 rustc --version` before relying on it.
+`nightly-2026-07-27` pinned by `./rust-toolchain.toml` (components `rust-src`, `rustc-dev`, `llvm-tools`).
 
-## Compilation command (produced .js file)
+## Compilation command (single-crate `no_core` tests)
 
-```
+```sh
 rustc +nightly-2026-07-27 \
-  -Zcodegen-backend=<abs path to target/release/librustc_codegen_js.dylib> \
+  -Zcodegen-backend=<abs path to target/release/librustc_codegen_mires.dylib> \
+  --target targets/mires32-unwind.json \
   --edition 2021 --crate-type lib --emit=obj \
-  -Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebuginfo=0 \
+  -Ccodegen-units=1 -Cpanic=unwind -Coverflow-checks=off -Cdebuginfo=0 \
   -o <out>.js <test>.rs
 ```
 
-The "object file" the backend writes IS the JavaScript text. If rustc mangles the output
-path, scripts/compile.sh normalizes it afterward.
+For full multi-crate programs linked against `core` and `alloc`, `scripts/compile_core.sh` compiles with `--crate-type cdylib` against a keyed sysroot built by `scripts/build_sysroot.sh`, invoking `jsc-link` to run whole-program DCE, optimization, and JS emission.
 
 ## Test crate shape (no_core, single crate, no linking)
 
@@ -177,35 +164,17 @@ formatting anywhere -- print numbers and literal strs only.
 
 ## Scripts
 
-- scripts/build.sh    — cargo build --release from the spike root: the backend dylib and the
-                        `jsc-link` binary it execs at the link step, printing both paths
-- scripts/compile.sh  — $1=src $2=out.js; runs the rustc command above
-- scripts/entry.js    — exactly `rust_entry();`
-- scripts/test.sh     — build backend, then for each examples/tests/*.rs: compile,
-                        run `cat runtime/shim.js out.js scripts/entry.js | node -`,
-                        diff against .expected; print PASS/FAIL summary; nonzero exit on
-                        any failure. Artifacts go to build/ (gitignored). Also runs the
-                        examples/core-tests/ suite when a sysroot exists.
-- scripts/build_sysroot.sh — patch and build the real `core`, `compiler_builtins` and `alloc`
-                        with this backend into build/sysroot; run once before the core suite
-- scripts/compile_core.sh — $1=src $2=out.js against that sysroot (cdylib, so the link
-                        step runs)
-- scripts/emit-test.sh — the emitted-JavaScript goldens (see "Emit goldens" below);
-                        UPDATE_EXPECT=1 rebaselines
-- scripts/module-test.sh — compiles every emit fixture as a script and as an ES module and holds
-                        that the two agree item for item (see "Modules")
-- scripts/run-esm.sh  — runs a `js-modules=esm` program under node: the ES module form of the
-                        shim beside it, `rust_entry` imported by name
-- scripts/make-esm-shim.mjs — derives that ES module form from runtime/shim.js
-- scripts/check-sourcemap.js — decodes and checks a `.map` the backend wrote (see
-                        "Source maps"); `node scripts/check-sourcemap.js build/03_structs.js`
-- scripts/dom-test.sh — the `view!` suite: expands each examples/dom-tests fixture, compiles it as
-                        an ES module, runs it against the contract's recording stub and diffs both
-                        the JavaScript and the trace (see "Templates"); UPDATE_EXPECT=1 rebaselines.
-                        Framework-specific: without a `view-dom-macro/` checkout it prints SKIP and
-                        exits 3 (see "The suite")
-- scripts/dom-trace.mjs — runs one compiled client module against contract/harness/trace.mjs and
-                        prints the trace as JSON Lines
+- `scripts/build.sh` — runs `cargo build --release` from the repository root to build the backend dylib and `jsc-link`, printing both paths
+- `scripts/compile.sh` — `$1=src $2=out.js`; runs the single-crate compile command
+- `scripts/entry.js` — `rust_entry();`
+- `scripts/test.sh` — builds the backend, then compiles and runs each `examples/tests/*.rs` (`cat runtime/shim.js out.js scripts/entry.js | node -`), diffing against `.expected`; also runs `examples/core-tests/` when a sysroot is present. Artifacts go to `build/` (gitignored).
+- `scripts/build_sysroot.sh` — patches and builds `core`, `compiler_builtins`, and `alloc` into a keyed sysroot under `build/sysroot-cache/`
+- `scripts/compile_core.sh` — `$1=src $2=out.js` against that sysroot (`cdylib`, invoking `jsc-link`)
+- `scripts/emit-test.sh` — checks emitted-JavaScript goldens (`UPDATE_EXPECT=1` rebaselines)
+- `scripts/module-test.sh` — compiles emit fixtures as both plain scripts and ES modules and checks that items match (`Modules`)
+- `scripts/run-esm.sh` — runs a `js-modules=esm` program under Node with the generated ESM shim beside it
+- `scripts/make-esm-shim.mjs` — derives the ES module shim from `runtime/shim.js`
+- `scripts/check-sourcemap.js` — decodes and verifies a `.map` written by the linker (`node scripts/check-sourcemap.js build/03_structs.js`)
 
 ## Stage 1 + 2 deltas
 
@@ -215,110 +184,53 @@ another component has to agree with.
 
 ### Compilation
 
-The command in "Compilation command" gains `--target wasm32-unknown-unknown` and
-`--remap-path-prefix "$root/="` (the second so that a `#[track_caller]` location is repository
-relative rather than a path to somebody's checkout — see "Hoisted constants"). Nothing is ever
-handed to LLVM, so the only thing the target decides is the data layout the backend reads off
-`tcx` — and a 32-bit pointer width is what makes `usize`/`isize` exactly `u32`/`i32`, so layouts,
-niches, `size_of` and the constants rustc folds all agree with the JS side by construction. No
-wasm toolchain component is needed: a `#![no_core]` crate compiled with `--emit=obj` never links.
+The target is `targets/mires32-unwind.json` (rustc's `wasm32-unknown-unknown` layout with `"panic-strategy": "unwind"`) with `--remap-path-prefix "$root/="` so `#[track_caller]` locations are repository-relative (see "Hoisted constants"). Nothing is handed to LLVM, so the target selects only the 32-bit data layout (`usize`/`isize` match `u32`/`i32` for layouts, niches, `size_of`, and const folding).
 
-Tests against the real `core` use a second command (`scripts/compile_core.sh`):
-`--sysroot build/sysroot --crate-type cdylib`, the sysroot being what `scripts/build_sysroot.sh`
-builds. `cdylib` is the point — it makes rustc run `CodegenBackend::link`, which is where
-whole-program dead code elimination and zombie reporting happen.
+Tests against `core` and `alloc` compile via `scripts/compile_core.sh` (`--crate-type cdylib`) against the keyed sysroot built by `scripts/build_sysroot.sh`, so `CodegenBackend::link` invokes `jsc-link` for whole-program DCE, optimization, and zombie reporting.
 
-Incremental rustc invocations require `-Cllvm-args=js-producer=<sha256>`, where the digest covers the selected backend library. The compile and sysroot scripts supply it automatically. The producer verifies it before queries run. A missing incremental identity, stale digest, or duplicate identity is an error. Rustc tracks the argument, so replacing a backend at the same path invalidates its query and codegen caches while an unchanged backend permits reuse. The digest is independent of linker policy and is excluded from normalized emit options. Executable cleanup MIR archives carry and verify this producer identity separately.
+Incremental rustc invocations require `-Cllvm-args=js-producer=<sha256>`, where the digest covers the selected backend library. The compile and sysroot scripts supply it automatically, and the backend verifies it before queries run. A missing, stale, or duplicate digest is an error. Because rustc tracks the argument, replacing the backend library at the same path invalidates query and codegen caches while an unchanged library permits reuse. The digest is independent of linker policy and excluded from normalized emit options.
 
-`js-cleanup=on` is an experimental producer option, off by default. It retains executable ordinary and coroutine cleanup for the existing host-exception contract. It requires a matching cleanup-enabled sysroot and dependencies, and JIR lowering for reachable cleanup bodies. Baseline fallback is an error when it would discard those bodies' cleanup paths. Rust panic/abort behavior remains unchanged. The pinned MIR bridge preserves the shared coroutine layout and applies rustc's abort policy to the body used by rustc.
+In Mires v5, unwind mode is the sole build mode. Every crate and the sysroot compile for `targets/mires32-unwind.json` with `-Cpanic=unwind`, so rustc's optimized MIR preserves unwind edges directly. When a JavaScript host call throws an exception, the lowered unwind edges run every live Rust destructor on the way out and propagate the original thrown JS value across Rust frames. `patches/unwind/0001-core-eh-personality.patch` provides the `eh_personality` lang item required by `-Cpanic=unwind` (`examples/mini_core.rs` carries one for the `no_core` suite), and `patches/unwind/0002-stdlib-cold-nounwind.patch` marks `core`/`alloc`'s diverging pure-Rust panic and OOM helpers `#[rustc_nounwind]` so bounds checks and allocations do not emit redundant cleanup edges. `JSC_RUST_MIR_INLINE=off` is the default client-crate MIR-inlining setting across the driver scripts unless `JSC_RUST_MIR_INLINE=on` or `--mir-inline on` is requested, while `build_sysroot.sh` builds the stdlib with `-Zinline-mir`.
 
-Cleanup-enabled libraries carry a versioned, checksummed executable MIR member with stable definition, source and hygiene identities. Import validates the producer digest, rustc version, emit options, target layout and crate identity. Generic consumers can reconstruct that MIR without the original source files. A consumer given only a dependency's `.rmeta` (cargo's pipelining, which is how the sysroot's `alloc` sees `core`) reads the member from the rlib written beside it under the same stem; the identity checks prove it is the same compilation. A dependency whose rlib or member cannot be found is an error, never a fallback to rustc's optimized MIR, whose cleanup paths `-Cpanic=abort` removed. When two objects carry copies of one item, the link keeps a copy with cleanup edges over one without them, whatever their hashes, and keeps a copy that owes cleanup but declined encoding (its zombie fails a reachable use) over a body without cleanup edges. `scripts/cleanup-transport-test.py` checks cold/warm/edited builds, fresh consumers of warm libraries, incompatible producers, source absence, metadata-only dependencies with and without their rlib, the kept copy of a duplicated instance, and the cleanup edges of the sysroot `alloc`'s instances of `core` generics. The ordinary source-fact capture described below remains the default when executable cleanup is disabled.
+Key unwind-mode guarantees:
 
-Unset (or `JSC_PANIC=unwind`) selects the default unwind build mode; `JSC_PANIC=abort` is the opt-in `-Cpanic=abort` override. In unwind mode, the sysroot and every crate are compiled for `targets/mires32-unwind.json` (rustc's `wasm32-unknown-unknown` with `"panic-strategy": "unwind"`) with `-Cpanic=unwind`, and `js-cleanup=off` is appended after the caller's backend options, so a build that pins `js-cleanup=on` or a release profile runs in either mode. rustc's optimized MIR then keeps its unwind edges, and the backend lowers those: a JavaScript exception thrown by a host call runs the destructors of every live value on its way out and leaves the Rust frames as the same value, without the re-derived cleanup bodies of `js-cleanup=on`. The mode is keyed apart from every `abort`-mode sysroot (its panic strategy, the target spec's content and `patches/unwind/*.patch` join the cache key only in this mode); `patches/unwind/0001-core-eh-personality.patch` gives `core` the `eh_personality` lang item `-Cpanic=unwind` requires, so a crate needs nothing of its own (`examples/mini_core.rs` carries one for the `no_core` suite), and `patches/unwind/0002-stdlib-cold-nounwind.patch` marks `core`/`alloc`'s pure-Rust diverging panic/OOM helpers `#[rustc_nounwind]` so bounds checks and allocations do not emit redundant cleanup edges when Rust panics abort. `scripts/build_sysroot.sh`, `compile_core.sh`, `compile.sh`, `scripts/mires.mjs`, the experiment builders and `mires-build` read the switch (`JSC_RUST_MIR_INLINE=off` is the default client-crate MIR-inlining setting across those drivers unless `JSC_RUST_MIR_INLINE=on` or `--mir-inline on` is requested, while `build_sysroot.sh` builds the stdlib with `-Zinline-mir`); the receipts record it.
+* **Rust panics still abort.** The `#[panic_handler]` runs and every cleanup handler rethrows registered compiler aborts without running destructors (`__rt.is_abort`); only host exceptions unwind. `catch_unwind` remains unsupported (its intrinsic lowers to a zombie).
+* **Foreign calls that can propagate a host exception must keep unwind edges or be refused.** Rustc strips unwind edges from calls whose callee ABI cannot unwind (`"C"`, `"system"`, `"cdecl"`, `"unadjusted"`, and all non-`-unwind` foreign ABIs). Whenever a function holds a live value with drop glue across such a call (used after return, or live across a diverging call), the backend refuses it at compile time and points to `extern "C-unwind"`:
+  * foreign imports (`examples/unwind-tests/290_extern_c_import_rejected.rs`, `296_cdecl_import_rejected.rs`);
+  * function pointers or `dyn` methods with a non-unwinding ABI (`295_extern_c_fn_pointer_and_dyn.rs`, `297_extern_c_import_through_pointer.rs`);
+  * Rust functions with a non-unwinding ABI unless their transitive call and drop graph (checked with cycle detection) is available and proven free of `UnwindTerminate(Abi)` edges, non-sysroot foreign imports, indirect calls (function pointers, `dyn` methods, or dropping a `dyn` value), inline assembly, tail calls, and unresolved or bodyless non-sysroot callees (`293_extern_c_fn_called_from_rust.rs`, `299_extern_c_fn_of_dependency.rs`, `310_transitive_extern_c_import_rejected.rs`, `311_transitive_c_rust_c_rejected.rs`, `312_transitive_c_fn_ptr_and_drop_rejected.rs`);
+  * inlined non-unwinding functions that leave `UnwindTerminate(Abi)` edges in the caller (`294_extern_c_fn_inlined.rs`).
 
-In the unwind mode:
+  Calls with no live drop glue across them are accepted, as are Rust callees whose transitive call and drop graph is proven hazard-free, even across pure recursive cycles (`313_transitive_c_pure_cycle_accepted.rs`). Sysroot runtime imports are identified by their target sysroot library path (`298_import_from_sysroot_named_crate.rs`). Sysroot builds (`-Zforce-unstable-if-unmarked`) skip the check for `compiler_builtins`' internal C-ABI calls; their generics are checked when instantiated by user crates. `#[js_extern]` and `js_bindings!` expand to ordinary Rust functions and are unaffected; `mires-js` and fixture preludes declare their host imports `extern "C-unwind"`.
+* **Exported `extern "C" fn`s rethrow to JavaScript.** Their cleanup paths end in `UnwindTerminate(Abi)`, which JIR lowering emits as the same rethrow as `UnwindResume` once destructors finish (`UnwindTerminate(InCleanup)` declines in bodies with protected calls).
 
-* **A Rust panic is still an abort.** The `#[panic_handler]` runs, and every handler rethrows an abort without running cleanup (`__rt.is_abort`), exactly as under `-Cpanic=abort`; only a host exception unwinds. `catch_unwind` stays unsupported: the intrinsic is a zombie under any strategy but `abort`.
-* **Every call a host exception could cross keeps its cleanup, or the program is refused.** rustc removes the cleanup edge of any call whose callee's ABI cannot unwind (rustc's own `fn_can_unwind`: `"C"`, `"system"`, `"cdecl"`, `"unadjusted"` and every other ABI except the `-unwind` spellings and Rust's own), so the destructors a function holds across such a call are gone from its MIR. The backend refuses, where the call is compiled, each such call that may let a host exception through while the function holds a value with drop glue across it (used after the call returns; for a call that does not return, any such value whose storage is live), and every message names the fix, `extern "C-unwind"`:
-  * a call to a foreign import, with ``rustc_codegen_js: `name` is a foreign import with the "C" ABI, which cannot unwind: … Declare it `extern "C-unwind"`.`` and a note at the declaration (`examples/unwind-tests/290_extern_c_import_rejected.rs`, `296_cdecl_import_rejected.rs`);
-  * a call through a function pointer of such an ABI, or of a `dyn` method declared with one (`295_extern_c_fn_pointer_and_dyn.rs`, `297_extern_c_import_through_pointer.rs`);
-  * a call to a Rust function with such an ABI unless its transitive call and drop graph (tracked with cycle detection) is available and proven free of `UnwindTerminate(Abi)` edges, non-sysroot foreign imports, indirect calls (function pointers, `dyn` methods, or dropping a `dyn` value), inline assembly, tail calls, and unresolved or bodyless non-sysroot callees (`293_extern_c_fn_called_from_rust.rs`, `299_extern_c_fn_of_dependency.rs`, `310_transitive_extern_c_import_rejected.rs`, `311_transitive_c_rust_c_rejected.rs`, `312_transitive_c_fn_ptr_and_drop_rejected.rs`);
-  * such a function inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges in the caller (`294_extern_c_fn_inlined.rs`).
+`scripts/unwind-mode-test.sh` runs `examples/unwind-tests/` with rustc defaults and with `JSC_RUST_MIR_INLINE=on JSC_RUST_OPT_LEVEL=z`.
 
-  A call across which the function holds nothing to drop is accepted: the exception passes that frame as it would with the edge, and the frame above decides for itself. A Rust callee whose transitive call and drop graph is available and proven free of those hazards cannot let an exception out and is accepted, even across pure recursive cycles (`313_transitive_c_pure_cycle_accepted.rs`). The imports the sysroot's own crates declare are the runtime's and accepted; which crates those are is decided by where rustc loaded them from (the target's sysroot library directory), not by their names (`298_import_from_sysroot_named_crate.rs`). The sysroot build's own compilations (`-Zforce-unstable-if-unmarked`) are not checked: they call no host function, and `compiler_builtins`' intrinsics call one another through the C ABI; their generics are checked where a program instantiates them. It is a compile-time error rather than a zombie because the JIR lane replaces an item's zombies with its lowering's. `#[js_extern]` and `js_bindings!` expand to ordinary Rust functions, so their declarations are unaffected; `mires-js`, `view-abi` and the fixture preludes declare their imports `"C-unwind"`, which changes nothing under `-Cpanic=abort` (rustc gives the call `unwind unreachable` either way).
-* **An exported `extern "C" fn` rethrows when JavaScript calls it.** Its cleanup path ends in `UnwindTerminate(Abi)`, which the JIR lowering emits as the same rethrow as `UnwindResume` once the drops have run (`UnwindTerminate(InCleanup)` still declines in a body with protected calls); a call to it from Rust is refused as above. The lowering is the same in both modes.
-* **The baseline lane cannot build programs with cleanup.** Every body that keeps a cleanup block needs the JIR lane: a reachable one that the baseline lane would print is refused with the `requires semantic cleanup lowering` refusal of `js-cleanup=on` above, and the backend's fail-closed guard gives an item whose JIR encoding declined (or `js-jir=off`) the same zombie. A suite row that asks the baseline lane to build such a program is skipped in this mode with its reason printed.
-* **Byte goldens are abort-mode text.** A golden recorded for the default mode is not compared in this mode; the behaviour checks beside it still run.
-
-`scripts/unwind-mode-test.sh` runs the mode's own fixtures (`examples/unwind-tests/`) in whichever mode `JSC_PANIC` selects, with rustc's defaults and with `JSC_RUST_MIR_INLINE=on JSC_RUST_OPT_LEVEL=z`.
-
-Backend options ride in on `-Cllvm-args`, space separated (`scripts/compile.sh` forwards
-`$JS_EXTRA_ARGS`):
+Backend and linker options are passed via `-Cllvm-args`, space-separated (`scripts/compile.sh`, `scripts/compile_core.sh`, and `scripts/build_sysroot.sh` forward `$JS_EXTRA_ARGS`):
 
 ```text
-js-names=readable|mangled    how identifiers are spelled; readable is the default
-js-root=NAME                 an extra dead-code-elimination root, repeatable
-js-structure=regions|trampoline   how control flow is rebuilt
-js-queue=on|off              the expression queue
-js-switch=dtree|flat         how `SwitchInt` is spelled
-js-comments=on|off           the `// <def path>` header comment on each item (default on)
-js-line-comments             `// file.rs:LINE` comments before each run of statements
-js-source-map=on|off         write a `.map` beside the program (default off; see "Source maps")
-js-emit-skip=PREFIX          hide items under a def path prefix (see "Emit goldens")
-js-scoped-lets               declare locals at their region LCA
+js-names=readable|mangled    identifier spelling (default readable)
+js-root=NAME                 extra dead-code-elimination root (repeatable)
+js-comments=on|off           // <def path> header comment on each item (default on)
+js-line-comments             // file.rs:LINE comments before statement runs
+js-source-map=on|off         write a .map beside the output (default off; see "Source maps")
+js-emit-skip=PREFIX          hide items under a def-path prefix in emit goldens
 js-minify=on|locals|off      short names and compact printing (default off; see "Minify mode")
 js-ecma-target=2018|latest   emitted JavaScript syntax ceiling (default latest)
 js-hoist-consts=on|off       share repeated constants (default on; see "Hoisted constants")
 js-modules=esm|script        ES module or plain script (default script; see "Modules")
-js-shim-module=SPEC          where `__rt` is imported from (default `./shim.js`)
-js-dom-module=SPEC           where the DOM runtime is imported from (default `topcoat-dom`)
-js-str=utf16|bytes           how a Rust `str` is held (link-only; release profiles default to `bytes`)
+js-shim-module=SPEC          where __rt is imported from (default ./shim.js)
+js-str=utf16|bytes           Rust str representation (link-only; release profiles default to bytes)
+js-opt=off|report|on         JIR optimizer mode (default off)
+js-opt-report=PATH           write the v6 JSON optimization report
 js-profile=NAME              dev, report, release-size, release-balanced, or release-speed
 ```
 
-`$JS_EXTRA_ARGS` is forwarded by **all three** compile paths: `scripts/compile.sh`,
-`scripts/compile_core.sh` and `scripts/build_sysroot.sh` (which turns each space separated option
-into its own `-Cllvm-args=`, since rustflags are split on whitespace).
+`js-profile` expands before explicit flags so any explicit flag always wins regardless of command-line order. The three release profiles select `js-ecma-target=2018`, `js-opt=on`, and `js-str=bytes` (unless overridden with `js-str=utf16`); `release-size` and `release-balanced` enable full minification (`js-minify=on`), while `release-speed` keeps item names readable. `dev` and `report` keep `js-ecma-target=latest` and `js-str=utf16`.
 
-`js-profile` is an alias layer: profiles expand before explicit options, so a spelled-out option always wins regardless of command-line order. The three release profiles select `js-ecma-target=2018`, the JIR lane, optimizer emission, and `js-str=bytes` (unless `-Cllvm-args=js-str=utf16` or a non-JIR lane is selected); release-size and release-balanced use full minification, while release-speed keeps item names. Dev and report retain the `latest` syntax target and `js-str=utf16`.
+**Emit-affecting options.** An option is emit-affecting if it can change the JIR or emitted metadata of an item that multiple crates might codegen. Link-only options (`js-comments`, `js-emit-skip`, `js-modules`, `js-shim-module`, `js-source-map`, `js-str`, `js-opt-report`, chunk flags) only affect what `jsc-link` synthesizes or reads and do not require rebuilding the sysroot. Every crate in a program must share the same emit-affecting options; otherwise two crates codegen the same generic instantiation differently and `jsc-link` rejects the mismatch. `scripts/sysroot-cache.sh` keys sysroot directories by emit-affecting options so `scripts/test.sh` keeps sysroot and crate flags aligned automatically.
 
-**An option is emit-affecting when it can change the text of an item two crates might both
-codegen.** That is the whole of the rule, and everything below follows from it: an option that
-only decides what the *link step* synthesizes around the items, or that only reaches the leaf
-crate's own output, is not emit-affecting however visible its effect on the finished file. The
-module options are the worked example -- see "Modules".
-
-**Every crate in one program must be compiled with the same emit-affecting flags.** The same
-generic instantiation is codegenned in several crates, and the link step compares the two
-spellings: if `core` was built with one set of flags and the crate linking it with another, the
-identical function comes out as two different definitions and the link fails with
-`two different definitions of ...`. Rebuild the sysroot after any change that alters emitted code
-(readable local names did exactly this):
-
-```sh
-JS_EXTRA_ARGS='js-names=mangled' ./scripts/build_sysroot.sh   # then the same for the crate
-```
-
-Emit-affecting, so the sysroot has to be rebuilt to match: `js-names`, `js-structure`,
-`js-queue`, `js-switch`, `js-scoped-lets`, `js-minify`, `js-ecma-target`, `js-hoist-consts` and
-**`js-line-comments`** — the last one is
-the surprise, because only the *leading* header comment run is stripped before two definitions are
-compared (`LinkItem::code`), and its comments are interleaved through the body.
-
-`scripts/build_sysroot.sh` records the options it built with in `build/sysroot/.js-args`, and
-`scripts/test.sh` rebuilds the sysroot when they disagree with its own `$JS_EXTRA_ARGS`, so the
-suite is green in every mode from one command. The diagnostic says so too: a
-`two different definitions of ...` error now carries the note that names the cause.
-
-Not emit-affecting, so they can be passed to one crate alone: `js-comments` (the header comment
-run, which is exactly what `LinkItem::code` strips), `js-emit-skip` (acted on by the test script,
-never by the backend), the three **module options** (everything they add is synthesized at link
-time; see "Modules") and **`js-source-map`** (its markers print nothing; the JavaScript is
-required to come out byte for byte identical). A map can therefore be asked for without rebuilding
-the sysroot — a `core` built without one simply contributes items with no mappings, which then
-read as generated glue and are stepped over.
-
-`js-ecma-target=2018` is a syntax ceiling, not an ES2018-runtime claim. It prints BigInt constants through `BigInt("...")`, lowers logical and nullish assignment with exact one-evaluation semantics, and leaves runtime requirements such as `BigInt`, `globalThis`, `queueMicrotask`, `MessageChannel`, and `TextEncoder` in the separate final-artifact inventory. A pinned Acorn 8.15.0 parse of every public artifact is the compliance authority; Terser's `ecma` setting is policy metadata, and opaque `js!` input is accepted only when that final parse succeeds.
+`js-ecma-target=2018` is a syntax ceiling, not an ES2018-runtime claim. It prints BigInt constants via `BigInt("...")`, lowers logical and nullish assignment with exact single-evaluation semantics, and leaves runtime API requirements (`BigInt`, `globalThis`, `queueMicrotask`, `MessageChannel`, `TextEncoder`) to the final artifact inventory. A pinned Acorn 8.15.0 parse of public artifacts checks syntax compliance.
 
 ### Value representation
 
@@ -356,21 +268,7 @@ follow before a whole assignment, a `StorageLive`, a `StorageDead` or a whole mo
 question. A local assigned whole before every field write it gets, which is all of the MIR rustc
 builds from source, has no such point and is lowered exactly as before.
 
-`backend/src/assembly.rs` answers this for the baseline lane over rustc's MIR and
-`jsc-link/src/lower/assembly.rs` for the JIR lane over JIR-S. The JIR lane makes such a local a cell
-and puts a `CellAlloc` at each point after the entry; a `CellAlloc` of a container-typed cell is
-spelled as the empty container when the cell's storage is written in place (a mutable view rooted at
-the cell with a path, or a `SetDiscriminant` on a load of it) before a store replaces it
-(`fuse::fresh_cell_allocs`), and as nothing otherwise. Before this, the first field write threw
-`Cannot set properties of undefined`: every clone of a `(String, usize)`, and every `Vec` of such
-tuples cloned. `examples/core-tests/340_assembled_aggregates.rs` writes the shapes in custom MIR
-(the return place for a pair, a triple, a struct, an array and an enum; a local assembled and moved
-in a loop, with storage markers and without; assembled on one path and assigned whole on the other;
-assigned whole once and assembled again after each move), `341_clone_shim_aggregates.rs` pins the
-clone shims of tuples and closures, and `346_async_closure_clone.rs` the clone of an async closure
-(which the baseline lane refuses earlier: it cannot take a field of one). The clone of a coroutine
-(unstable `coroutine_clone`) and a nested field write into a container not made yet (`_0.1.0 = ..`,
-custom MIR only) are not covered.
+`jsc-link/src/lower/assembly.rs` handles this over JIR-S by making such a local a cell and placing a `CellAlloc` at each restart point after entry; a `CellAlloc` of a container-typed cell emits the empty container when the cell's storage is written in place (a mutable view rooted at the cell with a path, or a `SetDiscriminant` on a load of it) before a store replaces it (`fuse::fresh_cell_allocs`), and emits nothing otherwise. Before this, the first field write threw `Cannot set properties of undefined` (affecting clones of `(String, usize)` and `Vec`s of those tuples). `examples/core-tests/340_assembled_aggregates.rs` exercises these shapes in custom MIR, `341_clone_shim_aggregates.rs` tests tuple and closure clone shims, and `346_async_closure_clone.rs` tests cloning an async closure. Cloning a coroutine (unstable `coroutine_clone`) and nested field writes into an uncreated container (`_0.1.0 = ..`, custom MIR only) are not covered.
 
 ### Runtime shim additions
 
@@ -542,7 +440,6 @@ rather than through the JavaScript.
 - `scripts/check-sourcemap.js <out.js> [source-substring]` checks a map without a browser: JSON
   shape, every VLQ segment, every index in range, every generated position inside the file, every
   original position inside its source, every line mapped, and `ignoreList` naming only glue.
-  `demo/index.html`'s header comment has the manual DevTools recipe.
 - Byte budgets (`NN.maxbytes`) are **not enforced** by `scripts/test.sh` when `$JS_EXTRA_ARGS`
   asks for `js-source-map`, `js-line-comments` or `js-minify`: the budgets are baselined against
   the default mode, and moving them to fit another mode would stop them catching what they exist
@@ -586,9 +483,7 @@ without either having to know what the other did. Beyond that, a local never tak
 function it is in already mentions (so it cannot shadow an item, `__rt` or a JS builtin), never a
 reserved word, and never one of the globals in `minify.rs::GLOBALS`.
 
-What keeps its name: **exported items** (`#[no_mangle]`, `#[export_name]`) at both passes —
-`counter_clicked` is called from `demo/index.html` and `rust_entry` from `scripts/entry.js`, and
-renaming those would be renaming the program's interface. An export short enough for the allocator
+What keeps its name: **exported items** (`#[no_mangle]`, `#[export_name]`) at both passes—for example `rust_entry` called from `scripts/entry.js`, since renaming exports breaks the program's external interface. An export short enough for the allocator
 to reach (three characters or fewer) is warned about at link time, because it is the one name the
 local renamer cannot see; this is the same hazard `names.rs` documents for readable local names.
 
@@ -656,14 +551,6 @@ property of codegen rather than of what a crate depends on.
 dereferenced on both sides of an assignment, an offset folded into the index it produces
 (`p.buf[p.off + n]`), a primitive local boxed because its address is taken, and the loop every
 monomorphized `slice::Iter` becomes.
-
-## Demo (demo/)
-
-counter.rs: same no_core header + mini_core; a `Counter` struct with
-`fn increment(&mut self)` and a `#[no_mangle] fn counter_clicked(n: i32) -> i32`
-pure handler (state lives in JS). index.html: loads shim.js and counter.js (script tags),
-a button and a span; clicking calls `counter_clicked(current)` and renders the result.
-No server needed — file:// friendly.
 
 ## Pointers (stage 1.5)
 
@@ -1788,16 +1675,10 @@ is a JavaScript array of one element type and is retyped exactly once, so both a
 rather than slow paths (see "Retyping" and "Run time refusals" above). No amount of work on the
 allocation model changes that: it is the same reinterpretation `guard_heap_retype.rs` pins.
 
-The host already has a hash table. `topcoat-js` is the crate that hands it to Rust as
-`topcoat_js::collections::{HashMap, HashSet}`, and `examples/core-tests/30_hashmap.rs` is the
-golden.
+The host already has a hash table. `mires-js` exposes it to Rust as
+`mires_js::collections::{HashMap, HashSet}`, and `examples/core-tests/30_hashmap.rs` tests it.
 
-**A `HashMap<K, V>` IS a host `Map`.** `repr(transparent)` over a one word handle, exactly as
-`view_abi::Node` is over a DOM node: the JavaScript value the backend keeps in a local of that type
-is the `Map` object itself. There is no handle table, no side allocation and no `Drop`; nothing
-frees a map but the engine's collector, which is what makes moving one into a struct, into a
-closure or through a function free and identity preserving. A `HashSet<T>` is a `HashMap<T, ()>`
-under the same wrapper.
+**A `HashMap<K, V>` is a host `Map`.** Declared `#[repr(transparent)]` over a one-word handle, the JavaScript value held in a local of that type is the `Map` object itself. There is no handle table, side allocation, or `Drop`: the JS garbage collector reclaims it, and moving a map into a struct, closure, or callee preserves identity at zero cost. `HashSet<T>` wraps `HashMap<T, ()>` in the same way.
 
 **A key is a JavaScript value a `Map` compares by value.** A `Map` compares with SameValueZero,
 which is by value for a number, a BigInt, a boolean and a string, and object *identity* for
@@ -1815,11 +1696,10 @@ Floats are excluded, for the reason `core` gives them no `Eq`. Everything else i
 the entry would be filed under the object that carried the key and never found again by an equal one
 built later, which is a silent wrong answer with nothing reported anywhere.
 
-**The refusal is a type error, twice over.** `topcoat_js::collections::MapKey` is sealed, so an
-aggregate key is rejected at the call site with the key type named, before any code is generated;
-`examples/core-tests/guard_map_key.rs` pins that message. `backend/src/map.rs` carries the same rule
-again as a post-monomorphization check on the marker's key argument, which is unreachable through
-that crate and exists for a marker any other crate could call.
+**The refusal is a type error, twice over.** `mires_js::collections::MapKey` is sealed, so an
+aggregate key is rejected at the call site with the key type named before codegen runs
+(`examples/core-tests/guard_map_key.rs`). `backend/src/map.rs` enforces the same rule as a
+post-monomorphization check on the marker's key argument for any crate calling the raw marker directly.
 
 **`MapKey::Class` is what a key compares as**, and a lookup takes the class rather than the key
 type: `String`, `&str` and `str` all have `Class = str`, and every other key is its own class. So a
@@ -1889,21 +1769,13 @@ __rt.map_del(m, k)        // m.delete(k)
 __rt.map_keys(m)          // { buf: [...m.keys()], off: 0, len }: a snapshot, as a `&[K]`
 ```
 
-`scripts/make-esm-shim.mjs` needs no list to keep in step: it evaluates the shim and exports the keys
-of the `__rt` it built, so these are in the ES module form by construction, and `jsc-build`'s
-`shimcheck` reads that module's own exports.
+`scripts/make-esm-shim.mjs` needs no manually maintained list: it evaluates the shim and exports the keys of the `__rt` object it built, keeping the ESM shim synchronized automatically. `mires-build`'s `shimcheck` reads that module's exports directly.
 
 #### Not supported
 
-- **An `entry` API.** `or_insert_with` and friends would need a place a closure can be called into
-  and a key held across it; the four call shape (`has`, `get`, `set`, `del`) has no room for it
-  without a handle to a slot the map may rehash under. Deferred, not refused.
-- **A key that is not one of the classes above**, including a float, a tuple, an array and any
-  struct or enum. Sealed trait, plus the backend check.
-- **`&mut` aliasing across a lookup.** Two `get_mut` calls for one key hand out two references to
-  one place, and only the borrow checker stops that: the markers return a reference at a lifetime
-  the caller picks, so `topcoat-js` narrows it to a borrow of the map at every call site and the
-  markers are `unsafe fn` to say so.
+- **An `entry` API.** `or_insert_with` and similar methods need a mutable entry handle held across a closure call; the four-call surface (`has`, `get`, `set`, `del`) leaves that deferred.
+- **Keys outside the classes above**, including floats, tuples, arrays, structs, and enums (blocked by both the sealed trait and the backend check).
+- **`&mut` aliasing across a lookup.** Two `get_mut` calls for the same key would return two mutable references to one slot. The markers return a caller-chosen lifetime and are `unsafe fn`, while `mires-js` narrows the returned reference to borrow the map at every call site so the borrow checker prevents aliasing.
 
 ### The allocator shim
 
@@ -1985,9 +1857,8 @@ dependency order; then everything else. That is one new tier on top of the order
 
 **Names.** An imported binding is never renamed, by either half of `js-minify`: the renamer
 rewrites text, and renaming the binding inside an `import` would import a name the module does not
-export. `_$` is reserved for the DOM runtime's bindings (`_$insert`, `_$template`), and no
-generated local ever starts with it, so an imported binding cannot be shadowed either.
-`js-dom-module` decides where those come from and defaults to `topcoat-dom`.
+export. `_$` is reserved for imported runtime bindings, and no generated local ever starts with it,
+so an imported binding cannot be shadowed either.
 
 **The export clause** names the `#[no_mangle]`/`#[export_name]` items of the crate being linked, in
 sorted order, in one trailing statement. One clause rather than an `export` keyword on each
@@ -2011,11 +1882,8 @@ wrong.
 
 ### The shim has two forms, from one source
 
-`runtime/shim.js` stays a plain script: it assigns `globalThis.__rt`, it is concatenated ahead of a
-script mode program, and pages load it with a bare `<script src>` and extend the object afterwards
-(`demo/index.html` and `demo-app/src/glue.js` both do). A module cannot use that file — a
-namespace import needs named exports — and one file cannot be both, because `export` is a syntax
-error in a script.
+`runtime/shim.js` stays a plain script: it assigns `globalThis.__rt`, is concatenated ahead of a
+script-mode program, and can be loaded with a `<script src>` tag and extended afterwards. A module cannot use that file—a namespace import requires named exports—and one file cannot be both, because `export` is a syntax error in a classic script.
 
 So there is one source and one derived artifact, never two hand written copies.
 `scripts/make-esm-shim.mjs` writes the module form: the shim's own text, verbatim, followed by an
@@ -2031,140 +1899,20 @@ whatever else the crate declares.
 
 ### Object file format version
 
-An object file carries a `u16` format version. postcard is not self describing, so a table written
-in an older shape does not fail to parse — it parses into something else, and the program that
-comes out is wrong rather than rejected. A mismatch is an error naming the fix
-(`scripts/build_sysroot.sh --clean`). Bump `FORMAT_VERSION` in `rcgjs-object/src/object.rs`
-whenever the shape changes -- and also when the **JavaScript inside it** changes incompatibly,
-which is the same failure one level up: an object holding the old enum encoding would link cleanly
-against new objects and produce a program that is wrong rather than rejected.
+Object files carry a `u16` `FORMAT_VERSION` (currently `28` in `rcgjs-object/src/object.rs`) and `JIR_SCHEMA` (`24` in `rcgjs-object/src/jir/mod.rs`). Because `postcard` is not self-describing, reading an older table without a version check would mis-decode silently. A version mismatch fails immediately and directs the user to rebuild the sysroot (`scripts/build_sysroot.sh --clean`). Bump `FORMAT_VERSION` whenever the binary schema or incompatible runtime conventions change.
 
-Format 20 (Phase 1 W2) replaced the trailing `//# rcgjs:` text footer with a binary member: the
-printed baseline JavaScript still comes first as a plain UTF-8 text section, then a `RCGJS\0`
-member holding a header and six checksummed sections (interns, the eagerly read summary index,
-content-addressed deflated JIR-S bodies, the per-item baseline records, origins, and the frozen v1
-optimizer's metadata), then a fixed 16-byte trailer so a reader finds the member without scanning
-the text. The header pins the JIR schema, the rustc that produced the object, its data layout and
-the emit-affecting options. `rcgjs-object/src/object.rs` is the specification.
+Each `.o` file contains an `RCGJS\0` binary member with a header, checksummed sections (intern tables, summary index, content-addressed deflated JIR-S bodies, and source origins), and a fixed 16-byte trailer. The header pins the JIR schema, the `rustc` version, target data layout, and emit-affecting options. See `rcgjs-object/README.md` and `rcgjs-object/src/object.rs` for the full layout.
 
-Format 27 and JIR schema 15 carry source coroutine control-flow and suspension facts in the intern section. The pinned rustc backend wraps `mir_drops_elaborated_and_const_checked`, borrows `mir_promoted` before delegating to rustc, and stores owned yield locations, bare resume locals, and the complete source block graph. Each block records its terminator class and ordered normal, unwind, resume, cancellation, or imaginary successors. Bare drop locals and direct source callee identities are retained before MIR inlining; projected drop places and dynamic callees remain unavailable. The producer checks the complete ordered target sequence against rustc's successor iterator. The reader validates edge targets and terminator arity, requires exactly one matching yield record per yield block, and checks its resume/cancellation edges. These indices belong to the generic analysis body, including unreachable blocks. They are not indices into the transformed JIR body or proof of dynamic suspension counts. Local coroutine queries are requested before codegen units serialize their metadata, including generic-only libraries. The object reader retains those facts independently of emitted items and rejects invalid indices. The linker merges them by stable definition identity, resolves object-local source positions, and reports conflicting captures explicitly.
+### The link step is a separate program (`jsc-link`)
 
-The compiler session retains each captured coroutine's promoted MIR as owned tokens through rustc's encoder and reconstructs it through rustc's decoder when codegen requests source facts. This preserves instruction operands, types, source scopes and cleanup edges after the original provider consumes the body, without retaining borrowed MIR or modifying rustc's passes. Session-local span, definition and allocation IDs make these snapshots unsuitable for object files or reuse in another compiler session. Only the existing source-fact tables cross that boundary. Self-check mode round-trips ordinary bodies after provider delegation too, compares the full body with only recomputable CFG caches cleared, and re-encodes the result. The suspension-facts harness requires these checks. Retaining source MIR does not elaborate its drops, emit exceptional cleanup or provide executable generic bodies to downstream crates.
+The backend dylib writes JIR-S object files and invokes its sibling binary `jsc-link` with a version-4 manifest (`MANIFEST_VERSION = 4`). Whole-program reachability, deduplication, JIR optimization, JS lowering, chunking, source maps, `.d.ts` generation, and optimization reporting all run inside `jsc-link`. `scripts/build.sh` builds both artifacts, and `JSC_LINK_BIN` overrides the `jsc-link` path. See `jsc-link/README.md` and `OPTIMIZER.md` for pass and manifest details.
 
-The producer also follows existing debug-place records through the pinned analysis-to-runtime passes, which preserve their order. It retains each record's original bare local identity before delegation, checks record count, name and source scope afterward, then resolves the transformed whole-field projection through rustc's runtime coroutine layout. A generated Pin alias must have one direct assignment from the coroutine argument. This does not add or alter MIR debug records. The optional `runtime_frame` table records saved-field indices, state membership and proven source-local correspondences. Empty source lists remain explicit for unnamed, projected or transformed-away records, including compiler-generated cleanup state. A changed record identity makes the table unavailable. The linker separately checks its shape against the monomorphic coroutine type. This maps whole source locals to runtime fields; it does not map source yield blocks to runtime states, reconstruct initialized cleanup or select continuations.
+Key JIR-lowering and optimization invariants:
 
-The schema-8 `async` report keeps source yield sites separate from the estimated post-transform suspension states. An unavailable capture stays unavailable, including when an incremental query bypasses the producer hook. The backend keeps no MIR references in its session cache and supports one compiler session per process, as its global options do. Each codegen unit records the source queries as dependencies so edits to a generic-only library invalidate its saved metadata. The report derives normal-flow segments from block zero and every resume destination, stopping at yields. Segments may overlap and contain loops; imaginary borrow-check edges are excluded and unwind exits are reported separately. A resume destination from an unreachable yield still has a segment, so segment existence does not prove entry reachability. Potential async-drop cancellation edges are preserved on `Drop` terminators. A source yield count of zero does not prove that driving the future cannot suspend. The graph does not contain executable instruction operands, complete call effects, or a runtime drop plan. These facts alone never authorize native continuation lowering. Await relationships, wake sources, source-to-state mapping, live storage, initialized cleanup, and driver/cancellation legality require separate proofs. `scripts/suspension-facts-test.sh` checks local and generic-library captures, source lines, zero fallback, runtime results, off/report JavaScript identity, and cold/warm/edited incremental builds. Its independent `source-cfg-mir.py` check compares every block and edge with the pinned rustc analysis MIR dumps in cold and edited builds. The same checker independently reads runtime saved-field layouts and debug places, and rejects swapped source mappings and missing state fields.
-
-Each yield can also carry `liveness` with sorted source-local indices for retained values, retained locals previously borrowed, and live storage. The producer reuses the pinned `rustc_mir_dataflow` analyses and validates the retained union, field types, source identities, per-yield field order and source positions against `mir_coroutine_witnesses`. No source-position matching is used to infer local identity. Missing witnesses remain unavailable. The object reader rejects duplicate, out-of-range, self-retention and inconsistent borrowed-local records. These are promoted-MIR facts, not indices into the optimized runtime frame, initialized drop flags, or an executable continuation plan.
-
-The liveness fixture distinguishes a retained borrow, a consumed guard, a held guard and values live at different yields. Independent MIR checks resolve the authored local names and reject omitted live/borrowed records. Cold/warm/edited builds also replace a borrow with a value copy while keeping the yield count unchanged, verifying that incremental metadata tracks the changed retained state. Runtime-frame correspondence, executable source operands and state-specific cleanup remain separate requirements.
-
-The optional `initialization` table records conservative promoted-MIR move-path state before and after each terminator's primary effect. The producer reuses rustc's default maybe-initialized and maybe-uninitialized analyses over all tracked types. A path present in both sets is conditional; an aggregate's children must be considered separately after partial moves. Paths preserve their source local, parent and projection indices. Type-changing projections without generic type identity remain unavailable. Unreachable points carry no state. The object reader checks path ancestry, local and path indices, sorted unique sets and block coverage. These facts precede rustc's later drop-elaboration refinements and are not runtime drop flags. After a call's primary effect, moved arguments have left the caller but the return destination is not yet initialized: that happens only on the normal-return edge.
-
-The initialization fixture observes uninitialized and initialized locals, a partially moved tuple, conditional initialization across a real suspension, and call argument/destination state. Independent textual MIR probes locate the authored locals and calls. A conditional-to-definite initialization edit preserves the yield count while changing the serialized state, and four deliberately corrupted reports must fail the probe checks. Executable operands, runtime state correspondence and cleanup emission remain open.
-
-### Experimental ready Promise boundaries
-
-`js-jir-ready-futures=on` is a link-only opt-in for ordinary `future_to_promise` boundaries under the JIR `future-poller` pass. It is off by default and in every release profile. The linker requires a compiler-generated coroutine with no source yields or saved suspension state, plain captures without references or destructors, no source-local cleanup, an unused poll context, and only proven typed extern calls. Source callee identities also reject ordinary helpers hidden by MIR inlining. The positional producer/linker manifest is version 4. Custom pollers, awaits, retained borrows, and unsupported cleanup use the established executor.
-
-The selected `host_future_ready` driver preserves the existing poll and drop callbacks and passes a valid no-op waker. It creates a fresh Promise, drives synchronously, reads the ready result before dropping the future, and clears its retained frame before Promise adoption. Poll and drop exceptions retain their identity, with a drop exception taking priority. This removes scheduler flags, queued wake handling, and scheduling closures; it does not remove the Rust poll state machine, Context construction, or callback glue. It adds no Promise job boundary before first progress. Ordinary future construction stays inert until driven.
-
-Selection requires all analyzed ordinary Promise boundaries to be eligible, so a mixed program does not intentionally add a second driver facility. Any final lowering refusal while the ready plan is selected retries the whole program with that plan disabled. Report mode records `would_select` while retaining off-identical JavaScript. Async report schema 8 exposes `ready_boundaries` separately from the unselected suspension graphs. Rows explicitly leave `package_profitability_proven` false: the override is experimental, and complete-package economics and protected runtime remain external admission requirements.
-
-`scripts/promise-ready-test.sh` verifies compiled transition traces, inert construction, thenable adoption, rejection identity, reentrant driving, decline controls, source-call checks after MIR inlining, and injected whole-plan rollback. `scripts/runtime-ready.test.mjs` pins callback/drop exception priority and result access order in both full and extracted runtimes. `scripts/promise-ready-package.mjs <build-directory>` compares the complete minified runtime closure against the same fixture with the option off. `scripts/promise-ready-browser.mjs <build-directory> <output-directory>` runs the compiled fixtures, decline controls, rollback and complete packages in Chrome, Firefox and Safari. These checks do not qualify general suspending continuations, initialized-state cleanup, owner cancellation, or automatic release-policy selection.
-
-### The link step is a separate program, and the lane is its decision (v2)
-
-The dylib no longer links anything itself. It writes object files and execs its sibling binary
-`jsc-link` with a manifest; the graph walk, deduplication, chunking, the source map, the `.d.ts`,
-the report and the optimizer passes all live there. `scripts/build.sh` builds both and prints
-both paths, and `JSC_LINK_BIN` overrides where the dylib looks. `jsc-link/README.md` is the
-specification of the manifest and of the lanes.
-
-Because an object file carries both v1's printed JavaScript and the item's JIR-S body,
-`-Cllvm-args=js-lane=baseline|jir|shadow` chooses which spelling each item is printed from **at
-link time**: it is not emit-affecting, it does not enter the sysroot cache key, and one set of
-objects serves every lane. `baseline` is the default and is byte-identical to v1;
-`jir` prints the JIR lowering wherever it succeeded and v1's text for the rest, beside a
-`<out>.lane.json` sidecar; `shadow` prints both programs from one link so they can be diffed.
-`js-lane=jir` composes with `js-opt=on`: the pair was refused through Phase 2, because v1's text
-optimizer rewrote baseline JavaScript the lane does not print, and Phase 3 lifted the refusal by
-re-landing the rewrites as JIR passes (`jsc-link/src/opt/`). Phase 5 (W5h) then deleted the v1
-text optimizer outright: on the baseline lane `js-opt=on` now means the producer-baked passes plus
-link-dedup, with no link-time text rewriting, and `on` output is byte-identical to `off` plus
-dedup. `-Cllvm-args=js-jir-flat-abi=on|off` (default
-on, link-only) turns the lane's flat direct-call ABI off for bisecting.
-`-Cllvm-args=js-jir-typed-storage=on|off` (default off, also link-only) enables the experimental
-exact/reserved numeric storage path. It has no effect unless the lane is `jir` and the optimizer is
-`on`, and it does not require a distinct sysroot.
-
-The flat ABI covers eligible private direct-call parameters and narrow field-only product
-results. Result lane 0 is returned normally; additional lanes use program-wide collision-safe
-`$rN` spill bindings and must be consumed immediately by the direct caller. Caller and callee
-rewrite transactionally, and any unsupported export, indirect use, suspension, or lowering retry
-restores the canonical materialized ABI. Fixture 91 protects the result path. Interprocedural
-projection forwarding may reuse call arguments only for an immediately adjacent same-block copy;
-fixture 92 protects the mutation boundary.
-
-The typed-storage override does not change the semantic `NativeVec` carrier. For an eligible
-private `Vec<T>::with_capacity`, it allocates the buffer as one `Uint8Array`, `Int8Array`,
-`Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, or `Float64Array` at the
-greater of a constant initial capacity and a proven maximum logical length. The 32-bit target's
-`usize` and `isize` use the corresponding 32-bit arrays. The vector still carries independent
-`len` and logical `cap` fields; TypedArray length is never exposed as Rust capacity.
-
-The proof follows only a unique acyclic `Goto` path and applies integer-capacity casts with exact
-source/target widths and signedness. It permits private push, clear, length, emptiness,
-indexing/mutation, POD drop, and an immutable slice consumed only by a selected scalar
-`buf, off, len` direct-call ABI. A branch or unknown mutation loses the length proof. Dropful,
-zero-sized, unsized, or unsupported elements; custom or unknown allocators; capacity/layout,
-identity, address, or raw-parts observation; retained or mutable views; owned copies;
-remove/extend emission; and unadapted call, host, indirect, vtable, export, store, or return
-boundaries decline the complete value-local choice.
-
-Current schema-15 lane reports publish `constant_initial_capacity`, `proven_maximum_length`,
-`proven_exact_final_length`, `selected`, and an exact terminal reason for every candidate.
-`storage_mode` records whether the executable override was active, while selected rows record what
-actually changed. With the option absent, reporting remains observational and emission is
-unchanged. Fixture 104 and `scripts/storage-plan-test.sh` are the executable contract.
-
-Finished-AST SROA on a JIR-lowered declaration may forward a direct compiler-local alias only when
-the JIR SSA definition dominates it and the source slot is never replaced: an unassigned parameter
-or a local with exactly one whole write. The alias must itself have one source. A field alias keeps
-the narrower rule: its root is a fresh object literal and its final field is never assigned. The
-rewrite redirects reads to the already-evaluated source slot rather than moving the source
-expression, so object identity and mutation remain visible; reassigned sources, replaced-field
-snapshots, shadowed names, and verbatim JavaScript decline.
-
-JIR schema 9 appends one exact standard-iterator identity to `TypeMeta`. `SliceIter` and
-`Enumerate` use existing rustc diagnostic items; `patches/0013-iterator-diagnostic-items.patch`
-marks `Take` and `Skip`. The producer records only those compiler identities. A path, source span,
-debug name, or emitted JavaScript name is never semantic evidence for iterator lowering.
-
-The finished-JIR `slice-iter` pass covers exactly
-`Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>`. The complete construction,
-source/end pointer relation, slice metadata length, direct or fresh mutable-borrow driver, loop SCC,
-backedges, and common exit must match. Adapter values may not escape. Blocks between a loop exit
-and its one parameter-free common exit may only read, project, borrow, cast, or discardably update
-the dead adapter state. Calls, arithmetic, unrelated stores, observed remaining length, other
-element types, and other adapter orders decline the rewrite.
-
-The replacement carries one checked `usize` cursor. `Take` tests both source length and limit;
-`Skip` begins at the limit and subtracts it for the enumerate index. The indexed byte borrow and
-cursor increment remain explicit JIR operations. Existing DCE removes the unreachable adapter
-graph. Before later slice forwarding, a `SliceIteratorCursor` witness independently checks the
-exact adapter, source, length, limit, cursor, guards, enumerate index, borrow, preheader, backedges,
-body, and exit for every selected loop. Complete rewrite SCCs and their preheaders must be pairwise
-disjoint. Failure preserves the original item with `proof.witness`. Lane-report schema 15 publishes
-global and per-item `slice_iter.would_lower` and `slice_iter.final_emitted`; report mode and witness
-fallback always report zero final cursors. Fixture 105 and `scripts/slice-iterator-test.sh` define
-the positive, explicit decline, early-break, and targeted-witness-fault contract.
-
-Lowering may inline a synthetic slot view only while its root is pure. An effectful expression that
-returns a slot is materialized before dereference, store-through, or the first borrow/raw view; this
-preserves Rust's one-evaluation rule. Pure field views stay visible to the alias planner instead of
-being hidden behind a temporary, so later stores still invalidate their reads. The JIR lowering
-tests pin both sides of that rule.
+- **Flat direct-call ABI** (`js-jir-flat-abi=on|off`, default on, link-only): flattens eligible private direct-call parameters and narrow field-only product results. Result lane 0 is returned directly; additional lanes use collision-safe `$rN` spill bindings consumed immediately by the direct caller. Caller and callee rewrite transactionally, rolling back to canonical materialization on unsupported exports, indirect uses, suspension, or lowering retries (fixture 91). Interprocedural projection forwarding reuses call arguments only for an immediately adjacent same-block copy (fixture 92).
+- **Finished-AST SROA**: forwards a direct compiler-local alias only when the JIR SSA definition dominates it and the source slot is never replaced (an unassigned parameter or single-write local), redirecting reads to the already-evaluated source slot so object identity and mutation stay visible. Field aliases require a fresh object literal root whose target field is never reassigned. Reassigned sources, replaced-field snapshots, shadowed names, and raw `js!{}` blocks decline.
+- **Slice-iterator cursor pass (`slice-iter`)**: matches `Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>` using compiler diagnostic items (`patches/0013-iterator-diagnostic-items.patch`), never path strings or emitted names. Eligible non-escaping loops lower to a checked `usize` cursor verified by `SliceIteratorCursor` witness checks before later slice forwarding; witness failure rolls the item back (`proof.witness`). Fixture 105 and `scripts/slice-iterator-test.sh` test positive, decline, early-break, and witness-fault cases.
+- **Slot view purity**: lowering inlines a synthetic slot view only while its root expression is pure. Effectful expressions returning a slot are materialized before dereference, store-through, or borrow to preserve Rust's single-evaluation rule, while pure field views remain visible to alias analysis so later stores invalidate stale reads.
 
 ## Chunks (stage 4)
 
@@ -2293,608 +2041,32 @@ The `view-async` crate drives Rust futures under a captured reactive owner. With
 
 The Promise bridge uses two primitives. `__rt.microtask(f)` is `queueMicrotask`. `__rt.settled(v, f)`
 calls `f(x, true)` when `v` resolves and `f(e, false)` when it rejects, and queues `f(v, true)` for
-a value that is not a thenable at all. Two decisions there: the thenable test is
-`typeof v.then === "function"` and not upstream's `"then" in v` property test (CONTRACT-DOM 14.9),
-because this one refuses to call what is not callable; and a rejection is delivered as a VALUE with
-`ok === false` rather than left as a rejection, because the pinned runtime's error handling is
-entirely synchronous and a rejection reaches none of it (CONTRACT-DOM 14.4).
+non-thenables. The thenable test checks `typeof v.then === "function"`, reads `then` once, and invokes that retrieved callable with the original value as its receiver so getter, call, and synchronous callback exceptions propagate unchanged. Rejections are delivered as values with `ok === false`.
 
-The bridge reads `then` once and invokes that retrieved callable with the original value as its receiver. Getter, call, and synchronous callback exceptions propagate unchanged. Reading a callable's own `call` property is unnecessary and may itself invoke a getter or proxy trap. Non-callable values retain the deferred successful callback.
+`mires_js::await_promise` catches an exception thrown by that subscription call and returns `Poll::Ready(Err(error))` on the first poll, letting the awaiting Rust body run its normal error path and drop initialized locals. A synchronous settlement callback followed by a throw still returns the thrown error, and queued or later callbacks cannot resume a completed driver.
 
-Both `topcoat_js::await_promise` and `view_async::await_promise` catch an exception from that subscription call and return `Poll::Ready(Err(error))` in the first poll. The awaiting Rust body can then follow its normal error path and drop initialized locals. A synchronous settlement callback followed by a throw still returns the thrown error; queued or later callbacks cannot resume a completed driver. Successful subscription keeps the existing later-poll scheduling. This boundary does not catch exceptions from unrelated Rust or host calls or provide Rust unwinding.
+Safe Rust task drivers catch host exceptions around polling while keeping the outer future-slot borrow outside the catch boundary. Terminal state is marked and the future is removed from its slot before drop, so polling, completion, cancellation, or a throwing drop never leaves a frame reachable to a queued wake. A drop exception takes precedence over a poll exception, matching the host driver, and plain tasks propagate the original thrown JS value. `scripts/active-poll-cleanup-test.sh` tests active-call cleanup across first-poll locals, post-resumption locals, partial aggregate construction, moved arguments, and throwing right-hand sides.
 
-`view_abi::try_host` exposes the existing `rcgjs.host.try` operation for a closure returning unit and a typed error. As with `on_settled`, the error type is the caller's claim about the host value. `view_async` uses this boundary without leaving its captured owner. The subscription suite covers host values, strings, numbers, and unit, including deferred first polling, exact microtask order, initialized-local cleanup, rejection identity, and late callbacks after a throw.
+## Host callbacks
 
-Both safe Rust task drivers catch host exceptions around polling while keeping the outer future-slot borrow outside the catch boundary. Terminal state is marked and the future is taken out of its slot before drop. Polling, completion, cancellation and throwing drop cannot leave the frame available to a queued wake. A drop exception takes precedence over a poll exception, matching the optimized host driver. Owner tasks run both polling and drop under the captured owner and propagate through the existing DOM error policy, which preserves Error instances and normalizes other thrown values. Plain tasks propagate the original host value. This is driver cleanup, not general Rust unwinding or reconstruction of locals initialized inside an active poll. The panic policy is unchanged. `scripts/task-cleanup-test.sh` and `scripts/task-cleanup-browser.mjs` compare the compiled drivers, owner cancellation, cleanup order and exception identity; the control mode runs preserved original libraries against the same checks.
-
-`scripts/active-poll-cleanup-test.sh` gates the separate active-call cleanup contract. Its safe Rust fixture covers first-poll locals, locals created after resumption, partial aggregate construction, an owned argument moved into an ordinary callee, and replacement whose right-hand side throws. Both Promise drivers run each case normally and with an injected host exception: 20 rows per build. The JIR lane builds under `js-profile=release-balanced`, so `js-cleanup=on`, in each of off/report/on, and all 60 rows must pass: every initialized local drops in order before the Promise settles, with the original value or the injected exception. off and report must emit byte-identical JavaScript, and each source map must check. The baseline lane has no semantic cleanup lowering, so in every mode the gate requires its compilation to fail with the `requires semantic cleanup lowering` refusal (see `js-cleanup=on` above) and leave no program (the source map may be written before the link refuses). The script retains every result and exits nonzero on any failing row, any baseline program, or any baseline failure other than that refusal. Passing driver cleanup does not satisfy this gate: a suspended future's drop shim cannot recover a local that exists only inside an active Rust invocation.
-
-The owner is captured at `spawn`, before the first poll, and every resume runs inside `_$runWithOwner`. Owner cleanup cancels the task, drops its initialized future state under that same owner, and prevents later wakes from polling it. If cleanup occurs during an active poll, dropping the pinned frame waits until the poll returns. Already-issued native Promise or fetch work continues independently. Completion and repeated cleanup drop the future at most once.
-
-The `rcgjs.host.spawnowner.v2` marker admits this cleanup policy in both compiler lanes. Its optimized driver receives `onCleanup` as a seventh argument. The older `rcgjs.host.spawnowner` marker retains its six-argument driver contract, so linking an older object does not silently change its lifetime policy. `rcgjs.tc.cleanup` registers a closure with the current owner's `onCleanup`; without an owner, it registers nothing.
-
-An island's setup must stay synchronous whatever this does (CONTRACT-DOM 14.6), so the executor is
-only ever reached from an event handler or an effect. That is a constraint the emitter does not
-check and the crate documents; a continuation resuming after the hydration bracket builds fresh DOM
-instead of claiming the server's, and reports nothing in a production build.
-
-## Templates (stage 3)
-
-A `view!` compiled for the client reaches the backend as calls to the marker functions in
-`view-abi`, and the backend replaces them with dom-expressions emission. This is the seam where the
-compiler meets the framework: everything above this section is about lowering Rust, and this is the
-one place the backend knows what a framework is.
-
-The reference the emitted calls are held to is `contract/CONTRACT-DOM.md` and the corpus under
-`contract/fixtures/corpus/`. Both are read only from the backend's side.
-
-### The markers
-
-Each marker is an ordinary Rust function with an unreachable body, recognized by the
-`link_section` it carries. Recognition happens in `abi.rs` **before** `is_foreign_item` and before
-the callee resolves, because nothing else about the call is unusual: it would compile and it would
-abort at run time.
-
-| section | lowering |
-|---|---|
-| `rcgjs.tc.template` | interned `_$template` cloner, the walk, and the record its holes are filled through |
-| `rcgjs.tc.hole` | one hole, written once |
-| `rcgjs.tc.handler` | one hole, whose value is an event handler |
-| `rcgjs.tc.effect` | one hole, driven by a closure |
-| `rcgjs.tc.cond` | `_$memo` over a conditional's test, and an accessor that dispatches on it |
-| `rcgjs.tc.list` | `[]`, the list of rows a `for` renders into |
-| `rcgjs.tc.push` | `list.push(row)` |
-| `rcgjs.tc.signal` | `createSignal(init)` |
-| `rcgjs.tc.sget` | `pair[0]()` |
-| `rcgjs.tc.sset` | `pair[1](value)` |
-| `rcgjs.tc.content` | the value, or `null` for the branch that renders nothing |
-| `rcgjs.tc.component` | `_$createComponent(thunk)`, inserted where a dynamic child would be |
-| `rcgjs.tc.text` | the string a value renders as: a conversion, or its own `Display` |
-| `rcgjs.tc.pushkeyed` | `list.push(__rt.keyed_row(site, key, row))` |
-| `rcgjs.tc.etv` | `event.target.value || ""`, the text of the element an event came from |
-| `rcgjs.tc.epd` | `event.preventDefault()` |
-| `rcgjs.tc.cleanup` | `_$onCleanup(() => body(env))` |
-| `rcgjs.tc.micro` | `__rt.microtask(() => body(env))` |
-| `rcgjs.tc.settled` | `__rt.settled(value, (x, ok) => body(env, x, ok))` |
-| `rcgjs.tc.owner` | `_$getOwner()` |
-| `rcgjs.tc.withowner` | `_$runWithOwner(owner, () => body(env))` |
-| `rcgjs.tc.hostval` | the identity: a host value read as the `V` its caller claims |
-
-The backend reads `abi: u32` first and refuses a payload announcing anything but version 6, by
-name. A payload it cannot read at all is a zombie at the call site naming the field that failed,
-never a panic in the compiler.
-
-**Adding a marker does not bump the version.** The version describes the shape of the payload and of
-the value model, which is what an old backend cannot cope with silently. A marker section it has
-never heard of is already loud: it reports "`rcgjs.tc.<name>` is not a `view-abi` marker this backend
-knows", at the call site, naming the cause. So `etv` and `epd` were additive at version 4, and so
-were the five executor markers; what took the ABI to version 5 is the two new handle TYPES,
-`JsValue` and `Owner`, which are part of the value model rather than of the marker set, and what
-took it to version 6 is the two template construction flags below, which are new payload fields.
-
-An ABI bump does not move the sysroot. `ABI_VERSION` is read in one place, at a marker call site,
-and `core`, `alloc` and `compiler_builtins` contain none: no rlib in the sysroot carries a
-`TemplateData`. What decides whether an existing rlib is still readable is the object file's own
-`FORMAT_VERSION`, which versions the item table, and it is unchanged. `build_sysroot.sh` is more
-conservative than that and rebuilds on any change to the backend dylib, which is a build script
-decision rather than an ABI requirement.
-
-The executor imports `getOwner`, `runWithOwner`, and `onCleanup` from the configured DOM module. The vendored runtime exports these from one reactive graph, together with `createSignal` and the other reactive additions. A custom DOM module must provide the same owner and cleanup contract.
-
-The two event markers take the event **by reference**, unlike the signal markers, which take their
-handle by value (see "The handles are transparent, and taken by value"). The reason the two differ:
-a handler closure's parameter already is a `&Event` -- that is the only way an `Event` is ever
-reached -- and a marker's arguments are read by the backend rather than interpreted by the value
-model, so what arrives is the DOM event the runtime passed the closure. Taking it by value would ask
-the value model to copy a value out of a reference it has no representation for. `Event` therefore
-stays an opaque struct with no handle field.
-
-`|| ""` rather than `?? ""` on the target value: a `&str` return promises a string, and an element
-with no `value` (a `<div>` the event bubbled from) would otherwise hand Rust `undefined`, which
-breaks the moment anything reads its length. The two operators cannot differ here, because they
-disagree only on falsy values that are neither `null` nor `undefined` and `target.value` is always a
-string, whose one falsy value is the empty string this substitutes anyway.
-
-### A component hole
-
-A component invocation is a hole of its own kind, and it is inserted exactly the way a dynamic
-child is: no anchor when it is an element's sole child, before the `<!>` when it has siblings, and
-between the `<!$>`/`<!/>` pair in a hydratable template. `HoleKind::inserts_a_node` is what the walk
-planner and the target locator ask, rather than naming `Child` twice.
-
-What the kind changes is that the value is wrapped in `_$createComponent`:
-
-```js
-_$insert(root, _$createComponent(() => card$fn({ title: name, count: 3 })), anchor);
-```
-
-Three things about that shape are load bearing.
-
-- **`createComponent` is what nests the hydration keys.** It swaps `sharedConfig.context` for a
-  child context, runs the call, and restores the parent's already-advanced counter
-  (CONTRACT-DOM.md 9.5). Routing the call through it is the whole reason the client half needs no
-  key bookkeeping of its own.
-- **One argument, not two.** Upstream's `createComponent(Comp, props)` is
-  `untrack(() => Comp(props || {}))`, so a one-argument call passes `undefined` and the thunk is
-  invoked with `{}`, which it ignores. The props object is not lost: a Topcoat client component is a
-  plain Rust fn taking one props struct, and a struct argument is a JS object keyed by field name,
-  so the object is inside the thunk and the callee destructures it. That is the equivalence family
-  07 is built on, and `contract/fixtures/corpus/deltas.json` predicted this exact shape.
-- **A component reaches the backend through `component`, not `hole`,** for the reason given below
-  for `handler`: `hole<V>` cannot call a `V`, so a component passed through it would arrive with its
-  body, the component function, and everything the component calls all missing from the program.
-
-### Text conversion
-
-`text(v)` is the string a hole's value renders as. The backend sees the monomorphized `T`, so most
-values need no formatting machinery: `str` is already a string, a reference is read through (which
-is what makes `(*title)` unnecessary for a `&&str`), `bool`, the integers and the floats go through
-`String(x)`, and a `char` goes through `String.fromCodePoint` because a `char` is a code point
-NUMBER in the value model and `String(x)` would print the number.
-
-Anything else is `T`'s own `Display`, and that is ordinary Rust rather than an emission: the call
-goes to `view_abi::display_to_str::<T>`, which streams into the host string builder (`sb_*`, see
-"Allocation") and returns the finished string. The marker's body names that function so the
-collector walks into it, and the backend finds it beside the marker rather than by spelling a path.
-`alloc::String` takes this path too: it is a `Vec` of bytes in the value model, not a JS string.
-
-### Keyed rows
-
-`push_keyed(&list, key, row)` appends a row matched to the row of the same key from the previous
-render:
-
-```js
-__tc_rows.push(__rt.keyed_row("<crate>#<n>", <key string>, <row>));
-```
-
-The key is converted exactly as a `text` value is, so a key is compared by the text it renders as.
-`__rt.keyed_row` keeps one `Map` per loop; the site is `<crate name>#<n>` rather than a bare number
-because the counter is per codegen unit, and two loops compiled in different crates would otherwise
-share one cache, which is a wrong-rows bug rather than a slow one.
-
-This is a pragmatic reconcile and not the runtime's `_$mapArray`. A view's `for` is an eager Rust
-loop, so every row is BUILT on every render and the row of a cached key is then discarded in favour
-of the node that key already had. What it buys is node identity: reordering a list moves the
-existing nodes rather than replacing them, so whatever DOM state they carry survives. The cache is
-not pruned, so a key that stops appearing keeps its node alive. Keyed tracking that skips building
-needs the collection handed over as a JavaScript value plus a row function the runtime calls, and a
-Rust iterator is neither.
-
-Two marker shapes exist for reasons that are not about what they emit:
-
-- **`handler` rather than `hole`** for an event handler, because a marker's body is what makes the
-  closure it is handed reachable: the monomorphization collector walks into a closure only through
-  a call, and `hole<V>` cannot call a `V`. `handler`'s bound is `Fn(&Event) -> R`, and its body
-  builds the event and calls the closure. The value is discarded, as a DOM listener's is.
-- **`cond` rather than one closure over the whole conditional**, because a test buried in a closure
-  that also builds the branches cannot be hoisted; see "Memo hoisting" below.
-
-`list`/`push` is how a `for` is lowered, and the design is the one the corpus's own family 13 notes
-call the structural match: the loop stays Rust. Its iterator is a Rust iterator, so nothing the
-backend could synthesize would iterate it; instead the loop runs where it was written, appends each
-row to the list, and the list of DOM nodes is one value `_$insert` takes. That renders a list rather
-than tracking one, and `view_abi::list` says so: a keyed, per-row `_$mapArray` needs the collection
-handed over as a JavaScript value plus a row function the runtime calls, and neither is expressible
-while the iterator is a Rust one.
-
-### Arguments the backend reads instead of lowering
-
-Some marker arguments never appear in the emitted JavaScript: a `template` payload, which is
-decoded at codegen time; a hole index, which is a compile time constant; the `&root` of a hole and
-the `&list` of a `push`, which name something the backend is already holding; and a signal ordinal,
-which is dropped. Nothing is left to consume the MIR that computed them, so `abi.rs`'s
-`consumed_locals` drops it: the local carrying such an argument, and each local behind it, has its
-assignment skipped. Such a borrow also forces no box; see "References and raw pointers".
-
-The rule is narrow on purpose. A local qualifies only when it is assigned once, read once and
-never borrowed, which means its one reader was the argument that was just consumed and its
-assignment has nothing left to feed. The walk follows the moves and borrows an expansion writes and
-stops at anything else, so a body this pass does not fully understand keeps every store it had.
-
-This is what makes the payload `static` disappear. Nothing keys on it and nothing could: it carries
-no attribute, and a structural match on its type would recognize a type rather than a use. What
-removes it is the reachability pass in `link.rs`, which drops any binding no reachable item
-mentions. The one thing that kept it mentioned was the dead store, and the dead store is gone.
-
-### One decoder, two readers
-
-`backend/src/constant/raw.rs` holds the byte level primitives: reading a scalar, decoding a
-`Variants::Multiple` tag (direct and niche), and following the provenance and length behind a
-`&str` or a `&[T]`. Two readers sit on it, and neither has a decoder of its own:
-
-- `constant.rs` turns a constant into a JavaScript expression, which is what a `static` the
-  program keeps needs;
-- `constread.rs` turns the same bytes into a `ConstVal` the **backend** reads, which is what a
-  `static` the backend consumes at codegen time needs.
-
-A second, independent decoder is the failure mode this arrangement exists to prevent: it would
-agree with the first on every case anyone tested and disagree on the one nobody did.
-
-### The walk
-
-A hole's `path` is a run of `c` (`firstChild`) and `n` (`nextSibling`). `Walk::plan` names **every
-prefix of every needed walk** exactly once, which is both what shares work between two holes under
-one element and what CONTRACT-DOM 3.2 describes: only nodes on the path to a dynamic position are
-named at all.
-
-A `Child` hole's walk reaches one of two things and the emitted call differs:
-
-```js
-_$insert(el, value)                  // the value is the element's sole child
-_$insert(parent, value, anchor)      // the value goes before an anchor comment
-```
-
-The two are **indistinguishable from the walk alone**: `c` is both "the first child element" and
-"the first child, which is an anchor", so the template's HTML is parsed and the node the walk
-reaches is looked at. `template.rs`'s `Tree` is that parser: elements, text runs and the three
-comment forms, over the closed grammar the emitter writes rather than over HTML in general. A walk
-that reaches no node is a hole error naming the walk, never a guess.
-
-The element an anchored child inserts into is the walk with its last descent dropped: an anchor is
-a child position, so its walk is its element's walk plus one `c` and a run of `n`.
-
-A hydratable template's walk moves over the **server's** nodes, and there the pair that brackets a
-dynamic child has the rendered value between its two markers while the template says the markers are
-siblings. Two things follow, and both are part of the walk rather than of the hole:
-
-```js
-$t1 = $t0.nextSibling;                     // the `<!$>`
-$t2 = _$getNextMarker($t1.nextSibling);    // the `<!/>`, and the nodes between the two
-$t3 = $t2[0].nextSibling;                  // whatever the template has after the pair
-_$insert(parent, value, $t2[0], $t2[1]);
-```
-
-- **`_$getNextMarker` is handed the node after the `<!$>`**, never the marker itself. It scans
-  forward for the matching `<!/>` counting nested pairs, so handed the opening marker it counts that
-  one and runs off the end: the value's own nodes are not collected and the insert replaces what the
-  server wrote instead of adopting it. One DOM mutation per dynamic text hole is the symptom.
-- **A walk that continues past a pair re-bases on the `<!/>` the call returned.** Counting siblings
-  from the `<!$>` lands inside the rendered value. So the closing marker is named by the call rather
-  than by a `nextSibling`, and everything after it is walked from there.
-
-Both are upstream's shape, node for node
-(`contract/fixtures/upstream/__dom_hydratable_fixtures__/textInterpolation/output.js`); the one
-spelling difference is indexing in place of `[_el$, _co$] =` destructuring, and the same two values
-reach `_$insert` in the same order. Because the call is in the walk, a hole whose pair another walk
-also needs shares one `_$getNextMarker`, exactly as two holes share a prefix.
-
-`examples/dom-tests/18_hydratable` is the fixture, and its `after_two_holes` case is the one that
-needs both rules: two dynamic children under one element with static text between and after them.
-
-### Which sink a hole reaches, and what it is handed
-
-`_$insert` takes a value **or** an accessor and subscribes to the accessor itself, so a reactive
-child hole needs no effect around it and is handed `() => body(env)`. Every other reactive sink is
-written inside an `_$effect` and is handed the call, `body(env)`, because what it writes is the
-value the closure returned rather than the closure. An event sink is handed a function whether or
-not it re-runs, because the sink is what calls it.
-
-`_$classList` and `_$style` diff against what they returned last time, so a reactive one takes the
-effect's previous value as a third argument: `_$effect(_$p => _$style(node, value, _$p))`. That is
-upstream's shape for a lone diffing sink (CONTRACT-DOM 6.2).
-
-### Template construction flags, and the SVG wrapper
-
-`_$template` takes three booleans after the HTML, and the payload carries the two of them a Topcoat
-program can reach: `is_import_node` and `is_svg`. `isMathML` is always false, because the emitter
-knows its own namespaces and has no MathML lowering. The call is emitted with all three arguments
-when either flag is set and with the HTML alone otherwise, which is what the reference compiler
-emits (CONTRACT-DOM 2.4).
-
-`view-dom`'s `Template::finish` decides both:
-
-- **`is_import_node`** when any element in the template has a dashed tag name. The runtime then
-  instantiates with `document.importNode` instead of `cloneNode`, so a custom element upgrades on
-  insertion. The decision is per template, not per element: one dashed descendant flags the whole
-  template.
-- **`is_svg`** when the template's ROOT is an SVG-only element. `<svg>` itself is not one: it is an
-  ordinary HTML element to the fragment parser, so a template rooted at one parses in the right
-  namespace already and takes no flag. The element list is generated by `view-dom/build.rs` from
-  `contract/fixtures/properties.json`'s `SVGElements`, the same extracted table the property and
-  delegated-event classifiers read, so it is upstream's list rather than a copy of it.
-
-**`is_svg` and the `<svg>` wrapper are one decision and must never be made by halves.** Under the
-flag the runtime returns `t.content.firstChild.firstChild`, one level deeper than usual
-(CONTRACT-DOM 2.2), because the template string is wrapped in a literal `<svg>` first. So
-`Template::finish` writes the wrapper into the HTML, and `Template::tree` roots the walk at the
-wrapper's first child to match. Hole paths are untouched: they stay rooted at the element that was
-written, which is the node the runtime hands back.
-
-Emitting the flag without the wrapper, or the wrapper without the flag, **silently yields the wrong
-root node**. Nothing reports it. A walk read one level too high answers `kind_at` with the wrong
-node kind, which turns an anchored child insert into a sole-child one and back, so the emitted call
-is well formed and inserts into the anchor comment at run time.
-`examples/dom-tests/24_svg_wrapper_walk.rs` is the pin: its `root_group` case is a shape whose two
-readings differ, and its golden is what tells them apart.
-
-The wrapper is closed, unlike the trailing tags a template may leave open, because the extra unwrap
-counts on it. That makes it the one template string the reference does not minify all the way
-either, which the L2 harness accounts for with a family-09 rule.
-
-### Interning and declaration order
-
-A cloner is a module level `const` interned on **the HTML text and the two construction flags**,
-never a def path: two crates that build the same template must name one cloner, and a def path is
-spelled relative to whoever printed it (see `naming.rs`). That is what makes the runtime's
-per-cloner memoisation per template rather than per render (CONTRACT-DOM 2.1).
-
-A template with neither flag keys on `tmpl\x01<html>` and a flagged one on
-`tmpl\x01<flags>\x01<html>`, which cannot collide with it because a template's HTML always opens
-with `<`. The flags belong in the key because they are part of the cloner rather than of the text:
-two templates with one HTML text and different flags are two different construction routines, and
-interning them together would give whichever was emitted second the first one's `importNode` or
-unwrap depth.
-
-Interning on the HTML means a cloner's *name* is a hash, and a name is what `link.rs` used to order
-module level bindings by. The reference compiler declares one `_$template` per distinct string in
-first-use order, and a trace numbers templates in declaration order, so the order is observable: a
-permuted set of cloners shows up as a difference on nearly every record.
-
-So a cloner carries a `SourceOrder`, the position of the `view!` that built it, and `link.rs` places
-the bindings that carry one before the rest and in that order. It is the position of the macro call
-rather than of the `static` the expansion generated, which is what "first use" means in the
-reference output. Two more rules make that order the source's rather than an accident:
-
-- **The earliest use wins.** A template several views build is interned by the first *codegenned*
-  use, and codegen order is a symbol-hash order with nothing to do with the source. Every use offers
-  its position (`CguCx::order_at_most`) and the smallest one stays. Only uses in one codegen unit can
-  offer one, which with one unit per crate is every use in the crate.
-- **Two templates of one view tie-break on the index the emitter numbered the payload with.** The
-  span cannot answer this: a proc macro's output all carries the macro call's span, so every payload
-  of one view has the same one. `__TC_TEMPLATE_2` is the third template the view mentions, which is
-  where the reference declares it.
-
-Adding the field and then the tie-breaker bumped the object file's `FORMAT_VERSION` to 3.
-
-Runtime names are `ItemKind::Import` items from the `js-dom-module` specifier (default
-`topcoat-dom`), one item per name, bound as `_$template`, `_$insert`, `_$effect` and so on: the
-`_$` convention upstream's output uses, so a diff against the reference is about code rather than
-spelling. They deduplicate, order and survive dead code elimination through the machinery
-"Modules" already describes.
-
-Because those are imports, **a program using templates must be compiled with
-`-Cllvm-args=js-modules=esm`**. In script output an `import` is a syntax error in the file rather
-than a wrong value, so the instantiation is refused with a zombie saying so instead.
-
-### `delegateEvents`
-
-Emitted with the instantiation, inside the compiled function, so the program keeps having no module
-level side effects. The reference emits one call at the end of the module carrying the union over
-every template; ours is one call per instantiated template that needs one, placed before its holes
-are filled. Both register the same listeners. The event list is deduplicated and sorted by the
-backend rather than trusted from the payload, because a duplicate would register one listener
-twice.
-
-### Reaching a handler's body
-
-The monomorphization collector walks into a closure only through a call, so a closure handed to a
-marker is collected exactly when the marker's body calls it. Every marker that takes one does:
-`cond` calls all three of its closures, `effect` calls its own, and `handler` builds an `Event` and
-calls the handler with it. `Event` is constructible only inside `view-abi`, which is what lets that
-body exist at all.
-
-Function items passed to these markers or to `topcoat-js` callbacks use their signature metadata
-for argument counts. A non-generic function in another crate can have compiled code in its rlib
-without exporting MIR to the caller. That absence does not prevent calling the function. Closure
-environments still use their MIR argument layout. `scripts/function-item-callbacks-test.sh` checks
-external zero-, one-, and two-argument functions, exception identity, generic functions and closures
-in both lanes and all three optimizer modes.
-
-So there is no walk of the backend's own here, and there was one: while a handler reached the
-backend through the fully generic `hole<V>`, which cannot call a `V`, the backend re-walked the
-body the way the collector would. That is gone with the marker that made it necessary. A handler
-calling anything at all used to name a function no crate defined -- 17_signal's golden carried a
-throwing stub for `Sig::set` -- and the marker is what fixed it, not a second collector.
-
-A handler's parameter also has a type now, which is what lets one be written the way the corpus
-writes it. `view-dom` normalizes three forms into `handler`'s `Fn(&Event) -> R`: a closure written
-in place keeps its body and has a bare parameter annotated; a **name** is the function to call and
-is passed through; any **other expression** is the body to run, which is what Topcoat's
-`@click=$(count.set(1))` means, and becomes the body of a closure over the event.
+Function items passed to `mires-js` callbacks use their signature metadata for argument counts, so non-generic functions in other crates can be called without exporting MIR to the caller; closure environments still use their MIR argument layout (`scripts/function-item-callbacks-test.sh`).
 
 ### A thunk built inside a loop snapshots its environment
 
-A closure reaches a marker as a **thunk**: `($a0) => body(env, $a0)` for a handler, `() => body(env)`
-for an accessor, and the bare call `body(env)` where the marker writes inside an effect of its own.
-`env` is the expression the closure's environment lowered to, which for a `move` closure over the
-loop variable is the *binding* of a local.
+A Rust closure passed across a host callback boundary lowers to a thunk such as `($a0) => body(env, $a0)` or `() => body(env)`, where `env` is the lowered closure environment—often a local binding for a `move` closure inside a loop.
 
-Every local is declared once, in the function prelude ("Emitted JS shape"), so a `for` over the rows
-of a grid assigns a fresh environment array to the same binding on every turn. An arrow closing over
-that binding would read whatever the last turn left there, and every row's handler would act on the
-last row. So a thunk whose creation site lies on a control flow cycle takes the environment as the
-parameter of an immediately invoked wrapper:
+Because locals are declared once in the function prelude, each iteration of a loop reassigns that same binding to a fresh environment array. A bare arrow closing over the binding would see whatever the final iteration left behind. Any thunk created inside a control-flow cycle therefore snapshots its environment through an immediately invoked wrapper:
 
 ```js
-$t2.$$click = (($c) => ($a0) => per_row$closure_1($c, $a0))([picked, row]);
+(($c) => ($a0) => per_row$closure_1($c, $a0))([picked, row])
 ```
 
-`$c` is in the `$` namespace the backend reserves for its own names, so it can never shadow a local.
-Outside a cycle the arrow is emitted bare: nothing reassigns the binding, and the wrapper would only
-be noise. The **call** form is never wrapped, because it runs before the loop moves on.
+`$c` lives in the reserved `$` namespace so it cannot shadow user locals. Outside a cycle, the arrow is emitted directly. Cycle membership is computed on the same non-cleanup CFG handed to the structurizer, so it holds uniformly across structured regions and trampoline fallbacks.
 
-"Inside a cycle" is measured on the same graph the structurizer is handed -- the non-cleanup blocks
-and the edges between two of them -- so it means the same thing here as it does in the emitted
-JavaScript. It is not gated on `js-scoped-lets`, and it holds in the dispatch fallback too, where
-every block shares one `switch` scope and the binding is even more obviously shared.
+Two macro-free fixtures test host callback behavior directly:
 
-### The handles are transparent, and taken by value
-
-`Node` and `Sig<T>` are both `#[repr(transparent)]` one-word handles, and the JS value the backend
-keeps in one is a DOM node, a list of them, or the runtime's `[get, set]` pair. Transparency is what
-makes that possible: in the value model an ordinary struct is an object keyed by field name, and a
-value copied out of one is REBUILT field by field, so a handle copied by value would come back as
-`{ handle: undefined }` and reading it would call `undefined`. Transparency makes both the field read
-and the rebuild the identity.
-
-`sig_get`/`sig_set` therefore take `Sig<T>` **by value**, and `Sig::get`/`Sig::set` take `self` by
-value, which is why `Sig<T>` is `Copy`. The alternative fails in the other direction: a `&Sig<T>` is
-a reference to a one-word primitive, so the value model boxes the local as soon as anything takes its
-address and the marker is handed the box rather than the pair. Taking the handle by value removes the
-address-taking, and a copy of a handle correctly names the same signal.
-
-A non-`move` closure still captures a `Copy` handle by reference, so a local a closure reads does
-box, and the read through it is spelled `env[0].buf[env[0].off]` -- the pair is read out of the box
-before the marker sees it, which is correct but costs an indirection. Emitting a view's reactive-hole
-and handler closures as `move` closures would remove it.
-
-### Effect groups
-
-Holes of one `effect_group` collapse into a single `_$effect` carrying a `_p$` previous-value
-record, per CONTRACT-DOM 6.2:
-
-```js
-_$effect(_p$ => {
-  let _v$ = first(env), _v$2 = second(env);
-  _v$ !== _p$.e && (node.disabled = _p$.e = _v$);
-  _v$2 !== _p$.t && _$setAttribute(node, "title", _p$.t = _v$2);
-  return _p$;
-}, { e: undefined, t: undefined });
-```
-
-Every reactive hole still arrives as its own marker call, so the effect cannot be written until
-every write it carries is known: a hole of a shared group is buffered, and the last one of the
-group to arrive emits all of them. `view-dom` groups the reactive binds of one element and puts a
-child hole or an event hole in no group, so a group's holes are consecutive and an expansion fills
-them in order. A group that never completed is a group whose writes were buffered and never
-emitted, which is a miscompilation rather than a missed optimization, so `codegen_body` records a
-zombie naming it.
-
-A group of one stays a plain effect. A record with one key buys nothing, and it is also what
-upstream emits.
-
-Record keys come from upstream's frequency ordered alphabet (CONTRACT-DOM 6.3) and the
-value locals are `_v$`, `_v$2`, and so on. Both are private to one effect, so any unique scheme
-would be correct; matching upstream is what makes the emitted code diffable against the reference.
-Upstream numbers `_v$` across a whole function and this numbers it per effect, which is the one
-spelling difference left in the shape.
-
-A note for CONTRACT-DOM's owners, unchanged from when it was found and repeated because nothing has
-acted on it: **6.3's heading says "base 53" and the alphabet it quotes is 54 characters long.**
-Upstream divides by `chars.length`, so the real base is 54; `record_key` follows the string, and its
-unit tests pin `record_key(53) == "$"` and `record_key(54) == "te"`. `contract/` is read only from
-here, so this is reported rather than corrected.
-
-### Memo hoisting
-
-A conditional's test is hoisted into `_$memo`, so an unchanged test does not rebuild the branch
-(CONTRACT-DOM 6.4):
-
-```js
-$t0 = _$memo(() => test(env));
-_$insert(root, () => $t0() ? then(env) : els(env));
-```
-
-which is the reference compiler's conditional
-(`__dom_fixtures__/conditionalExpressions`) with its immediately invoked wrapper flattened: that
-wrapper exists to make the memo's declaration an expression, and a statement position needs none.
-The reference also writes `!!test`; here the test is a `Fn() -> bool`, so its value is already a
-JavaScript boolean and the coercion has nothing to do.
-
-What makes it possible is that the test arrives as a closure of its own, through `view_abi::cond`.
-Handed one closure over the whole conditional the backend has no test to hoist, only a function that
-computes a branch, and producing the shape above would mean splitting one MIR body into three.
-
-Both spellings of a conditional go through `cond`: a markup-bodied `if`/`else if`, and a Rust `if`
-inside `$(..)` whose branches are values rather than markup. An `else if` chain nests, the outer
-`else` closure's body being another `cond`, which is how the reference nests its own memos too.
-
-Two shapes are deliberately left as one closure, and `view_abi::cond` says why: a `match`, and an
-`if let`. Their tests are patterns rather than booleans and an arm's body reads what the pattern
-bound, so handing the test over separately would mean matching once to choose the arm and again
-inside it to bind, which is a different program from the one that was written. Family 12's remaining
-`memo` delta is exactly this.
-
-### What version 3 of the ABI changed
-
-Three defects the previous milestone found were in `view-abi`, and version 3 is those fixes. All
-three were fixed in the ABI rather than worked around in the backend, and the backend workaround
-each one had is gone.
-
-**1. `Node` is a `repr(transparent)` one-word handle.** It used to be `Node(())`, zero sized, so a
-template root passed as a value was folded to a constant and reached the backend as `undefined`:
-every branch of a markup-bodied `if` or `match` built its template and then contributed nothing, and
-an island entry point returned nothing. Both halves of the declaration are load bearing. Non-zero
-sized, so the value survives; **transparent**, so the handle *is* its field, because an ordinary
-one-field struct is an object keyed by field name here and a value copied out of one is rebuilt field
-by field -- which turned a root passed through a `Node` into `{ handle: undefined }`.
-
-**2. `handler` exists,** so a handler's body is reachable and its parameter has a type. See
-"Reaching a handler's body".
-
-**3. `each` is `list`/`push`,** so a `for` lowers. See "The markers".
-
-### The suite
-
-**In this repository the suite is framework-specific, and skipped.** Every fixture in
-`examples/dom-tests/`, and every one in `examples/keyed-tests/`, is written with `view_dom_macro`, a
-Topcoat framework crate this repository deliberately does not carry (docs/V2-RESTORATION.md).
-Without a `view-dom-macro/` checkout, `scripts/dom-test.sh` and `scripts/dom-matrix-test.sh` print
-`SKIP: framework-specific suite (needs view_dom_macro; see CONTRACT.md)` and exit 3 before building
-anything. `scripts/lane-shadow-test.sh` leaves `dom-tests` out of its default suites; named, it is
-one `SKIP framework` row, which its `N/M agree, K skipped` summary never counts as an agreement.
-`scripts/jir-coverage.sh` records the suite as `skipped-needs-framework`. `scripts/matrix.sh`'s
-`checks` row reports `for-handler-test`, `keyed-compiled-test`, `island-sourcemap-test` and
-`artifact-manifest-test`, which need `view-dom-macro` or `demo-app`, as `SKIP framework` lines,
-neither passed nor failed. The committed `NN.js.expected` and `NN.trace.expected` are frozen
-September 7 data that no gate here re-emits, so `contract/harness/check-l2-status.mjs` measures
-those frozen traces and not this compiler's output. The rest of this section describes the suite
-as it runs with a framework checkout.
-
-**The generic subset.** Two compiler behaviours were pinned only by DOM fixtures. Each now has a
-macro-free fixture, run in `scripts/matrix.sh`'s `checks` row:
-
-- `examples/host_loop_callbacks.rs` (`scripts/host-loop-callbacks-test.sh`) is what
-  `23_for_row_handlers` pinned. Closures created directly in `for` loop bodies, handed to the host
-  and called after the loop, must answer their own turn's captures: by value, through a reference
-  to a `Copy` value, from a nested loop, together with an outer counter they mutate, and a running
-  local the loop reassigns (see "A thunk built inside a loop snapshots its environment"). The
-  release build (`js-profile=release-balanced`, so `js-cleanup=on`, on the JIR lane) keeps
-  `callback0` out of line, so each thunk is created in a call frame of its own. The inlined build
-  (`JSC_RUST_MIR_INLINE=on`, both lanes) puts the marker on the loop itself, and there the check
-  requires the immediately invoked `(($c) => ($a0) => body($c, $a0))(env)` wrapper at every site.
-  On the parsed program, both builds require that no function created on a loop escapes over a
-  binding of the enclosing function. Optimizer off, report and on; off and report byte identical.
-- `examples/host_event_access.rs` (`scripts/host-event-access-test.sh`) is what
-  `21_event_accessors` pinned, together with the listener around it. A `#[js_extern]`
-  `addEventListener` receives a closure that reads `event.target.value` (the empty string when there
-  is no string value) and calls `preventDefault()` once, on the event it was handed. A second
-  listener holds a `Drop` guard across `preventDefault`, which the check makes throw an Error, an
-  object, a symbol, `undefined` and `null`. The guard must drop exactly once, nothing after the call
-  may run, and the caller must receive the thrown value itself. JIR lane under
-  `js-profile=release-balanced`, optimizer off, report and on; off and report byte identical.
-
-`examples/dom-tests/` holds one fixture per corpus family it mirrors, written against
-`dom_view_client_only!` because the reference traces were recorded from the non-hydratable preset.
-Each carries `NN.js.expected` and `NN.trace.expected`, and `NN.family` names the corpus family its
-trace is compared against where one means the same thing.
-
-Two fixtures mirror no family. `16_topcoat_spread` pins an emission shape the corpus writes with a
-type the spike does not build. `18_hydratable` is the only one compiled with `dom_view!`, the mode an
-island's client half uses: it pins the marker-pair walk described above, which is invisible in a
-client-only template, and its `twelve_holes` case pins that nothing emitted depends on how hydration
-keys are *spelled*. The client asks the runtime for them (`_$getNextElement`, `_$getNextMarker`),
-which counts with `sharedConfig` and looks the node up in the registry the server's `data-hk`
-attributes filled, so a change to the server's encoding cannot move a walk.
-
-Compiling one needs two things the `core` suite never does: `view-abi` built by this backend into
-an rlib, and `view-dom-macro` built by plain cargo **for the host**, because a proc macro runs in
-the compiler's own process whatever `--target` says. `compile_core.sh` grew `--extern NAME=PATH`
-and `--crate-type` for both. There is no pre-expansion step: rustc loads the host macro dylib and
-compiles the fixture in one pass, and the output is byte for byte what expanding first produced.
-
-L2 (trace parity, corpus README) is reported per family rather than allowed to fail the suite: a
-difference there is a finding about two emitters and not necessarily a regression in this one.
-`examples/dom-tests/deltas.json` holds the accepted ones and, deliberately, holds only differences
-that are total and mechanical: a template spelling convention, a field the reference's own
-execution fills with a healed free binding. A difference in what is **emitted** is never a rule.
-Those are listed in that file under `$whatIsDeliberatelyNotHere`, per family, so that every line a
-comparison still reports has a written cause: anchor placement (view-dom's, documented in
-`view-dom/src/lib.rs`), Topcoat's write-once `(expr)` against JSX's always-reactive attribute,
-`delegateEvents` placement, a `match`'s missing memo, a reference program written with a component
-Topcoat has no form for (`<Show>`, `<For>`), and the cases a family has that no fixture here can
-write yet. A delta that gets fixed moves to `$measuredAndRetired` with the measurement that pins the
-fix, rather than being deleted.
+- `examples/host_loop_callbacks.rs` (`scripts/host-loop-callbacks-test.sh`) verifies closures created inside loops (including nested loops, outer mutated counters, and reassigned loop locals) both out-of-line and with `JSC_RUST_MIR_INLINE=on`, checking that no loop-created function escapes over an enclosing binding.
+- `examples/host_event_access.rs` (`scripts/host-event-access-test.sh`) verifies a `#[js_extern]` event listener reading `event.target.value` and calling `preventDefault()`, plus `Drop` guard cleanup when `preventDefault()` throws an `Error`, object, symbol, `undefined`, or `null`.
 
 ## Declared JavaScript interfaces (`#[js_extern]`, stage 4)
 
@@ -2925,19 +2097,9 @@ unsafe extern "C" {
 }
 ```
 
-### Nothing foreign survives the expansion, and it must not
+### Nothing foreign survives the expansion
 
-Each declaration becomes a **marker function**: an ordinary Rust `fn` with a body, carrying the
-descriptor in a `link_section`, exactly as `view-abi`'s markers do. The block is written as a
-foreign one because that is the shape the signatures suit, and rustc rejects the attribute on what
-it looks like: *"the `link_section` attribute cannot be used on foreign functions ... this was
-previously accepted by the compiler but is being phased out; it will become a hard error"*. The
-help text names the shape that works, and that is the shape the macro writes.
-
-The call is intercepted in `abi.rs`'s `codegen_call`, in the arm beside the `view-abi` markers and
-ahead of `is_foreign_item`, so the marker body is never reached. Every body is then unreachable
-from anything and dead code elimination removes it, along with the `core::fmt` chain its
-`unreachable!` would otherwise pull in.
+Each declaration becomes a marker function—an ordinary Rust `fn` with a body carrying the descriptor in `link_section`—because rustc rejects `#[link_section]` on `extern` items. Calls are intercepted in `abi.rs` ahead of `is_foreign_item`, so the marker body is unreachable and removed by dead-code elimination (along with any `core::fmt` code its `unreachable!` would pull in).
 
 ### The descriptor
 
@@ -2945,75 +2107,31 @@ from anything and dead code elimination removes it, along with the `core::fmt` c
 rcgjs.ext.<version>.<shape><flags>.<slots>.<module-len>,<name-len>.<module><name>
 ```
 
-for example `rcgjs.ext.3.n-.-.8,5.chart.jsChart`. `<flags>` is a run of letters or `-` for none:
-`n` is a nullable return and `g` is a path rooted at the global scope. `<slots>` is the per-slot
-host contract, `-` where the declaration annotated none: a `,` separated run of `<key><letters>`
-entries in slot order, naming the carriers the host accepts at that slot and how it observes the
-value. Version 2, the same grammar without `<slots>`, is still decoded and annotates nothing. The fields are length prefixed rather than
-delimited because a module specifier holds `.`, `/`, `-`, `@` and `:` and a JavaScript name holds
-`$` and `_`: no character is safely excluded from both, a delimiter would need escaping, and an
-escaping bug is silent. Decoding is total, and the version is the first field read, so a descriptor
-this backend does not understand is a zombie naming the descriptor rather than a guess.
-
-The format lives in one file, `js-extern-macro/src/descriptor.rs`, which the macro compiles and the
-backend includes with `#[path]`. A proc-macro crate can export nothing but proc macros, so sharing
-it any other way would have meant a third crate carrying one file, and two copies of a format is how
-a format drifts.
+For example, `rcgjs.ext.3.n-.-.8,5.chart.jsChart` encodes `new Chart(..)` from `"chart.js"`. `<flags>` is a run of letters or `-` for none (`n` nullable return, `g` global root). `<slots>` encodes per-slot host carrier and observation facts (`-` when unannotated); version 2 (without `<slots>`) is still accepted. Byte lengths avoid delimiter escaping bugs for module specifiers containing `.`, `/`, `-`, `@`, and `:`, and version-first decoding turns unknown descriptors into named zombies. `js-extern-macro/src/descriptor.rs` is compiled by the macro crate and included by the backend via `#[path]` so both sides share one codec.
 
 ### The shapes, and where each is rooted
 
-**Three roots exist and every declaration has exactly one:** the call's first argument, a module's
-imported binding, or the global scope. A module specifier names the second, the `g` flag
-(`#[js(global)]`) names the third, and the absence of both leaves a member shape on its argument.
-A call and a construction have no receiver, so with no module they are already global and need no
-flag. An index is the one shape a module specifier does not move: a collection is reached THROUGH
-something, so `chart.data.datasets[k]` inside a block that names a package is the ordinary
-declaration. The name is a dotted path walked from wherever it is rooted, so one declaration covers
-a walk.
+Every declaration has one of three roots: argument 0, a module import binding, or the global scope (`#[js(global)]`). `call` and `new` have no receiver and default to the global root when no module is given. `index` stays rooted at argument 0 even inside a module block unless `global` is explicitly set. Dotted names walk step by step from the root.
 
-| `#[js(..)]` | rooted at | emitted |
-|---|---|---|
-| `call = "Chart.register"`, module given | the imported `Chart` | `Chart.register(a, ..)` |
-| `call = "f"`, no module | a global | `f(a, ..)` |
-| `new = "Chart"`, module given | the imported `Chart` | `new Chart(a, ..)` |
-| `new = "EventSource"`, no module | a global | `new EventSource(a, ..)` |
+| `#[js(..)]` | Rooted at | Emitted |
+| --- | --- | --- |
+| `call = "Chart.register"`, module given | imported `Chart` | `Chart.register(a, ..)` |
+| `call = "f"`, no module | global | `f(a, ..)` |
+| `new = "Chart"`, module given | imported `Chart` | `new Chart(a, ..)` |
+| `new = "EventSource"`, no module | global | `new EventSource(a, ..)` |
 | `method = "update"` | argument 0 | `a0.update(a1, ..)` |
 | `get = "data.datasets"` | argument 0 | `a0.data.datasets` |
-| `get = "Chart.version"`, module given | the imported `Chart` | `Chart.version` |
-| `global, get = "dash.status"` | a global | `dash.status` |
+| `get = "Chart.version"`, module given | imported `Chart` | `Chart.version` |
+| `global, get = "dash.status"` | global | `dash.status` |
 | `set = "title"` | argument 0 | `a0.title = a1` |
 | `index = "data.datasets"` | argument 0 | `a0.data.datasets[a1]` |
 | `index_set` | argument 0 | `a0[a1] = a2` |
 
-The flag exists because a member shape has an argument to fall back on and a call does not. Without
-it, `#[js(get = "dash.status")]` with no module reads a property of ARGUMENT ZERO -- silently, since
-a declaration taking no arguments gets `undefined.status` and one taking an unrelated argument reads
-a property of that. `global` also CLEARS a block's module rather than sitting beside it, which is
-what lets a browser global be declared inside a block that names a package; `#[js(global, module =
-"x")]` is a spanned error naming both roots.
-
-A call and a method are the same emission: the path's last step is called as a member, so a static
-keeps its receiver. A walk is emitted step by step rather than collapsed, because each step is a
-property read the interface may be doing deliberately.
-
-A declaration that names a module binds it with an `ItemKind::Import`, whose local is keyed on the
-module and the name together: two modules exporting `Chart` bind two locals, and two crates
-importing the same `Chart` bind one, which the linker then collapses. Only the path's FIRST segment
-is imported, because `import { Chart.register }` is not a thing anyone can write.
+`global` clears a block-level `module = "..."`, letting browser globals live inside a module block; combining `#[js(global, module = "x")]` on one item is a compile error. Only the first segment of a dotted path is imported (`import { Chart as ... }`), and imports are interned by `(module, name)`.
 
 ### Arguments pass through
 
-The value model already spells a number as a number, a `&str` as a string and a `#[repr(C)]` struct
-as an object keyed by field name, so a declared interface receives the arguments it was declared
-with and nothing is marshalled. What a shape adds is position: the receiver, the key an index reads
-and the value a setter writes are taken from the front of the argument list, and everything after
-them is passed on in order. **Nothing is padded**: a declaration with fewer parameters produces a
-call with fewer arguments, which a library that branches on `arguments.length` can see.
-
-An opaque JavaScript value is declared on the Rust side as a `#[repr(transparent)]` struct holding
-one machine word, for the two reasons `view_abi::Node` gives: a zero sized value is folded away by
-MIR, and an ordinary one field struct is rebuilt field by field, so a JavaScript object passed
-through one would come back as `{ handle: undefined }`.
+Numbers, `&str`, and `#[repr(C)]` structs already match their JS representations, so arguments pass through unmarshalled after the shape consumes any receiver, index key, or assigned value. Nothing is padded with `undefined`, preserving exact `arguments.length`. Opaque host handles use a `#[repr(transparent)]` one-word struct so MIR does not fold them away as ZSTs and value copies do not rebuild them as plain `{ handle: undefined }` objects.
 
 ### Byte buffers cross by copy
 
@@ -3128,88 +2246,35 @@ pub fn post(url: &str, content_type: &str, body: &str) -> JsValue {
 }
 ```
 
-This is the sibling of `#[js_extern]` and not a replacement for it. A declaration names an interface
-that already exists and is worth naming; a block is for the value that has no name, and the case
-that produced it is above. `fetch(url, init)` takes an options object holding
-`{ method, headers: { "content-type": .. }, body }`, and the value model makes a `#[repr(C)]` struct
-an object keyed by FIELD NAME. `content-type` is not a Rust field name, and no `#[js(rename)]` fixes
-it, because the object is a VALUE rather than a declaration. Before this, `topcoat-dom` declared one
-host function whose whole job was to hold that object.
+This complements `#[js_extern]` for ad-hoc JavaScript expressions such as options objects with non-Rust keys (`"content-type"` in the `fetch` example above) that cannot be expressed cleanly as a `#[repr(C)]` struct field.
 
-### The block is one expression, and it is not validated
+### The block is one expression and is not parsed as JS
 
-`js!{}` produces a JavaScript expression, not a statement list. A `;` outside every bracket, or a
-statement keyword at the outermost depth, is a spanned error; inside a function body written in the
-block they are ordinary statements. What is checked is that, that every bracket balances, that no
-string, template literal, comment or regular expression is left open, and that no name collides with
-an emitted capture slot.
+`js!{}` accepts a single JavaScript expression. Top-level `;` tokens or statement keywords outside nested function bodies are rejected with a spanned compile error, along with unbalanced brackets, unclosed literals/comments, or collisions with generated capture slots.
 
-**The block is NOT checked to be valid JavaScript.** There is no parser in the macro and none in the
-backend, so a malformed block is a syntax error in the browser rather than a spanned error in Rust.
-That is an accepted trade-off, taken deliberately: the alternative measured was `boa_parser`, which
-at this pin drags `boa_ast`, `boa_interner`, `boa_macros` and `icu` data for a question that needs
-no grammar. If a parser is ever vendored into `contract/vendor`, a build step can parse every
-emitted block and report at build time; the analysis below does not change either way.
+The macro and backend do not run a full JavaScript parser, so syntax errors inside a `js!{}` block surface in the JS engine (or final Acorn parse check). That avoids pulling a JS parser dependency tree into the proc macro.
 
-### What is a capture, and what is not
+### Captures and free-variable analysis
 
-Free variable analysis is a LEXER, `js-macro/src/lexer.rs`, with no dependency. It skips the four
-places an identifier is not an identifier -- strings, template literals (which nest through `${}`),
-comments and regular expression literals -- counts bracket depth, and knows the binding forms:
-`let`, `const`, `var`, function parameters, arrow parameters, a function's own name, `catch`, and
-`for` heads. Everything else identifier shaped is a capture, except:
+`js-macro/src/lexer.rs` is a dependency-free lexer that skips strings, nested template literals (`${...}`), comments, and regex literals, tracks bracket depth and binding forms (`let`, `const`, `var`, function/arrow parameters, function names, `catch`, and `for` heads), and treats every other free identifier as a Rust capture except:
 
-| not a capture | example |
-|---|---|
-| a reserved word | `typeof x` |
-| one of four host names | `globalThis`, `undefined`, `NaN`, `Infinity` |
-| a property after `.` or `?.` | `r.text` |
-| an object literal key | `{ method: "POST" }` |
-| a name the block binds, where it binds it | `r => r.text()` |
+| Not a capture | Example |
+| --- | --- |
+| Reserved words | `typeof x` |
+| Four built-in host names | `globalThis`, `undefined`, `NaN`, `Infinity` |
+| Properties after `.` or `?.` | `r.text` |
+| Object literal keys | `{ method: "POST" }` |
+| Locally bound names in scope | `r => r.text()` |
 
-**The failure direction is chosen and it is the loud one.** An identifier the lexer cannot classify
-is reported FREE, becomes a real Rust identifier in the expansion, and is therefore a spanned
-"cannot find value" from rustc rather than a capture that silently went missing.
+Ambiguous identifiers default to being treated as free captures so rustc reports a spanned "cannot find value" error instead of silently dropping a binding. Host globals are referenced through `globalThis` so every host dependency is greppable and free identifiers stay unambiguous.
 
-A name the host supplies is reached through `globalThis`. That is a rule and not a shortcut around a
-builtins list: a list would go stale against whatever the page loaded, and going through
-`globalThis` makes every host name a block depends on greppable, which is what keeps "a free
-identifier is a Rust binding" total.
+- **Object literal shorthand:** `{ body }` counts as a capture and rewrites to `{ body: <slot> }` so the property key stays intact.
+- **Scoped bindings:** bound names apply only within their lexical scope (block body or expression body up to `,`, `;`, or non-ternary `:`).
+- **Regex vs. division:** `/` after a value-ending token (including `}`) lexes as division, biasing mistakes toward loud unbound-identifier errors instead of silently swallowing code up to the next `/`.
 
-**The object literal shorthand is a reference**, so `{ body }` is a capture. It is written out as
-`{ body: <slot> }` rather than replaced in place, because replacing the token would have renamed the
-key.
+### Token blocks vs. raw string blocks
 
-**Scopes, not a set of names.** `r => r.text()` needs `r` bound inside the arrow and free outside
-one, so a bound name is bound over a region. A scope opens at `) =>`, at `ident =>`, and at the `(`
-of a `function`, a `catch` or an object method shorthand; it ends at the close of a block body, or
-for an expression body at the next `,`, `;` or non ternary `:` at the same depth.
-
-**Regular expression against division: the lean is toward division.** JavaScript answers this from
-the parser's state and a lexer has only what came before, so a `/` after something that ENDS A VALUE
-divides and after anything else opens a regular expression. The genuinely ambiguous token is `}`,
-which ends a value when it closed an object literal and does not when it closed a block, and it is
-counted as ending one. Both mistakes are possible and they are not equal: reading a regular
-expression as a division lexes the pattern as code and its identifier shaped pieces come out FREE,
-which errors; reading a division as a regular expression swallows the code up to the next `/`, and
-an identifier inside it disappears without a word.
-
-### The two ways to write a block
-
-A block is ordinarily written as tokens, and the macro reconstructs the JavaScript from them.
-Rust's own lexer runs first, so a backtick never reaches the macro (`error: unknown start of token`)
-and comments are gone by then. A block that needs either is written as a single RAW string literal,
-whose contents are taken verbatim:
-
-```rust
-let greeting: JsValue = js! { r#"`hello ${name}`"# };
-```
-
-A plain `"..."` is an ordinary JavaScript string expression, which is what it looks like, so the two
-forms are unambiguous. The reconstruction keeps ADJACENCY, which `Spacing::Joint` records: two
-punctuation marks written together stay together and two written apart stay apart, so `?.` stays an
-optional chain and `a - -b` does not become a decrement. Nothing else needs a space, because an
-identifier or a literal after punctuation can never lex as part of it.
+Ordinary blocks are written as Rust tokens and reconstructed while preserving `Spacing::Joint` punctuation adjacency (`?.` stays joined; `a - -b` stays separated). Blocks needing backticks or JS comments use a single raw string literal (`js! { r#"`hello ${name}`"# }`), whereas a regular `"..."` string stays a JS string literal.
 
 ### The block descriptor
 
@@ -3217,98 +2282,25 @@ identifier or a literal after punctuation can never lex as part of it.
 rcgjs.js.<version>.<slots>.<text>
 ```
 
-for example `rcgjs.js.1.2.fetch(_$js0,{body:_$js1})`. `<slots>` is how many captures the block takes,
-which is also how many arguments the marker call carries. `<text>` runs to the end of the section and
-so needs no length, because the three fields before it hold no `.`; it is escaped to one line, with
-a backslash spelling `\\`, `\n`, `\r` and `\0` -- the last because rustc refuses NUL in a
-`link_section` outright, and the rest so the section stays greppable in a fixture and readable in an
-error message. The escape is reversed exactly, so nothing about the JavaScript is normalized in
-transit.
+For example: `rcgjs.js.1.2.fetch(_$js0,{body:_$js1})`. `<slots>` is the capture count; `<text>` runs to the end of the section with `\\`, `\n`, `\r`, and `\0` escaped for `link_section` compatibility and reversed verbatim on decode. `js-macro/src/block.rs` is shared between the macro and backend via `#[path]`. Because capture slots are substituted in the macro, diagnostics point to Rust source spans and the backend needs no second lexer.
 
-The prefix distinguishes the three markers this backend intercepts: `rcgjs.tc.` is `view-abi`,
-`rcgjs.ext.` is a `#[js_extern]` declaration, `rcgjs.js.` is a block. Decoding is total and the
-version is the first field read, so a block this backend does not understand is a zombie naming the
-block rather than a guess.
+### Transport and emission
 
-The format lives in one file, `js-macro/src/block.rs`, which the macro compiles and the backend
-includes with `#[path]`, for the reason `js-extern-macro/src/descriptor.rs` does: a proc-macro crate
-can export nothing but proc macros, and two copies of a format is how a format drifts.
-
-**The slots are already substituted when the section is written.** The analysis lives in the macro,
-which is where the spans are and so where an error can be reported; carrying the capture NAMES
-instead would mean a second lexer in the backend to find them again, and two lexers that disagree is
-a miscompile. What the backend receives is text with holes at fixed names.
-
-### The transport and the emission
-
-The macro writes a marker function inside the expression, carrying the descriptor in its
-`link_section`, and calls it with the captures:
-
-```rust
-{
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.js.1.2....")]
-    #[inline(never)]
-    fn __topcoat_js_block<__JsBlock, __JsCapture0, __JsCapture1>(
-        __js_capture0: __JsCapture0,
-        __js_capture1: __JsCapture1,
-    ) -> __JsBlock { ::core::unreachable!(..) }
-    __topcoat_js_block(url, body)
-}
-```
-
-The captures route through real identifiers, which is what makes an undeclared one rustc's error
-rather than the macro's. The marker is generic so that a block takes captures of any type and
-produces a value of whichever type its context infers; `js!{}` in statement position therefore needs
-an annotation (`let _: () = js!{ .. };`), which is the price of not naming a return type.
-
-The call is intercepted in `abi.rs`'s `codegen_call`, in the arm after the `#[js_extern]` one and
-ahead of `is_foreign_item`, for the same reason: the marker is an ordinary Rust function with a body
-and would otherwise resolve. `js_block.rs` decodes the section, lowers each argument with the
-ordinary operand path, and emits an arrow that is called immediately:
+The macro expands to a generic marker function carrying `#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.js....")]` called with the captured Rust expressions (so rustc checks capture names and types; statement-position `js!{}` needs a type annotation such as `let _: () = js!{ .. };`). `abi.rs` intercepts the call before `is_foreign_item` and emits an immediately invoked arrow function:
 
 ```js
 ((_$js0, _$js1) => globalThis.fetch(_$js0, { body: _$js1 }))(url, body)
 ```
 
-An arrow rather than a textual splice of the argument expressions. An argument is an arbitrary
-expression: splicing would evaluate it once per occurrence, in whatever order the block happens to
-name its captures, and would need the backend to print an expression to text and re-parenthesize it.
-Binding is the operation a capture wants and JavaScript already has it. A block with no captures
-needs no arrow and gets none.
+Binding captures through an arrow guarantees each capture expression evaluates once in order without re-parenthesizing arbitrary expressions; zero-capture blocks emit the expression directly without a wrapper.
 
-### What a block costs
+### Minification interaction
 
-The text is `jsast::Expr::Raw`, and `minify.rs`'s local pass refuses to rename anything in an item
-holding one, because it cannot see which names the text mentions. **A function containing a `js!{}`
-block therefore keeps its long local names.** That is a real cost with a known fix -- hoisting a
-block into an item of its own would confine it to that item -- and it is not paid until a block is
-written.
+Raw `js!{}` expressions lower to `jsast::Expr::Raw`. Local minification skips functions containing `Expr::Raw` so it cannot rename identifiers referenced inside opaque JS text. Whole-program item renaming still substitutes exact matches against the item table (`$h`-hashed or `$a`-renamed symbols).
 
-The link time item rename is textual, and its soundness argument named the emitted text as having no
-regular expression literals, no template literals, no single quoted strings and no block comments. A
-block may hold all four. The pass still substitutes only an exact match against the item table, and
-an item name carries a `$h` hash infix or is `$a` from the pass itself, so a block would have to
-spell one to be touched.
+### Tests
 
-### What checks it
-
-`js-macro`'s own unit tests are the lexer's: strings, template literals and their nesting, comments,
-regular expressions against division, parameters and their defaults, declarations and destructuring,
-`for` heads and `catch`, property keys against ternaries and `case` labels, the shorthand, bracket
-nesting, and every refusal.
-
-`examples/emit/21_js_block.rs` is the end to end fixture, with a byte for byte golden over the
-emitted JavaScript and its stdout under node: a block with no captures, numeric captures, the
-unspellable key, a capture named twice, the shorthand, an arrow parameter that is NOT a capture, and
-a template literal through the verbatim form. It is compiled against the real `core` (`.core`) with
-`js-macro` built for the host, which is what `emit-test.sh`'s `NN.macro` companion is for.
-
-`examples/async-tests/06_procedure.rs` is the motivating case, and it is not run here: it needs the
-Topcoat framework's `topcoat_runtime_macro` and `topcoat_dom`, which are not part of this
-repository, so `scripts/async-test.sh` reports it as SKIP. Its checks stay in
-`scripts/async-check.mjs` and run when the fixture is named and built: they install
-`globalThis.fetch`, record the init object the compiled program built, and assert the method, the
-media type under the header name Rust cannot spell, and the argument array.
+`js-macro` unit tests cover lexing, scopes, regex/division disambiguation, shorthand, and rejections. `examples/emit/21_js_block.rs` tests end-to-end compilation and Node execution across zero-capture blocks, numeric captures, quoted object keys, repeated captures, shorthand, arrow parameters, and raw-string template literals.
 
 ## Effect-summary interpretation
 

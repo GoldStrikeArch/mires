@@ -498,12 +498,11 @@ ratio is measured (more code loaded, shared globals such as GopherJS's). `--desi
 browser-workloads' design instead (a port-vs-js cell and an A/A cell, each in its own process or
 page) for comparison.
 
-**These numbers are not a performance claim.** The machine load is not controlled: receipts in this
-tree were recorded while other agents were compiling. The recorded pilot run (24 samples per cell, the
-rotating bench variant on) saw 1-minute load averages of 4.5 to 6.0 on a 10-core machine and A/A
+**These numbers are not a performance claim.** Machine load is not controlled: receipts in this
+tree were recorded while other builds were running. The recorded pilot run (24 samples per cell, with the
+rotating bench variant enabled) saw 1-minute load averages of 4.5 to 6.0 on a 10-core machine and A/A
 ratios of 0.90 to 1.02; an earlier run at a
-load of 10 to 24 gave Firefox A/A ratios from 0.68 to 1.95 ([`tasks/lessons.md`](../../tasks/lessons.md)
-records ±40% A/B swings on identical code above roughly 20), and the independent verification of
+load of 10 to 24 gave Firefox A/A ratios from 0.68 to 1.95 (identical code can swing ±40% above a load average of roughly 20), and an independent verification of
 this harness saw A/A from 0.74 to 1.84 across seeds and designs at loads of 5 to 22. One run's A/A
 range is not a property of the protocol. Read every ratio next to its A/A and load average. Limits, as in
 `browser-workloads`:
