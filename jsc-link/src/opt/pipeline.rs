@@ -31,6 +31,7 @@
 
 use std::sync::OnceLock;
 
+use crate::analysis::arena::ProgramBoundsFacts;
 use crate::jir::decline::{Decline, LowerDecline, OpClass, ProofDecline};
 use crate::jir::repr::Func;
 use crate::jir::TypeTable;
@@ -110,17 +111,35 @@ fn pass_set() -> &'static PassSet {
     })
 }
 
-/// Whether the O group's pass `name` (`inline`, `devirt`, `dce`, `constprop`) is selected by
-/// `RCGJS_JIR_PASSES` — the lane driver's half of the same switch the per-item passes read.
-pub fn o_pass_enabled(name: &str) -> bool {
-    let passes = pass_set();
-    match name {
-        "inline" => passes.inline,
-        "devirt" => passes.devirt,
-        "dce" => passes.dce,
-        "constprop" => passes.constprop,
-        _ => false,
+/// O-group interprocedural pass toggle read from `RCGJS_JIR_PASSES`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OPass {
+    Inline,
+    Devirt,
+    Dce,
+    Constprop,
+}
+
+impl OPass {
+    /// Whether this pass is selected by `RCGJS_JIR_PASSES`.
+    pub fn enabled(self) -> bool {
+        let passes = pass_set();
+        match self {
+            Self::Inline => passes.inline,
+            Self::Devirt => passes.devirt,
+            Self::Dce => passes.dce,
+            Self::Constprop => passes.constprop,
+        }
     }
+}
+
+/// Shared immutable inputs for one per-function optimizer pipeline invocation.
+struct PipelineCx<'a> {
+    table: &'a TypeTable,
+    interns: &'a crate::jir::interns::Interns,
+    opts: &'a Opts,
+    facts: Option<&'a ProgramBoundsFacts>,
+    inject_fault: bool,
 }
 
 /// Runs the lane's optimizer over one function, in place.
@@ -133,6 +152,7 @@ pub fn o_pass_enabled(name: &str) -> bool {
 /// and the rewritten clone is dropped — including when it fails to verify, which is reported as
 /// "would not have applied" rather than declining the item, since a decline would be a
 /// difference `off` does not have.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn optimize(
     func: &mut Func,
     table: &TypeTable,
@@ -140,7 +160,27 @@ pub fn optimize(
     opts: &Opts,
     stats: &mut OptStats,
 ) -> Result<(), Decline> {
-    optimize_with_fault(func, table, interns, opts, stats, true)
+    optimize_with_facts(func, table, interns, opts, None, stats)
+}
+
+/// Runs the lane's optimizer over one function with optional whole-program
+/// [`ProgramBoundsFacts`] for range analysis and witness verification.
+pub fn optimize_with_facts(
+    func: &mut Func,
+    table: &TypeTable,
+    interns: &crate::jir::interns::Interns,
+    opts: &Opts,
+    facts: Option<&ProgramBoundsFacts>,
+    stats: &mut OptStats,
+) -> Result<(), Decline> {
+    let cx = PipelineCx {
+        table,
+        interns,
+        opts,
+        facts,
+        inject_fault: true,
+    };
+    optimize_with_fault(func, &cx, stats)
 }
 
 /// Runs the lane's optimizer without injecting `RCGJS_WITNESS_FAULT`, for planning and sizing
@@ -152,25 +192,29 @@ pub fn optimize_for_probe(
     opts: &Opts,
     stats: &mut OptStats,
 ) -> Result<(), Decline> {
-    optimize_with_fault(func, table, interns, opts, stats, false)
+    let cx = PipelineCx {
+        table,
+        interns,
+        opts,
+        facts: None,
+        inject_fault: false,
+    };
+    optimize_with_fault(func, &cx, stats)
 }
 
 fn optimize_with_fault(
     func: &mut Func,
-    table: &TypeTable,
-    interns: &crate::jir::interns::Interns,
-    opts: &Opts,
+    cx: &PipelineCx<'_>,
     stats: &mut OptStats,
-    inject_fault: bool,
 ) -> Result<(), Decline> {
-    if reports(opts, OptimizerPass::Sroa) || reports(opts, OptimizerPass::AstDce) {
+    if reports(cx.opts, OptimizerPass::Sroa) || reports(cx.opts, OptimizerPass::AstDce) {
         let mut probe = func.clone();
-        if run(&mut probe, table, interns, opts, stats, inject_fault).is_err() {
+        if run(&mut probe, cx, stats).is_err() {
             *stats = OptStats::default();
         }
         return Ok(());
     }
-    run(func, table, interns, opts, stats, inject_fault)
+    run(func, cx, stats)
 }
 
 /// Whether `pass` is one this mode measures without keeping: `js-opt=report`'s whole job.
@@ -179,14 +223,10 @@ fn reports(opts: &Opts, pass: OptimizerPass) -> bool {
 }
 
 /// The passes themselves, over whichever function the caller is willing to have rewritten.
-fn run(
-    func: &mut Func,
-    table: &TypeTable,
-    interns: &crate::jir::interns::Interns,
-    opts: &Opts,
-    stats: &mut OptStats,
-    inject_fault: bool,
-) -> Result<(), Decline> {
+fn run(func: &mut Func, cx: &PipelineCx<'_>, stats: &mut OptStats) -> Result<(), Decline> {
+    let table = cx.table;
+    let interns = cx.interns;
+    let opts = cx.opts;
     let passes = pass_set();
     let mut witnesses: Vec<Witness> = Vec::new();
     let dce_options = dce::Options {
@@ -266,14 +306,7 @@ fn run(
     }
 
     if runs_dce && passes.slice_iter {
-        run_slice_iter(
-            func,
-            table,
-            &dce_options,
-            &mut witnesses,
-            stats,
-            inject_fault,
-        )?;
+        run_slice_iter(func, cx, &dce_options, &mut witnesses, stats)?;
     }
 
     if runs_dce {
@@ -288,9 +321,8 @@ fn run(
     }
 
     if opts.analyzes(OptimizerPass::AstDce) && passes.range {
-        let range = range::with_current_program_facts(|arena_facts| {
-            range::run_with_interns_and_facts(func, table, interns, arena_facts, &mut witnesses)
-        });
+        let range =
+            range::run_with_interns_and_facts(func, table, interns, cx.facts, &mut witnesses);
         if range.changed() {
             stats.range_changed = true;
             stats.asserts_removed += range.asserts_removed;
@@ -301,7 +333,7 @@ fn run(
 
     // The `BoundsRemoved` witnesses name blocks and values of the function as `range` left it,
     // so they are checked before the cleanup below renumbers anything.
-    checked(&mut witnesses, func, table, stats, inject_fault)?;
+    checked(&mut witnesses, func, cx, stats)?;
 
     // The removed asserts leave their comparisons and length reads dead; this cleanup's own
     // witnesses are payload-only and get their own check.
@@ -311,7 +343,7 @@ fn run(
             stats.ast_dce_changed = true;
             verified(func, table, "ast-dce")?;
         }
-        checked(&mut cleanup, func, table, stats, inject_fault)?;
+        checked(&mut cleanup, func, cx, stats)?;
     }
     if runs_pea {
         if super::partial_escape::promote_cell_borrows(func, table) {
@@ -323,7 +355,7 @@ fn run(
                     stats.ast_dce_changed = true;
                     verified(func, table, "ast-dce")?;
                 }
-                checked(&mut cleanup, func, table, stats, inject_fault)?;
+                checked(&mut cleanup, func, cx, stats)?;
             }
         }
         if super::partial_escape::unbox_cells(func, table) {
@@ -338,20 +370,18 @@ fn run(
 /// and cleans up the dead adapter graph.
 fn run_slice_iter(
     func: &mut Func,
-    table: &TypeTable,
+    cx: &PipelineCx<'_>,
     dce_options: &dce::Options,
     witnesses: &mut Vec<Witness>,
     stats: &mut OptStats,
-    inject_fault: bool,
 ) -> Result<(), Decline> {
-    let lowered = super::slice_iter::run(func, table);
+    let lowered = super::slice_iter::run(func, cx.table);
     if lowered.is_empty() {
         return Ok(());
     }
     stats.slice_iterator_loops_would_lower += lowered.len() as u32;
-    if witness::enabled() && inject_fault {
-        if let Some(target) = std::env::var_os("RCGJS_WITNESS_FAULT") {
-            let target = target.to_string_lossy();
+    if witness::enabled() && cx.inject_fault {
+        if let Some(target) = witness::env_witness_fault() {
             if target
                 .split(|c: char| c == ',' || c.is_whitespace())
                 .any(|tok| matches!(tok, "slice-iterator" | "all" | "1"))
@@ -361,10 +391,10 @@ fn run_slice_iter(
             }
         }
     }
-    if dce::run_with(func, table, dce_options, witnesses) {
+    if dce::run_with(func, cx.table, dce_options, witnesses) {
         stats.ast_dce_changed = true;
     }
-    verified(func, table, "slice-iterator-cursor")
+    verified(func, cx.table, "slice-iterator-cursor")
 }
 
 /// Runs the independent witness checks over one batch, when they are enabled, and turns a
@@ -372,22 +402,19 @@ fn run_slice_iter(
 fn checked(
     witnesses: &mut [Witness],
     func: &Func,
-    table: &TypeTable,
+    cx: &PipelineCx<'_>,
     stats: &mut OptStats,
-    inject_fault: bool,
 ) -> Result<(), Decline> {
     stats.witnesses_recorded += witnesses.len() as u32;
     if !witness::enabled() || witnesses.is_empty() {
         return Ok(());
     }
-    if inject_fault {
-        if let Some(target) = std::env::var_os("RCGJS_WITNESS_FAULT") {
-            corrupt(witnesses, target.to_string_lossy().as_ref());
+    if cx.inject_fault {
+        if let Some(target) = witness::env_witness_fault() {
+            corrupt(witnesses, target);
         }
     }
-    let check_res = range::with_current_program_facts(|arena_facts| {
-        witness::check_all_with_context(witnesses, func, table, arena_facts)
-    });
+    let check_res = witness::check_all_with_context(witnesses, func, cx.table, cx.facts);
     if check_res.is_err() {
         stats.witnesses_failed += 1;
         return Err(Decline::Proof(ProofDecline::Witness));
@@ -403,7 +430,9 @@ fn corrupt(witnesses: &mut [Witness], target: &str) {
     for witness in witnesses.iter_mut() {
         match witness {
             Witness::ConstFold { result, .. } => *result = !*result,
-            Witness::BranchFold { taken, .. } => *taken = u32::MAX,
+            Witness::BranchFold { taken, .. } => {
+                *taken = crate::jir::repr::RBlockId(u32::MAX);
+            }
             Witness::BoundsRemoved { fact, .. } => {
                 *fact = super::witness::BoundsFact::Numeric {
                     index_hi: 1,

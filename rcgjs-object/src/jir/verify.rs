@@ -21,15 +21,32 @@ use super::semantic::{
 };
 use super::types::{TypeKind, TypeTable};
 
+/// Structured category of a [`VerifyError`] so callers can match specific failures without
+/// inspecting formatted diagnostic strings.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VerifyErrorKind {
+    /// A JIR-R value was used after being moved on an incoming path.
+    UseAfterMove,
+    /// Any other structural or semantic verification failure.
+    #[default]
+    Other,
+}
+
 /// A verification failure. The message is the v1 validator text where one existed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifyError {
+    pub kind: VerifyErrorKind,
     pub message: String,
 }
 
 impl VerifyError {
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(VerifyErrorKind::Other, message)
+    }
+
+    pub fn with_kind(kind: VerifyErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
     }

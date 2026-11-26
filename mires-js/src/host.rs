@@ -111,7 +111,20 @@ impl HostValue for &str {
 #[derive(Clone, Copy)]
 pub struct JsValue {
     #[allow(dead_code)]
-    handle: u32,
+    handle: crate::HostHandle,
+}
+
+#[cfg(test)]
+impl JsValue {
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self {
+            handle: crate::HostHandle::from_raw(raw),
+        }
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.handle.raw()
+    }
 }
 
 impl sealed::Sealed for JsValue {}
@@ -231,6 +244,8 @@ impl JsValue {
 
     /// Whether the value is an `Error` in the current realm.
     #[must_use]
+    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.iserror")]
+    #[inline(never)]
     pub fn is_error(self) -> bool {
         host_is_error(self)
     }
@@ -241,6 +256,17 @@ impl JsValue {
     #[inline(never)]
     pub fn erase<T: HostValue>(value: T) -> Self {
         host_erase(value)
+    }
+
+    /// Reads this host value as `T`, returning the original value if it does not match `T`.
+    ///
+    /// Unlike [`read`](Self::read), a type mismatch returns `Err(self)` instead of throwing a
+    /// `TypeError`.
+    pub fn try_read<T: HostValue>(self) -> Result<T, Self> {
+        match T::accepts(self) {
+            true => Ok(host_read(self)),
+            false => Err(self),
+        }
     }
 
     /// Reads this host value as `T`.

@@ -13,4 +13,5 @@ pub mod effects;
 pub mod heap;
 pub mod js_alloc;
 pub mod param_use;
+pub(crate) mod reach;
 pub mod refs;

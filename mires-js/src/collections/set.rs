@@ -1,5 +1,6 @@
 //! [`HashSet`], and iterating one.
 
+use core::iter::{ExactSizeIterator, FusedIterator};
 use core::marker::PhantomData;
 
 use super::key::MapKey;
@@ -68,8 +69,12 @@ impl<T: MapKey> HashSet<T> {
     /// Over a snapshot of the keys, with zero per-entry map lookups.
     #[must_use]
     pub fn iter(&self) -> SetIter<'_, T> {
+        // SAFETY: Every key inserted into `self.raw` snapshots as `T::Snapshot`, and the returned
+        // slice is tied to `&self`.
+        #[allow(unsafe_code)]
+        let keys = unsafe { raw::map_keys::<T::Snapshot>(self.raw) };
         SetIter {
-            keys: raw::map_keys::<T::Snapshot>(self.raw),
+            keys,
             index: 0,
             marker: PhantomData,
         }
@@ -115,5 +120,35 @@ impl<'a, T: MapKey> Iterator for SetIter<'a, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let rem = self.keys.len() - self.index;
         (rem, Some(rem))
+    }
+}
+
+impl<T: MapKey> ExactSizeIterator for SetIter<'_, T> {}
+
+impl<T: MapKey> FusedIterator for SetIter<'_, T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_iter_is_exact_size_and_fused() {
+        let keys = [10u32, 20, 30];
+        let mut iter = SetIter::<u32> {
+            keys: &keys,
+            index: 0,
+            marker: PhantomData,
+        };
+        assert_eq!(iter.len(), 3);
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+        assert_eq!(iter.next(), Some(&10));
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next(), Some(&20));
+        assert_eq!(iter.len(), 1);
+        assert_eq!(iter.next(), Some(&30));
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.len(), 0);
     }
 }

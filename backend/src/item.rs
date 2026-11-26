@@ -41,15 +41,6 @@ impl ZombieLog {
     pub(crate) fn take(&self) -> Vec<Zombie> {
         std::mem::take(&mut self.list.borrow_mut())
     }
-
-    /// Moves everything recorded here into another log.
-    ///
-    /// For lowering that builds an item out of several sub-lowerings — a `static` initializer, a
-    /// vtable — where the zombies all belong to the one item that comes out.
-    #[allow(dead_code)]
-    pub(crate) fn drain_into(&self, other: &ZombieLog) {
-        other.list.borrow_mut().extend(self.take());
-    }
 }
 
 /// A span, projected onto the plain numbers [`SpanKey`] carries.

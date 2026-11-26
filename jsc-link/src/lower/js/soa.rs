@@ -18,11 +18,12 @@ use rcgjs_object::jir::interns::StrId;
 use rcgjs_object::jir::repr::{Op, OpKind, Proj, Root, ValueId};
 use rcgjs_object::jir::semantic::{ConstTree, DropGlue, StandardOperation};
 use rcgjs_object::jir::types::{NominalForm, TypeId, TypeKind};
-use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
+use rcgjs_object::jsast::{self, BinOp, CompoundOp, Expr, Stmt};
 use rcgjs_object::ptr::{self, BUF, OFF};
 
 use crate::plan::soa_vec::{SoaLayout, SoaPlan};
 
+use super::ast_util::is_zero_num;
 use super::call::Lowered;
 use super::place::{self, JsPlace};
 use super::ptr::{sequenced, unwrap_offset_cond};
@@ -40,24 +41,6 @@ pub fn encode_bool(val: Expr) -> Expr {
 /// Decodes a `Uint8Array` element (`0` or `1`) back into a JS `boolean`.
 pub fn decode_bool(raw: Expr) -> Expr {
     jsast::binary(BinOp::StrictNe, raw, jsast::num(0))
-}
-
-fn is_simple_atom(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Ident(_)
-            | Expr::Num(_)
-            | Expr::RawNum(_)
-            | Expr::Bool(_)
-            | Expr::Str(_)
-            | Expr::Undefined
-            | Expr::Null
-            | Expr::BigInt(_)
-    )
-}
-
-fn is_zero_expr(e: &Expr) -> bool {
-    matches!(e, Expr::Num(n) if *n == 0.0) || matches!(e, Expr::RawNum(s) if s == "0")
 }
 
 fn peel_seq(expr: Expr) -> (Vec<Expr>, Expr) {
@@ -114,7 +97,7 @@ fn inline_alloc_cols_expr(layout: &SoaLayout, cap: Expr) -> Expr {
 impl<'a> JsCx<'a> {
     /// Returns the SoA layout if `ty` (after peeling) is an SoA element type.
     pub fn soa_layout(&self, ty: TypeId) -> Option<&SoaLayout> {
-        self.soa.as_deref()?.get(self.table, ty)
+        self.soa?.get(self.table, ty)
     }
 
     /// Returns the SoA layout if `vec_ty` is a `Vec<T, Global>` whose element `T` uses SoA.
@@ -141,7 +124,7 @@ impl<'a> JsCx<'a> {
 
     /// Handles top-level `OpKind::Const` of an empty SoA `Vec<T, Global>` or empty `&[T]` slice.
     pub(super) fn soa_const_expr(&self, tree: &ConstTree, ty: TypeId) -> Res<Option<Expr>> {
-        if self.soa.as_deref().is_none_or(SoaPlan::is_empty) {
+        if self.soa.is_none_or(SoaPlan::is_empty) {
             return Ok(None);
         }
         let peeled = self.table.peeled(ty);
@@ -223,13 +206,7 @@ impl<'a> JsCx<'a> {
             stmts.push(bind);
             (ptr::slot_buf(s.clone()), ptr::slot_off(s))
         };
-        let b = if matches!(b_raw, Expr::Ident(_)) {
-            b_raw
-        } else {
-            let (bind, id) = self.temp(b_raw);
-            stmts.push(bind);
-            id
-        };
+        let b = self.bind_temp_if_needed(b_raw, stmts);
         let o = if matches!(o_raw, Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_)) {
             o_raw
         } else {
@@ -306,13 +283,7 @@ impl<'a> JsCx<'a> {
         value: Expr,
     ) -> Res<Vec<Stmt>> {
         let mut stmts = Vec::new();
-        let b = if matches!(buf, Expr::Ident(_)) {
-            buf
-        } else {
-            let (bind, id) = self.temp(buf);
-            stmts.push(bind);
-            id
-        };
+        let b = self.bind_temp_if_needed(buf, &mut stmts);
         let o = if matches!(off, Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_)) {
             off
         } else {
@@ -352,13 +323,7 @@ impl<'a> JsCx<'a> {
                         if !known_keys.contains(k.as_str()) {
                             continue;
                         }
-                        let val = if is_simple_atom(&v) {
-                            v
-                        } else {
-                            let (bind, id) = self.temp(v);
-                            stmts.push(bind);
-                            id
-                        };
+                        let val = self.bind_atom(v, &mut stmts);
                         evaluated.insert(k, val);
                     }
                     for f in &layout.fields {
@@ -388,13 +353,7 @@ impl<'a> JsCx<'a> {
                     };
                     let mut evaluated: Vec<Expr> = Vec::with_capacity(items.len());
                     for item in items {
-                        let val = if is_simple_atom(&item) {
-                            item
-                        } else {
-                            let (bind, id) = self.temp(item);
-                            stmts.push(bind);
-                            id
-                        };
+                        let val = self.bind_atom(item, &mut stmts);
                         evaluated.push(val);
                     }
                     for f in &layout.fields {
@@ -474,7 +433,7 @@ impl<'a> JsCx<'a> {
         count: Expr,
         count_is_one: bool,
     ) -> Vec<Stmt> {
-        if is_zero_expr(&count) {
+        if is_zero_num(&count) {
             let mut out = Vec::new();
             for e in [dst, src, count] {
                 if !jsast::is_droppable(&e) {
@@ -512,7 +471,7 @@ impl<'a> JsCx<'a> {
         _types: &[TypeId],
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
-        if self.soa.as_deref().is_none_or(SoaPlan::is_empty) {
+        if self.soa.is_none_or(SoaPlan::is_empty) {
             return Ok(None);
         }
         let Some(name) = self.interns.str(name_id) else {
@@ -533,7 +492,7 @@ impl<'a> JsCx<'a> {
                 let slice_expr = self.expr_of(*slice_v)?;
                 let idx_expr = self.expr_of(*idx_v)?;
                 let (buf, off) = self.soa_unpack_slot_expr_for_place(slice_expr);
-                let total_off = if is_zero_expr(&off) {
+                let total_off = if is_zero_num(&off) {
                     idx_expr
                 } else {
                     place::offset(off, idx_expr)
@@ -612,7 +571,7 @@ impl<'a> JsCx<'a> {
         is_reverse: bool,
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
-        if self.soa.as_deref().is_none_or(SoaPlan::is_empty) {
+        if self.soa.is_none_or(SoaPlan::is_empty) {
             return Ok(None);
         }
         let table = self.table;
@@ -668,14 +627,8 @@ impl<'a> JsCx<'a> {
                     )
                 }
             };
-            let b = if matches!(buf_raw, Expr::Ident(_)) {
-                buf_raw
-            } else {
-                let (bb, id) = self.temp(buf_raw);
-                setup.push(bb);
-                id
-            };
-            let off_is_zero = is_zero_expr(&off_raw);
+            let b = self.bind_temp_if_needed(buf_raw, &mut setup);
+            let off_is_zero = is_zero_num(&off_raw);
             let (bl, l) = self.temp(off_raw);
             setup.push(bl);
             let r_init = if off_is_zero {
@@ -700,12 +653,12 @@ impl<'a> JsCx<'a> {
                 body.push(jsast::assign_stmt(cr, tmp.clone()));
             }
             body.push(jsast::expr_stmt(jsast::compound_assign(
-                BinOp::Add,
+                CompoundOp::Add,
                 l.clone(),
                 jsast::num(1),
             )));
             body.push(jsast::expr_stmt(jsast::compound_assign(
-                BinOp::Sub,
+                CompoundOp::Sub,
                 r.clone(),
                 jsast::num(1),
             )));
@@ -770,12 +723,12 @@ impl<'a> JsCx<'a> {
             body.push(jsast::assign_stmt(br_elem, tmp.clone()));
         }
         body.push(jsast::expr_stmt(jsast::compound_assign(
-            BinOp::Add,
+            CompoundOp::Add,
             l.clone(),
             jsast::num(1),
         )));
         body.push(jsast::expr_stmt(jsast::compound_assign(
-            BinOp::Sub,
+            CompoundOp::Sub,
             r,
             jsast::num(1),
         )));
@@ -798,23 +751,8 @@ impl<'a> JsCx<'a> {
         };
 
         let mut setup = Vec::new();
-        let bind_atom = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
-            if is_simple_atom(&expr) {
-                expr
-            } else {
-                let (bind, id) = self.temp(expr);
-                setup.push(bind);
-                id
-            }
-        };
-        let v = if matches!(self.expr_of(*v_v)?, Expr::Ident(_)) {
-            self.expr_of(*v_v)?
-        } else {
-            let (bind, id) = self.temp(self.expr_of(*v_v)?);
-            setup.push(bind);
-            id
-        };
-        let nl = bind_atom(self.expr_of(*new_len_v)?, &mut setup);
+        let v = self.bind_temp_if_needed(self.expr_of(*v_v)?, &mut setup);
+        let nl = self.bind_atom(self.expr_of(*new_len_v)?, &mut setup);
         let val_expr = self.expr_of(*val_v)?;
 
         // Extract field fill values before mutating `v` (peeking through struct/tuple literals).
@@ -842,7 +780,7 @@ impl<'a> JsCx<'a> {
                     let mut map: HashMap<String, Expr> = HashMap::new();
                     for (k, ev) in entries {
                         if known.contains(k.as_str()) {
-                            map.insert(k, bind_atom(ev, &mut setup));
+                            map.insert(k, self.bind_atom(ev, &mut setup));
                         }
                     }
                     for f in &layout.fields {
@@ -861,7 +799,7 @@ impl<'a> JsCx<'a> {
             if items.len() == layout.total_fields {
                 let mut evaluated = Vec::with_capacity(items.len());
                 for item in items {
-                    evaluated.push(bind_atom(item.clone(), &mut setup));
+                    evaluated.push(self.bind_atom(item.clone(), &mut setup));
                 }
                 for f in &layout.fields {
                     let raw = evaluated[f.field_idx as usize].clone();
@@ -875,13 +813,7 @@ impl<'a> JsCx<'a> {
             }
         }
         if !peeked {
-            let val_id = if matches!(val_expr, Expr::Ident(_)) {
-                val_expr
-            } else {
-                let (bind, id) = self.temp(val_expr);
-                setup.push(bind);
-                id
-            };
+            let val_id = self.bind_temp_if_needed(val_expr, &mut setup);
             for f in &layout.fields {
                 let raw = if layout.is_tuple {
                     jsast::index(val_id.clone(), jsast::num(f.field_idx as f64))
@@ -947,74 +879,71 @@ impl<'a> JsCx<'a> {
         operation: StandardOperation,
         args: &[ValueId],
     ) -> Res<Option<Lowered>> {
-        if self.soa.as_deref().is_none_or(SoaPlan::is_empty) {
+        if self.soa.is_none_or(SoaPlan::is_empty) {
             return Ok(None);
         }
-        let table = self.table;
-        let vec_ty = match operation {
-            StandardOperation::NativeVecNew
-            | StandardOperation::NativeVecWithCapacity
-            | StandardOperation::NativeVecFromElemZeroed
-            | StandardOperation::NativeVecFromArray
-            | StandardOperation::NativeVecFromRawParts => {
-                let Some(res) = op.result else {
-                    return Ok(None);
-                };
-                self.ty_of(res)?
-            }
-            StandardOperation::NativeVecIntoBoxedSlice => {
-                let Some(&v0) = args.first() else {
-                    return Ok(None);
-                };
-                self.ty_of(v0)?
-            }
-            _ => {
-                let Some(&v0) = args.first() else {
-                    return Ok(None);
-                };
-                let arg_ty = self.ty_of(v0)?;
-                let Some(pt) = value::pointee_of(table, arg_ty) else {
-                    return Ok(None);
-                };
-                pt
-            }
+        let Some(vec_ty) = super::call::resolve_vec_call_target(self, op, operation, args)? else {
+            return Ok(None);
         };
         let Some(layout) = self.soa_vec_layout(vec_ty) else {
             return Ok(None);
         };
+        match operation {
+            StandardOperation::NativeVecNew
+            | StandardOperation::NativeVecWithCapacity
+            | StandardOperation::NativeVecFromElemZeroed
+            | StandardOperation::NativeVecFromArray => {
+                self.lower_soa_vec_construct(layout, operation, args)
+            }
+            StandardOperation::NativeVecCapacity
+            | StandardOperation::NativeVecAsPtr
+            | StandardOperation::NativeVecAsMutPtr
+            | StandardOperation::NativeVecAsSlice
+            | StandardOperation::NativeVecAsMutSlice
+            | StandardOperation::VecAsSlice => {
+                self.lower_soa_vec_index_slice(layout, operation, args)
+            }
+            StandardOperation::NativeVecReserve
+            | StandardOperation::NativeVecReserveExact
+            | StandardOperation::NativeVecTryReserve
+            | StandardOperation::NativeVecTryReserveExact
+            | StandardOperation::NativeVecShrinkTo
+            | StandardOperation::NativeVecTryShrinkTo
+            | StandardOperation::NativeVecGrowOne => {
+                self.lower_soa_vec_grow_reserve(layout, operation, args)
+            }
+            StandardOperation::NativeVecPush
+            | StandardOperation::NativeVecPushMut
+            | StandardOperation::NativeVecPop => {
+                self.lower_soa_vec_push_pop(op, layout, operation, args)
+            }
+            _ => Err(decline(
+                OpClass::Call,
+                format!("unsupported NativeVec operation `{operation:?}` on SoA Vec"),
+            )),
+        }
+    }
 
-        let const_u128 = |v: ValueId| -> Option<u128> {
-            match self.def_of(v).map(|d| &d.kind) {
-                Some(OpKind::Const(ConstTree::Scalar { bits, .. })) => Some(*bits),
-                _ => None,
-            }
-        };
-        let bind_if_needed = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
-            if matches!(expr, Expr::Ident(_)) {
-                expr
-            } else {
-                let (bind, id) = self.temp(expr);
-                setup.push(bind);
-                id
-            }
-        };
-        let bind_atom = |expr: Expr, setup: &mut Vec<Stmt>| -> Expr {
-            if is_simple_atom(&expr) {
-                expr
-            } else {
-                let (bind, id) = self.temp(expr);
-                setup.push(bind);
-                id
-            }
-        };
+    fn soa_const_u128(&self, v: ValueId) -> Option<u128> {
+        match self.def_of(v).map(|d| &d.kind) {
+            Some(OpKind::Const(ConstTree::Scalar { bits, .. })) => Some(*bits),
+            _ => None,
+        }
+    }
 
+    fn lower_soa_vec_construct(
+        &self,
+        layout: &SoaLayout,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
         match operation {
             StandardOperation::NativeVecNew => Ok(Some(Lowered::value(empty_vec_expr(layout)))),
             StandardOperation::NativeVecWithCapacity => {
                 let [cap_v] = args else {
                     return Ok(None);
                 };
-                if let Some(c) = const_u128(*cap_v) {
+                if let Some(c) = self.soa_const_u128(*cap_v) {
                     if c == 0 {
                         return Ok(Some(Lowered::value(empty_vec_expr(layout))));
                     }
@@ -1038,7 +967,7 @@ impl<'a> JsCx<'a> {
                 let [n_v] = args else {
                     return Ok(None);
                 };
-                if let Some(c) = const_u128(*n_v) {
+                if let Some(c) = self.soa_const_u128(*n_v) {
                     if c == 0 {
                         return Ok(Some(Lowered::value(empty_vec_expr(layout))));
                     }
@@ -1063,53 +992,69 @@ impl<'a> JsCx<'a> {
                     vec![n],
                 ))))
             }
-            StandardOperation::NativeVecFromArray => {
-                let [arr_v] = args else {
-                    return Ok(None);
-                };
-                let arr_ty = self.ty_of(*arr_v)?;
-                let Some(TypeKind::Array { length, .. }) =
-                    table.get(table.peeled(arr_ty)).map(|d| &d.kind)
-                else {
-                    return Ok(None);
-                };
-                let len = *length;
-                let arr_expr = self.expr_of(*arr_v)?;
-                if len == 0 {
-                    let mut setup = Vec::new();
-                    if !jsast::is_droppable(&arr_expr) {
-                        setup.push(jsast::expr_stmt(arr_expr));
-                    }
-                    return Ok(Some(Lowered::Value(setup, empty_vec_expr(layout))));
+            StandardOperation::NativeVecFromArray => self.lower_soa_vec_from_array(layout, args),
+            _ => unreachable!("matched in lower_soa_vec_call"),
+        }
+    }
+
+    fn lower_soa_vec_from_array(
+        &self,
+        layout: &SoaLayout,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let [arr_v] = args else {
+            return Ok(None);
+        };
+        let arr_ty = self.ty_of(*arr_v)?;
+        let Some(TypeKind::Array { length, .. }) =
+            self.table.get(self.table.peeled(arr_ty)).map(|d| &d.kind)
+        else {
+            return Ok(None);
+        };
+        let len = *length;
+        let arr_expr = self.expr_of(*arr_v)?;
+        if len == 0 {
+            let mut setup = Vec::new();
+            if !jsast::is_droppable(&arr_expr) {
+                setup.push(jsast::expr_stmt(arr_expr));
+            }
+            return Ok(Some(Lowered::Value(setup, empty_vec_expr(layout))));
+        }
+        let mut setup = Vec::new();
+        let alloc_expr = if layout.fields.len() <= 4 {
+            inline_alloc_cols_expr(layout, jsast::num(len as f64))
+        } else {
+            jsast::call(
+                jsast::id(layout.alloc_name.as_str()),
+                vec![jsast::num(len as f64)],
+            )
+        };
+        let (bb, b) = self.temp(alloc_expr);
+        setup.push(bb);
+        match arr_expr {
+            Expr::Array(items) if items.len() == len as usize => {
+                for (i, item) in items.into_iter().enumerate() {
+                    setup.extend(self.soa_write_elem(
+                        layout,
+                        b.clone(),
+                        jsast::num(i as f64),
+                        item,
+                    )?);
                 }
-                let mut setup = Vec::new();
-                let alloc_expr = if layout.fields.len() <= 4 {
-                    inline_alloc_cols_expr(layout, jsast::num(len as f64))
-                } else {
-                    jsast::call(
-                        jsast::id(layout.alloc_name.as_str()),
-                        vec![jsast::num(len as f64)],
-                    )
-                };
-                let (bb, b) = self.temp(alloc_expr);
-                setup.push(bb);
-                if let Expr::Array(items) = arr_expr {
-                    if items.len() == len as usize {
-                        for (i, item) in items.into_iter().enumerate() {
-                            setup.extend(self.soa_write_elem(
-                                layout,
-                                b.clone(),
-                                jsast::num(i as f64),
-                                item,
-                            )?);
-                        }
-                        return Ok(Some(Lowered::Value(
-                            setup,
-                            jsast::object_of(vec![("buf", b), ("len", jsast::num(len as f64))]),
-                        )));
+            }
+            other => {
+                let is_mismatched_lit = matches!(other, Expr::Array(_));
+                let arr_id = self.bind_temp_if_needed(other, &mut setup);
+                if !is_mismatched_lit && len <= 4 {
+                    for i in 0..len {
+                        setup.extend(self.soa_write_elem(
+                            layout,
+                            b.clone(),
+                            jsast::num(i as f64),
+                            jsast::index(arr_id.clone(), jsast::num(i as f64)),
+                        )?);
                     }
-                    // Fallback if array literal length differs unexpectedly.
-                    let arr_id = bind_if_needed(Expr::Array(items), &mut setup);
+                } else {
                     let (bi, i) = self.temp(jsast::num(0));
                     setup.push(bi);
                     let mut body = self.soa_write_elem(
@@ -1119,7 +1064,7 @@ impl<'a> JsCx<'a> {
                         jsast::index(arr_id, i.clone()),
                     )?;
                     body.push(jsast::expr_stmt(jsast::compound_assign(
-                        BinOp::Add,
+                        CompoundOp::Add,
                         i.clone(),
                         jsast::num(1),
                     )));
@@ -1127,46 +1072,26 @@ impl<'a> JsCx<'a> {
                         jsast::binary(BinOp::Lt, i, jsast::num(len as f64)),
                         body,
                     ));
-                } else {
-                    let arr_id = bind_if_needed(arr_expr, &mut setup);
-                    if len <= 4 {
-                        for i in 0..len {
-                            setup.extend(self.soa_write_elem(
-                                layout,
-                                b.clone(),
-                                jsast::num(i as f64),
-                                jsast::index(arr_id.clone(), jsast::num(i as f64)),
-                            )?);
-                        }
-                    } else {
-                        let (bi, i) = self.temp(jsast::num(0));
-                        setup.push(bi);
-                        let mut body = self.soa_write_elem(
-                            layout,
-                            b.clone(),
-                            i.clone(),
-                            jsast::index(arr_id, i.clone()),
-                        )?;
-                        body.push(jsast::expr_stmt(jsast::compound_assign(
-                            BinOp::Add,
-                            i.clone(),
-                            jsast::num(1),
-                        )));
-                        setup.push(jsast::while_(
-                            jsast::binary(BinOp::Lt, i, jsast::num(len as f64)),
-                            body,
-                        ));
-                    }
                 }
-                Ok(Some(Lowered::Value(
-                    setup,
-                    jsast::object_of(vec![("buf", b), ("len", jsast::num(len as f64))]),
-                )))
             }
+        }
+        Ok(Some(Lowered::Value(
+            setup,
+            jsast::object_of(vec![("buf", b), ("len", jsast::num(len as f64))]),
+        )))
+    }
+
+    fn lower_soa_vec_index_slice(
+        &self,
+        _layout: &SoaLayout,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let [v_v] = args else {
+            return Ok(None);
+        };
+        match operation {
             StandardOperation::NativeVecCapacity => {
-                let [v_v] = args else {
-                    return Ok(None);
-                };
                 let v = self.expr_of(*v_v)?;
                 Ok(Some(Lowered::value(jsast::member(
                     jsast::member(jsast::member(v, "buf"), "f0"),
@@ -1174,9 +1099,6 @@ impl<'a> JsCx<'a> {
                 ))))
             }
             StandardOperation::NativeVecAsPtr | StandardOperation::NativeVecAsMutPtr => {
-                let [v_v] = args else {
-                    return Ok(None);
-                };
                 let v = self.expr_of(*v_v)?;
                 Ok(Some(Lowered::value(ptr::slot(
                     jsast::member(v, "buf"),
@@ -1186,11 +1108,8 @@ impl<'a> JsCx<'a> {
             StandardOperation::NativeVecAsSlice
             | StandardOperation::NativeVecAsMutSlice
             | StandardOperation::VecAsSlice => {
-                let [v_v] = args else {
-                    return Ok(None);
-                };
                 let mut setup = Vec::new();
-                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let v = self.bind_temp_if_needed(self.expr_of(*v_v)?, &mut setup);
                 let slice = ptr::fat_slice(
                     jsast::member(v.clone(), "buf"),
                     jsast::num(0),
@@ -1198,15 +1117,26 @@ impl<'a> JsCx<'a> {
                 );
                 Ok(Some(Lowered::Value(setup, slice)))
             }
+            _ => unreachable!("matched in lower_soa_vec_call"),
+        }
+    }
+
+    fn lower_soa_vec_grow_reserve(
+        &self,
+        layout: &SoaLayout,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        match operation {
             StandardOperation::NativeVecReserve | StandardOperation::NativeVecReserveExact => {
                 let [v_v, used_v, add_v] = args else {
                     return Ok(None);
                 };
                 let exact = operation == StandardOperation::NativeVecReserveExact;
                 let mut setup = Vec::new();
-                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
-                let used = bind_atom(self.expr_of(*used_v)?, &mut setup);
-                let add = bind_atom(self.expr_of(*add_v)?, &mut setup);
+                let v = self.bind_temp_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let used = self.bind_atom(self.expr_of(*used_v)?, &mut setup);
+                let add = self.bind_atom(self.expr_of(*add_v)?, &mut setup);
                 setup.push(jsast::if_(
                     jsast::binary(
                         BinOp::Gt,
@@ -1264,13 +1194,25 @@ impl<'a> JsCx<'a> {
                     vec![v],
                 ))])))
             }
+            _ => unreachable!("matched in lower_soa_vec_call"),
+        }
+    }
+
+    fn lower_soa_vec_push_pop(
+        &self,
+        op: &Op,
+        layout: &SoaLayout,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        match operation {
             StandardOperation::NativeVecPush | StandardOperation::NativeVecPushMut => {
                 let [v_v, val_v] = args else {
                     return Ok(None);
                 };
                 let is_mut = operation == StandardOperation::NativeVecPushMut;
                 let mut setup = Vec::new();
-                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
+                let v = self.bind_temp_if_needed(self.expr_of(*v_v)?, &mut setup);
                 let val_expr = self.expr_of(*val_v)?;
                 let (bl, l) = self.temp(jsast::member(v.clone(), "len"));
                 setup.push(bl);
@@ -1297,82 +1239,85 @@ impl<'a> JsCx<'a> {
                 }
                 Ok(Some(Lowered::Value(setup, ptr::slot(b, l))))
             }
-            StandardOperation::NativeVecPop => {
-                let [v_v] = args else {
-                    return Ok(None);
-                };
-                let Some(res) = op.result else {
-                    return Ok(None);
-                };
-                let ret_ty = self.ty_of(res)?;
-                let peeled_ret = table.peeled(ret_ty);
-                let Some(TypeKind::Adt {
-                    form: NominalForm::Enum,
-                    variants,
-                    ..
-                }) = table.get(peeled_ret).map(|d| &d.kind)
-                else {
-                    return Ok(None);
-                };
-                let mut none_idx = None;
-                let mut some_info = None;
-                for (i, var) in variants.iter().enumerate() {
-                    if var.fields.is_empty() {
-                        none_idx = Some(i as u32);
-                    } else if var.fields.len() == 1 {
-                        some_info = Some((i as u32, var.fields[0].key));
-                    }
-                }
-                let (Some(none_idx), Some((some_idx, some_key))) = (none_idx, some_info) else {
-                    return Ok(None);
-                };
-                let Some(none_expr) =
-                    value::enum_value(table, self.interns, ret_ty, none_idx, Vec::new())
-                else {
-                    return Ok(None);
-                };
-
-                let mut setup = Vec::new();
-                let v = bind_if_needed(self.expr_of(*v_v)?, &mut setup);
-                let (_, res_id) = self.temp(jsast::undefined());
-
-                let mut some_body = Vec::new();
-                let (bl, l) = self.temp(jsast::binary(
-                    BinOp::UShr,
-                    jsast::binary(BinOp::Sub, jsast::member(v.clone(), "len"), jsast::num(1)),
-                    jsast::num(0),
-                ));
-                some_body.push(bl);
-                some_body.push(jsast::assign_stmt(
-                    jsast::member(v.clone(), "len"),
-                    l.clone(),
-                ));
-                let (bb, b) = self.temp(jsast::member(v.clone(), "buf"));
-                some_body.push(bb);
-                let elem_expr = self.soa_read_elem(layout, b, l);
-                let some_fields = match value::key_name(self.interns, some_key) {
-                    Some(k) => vec![(k, elem_expr)],
-                    None => Vec::new(),
-                };
-                let Some(some_expr) =
-                    value::enum_value(table, self.interns, ret_ty, some_idx, some_fields)
-                else {
-                    return Ok(None);
-                };
-                some_body.push(jsast::assign_stmt(res_id.clone(), some_expr));
-
-                setup.push(jsast::if_else(
-                    jsast::binary(BinOp::StrictEq, jsast::member(v, "len"), jsast::num(0)),
-                    vec![jsast::assign_stmt(res_id.clone(), none_expr)],
-                    some_body,
-                ));
-                Ok(Some(Lowered::Value(setup, res_id)))
-            }
-            _ => Err(decline(
-                OpClass::Call,
-                format!("unsupported NativeVec operation `{operation:?}` on SoA Vec"),
-            )),
+            StandardOperation::NativeVecPop => self.lower_soa_vec_pop(op, layout, args),
+            _ => unreachable!("matched in lower_soa_vec_call"),
         }
+    }
+
+    fn lower_soa_vec_pop(
+        &self,
+        op: &Op,
+        layout: &SoaLayout,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let [v_v] = args else {
+            return Ok(None);
+        };
+        let Some(res) = op.result else {
+            return Ok(None);
+        };
+        let table = self.table;
+        let ret_ty = self.ty_of(res)?;
+        let peeled_ret = table.peeled(ret_ty);
+        let Some(TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            ..
+        }) = table.get(peeled_ret).map(|d| &d.kind)
+        else {
+            return Ok(None);
+        };
+        let mut none_idx = None;
+        let mut some_info = None;
+        for (i, var) in variants.iter().enumerate() {
+            if var.fields.is_empty() {
+                none_idx = Some(i as u32);
+            } else if var.fields.len() == 1 {
+                some_info = Some((i as u32, var.fields[0].key));
+            }
+        }
+        let (Some(none_idx), Some((some_idx, some_key))) = (none_idx, some_info) else {
+            return Ok(None);
+        };
+        let Some(none_expr) = value::enum_value(table, self.interns, ret_ty, none_idx, Vec::new())
+        else {
+            return Ok(None);
+        };
+
+        let mut setup = Vec::new();
+        let v = self.bind_temp_if_needed(self.expr_of(*v_v)?, &mut setup);
+        let (_, res_id) = self.temp(jsast::undefined());
+
+        let mut some_body = Vec::new();
+        let (bl, l) = self.temp(jsast::binary(
+            BinOp::UShr,
+            jsast::binary(BinOp::Sub, jsast::member(v.clone(), "len"), jsast::num(1)),
+            jsast::num(0),
+        ));
+        some_body.push(bl);
+        some_body.push(jsast::assign_stmt(
+            jsast::member(v.clone(), "len"),
+            l.clone(),
+        ));
+        let (bb, b) = self.temp(jsast::member(v.clone(), "buf"));
+        some_body.push(bb);
+        let elem_expr = self.soa_read_elem(layout, b, l);
+        let some_fields = match value::key_name(self.interns, some_key) {
+            Some(k) => vec![(k, elem_expr)],
+            None => Vec::new(),
+        };
+        let Some(some_expr) = value::enum_value(table, self.interns, ret_ty, some_idx, some_fields)
+        else {
+            return Ok(None);
+        };
+        some_body.push(jsast::assign_stmt(res_id.clone(), some_expr));
+
+        setup.push(jsast::if_else(
+            jsast::binary(BinOp::StrictEq, jsast::member(v, "len"), jsast::num(0)),
+            vec![jsast::assign_stmt(res_id.clone(), none_expr)],
+            some_body,
+        ));
+        Ok(Some(Lowered::Value(setup, res_id)))
     }
 
     /// Attempts to scalarize a non-inline `BorrowView` / `RawView` landing on an SoA element
@@ -1384,7 +1329,7 @@ impl<'a> JsCx<'a> {
         op: &Op,
         result: ValueId,
     ) -> Res<Option<Vec<Stmt>>> {
-        if self.soa.as_deref().is_none_or(SoaPlan::is_empty) {
+        if self.soa.is_none_or(SoaPlan::is_empty) {
             return Ok(None);
         }
         let (OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. }) = &op.kind
@@ -1537,7 +1482,58 @@ pub fn needed_helper_items(
     if plan.is_empty() {
         return Vec::new();
     }
-    let make = |name: &JsName, kind: ItemKind, refs: Vec<JsName>, js: String| LinkItem {
+    let mut out = Vec::new();
+    for layout in plan.layouts.values() {
+        let needed = SoaNeededHelpers::for_layout(layout, referenced);
+        emit_soa_alloc_helpers(layout, &needed, existing, &mut out);
+        emit_soa_capacity_helpers(layout, &needed, existing, &mut out);
+        emit_soa_copy_helper(layout, &needed, existing, &mut out);
+    }
+    out
+}
+
+struct SoaNeededHelpers {
+    empty: bool,
+    alloc: bool,
+    zeroed: bool,
+    grow: bool,
+    reserve: bool,
+    try_reserve: bool,
+    shrink: bool,
+    copy: bool,
+}
+
+impl SoaNeededHelpers {
+    fn for_layout(layout: &SoaLayout, referenced: &BTreeSet<JsName>) -> Self {
+        let mut empty = referenced.contains(&layout.empty_name);
+        let mut alloc = referenced.contains(&layout.alloc_name);
+        let zeroed = referenced.contains(&layout.zeroed_name);
+        let grow = referenced.contains(&layout.grow_name);
+        let reserve = referenced.contains(&layout.reserve_name);
+        let try_reserve = referenced.contains(&layout.try_reserve_name);
+        let shrink = referenced.contains(&layout.shrink_name);
+        let copy = referenced.contains(&layout.copy_name);
+        if zeroed || grow || reserve || try_reserve {
+            alloc = true;
+        }
+        if alloc || zeroed || shrink {
+            empty = true;
+        }
+        Self {
+            empty,
+            alloc,
+            zeroed,
+            grow,
+            reserve,
+            try_reserve,
+            shrink,
+            copy,
+        }
+    }
+}
+
+fn synth_soa_helper(name: &JsName, kind: ItemKind, refs: Vec<JsName>, js: String) -> LinkItem {
+    LinkItem {
         js,
         name: name.clone(),
         kind,
@@ -1552,255 +1548,259 @@ pub fn needed_helper_items(
         optimization: Default::default(),
         allocator_provider: Default::default(),
         jir: Default::default(),
-    };
-
-    let mut out = Vec::new();
-    for layout in plan.layouts.values() {
-        let mut need_empty = referenced.contains(&layout.empty_name);
-        let mut need_alloc = referenced.contains(&layout.alloc_name);
-        let need_zeroed = referenced.contains(&layout.zeroed_name);
-        let need_grow = referenced.contains(&layout.grow_name);
-        let need_reserve = referenced.contains(&layout.reserve_name);
-        let need_try_reserve = referenced.contains(&layout.try_reserve_name);
-        let need_shrink = referenced.contains(&layout.shrink_name);
-        let need_copy = referenced.contains(&layout.copy_name);
-
-        if need_zeroed || need_grow || need_reserve || need_try_reserve {
-            need_alloc = true;
-        }
-        if need_alloc || need_zeroed || need_shrink {
-            need_empty = true;
-        }
-
-        if need_empty && !existing.contains(&layout.empty_name) {
-            let mut cols = String::new();
-            for (idx, f) in layout.fields.iter().enumerate() {
-                if idx > 0 {
-                    cols.push_str(", ");
-                }
-                let _ = write!(cols, "{}: new {}(0)", f.col_name, f.scalar.ta_ctor());
-            }
-            out.push(make(
-                &layout.empty_name,
-                ItemKind::Const,
-                Vec::new(),
-                format!("\nconst {} = {{ {cols} }};\n", layout.empty_name.as_str()),
-            ));
-        }
-
-        if need_alloc && !existing.contains(&layout.alloc_name) {
-            let mut cols = String::new();
-            for (idx, f) in layout.fields.iter().enumerate() {
-                if idx > 0 {
-                    cols.push_str(", ");
-                }
-                let _ = write!(cols, "{}: new {}(n)", f.col_name, f.scalar.ta_ctor());
-            }
-            out.push(make(
-                &layout.alloc_name,
-                ItemKind::Fn,
-                vec![layout.empty_name.clone()],
-                format!(
-                    "\nfunction {}(n) {{\n  \
-                     if (n === 0) return {};\n  \
-                     if (n > {}) __rt.js_abort(\"capacity overflow\");\n  \
-                     return {{ {cols} }};\n\
-                     }}\n",
-                    layout.alloc_name.as_str(),
-                    layout.empty_name.as_str(),
-                    layout.max_elems,
-                ),
-            ));
-        }
-
-        if need_zeroed && !existing.contains(&layout.zeroed_name) {
-            out.push(make(
-                &layout.zeroed_name,
-                ItemKind::Fn,
-                vec![layout.empty_name.clone(), layout.alloc_name.clone()],
-                format!(
-                    "\nfunction {}(n) {{\n  \
-                     return n === 0 ? {{ buf: {}, len: 0 }} : {{ buf: {}(n), len: n }};\n\
-                     }}\n",
-                    layout.zeroed_name.as_str(),
-                    layout.empty_name.as_str(),
-                    layout.alloc_name.as_str(),
-                ),
-            ));
-        }
-
-        if need_grow && !existing.contains(&layout.grow_name) {
-            let mut sets = String::new();
-            for f in &layout.fields {
-                let _ = writeln!(sets, "    nb.{c}.set(old.{c});", c = f.col_name);
-            }
-            out.push(make(
-                &layout.grow_name,
-                ItemKind::Fn,
-                vec![layout.alloc_name.clone()],
-                format!(
-                    "\nfunction {}(v) {{\n  \
-                     const old = v.buf;\n  \
-                     const cap = old.f0.length;\n  \
-                     let next = cap === 0 ? {} : cap * 2;\n  \
-                     if (next > {}) {{\n    \
-                       if (cap >= {}) __rt.js_abort(\"capacity overflow\");\n    \
-                       next = {};\n  \
-                     }}\n  \
-                     const nb = {}(next);\n  \
-                     if (cap > 0) {{\n\
-                     {sets}  \
-                     }}\n  \
-                     v.buf = nb;\n  \
-                     return nb;\n\
-                     }}\n",
-                    layout.grow_name.as_str(),
-                    layout.min_cap,
-                    layout.max_elems,
-                    layout.max_elems,
-                    layout.max_elems,
-                    layout.alloc_name.as_str(),
-                ),
-            ));
-        }
-
-        if need_reserve && !existing.contains(&layout.reserve_name) {
-            let mut sets = String::new();
-            for f in &layout.fields {
-                let _ = writeln!(
-                    sets,
-                    "    nb.{c}.set(used === cap ? old.{c} : old.{c}.subarray(0, used));",
-                    c = f.col_name
-                );
-            }
-            out.push(make(
-                &layout.reserve_name,
-                ItemKind::Fn,
-                vec![layout.alloc_name.clone()],
-                format!(
-                    "\nfunction {}(v, used, add, exact) {{\n  \
-                     const req = used + add;\n  \
-                     if (req > {}) __rt.js_abort(\"capacity overflow\");\n  \
-                     const old = v.buf;\n  \
-                     const cap = old.f0.length;\n  \
-                     if (req <= cap) return;\n  \
-                     let next = exact ? req : Math.max(cap * 2, req, {});\n  \
-                     if (next > {}) next = {};\n  \
-                     const nb = {}(next);\n  \
-                     if (used > 0) {{\n\
-                     {sets}  \
-                     }}\n  \
-                     v.buf = nb;\n\
-                     }}\n",
-                    layout.reserve_name.as_str(),
-                    layout.max_elems,
-                    layout.min_cap,
-                    layout.max_elems,
-                    layout.max_elems,
-                    layout.alloc_name.as_str(),
-                ),
-            ));
-        }
-
-        if need_try_reserve && !existing.contains(&layout.try_reserve_name) {
-            let mut sets = String::new();
-            for f in &layout.fields {
-                let _ = writeln!(
-                    sets,
-                    "    nb.{c}.set(used === cap ? old.{c} : old.{c}.subarray(0, used));",
-                    c = f.col_name
-                );
-            }
-            out.push(make(
-                &layout.try_reserve_name,
-                ItemKind::Fn,
-                vec![layout.alloc_name.clone()],
-                format!(
-                    "\nfunction {}(v, used, add, exact) {{\n  \
-                     const req = used + add;\n  \
-                     if (req > {}) return false;\n  \
-                     const old = v.buf;\n  \
-                     const cap = old.f0.length;\n  \
-                     if (req <= cap) return true;\n  \
-                     let next = exact ? req : Math.max(cap * 2, req, {});\n  \
-                     if (next > {}) next = {};\n  \
-                     const nb = {}(next);\n  \
-                     if (used > 0) {{\n\
-                     {sets}  \
-                     }}\n  \
-                     v.buf = nb;\n  \
-                     return true;\n\
-                     }}\n",
-                    layout.try_reserve_name.as_str(),
-                    layout.max_elems,
-                    layout.min_cap,
-                    layout.max_elems,
-                    layout.max_elems,
-                    layout.alloc_name.as_str(),
-                ),
-            ));
-        }
-
-        if need_shrink && !existing.contains(&layout.shrink_name) {
-            let mut slices = String::new();
-            for (idx, f) in layout.fields.iter().enumerate() {
-                if idx > 0 {
-                    slices.push_str(", ");
-                }
-                let _ = write!(slices, "{c}: old.{c}.slice(0, target)", c = f.col_name);
-            }
-            out.push(make(
-                &layout.shrink_name,
-                ItemKind::Fn,
-                vec![layout.empty_name.clone()],
-                format!(
-                    "\nfunction {}(v, target) {{\n  \
-                     const old = v.buf;\n  \
-                     if (target >= old.f0.length) return;\n  \
-                     if (target === 0) {{ v.buf = {}; return; }}\n  \
-                     v.buf = {{ {slices} }};\n\
-                     }}\n",
-                    layout.shrink_name.as_str(),
-                    layout.empty_name.as_str(),
-                ),
-            ));
-        }
-
-        if need_copy && !existing.contains(&layout.copy_name) {
-            let mut same_buf = String::new();
-            let mut diff_buf = String::new();
-            for f in &layout.fields {
-                let _ = writeln!(
-                    same_buf,
-                    "    db.{c}.copyWithin(doff, soff, end);",
-                    c = f.col_name
-                );
-                let _ = writeln!(
-                    diff_buf,
-                    "    db.{c}.set(sb.{c}.subarray(soff, end), doff);",
-                    c = f.col_name
-                );
-            }
-            out.push(make(
-                &layout.copy_name,
-                ItemKind::Fn,
-                Vec::new(),
-                format!(
-                    "\nfunction {}(dst, src, count) {{\n  \
-                     if (count <= 0) return;\n  \
-                     const db = dst.buf, doff = dst.off, sb = src.buf, soff = src.off;\n  \
-                     const end = soff + count;\n  \
-                     if (db === sb) {{\n    \
-                       if (doff === soff) return;\n\
-                     {same_buf}  \
-                     }} else {{\n\
-                     {diff_buf}  \
-                     }}\n\
-                     }}\n",
-                    layout.copy_name.as_str(),
-                ),
-            ));
-        }
     }
-    out
+}
+
+fn format_col_allocs(layout: &SoaLayout, size_arg: &str) -> String {
+    let mut cols = String::new();
+    for (idx, f) in layout.fields.iter().enumerate() {
+        if idx > 0 {
+            cols.push_str(", ");
+        }
+        let _ = write!(
+            cols,
+            "{}: new {}({size_arg})",
+            f.col_name,
+            f.scalar.ta_ctor()
+        );
+    }
+    cols
+}
+
+fn format_reserve_sets(layout: &SoaLayout) -> String {
+    let mut sets = String::new();
+    for f in &layout.fields {
+        let _ = writeln!(
+            sets,
+            "    nb.{c}.set(used === cap ? old.{c} : old.{c}.subarray(0, used));",
+            c = f.col_name
+        );
+    }
+    sets
+}
+
+fn emit_soa_alloc_helpers(
+    layout: &SoaLayout,
+    needed: &SoaNeededHelpers,
+    existing: &BTreeSet<JsName>,
+    out: &mut Vec<LinkItem>,
+) {
+    if needed.empty && !existing.contains(&layout.empty_name) {
+        let cols = format_col_allocs(layout, "0");
+        out.push(synth_soa_helper(
+            &layout.empty_name,
+            ItemKind::Const,
+            Vec::new(),
+            format!("\nconst {} = {{ {cols} }};\n", layout.empty_name.as_str()),
+        ));
+    }
+
+    if needed.alloc && !existing.contains(&layout.alloc_name) {
+        let cols = format_col_allocs(layout, "n");
+        out.push(synth_soa_helper(
+            &layout.alloc_name,
+            ItemKind::Fn,
+            vec![layout.empty_name.clone()],
+            format!(
+                "\nfunction {}(n) {{\n  \
+                 if (n === 0) return {};\n  \
+                 if (n > {}) __rt.js_abort(\"capacity overflow\");\n  \
+                 return {{ {cols} }};\n\
+                 }}\n",
+                layout.alloc_name.as_str(),
+                layout.empty_name.as_str(),
+                layout.max_elems,
+            ),
+        ));
+    }
+
+    if needed.zeroed && !existing.contains(&layout.zeroed_name) {
+        out.push(synth_soa_helper(
+            &layout.zeroed_name,
+            ItemKind::Fn,
+            vec![layout.empty_name.clone(), layout.alloc_name.clone()],
+            format!(
+                "\nfunction {}(n) {{\n  \
+                 return n === 0 ? {{ buf: {}, len: 0 }} : {{ buf: {}(n), len: n }};\n\
+                 }}\n",
+                layout.zeroed_name.as_str(),
+                layout.empty_name.as_str(),
+                layout.alloc_name.as_str(),
+            ),
+        ));
+    }
+}
+
+fn emit_soa_capacity_helpers(
+    layout: &SoaLayout,
+    needed: &SoaNeededHelpers,
+    existing: &BTreeSet<JsName>,
+    out: &mut Vec<LinkItem>,
+) {
+    if needed.grow && !existing.contains(&layout.grow_name) {
+        let mut sets = String::new();
+        for f in &layout.fields {
+            let _ = writeln!(sets, "    nb.{c}.set(old.{c});", c = f.col_name);
+        }
+        out.push(synth_soa_helper(
+            &layout.grow_name,
+            ItemKind::Fn,
+            vec![layout.alloc_name.clone()],
+            format!(
+                "\nfunction {}(v) {{\n  \
+                 const old = v.buf;\n  \
+                 const cap = old.f0.length;\n  \
+                 let next = cap === 0 ? {} : cap * 2;\n  \
+                 if (next > {}) {{\n    \
+                   if (cap >= {}) __rt.js_abort(\"capacity overflow\");\n    \
+                   next = {};\n  \
+                 }}\n  \
+                 const nb = {}(next);\n  \
+                 if (cap > 0) {{\n\
+                 {sets}  \
+                 }}\n  \
+                 v.buf = nb;\n  \
+                 return nb;\n\
+                 }}\n",
+                layout.grow_name.as_str(),
+                layout.min_cap,
+                layout.max_elems,
+                layout.max_elems,
+                layout.max_elems,
+                layout.alloc_name.as_str(),
+            ),
+        ));
+    }
+
+    if needed.reserve && !existing.contains(&layout.reserve_name) {
+        let sets = format_reserve_sets(layout);
+        out.push(synth_soa_helper(
+            &layout.reserve_name,
+            ItemKind::Fn,
+            vec![layout.alloc_name.clone()],
+            format!(
+                "\nfunction {}(v, used, add, exact) {{\n  \
+                 const req = used + add;\n  \
+                 if (req > {}) __rt.js_abort(\"capacity overflow\");\n  \
+                 const old = v.buf;\n  \
+                 const cap = old.f0.length;\n  \
+                 if (req <= cap) return;\n  \
+                 let next = exact ? req : Math.max(cap * 2, req, {});\n  \
+                 if (next > {}) next = {};\n  \
+                 const nb = {}(next);\n  \
+                 if (used > 0) {{\n\
+                 {sets}  \
+                 }}\n  \
+                 v.buf = nb;\n\
+                 }}\n",
+                layout.reserve_name.as_str(),
+                layout.max_elems,
+                layout.min_cap,
+                layout.max_elems,
+                layout.max_elems,
+                layout.alloc_name.as_str(),
+            ),
+        ));
+    }
+
+    if needed.try_reserve && !existing.contains(&layout.try_reserve_name) {
+        let sets = format_reserve_sets(layout);
+        out.push(synth_soa_helper(
+            &layout.try_reserve_name,
+            ItemKind::Fn,
+            vec![layout.alloc_name.clone()],
+            format!(
+                "\nfunction {}(v, used, add, exact) {{\n  \
+                 const req = used + add;\n  \
+                 if (req > {}) return false;\n  \
+                 const old = v.buf;\n  \
+                 const cap = old.f0.length;\n  \
+                 if (req <= cap) return true;\n  \
+                 let next = exact ? req : Math.max(cap * 2, req, {});\n  \
+                 if (next > {}) next = {};\n  \
+                 const nb = {}(next);\n  \
+                 if (used > 0) {{\n\
+                 {sets}  \
+                 }}\n  \
+                 v.buf = nb;\n  \
+                 return true;\n\
+                 }}\n",
+                layout.try_reserve_name.as_str(),
+                layout.max_elems,
+                layout.min_cap,
+                layout.max_elems,
+                layout.max_elems,
+                layout.alloc_name.as_str(),
+            ),
+        ));
+    }
+
+    if needed.shrink && !existing.contains(&layout.shrink_name) {
+        let mut slices = String::new();
+        for (idx, f) in layout.fields.iter().enumerate() {
+            if idx > 0 {
+                slices.push_str(", ");
+            }
+            let _ = write!(slices, "{c}: old.{c}.slice(0, target)", c = f.col_name);
+        }
+        out.push(synth_soa_helper(
+            &layout.shrink_name,
+            ItemKind::Fn,
+            vec![layout.empty_name.clone()],
+            format!(
+                "\nfunction {}(v, target) {{\n  \
+                 const old = v.buf;\n  \
+                 if (target >= old.f0.length) return;\n  \
+                 if (target === 0) {{ v.buf = {}; return; }}\n  \
+                 v.buf = {{ {slices} }};\n\
+                 }}\n",
+                layout.shrink_name.as_str(),
+                layout.empty_name.as_str(),
+            ),
+        ));
+    }
+}
+
+fn emit_soa_copy_helper(
+    layout: &SoaLayout,
+    needed: &SoaNeededHelpers,
+    existing: &BTreeSet<JsName>,
+    out: &mut Vec<LinkItem>,
+) {
+    if !needed.copy || existing.contains(&layout.copy_name) {
+        return;
+    }
+    let mut same_buf = String::new();
+    let mut diff_buf = String::new();
+    for f in &layout.fields {
+        let _ = writeln!(
+            same_buf,
+            "    db.{c}.copyWithin(doff, soff, end);",
+            c = f.col_name
+        );
+        let _ = writeln!(
+            diff_buf,
+            "    db.{c}.set(sb.{c}.subarray(soff, end), doff);",
+            c = f.col_name
+        );
+    }
+    out.push(synth_soa_helper(
+        &layout.copy_name,
+        ItemKind::Fn,
+        Vec::new(),
+        format!(
+            "\nfunction {}(dst, src, count) {{\n  \
+             if (count <= 0) return;\n  \
+             const db = dst.buf, doff = dst.off, sb = src.buf, soff = src.off;\n  \
+             const end = soff + count;\n  \
+             if (db === sb) {{\n    \
+               if (doff === soff) return;\n\
+             {same_buf}  \
+             }} else {{\n\
+             {diff_buf}  \
+             }}\n\
+             }}\n",
+            layout.copy_name.as_str(),
+        ),
+    ));
 }

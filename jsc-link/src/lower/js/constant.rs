@@ -53,7 +53,7 @@ impl<'a> JsCx<'a> {
     /// `const` the producer hoisted holds the UTF-16 text, which is the same string only when the
     /// text is ASCII, so a non-ASCII literal is spelled inline.
     pub fn string_literal(&self, text: &str) -> Expr {
-        let bytes = crate::lower::bstr::enabled();
+        let bytes = self.bstr_enabled();
         if text.len() >= HOIST_STRING_BYTES {
             let name = hoisted_name("s", text);
             if self.summary.deps.iter().any(|dep| dep == &name) {
@@ -856,7 +856,7 @@ impl<'a> JsCx<'a> {
         // `Location::file` is a Rust `str`: under `js-str=bytes`, a `NonNull<str>` `loc$h..` is
         // rewritten to `__rt.bstr_bytes(...)` in `lane.rs`, whereas a plain `&str` `loc$h..`
         // (`mini_core`) holds UTF-16 text and only matches when ASCII.
-        let bytes = crate::lower::bstr::enabled();
+        let bytes = self.bstr_enabled();
         let (file_key, file_is_mut_str, line_key, col_key) = self.location_field_keys()?;
         if (!bytes || file_is_mut_str || file.is_ascii())
             && self.summary.deps.iter().any(|dep| dep == &hoisted)

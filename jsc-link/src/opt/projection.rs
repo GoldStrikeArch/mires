@@ -12,11 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::item::JsName;
 use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
-use crate::jir::repr::{Carrier, Func, Op, OpKind, ValueDef, ValueId};
+use crate::jir::repr::{Carrier, Func, Op, OpKind, RBlockId, ValueId};
 use crate::jir::semantic::{CallSemantic, Callee, TypeId};
 use crate::lower::fuse::{op_purity, Purity};
 
 use super::candidates;
+use super::cfg::{Cfg, DefUse};
+use super::tx::{try_rewrite_func, TxOutcome};
 
 /// What the pass changed and proved.
 #[derive(Clone, Debug, Default)]
@@ -59,20 +61,27 @@ pub fn run(
         let Some(Ok(func)) = funcs.get(&name) else {
             continue;
         };
-        let mut rewritten = func.clone();
-        let fields = expand_copies(&mut rewritten, table, &contracts);
-        if fields == 0 {
-            continue;
+        match try_rewrite_func(
+            func,
+            &table.types,
+            |rewritten| {
+                let fields = expand_copies(rewritten, table, &contracts);
+                (fields > 0).then_some(fields)
+            },
+            |_, _| true,
+        ) {
+            TxOutcome::Unchanged => {}
+            TxOutcome::RolledBack => {
+                stats.witnesses_failed += 1;
+            }
+            TxOutcome::Committed {
+                func: rewritten, ..
+            } => {
+                stats.witnesses_recorded += 1;
+                stats.items.insert(name.clone());
+                funcs.insert(name, Ok(rewritten));
+            }
         }
-        stats.witnesses_recorded += 1;
-        let verified = rewritten
-            .verify_carriers(&table.types, super::observed_carriers(&rewritten))
-            .is_ok();
-        if !verified {
-            continue;
-        }
-        stats.items.insert(name.clone());
-        funcs.insert(name, Ok(rewritten));
     }
     stats
 }
@@ -80,17 +89,10 @@ pub fn run(
 /// Fields every normal return forwards from the same ABI parameter.
 fn forwarded_fields(func: &Func, table: &crate::jir::TypeTable) -> Option<Contract> {
     let shape = candidates::shape(table, func.sig.result, 0)?;
-    let mut defs: Vec<Option<&OpKind>> = vec![None; func.values.len()];
-    for block in &func.blocks {
-        for op in &block.ops {
-            if let Some(result) = op.result {
-                defs[result.0 as usize] = Some(&op.kind);
-            }
-        }
-    }
+    let def_use = DefUse::of(func);
     let resolve = |mut value: ValueId| {
         for _ in 0..8 {
-            match defs[value.0 as usize] {
+            match def_use.def_kind(func, value) {
                 Some(OpKind::Copy(next) | OpKind::Move(next)) => value = *next,
                 _ => break,
             }
@@ -114,7 +116,7 @@ fn forwarded_fields(func: &Func, table: &crate::jir::TypeTable) -> Option<Contra
             variant: 0,
             active_field: None,
             fields,
-        }) = defs[value.0 as usize]
+        }) = def_use.def_kind(func, value)
         else {
             return None;
         };
@@ -171,7 +173,7 @@ fn expand_copies(
             let Some(name) = interns.str(*link_name) else {
                 continue;
             };
-            let Some(contract) = contracts.get(&JsName::new(name.to_owned())) else {
+            let Some(contract) = contracts.get(name) else {
                 continue;
             };
             if contract.ty == func.values[result.0 as usize].ty
@@ -192,15 +194,7 @@ fn expand_copies(
         return 0;
     }
 
-    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-    for (block_index, block) in func.blocks.iter().enumerate() {
-        for successor in block.term.successors() {
-            let incoming = &mut predecessors[successor.0 as usize];
-            if !incoming.contains(&block_index) {
-                incoming.push(block_index);
-            }
-        }
-    }
+    let cfg = Cfg::of(func);
     // A source result may cross the structuralizer's block split before MIR's local copy. Admit
     // exactly the dominance-trivial form: the call is the source block's final op, that block
     // unconditionally enters a unique-predecessor successor, and the copy occurs before any use
@@ -217,8 +211,16 @@ fn expand_copies(
             };
             let prefix_is_safe = |ops: &[Op]| {
                 ops.iter().all(|between| {
-                    op_purity(&between.kind) != Purity::Effect
-                        && !between.kind.uses().contains(source)
+                    if op_purity(&between.kind) == Purity::Effect {
+                        return false;
+                    }
+                    let mut uses_source = false;
+                    between.kind.for_each_use(|v| {
+                        if v == *source {
+                            uses_source = true;
+                        }
+                    });
+                    !uses_source
                 })
             };
             let safe = if *call_block == block_index {
@@ -230,7 +232,7 @@ fn expand_copies(
                         source_block.term,
                         crate::jir::repr::RTerm::Goto(target, _) if target == block.id
                     )
-                    && predecessors[block_index].as_slice() == [*call_block]
+                    && cfg.preds[block_index].as_slice() == [RBlockId(*call_block as u32)]
                     && prefix_is_safe(&block.ops[..op_index])
             };
             if safe {
@@ -285,7 +287,7 @@ fn expand_copies(
                         args[*parameter]
                     }
                     None => {
-                        let read = fresh(func, ty, op.origin);
+                        let read = func.push_value(ty, Carrier::Baseline, op.origin);
                         prefix.push(Op {
                             result: Some(read),
                             origin: op.origin,
@@ -300,7 +302,7 @@ fn expand_copies(
                 };
                 // Preserve the aggregate `Copy`'s per-field clone semantics. This is free for a
                 // scalar and makes a fresh pointer/product value where the baseline requires one.
-                let copied = fresh(func, ty, op.origin);
+                let copied = func.push_value(ty, Carrier::Baseline, op.origin);
                 prefix.push(Op {
                     result: Some(copied),
                     origin: op.origin,
@@ -320,16 +322,6 @@ fn expand_copies(
         func.blocks[block_index].ops = rewritten;
     }
     forwarded
-}
-
-fn fresh(func: &mut Func, ty: TypeId, origin: crate::jir::OriginId) -> ValueId {
-    let value = ValueId(func.values.len() as u32);
-    func.values.push(ValueDef {
-        ty,
-        carrier: Carrier::Baseline,
-        origin,
-    });
-    value
 }
 
 #[cfg(test)]

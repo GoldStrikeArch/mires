@@ -23,51 +23,32 @@ use super::interns::StrId;
 use super::origin::OriginTable;
 use super::semantic::{BasicBlock, BodyKind, Statement, Terminator};
 use super::summary::NormalizedBody;
+use crate::lane_report::push_string;
 
 /// The schema of the document [`write()`] produces.
 pub const CONFLICT_REPORT_SCHEMA: u32 = 1;
 
-/// What a group of same-named (or same-text) items turned out to be.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Verdict {
-    /// The encoded bodies are the same bytes. Nothing to decide.
-    Identical,
-    /// The bytes differ and the normal forms do not: exactly what the normal form exists for.
-    NormalizedIdentical,
-    /// The normal forms differ. [`ConflictRecord::difference`] names the first field.
-    Different,
-    /// One JavaScript name over two Rust items. A hard link error, not a choice.
-    NameCollision,
-    /// Fewer than two of the members carry a body.
-    NoBody,
+/// How the conflicting items were grouped together.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ConflictRelation {
+    /// One Rust item read from more than one object file.
+    Duplicate,
+    /// Two items whose printed JavaScript the text deduplicator merged.
+    Alias,
 }
 
-impl Verdict {
-    pub fn as_str(self) -> &'static str {
+impl ConflictRelation {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Identical => "identical",
-            Self::NormalizedIdentical => "normalized-identical",
-            Self::Different => "different",
-            Self::NameCollision => "name-collision",
-            Self::NoBody => "no-body",
+            Self::Duplicate => "duplicate",
+            Self::Alias => "alias",
         }
     }
-
-    /// Every verdict, in the order a histogram prints them.
-    pub const ALL: [Verdict; 5] = [
-        Verdict::Identical,
-        Verdict::NormalizedIdentical,
-        Verdict::Different,
-        Verdict::NameCollision,
-        Verdict::NoBody,
-    ];
 }
 
 /// As far as the objects can say, why two normal forms differ.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Cause {
-    /// Not applicable: the verdict is not [`Verdict::Different`].
-    None,
+pub enum DiffCause {
     /// One side's origins carry an inline stack and the other's do not: MIR inlining ran on one of
     /// the two crates.
     Inlined,
@@ -79,16 +60,68 @@ pub enum Cause {
     Undecodable,
 }
 
-impl Cause {
-    pub fn as_str(self) -> &'static str {
+impl DiffCause {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::None => "-",
             Self::Inlined => "inlined",
             Self::Shape => "shape",
             Self::Content => "content",
             Self::Undecodable => "undecodable",
         }
     }
+}
+
+/// What a group of same-named (or same-text) items turned out to be.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Verdict {
+    /// The encoded bodies are the same bytes. Nothing to decide.
+    Identical,
+    /// The bytes differ and the normal forms do not: exactly what the normal form exists for.
+    NormalizedIdentical,
+    /// The normal forms differ; `difference` names the first disagreeing field.
+    Different {
+        cause: DiffCause,
+        difference: String,
+    },
+    /// One JavaScript name over two Rust items. A hard link error, not a choice.
+    NameCollision,
+    /// Fewer than two of the members carry a body.
+    NoBody,
+}
+
+impl Verdict {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Identical => "identical",
+            Self::NormalizedIdentical => "normalized-identical",
+            Self::Different { .. } => "different",
+            Self::NameCollision => "name-collision",
+            Self::NoBody => "no-body",
+        }
+    }
+
+    pub const fn cause_str(&self) -> &'static str {
+        match self {
+            Self::Different { cause, .. } => cause.as_str(),
+            _ => "-",
+        }
+    }
+
+    pub fn difference(&self) -> Option<&str> {
+        match self {
+            Self::Different { difference, .. } => Some(difference.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Every verdict label, in the order a histogram prints them.
+    pub const ALL_LABELS: [&'static str; 5] = [
+        "identical",
+        "normalized-identical",
+        "different",
+        "name-collision",
+        "no-body",
+    ];
 }
 
 /// One member of a conflicting group.
@@ -109,12 +142,8 @@ pub struct ConflictEntry {
 pub struct ConflictRecord {
     /// The JavaScript name the group is keyed on.
     pub name: String,
-    /// `duplicate` for one item read twice, `alias` for two items the text optimizer merged.
-    pub relation: &'static str,
+    pub relation: ConflictRelation,
     pub verdict: Verdict,
-    pub cause: Cause,
-    /// The first field the two representative normal forms disagree about.
-    pub difference: Option<String>,
     pub entries: Vec<ConflictEntry>,
 }
 
@@ -125,7 +154,7 @@ impl ConflictRecord {
     /// decoded, and the cause falls back to shape and content.
     pub fn of(
         name: &str,
-        relation: &'static str,
+        relation: ConflictRelation,
         left: &NormalizedBody,
         right: &NormalizedBody,
         origins: Option<(&OriginTable, &OriginTable)>,
@@ -133,13 +162,30 @@ impl ConflictRecord {
         ConflictRecord {
             name: name.to_owned(),
             relation,
-            verdict: Verdict::Different,
-            cause: cause(left, right, origins),
-            difference: Some(
-                first_difference(left, right)
+            verdict: Verdict::Different {
+                cause: cause(left, right, origins),
+                difference: first_difference(left, right)
                     .unwrap_or_else(|| "nothing (the walk found no difference)".to_owned()),
-            ),
+            },
             entries: Vec::new(),
+        }
+    }
+
+    /// The record for a group where at least one side could not be decoded for comparison.
+    pub fn undecodable(
+        name: impl Into<String>,
+        relation: ConflictRelation,
+        message: impl Into<String>,
+        entries: Vec<ConflictEntry>,
+    ) -> ConflictRecord {
+        ConflictRecord {
+            name: name.into(),
+            relation,
+            verdict: Verdict::Different {
+                cause: DiffCause::Undecodable,
+                difference: message.into(),
+            },
+            entries,
         }
     }
 
@@ -154,7 +200,7 @@ pub fn cause(
     left: &NormalizedBody,
     right: &NormalizedBody,
     origins: Option<(&OriginTable, &OriginTable)>,
-) -> Cause {
+) -> DiffCause {
     if let Some((left_origins, right_origins)) = origins {
         let inlined = |origins: &OriginTable| {
             origins
@@ -163,16 +209,16 @@ pub fn cause(
                 .any(|origin| !origin.inline_stack.is_empty())
         };
         if inlined(left_origins) != inlined(right_origins) {
-            return Cause::Inlined;
+            return DiffCause::Inlined;
         }
     }
     if left.body.blocks.len() != right.body.blocks.len()
         || left.body.statement_count() != right.body.statement_count()
         || left.body.locals.len() != right.body.locals.len()
     {
-        return Cause::Shape;
+        return DiffCause::Shape;
     }
-    Cause::Content
+    DiffCause::Content
 }
 
 /// The first field of the body two normal forms disagree about, walked in the order the schema
@@ -360,16 +406,19 @@ pub fn render_report(records: &[ConflictRecord]) -> String {
     sorted.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
-            .then_with(|| a.relation.cmp(b.relation))
+            .then_with(|| a.relation.as_str().cmp(b.relation.as_str()))
             .then_with(|| a.verdict.as_str().cmp(b.verdict.as_str()))
     });
 
-    let mut counts: Vec<(Verdict, usize)> = Verdict::ALL
+    let mut counts: Vec<(&'static str, usize)> = Verdict::ALL_LABELS
         .iter()
-        .map(|verdict| {
+        .map(|label| {
             (
-                *verdict,
-                sorted.iter().filter(|row| row.verdict == *verdict).count(),
+                *label,
+                sorted
+                    .iter()
+                    .filter(|row| row.verdict.as_str() == *label)
+                    .count(),
             )
         })
         .collect();
@@ -384,7 +433,7 @@ pub fn render_report(records: &[ConflictRecord]) -> String {
         if index > 0 {
             out.push(',');
         }
-        push_string(&mut out, verdict.as_str());
+        push_string(&mut out, verdict);
         let _ = write!(out, ":{count}");
     }
     out.push_str("},\"conflicts\":[");
@@ -395,13 +444,13 @@ pub fn render_report(records: &[ConflictRecord]) -> String {
         out.push_str("{\"name\":");
         push_string(&mut out, &record.name);
         out.push_str(",\"relation\":");
-        push_string(&mut out, record.relation);
+        push_string(&mut out, record.relation.as_str());
         out.push_str(",\"verdict\":");
         push_string(&mut out, record.verdict.as_str());
         out.push_str(",\"cause\":");
-        push_string(&mut out, record.cause.as_str());
+        push_string(&mut out, record.verdict.cause_str());
         out.push_str(",\"difference\":");
-        match &record.difference {
+        match record.verdict.difference() {
             Some(difference) => push_string(&mut out, difference),
             None => out.push_str("null"),
         }
@@ -433,28 +482,6 @@ fn push_hash(out: &mut String, hash: Option<Hash128>) {
     }
 }
 
-/// A JSON string literal. Control characters are escaped the short way where JSON has one and as
-/// `\u00XX` otherwise; everything else, non-ASCII included, is written through as UTF-8.
-fn push_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            control if control < ' ' => {
-                let _ = write!(out, "\\u{:04x}", control as u32);
-            }
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,10 +490,8 @@ mod tests {
     fn the_report_is_deterministic_and_shaped_as_documented() {
         let record = |name: &str, verdict: Verdict| ConflictRecord {
             name: name.to_owned(),
-            relation: "alias",
+            relation: ConflictRelation::Alias,
             verdict,
-            cause: Cause::Shape,
-            difference: Some("blocks: 3 blocks  \u{2260}  4 blocks".to_owned()),
             entries: vec![ConflictEntry {
                 origin: "libcore".to_owned(),
                 path: "core::ptr::drop_glue".to_owned(),
@@ -474,10 +499,11 @@ mod tests {
                 normalized: Some(Hash128 { lo: 2, hi: 0 }),
             }],
         };
-        let rows = vec![
-            record("z", Verdict::Different),
-            record("a", Verdict::Different),
-        ];
+        let different = || Verdict::Different {
+            cause: DiffCause::Shape,
+            difference: "blocks: 3 blocks  \u{2260}  4 blocks".to_owned(),
+        };
+        let rows = vec![record("z", different()), record("a", different())];
         let forward = render_report(&rows);
         let backward = render_report(&[rows[1].clone(), rows[0].clone()]);
         assert_eq!(forward, backward);

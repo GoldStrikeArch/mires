@@ -5369,19 +5369,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
     plan.cell_names.insert(cell, "x".to_owned());
     plan.param_cells.insert(cell, x);
 
-    let flat_i64 = crate::plan::abi_flat::FlatParam {
-        ty: I64,
-        field_tys: Vec::new(),
-        passed: Vec::new(),
-        by_ref: false,
-        mutable: false,
-        written: false,
-        slice: false,
-        byte_str: None,
-        i64_pair: true,
-        tagged: None,
-        recursive: None,
-    };
+    let flat_i64 = crate::plan::abi_flat::FlatParam::i64_pair(I64);
     let target_abi = crate::plan::abi_flat::FlatSig {
         params: vec![Some(flat_i64.clone()), Some(flat_i64)],
         result: None,

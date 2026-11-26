@@ -251,9 +251,12 @@ pub(crate) fn type_contains_fn_ptr(
 /// Both the JIR and baseline emitters wrap `PanicImpl` bodies in `try { ... } catch ($e) { throw
 /// __rt.abort_error($e); }` (unless already an unconditional literal abort), so calling one can
 /// only diverge or raise a registered abort — never a catchable host exception.
-pub(crate) fn is_panic_impl_item(table: &BTreeMap<JsName, LinkItem>, name: &JsName) -> bool {
+pub(crate) fn is_panic_impl_item(
+    table: &BTreeMap<JsName, LinkItem>,
+    name: &(impl AsRef<str> + ?Sized),
+) -> bool {
     table
-        .get(name)
+        .get(name.as_ref())
         .filter(|item| item.kind == ItemKind::Fn)
         .and_then(|item| item.jir.body.as_ref())
         .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
@@ -307,181 +310,215 @@ pub(crate) fn run(
     run_checked(table, funcs, live).modified
 }
 
-/// Prunes `RTerm::Invoke` terminators with independent witness checking and per-function rollback.
-pub(crate) fn run_checked(
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
-    live: &BTreeSet<JsName>,
-) -> PruneInvokeStats {
-    let interns_map: BTreeMap<JsName, &Interns> = table
-        .iter()
-        .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
-        .collect();
+/// Whole-program scope and monotone throw-reachability solver for `prune_invoke`.
+struct ThrowAnalysis<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    interns_map: BTreeMap<JsName, &'a Interns>,
+    ok_funcs: BTreeSet<JsName>,
+    by_item: BTreeMap<ItemId, BTreeSet<JsName>>,
+    scan: RefScan,
+    external_fn_ptr: bool,
+    has_custom_allocator: bool,
+    has_opaque_fn: bool,
+    vtable_methods: BTreeMap<u32, BTreeSet<JsName>>,
+    vtable_drops: BTreeSet<JsName>,
+    vtable_unknown: bool,
+    static_refs: BTreeSet<JsName>,
+}
 
-    let ok_funcs: BTreeSet<JsName> = funcs
-        .iter()
-        .filter(|(_, res)| res.is_ok())
-        .map(|(name, _)| name.clone())
-        .collect();
+impl<'a> ThrowAnalysis<'a> {
+    fn collect_program_scope(
+        table: &'a BTreeMap<JsName, LinkItem>,
+        funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+        live: &BTreeSet<JsName>,
+    ) -> Self {
+        let interns_map: BTreeMap<JsName, &'a Interns> = table
+            .iter()
+            .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
+            .collect();
 
-    let mut by_item: BTreeMap<ItemId, BTreeSet<JsName>> = BTreeMap::new();
-    let mut scan = RefScan::default();
-    let mut external_fn_ptr = false;
-    let extra_roots = &crate::opts::get().roots;
+        let ok_funcs: BTreeSet<JsName> = funcs
+            .iter()
+            .filter(|(_, res)| res.is_ok())
+            .map(|(name, _)| name.clone())
+            .collect();
 
-    for (name, res) in funcs.iter() {
-        let Ok(func) = res else { continue };
-        by_item.entry(func.item).or_default().insert(name.clone());
-        let interns = interns_map.get(name).copied();
-        let types = interns.map(|i| &i.types);
-        if let (Some(item), Some(types)) = (table.get(name), types) {
-            let is_root = item.linkage.root || extra_roots.iter().any(|r| r == name.as_str());
-            if is_root
-                && func
-                    .sig
-                    .arguments
-                    .iter()
-                    .any(|&arg_ty| type_contains_fn_ptr(arg_ty, types, &mut BTreeSet::new()))
-            {
-                external_fn_ptr = true;
+        let mut by_item: BTreeMap<ItemId, BTreeSet<JsName>> = BTreeMap::new();
+        let mut scan = RefScan::default();
+        let mut external_fn_ptr = false;
+        let extra_roots = &crate::opts::get().roots;
+
+        for (name, res) in funcs.iter() {
+            let Ok(func) = res else { continue };
+            by_item.entry(func.item).or_default().insert(name.clone());
+            let interns = interns_map.get(name).copied();
+            let types = interns.map(|i| &i.types);
+            if let (Some(item), Some(types)) = (table.get(name), types) {
+                let is_root = item.linkage.root || extra_roots.iter().any(|r| r == name.as_str());
+                if is_root
+                    && func
+                        .sig
+                        .arguments
+                        .iter()
+                        .any(|&arg_ty| type_contains_fn_ptr(arg_ty, types, &mut BTreeSet::new()))
+                {
+                    external_fn_ptr = true;
+                }
+            }
+            for block in &func.blocks {
+                for op in &block.ops {
+                    refs::scan_op(func, op, types, &mut scan);
+                    let fn_ptr_boundary = match &op.kind {
+                        OpKind::Host { args, .. }
+                        | OpKind::Call {
+                            host: Some(_),
+                            args,
+                            ..
+                        } => Some(args.as_slice()),
+                        OpKind::Call {
+                            callee: Callee::Runtime { sysroot: false, .. },
+                            args,
+                            ..
+                        } => Some(args.as_slice()),
+                        OpKind::Call {
+                            callee: Callee::Foreign { symbol, .. },
+                            args,
+                            ..
+                        } => {
+                            let known_ok = interns
+                                .and_then(|i| i.str(*symbol))
+                                .is_some_and(|s| ok_funcs.contains(s));
+                            (!known_ok).then_some(args.as_slice())
+                        }
+                        _ => None,
+                    };
+                    if let Some(args) = fn_ptr_boundary {
+                        let Some(types) = types else {
+                            external_fn_ptr = true;
+                            continue;
+                        };
+                        if let Some(res_val) = op.result {
+                            if let Some(vdef) = func.values.get(res_val.0 as usize) {
+                                if type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new()) {
+                                    external_fn_ptr = true;
+                                }
+                            }
+                        }
+                        if args.iter().any(|arg| {
+                            func.values.get(arg.0 as usize).is_some_and(|vdef| {
+                                type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new())
+                            })
+                        }) {
+                            external_fn_ptr = true;
+                        }
+                    }
+                }
             }
         }
-        for block in &func.blocks {
-            for op in &block.ops {
-                refs::scan_op(func, op, types, &mut scan);
-                let fn_ptr_boundary = match &op.kind {
-                    OpKind::Host { args, .. }
-                    | OpKind::Call {
-                        host: Some(_),
-                        args,
-                        ..
-                    } => Some(args.as_slice()),
-                    OpKind::Call {
-                        callee: Callee::Runtime { sysroot: false, .. },
-                        args,
-                        ..
-                    } => Some(args.as_slice()),
-                    OpKind::Call {
-                        callee: Callee::Foreign { symbol, .. },
-                        args,
-                        ..
-                    } => {
-                        let known_ok = interns
-                            .and_then(|i| i.str(*symbol))
-                            .is_some_and(|s| ok_funcs.contains(&JsName::new(s.to_owned())));
-                        (!known_ok).then_some(args.as_slice())
+
+        let has_custom_allocator = table.values().any(|item| {
+            matches!(
+                item.allocator_provider,
+                AllocatorProvider::Custom | AllocatorProvider::Conflict
+            )
+        });
+
+        let mut has_opaque_fn = false;
+        let mut vtable_methods: BTreeMap<u32, BTreeSet<JsName>> = BTreeMap::new();
+        let mut vtable_drops: BTreeSet<JsName> = BTreeSet::new();
+        let mut vtable_unknown = false;
+        let mut static_refs: BTreeSet<JsName> = BTreeSet::new();
+
+        for name in live {
+            let Some(item) = table.get(name) else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn => {
+                    if !funcs.get(name).is_some_and(Result::is_ok) {
+                        has_opaque_fn = true;
                     }
-                    _ => None,
-                };
-                if let Some(args) = fn_ptr_boundary {
-                    let Some(types) = types else {
-                        external_fn_ptr = true;
+                }
+                ItemKind::Vtable => {
+                    let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns())
+                    else {
+                        vtable_unknown = true;
                         continue;
                     };
-                    if let Some(res_val) = op.result {
-                        if let Some(vdef) = func.values.get(res_val.0 as usize) {
-                            if type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new()) {
-                                external_fn_ptr = true;
+                    let BodyKind::Vtable { entries, .. } = &body.kind else {
+                        vtable_unknown = true;
+                        continue;
+                    };
+                    for (slot, entry) in entries.iter().enumerate() {
+                        match entry {
+                            VtableEntry::Drop(Some(d)) => {
+                                if let Some(s) = interns.str(d.link_name) {
+                                    vtable_drops.insert(JsName::new(s.to_owned()));
+                                } else {
+                                    vtable_unknown = true;
+                                }
                             }
+                            VtableEntry::Method(m) => {
+                                if let Some(s) = interns.str(m.link_name) {
+                                    vtable_methods
+                                        .entry(slot as u32)
+                                        .or_default()
+                                        .insert(JsName::new(s.to_owned()));
+                                } else {
+                                    vtable_unknown = true;
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    if args.iter().any(|arg| {
-                        func.values.get(arg.0 as usize).is_some_and(|vdef| {
-                            type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new())
-                        })
-                    }) {
-                        external_fn_ptr = true;
-                    }
+                }
+                ItemKind::Alloc | ItemKind::Import => {}
+                _ => {
+                    static_refs.extend(item.refs.iter().cloned());
                 }
             }
         }
-    }
 
-    let has_custom_allocator = table.values().any(|item| {
-        matches!(
-            item.allocator_provider,
-            AllocatorProvider::Custom | AllocatorProvider::Conflict
-        )
-    });
-
-    let mut has_opaque_fn = false;
-    let mut vtable_methods: BTreeMap<u32, BTreeSet<JsName>> = BTreeMap::new();
-    let mut vtable_drops: BTreeSet<JsName> = BTreeSet::new();
-    let mut vtable_unknown = false;
-    let mut static_refs: BTreeSet<JsName> = BTreeSet::new();
-
-    for name in live {
-        let Some(item) = table.get(name) else {
-            continue;
-        };
-        match item.kind {
-            ItemKind::Fn => {
-                if !funcs.get(name).is_some_and(Result::is_ok) {
-                    has_opaque_fn = true;
-                }
-            }
-            ItemKind::Vtable => {
-                let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns())
-                else {
-                    vtable_unknown = true;
-                    continue;
-                };
-                let BodyKind::Vtable { entries, .. } = &body.kind else {
-                    vtable_unknown = true;
-                    continue;
-                };
-                for (slot, entry) in entries.iter().enumerate() {
-                    match entry {
-                        VtableEntry::Drop(Some(d)) => {
-                            if let Some(s) = interns.str(d.link_name) {
-                                vtable_drops.insert(JsName::new(s.to_owned()));
-                            } else {
-                                vtable_unknown = true;
-                            }
-                        }
-                        VtableEntry::Method(m) => {
-                            if let Some(s) = interns.str(m.link_name) {
-                                vtable_methods
-                                    .entry(slot as u32)
-                                    .or_default()
-                                    .insert(JsName::new(s.to_owned()));
-                            } else {
-                                vtable_unknown = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ItemKind::Alloc | ItemKind::Import => {}
-            _ => {
-                static_refs.extend(item.refs.iter().cloned());
-            }
+        Self {
+            table,
+            interns_map,
+            ok_funcs,
+            by_item,
+            scan,
+            external_fn_ptr,
+            has_custom_allocator,
+            has_opaque_fn,
+            vtable_methods,
+            vtable_drops,
+            vtable_unknown,
+            static_refs,
         }
     }
 
-    let target_name_throws = |target: &JsName, may_throw: &BTreeSet<JsName>| -> bool {
-        if is_panic_impl_item(table, target) {
+    fn target_name_throws(&self, target: &str, may_throw: &BTreeSet<JsName>) -> bool {
+        if is_panic_impl_item(self.table, target) {
             return false;
         }
-        if ok_funcs.contains(target) {
+        if self.ok_funcs.contains(target) {
             return may_throw.contains(target);
         }
-        if let Some(item) = table.get(target) {
+        if let Some(item) = self.table.get(target) {
             return match item.kind {
-                ItemKind::Alloc => has_custom_allocator,
+                ItemKind::Alloc => self.has_custom_allocator,
                 _ => true,
             };
         }
         true
-    };
+    }
 
-    let intrinsic_without_fallback_throws = |name: StrId,
-                                             args: &[ValueId],
-                                             func: &Func,
-                                             interns: &Interns,
-                                             may_throw: &BTreeSet<JsName>|
-     -> bool {
+    fn intrinsic_without_fallback_throws(
+        &self,
+        name: StrId,
+        args: &[ValueId],
+        func: &Func,
+        interns: &Interns,
+        may_throw: &BTreeSet<JsName>,
+    ) -> bool {
         let Some(sym) = interns.str(name) else {
             return true;
         };
@@ -509,30 +546,32 @@ pub(crate) fn run_checked(
                     return true;
                 };
                 crate::lower::js::host::is_marker_name(target)
-                    || target_name_throws(&JsName::new(target.to_owned()), may_throw)
+                    || self.target_name_throws(target, may_throw)
             }
             _ => false,
         }
-    };
+    }
 
-    let op_throws = |func: &Func,
-                     op: &Op,
-                     interns: &Interns,
-                     may_throw: &BTreeSet<JsName>|
-     -> bool {
-        let resolve =
-            |id: StrId| -> Option<JsName> { interns.str(id).map(|s| JsName::new(s.to_owned())) };
+    fn op_throws(
+        &self,
+        func: &Func,
+        op: &Op,
+        interns: &Interns,
+        may_throw: &BTreeSet<JsName>,
+    ) -> bool {
         match &op.kind {
             OpKind::Host { payload, .. } => !host_payload_cannot_throw(payload, interns),
             OpKind::Intrinsic {
                 fallback: Some(d), ..
-            } => resolve(d.link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
+            } => interns
+                .str(d.link_name)
+                .is_none_or(|n| self.target_name_throws(n, may_throw)),
             OpKind::Intrinsic {
                 name,
                 fallback: None,
                 args,
                 ..
-            } => intrinsic_without_fallback_throws(*name, args, func, interns, may_throw),
+            } => self.intrinsic_without_fallback_throws(*name, args, func, interns, may_throw),
             OpKind::Drop {
                 glue: DropGlue::None,
                 ..
@@ -540,15 +579,18 @@ pub(crate) fn run_checked(
             OpKind::Drop {
                 glue: DropGlue::Direct { link_name, .. },
                 ..
-            } => resolve(*link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
+            } => interns
+                .str(*link_name)
+                .is_none_or(|n| self.target_name_throws(n, may_throw)),
             OpKind::Drop {
                 glue: DropGlue::Dynamic,
                 ..
             } => {
-                vtable_unknown
-                    || vtable_drops
+                self.vtable_unknown
+                    || self
+                        .vtable_drops
                         .iter()
-                        .any(|n| target_name_throws(n, may_throw))
+                        .any(|n| self.target_name_throws(n.as_str(), may_throw))
             }
             OpKind::Call {
                 callee,
@@ -567,16 +609,19 @@ pub(crate) fn run_checked(
                     Callee::Nop => false,
                     Callee::Direct { link_name, .. } => interns.str(*link_name).is_none_or(|s| {
                         crate::lower::js::host::is_marker_name(s)
-                            || target_name_throws(&JsName::new(s.to_owned()), may_throw)
+                            || self.target_name_throws(s, may_throw)
                     }),
                     Callee::Intrinsic {
                         fallback: Some(d), ..
-                    } => resolve(d.link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
+                    } => interns
+                        .str(d.link_name)
+                        .is_none_or(|n| self.target_name_throws(n, may_throw)),
                     Callee::Intrinsic {
                         name,
                         fallback: None,
                         ..
-                    } => intrinsic_without_fallback_throws(*name, args, func, interns, may_throw),
+                    } => self
+                        .intrinsic_without_fallback_throws(*name, args, func, interns, may_throw),
                     Callee::Runtime { member, sysroot } => {
                         !*sysroot
                             || interns
@@ -584,150 +629,140 @@ pub(crate) fn run_checked(
                                 .is_none_or(|s| !is_non_throwing_sysroot_shim_member(s))
                     }
                     Callee::Foreign { symbol, .. } => match interns.str(*symbol) {
-                        None => true,
-                        Some(sym) => {
-                            let js_name = JsName::new(sym.to_owned());
-                            if table.contains_key(&js_name) {
-                                target_name_throws(&js_name, may_throw)
-                            } else {
-                                true
-                            }
+                        Some(sym) if self.table.contains_key(sym) => {
+                            self.target_name_throws(sym, may_throw)
                         }
+                        _ => true,
                     },
                     Callee::Virtual { slot, .. } => {
-                        vtable_unknown
-                            || vtable_methods.get(slot).is_none_or(|ms| {
-                                ms.iter().any(|m| target_name_throws(m, may_throw))
+                        self.vtable_unknown
+                            || self.vtable_methods.get(slot).is_none_or(|ms| {
+                                ms.iter()
+                                    .any(|m| self.target_name_throws(m.as_str(), may_throw))
                             })
                     }
                     Callee::Indirect { signature } => {
-                        external_fn_ptr
-                            || has_opaque_fn
-                            || static_refs.iter().any(|n| {
-                                (ok_funcs.contains(n)
-                                    || table.get(n).is_some_and(|it| {
+                        self.external_fn_ptr
+                            || self.has_opaque_fn
+                            || self.static_refs.iter().any(|n| {
+                                (self.ok_funcs.contains(n)
+                                    || self.table.get(n).is_some_and(|it| {
                                         matches!(it.kind, ItemKind::Fn | ItemKind::Import)
                                     }))
-                                    && target_name_throws(n, may_throw)
+                                    && self.target_name_throws(n.as_str(), may_throw)
                             })
-                            || scan.named.iter().any(|it| {
-                                by_item.get(it).is_none_or(|names| {
-                                    names.iter().any(|n| target_name_throws(n, may_throw))
+                            || self.scan.named.iter().any(|it| {
+                                self.by_item.get(it).is_none_or(|names| {
+                                    names
+                                        .iter()
+                                        .any(|n| self.target_name_throws(n.as_str(), may_throw))
                                 })
                             })
-                            || scan.fn_pointer_targets.get(signature).is_none_or(|items| {
-                                items.iter().any(|it| {
-                                    by_item.get(it).is_none_or(|names| {
-                                        names.iter().any(|n| target_name_throws(n, may_throw))
+                            || self
+                                .scan
+                                .fn_pointer_targets
+                                .get(signature)
+                                .is_none_or(|items| {
+                                    items.iter().any(|it| {
+                                        self.by_item.get(it).is_none_or(|names| {
+                                            names.iter().any(|n| {
+                                                self.target_name_throws(n.as_str(), may_throw)
+                                            })
+                                        })
                                     })
                                 })
-                            })
                     }
                 }
             }
             _ => false,
         }
-    };
+    }
 
-    let mut may_throw_host: BTreeSet<JsName> = BTreeSet::new();
-    loop {
-        let mut changed = false;
-        for (name, res) in funcs.iter() {
-            if may_throw_host.contains(name) || is_panic_impl_item(table, name) {
-                continue;
-            }
-            let Ok(func) = res else { continue };
-            let Some(interns) = interns_map.get(name).copied() else {
-                may_throw_host.insert(name.clone());
-                changed = true;
-                continue;
-            };
-            // Traverse only reachable blocks from entry, following an `Invoke` unwind edge only
-            // when the protected op can actually throw; otherwise dead `RTerm::Throw(None)`
-            // cleanup pads would falsely taint non-throwing callers and block transitive pruning.
-            let mut throws = false;
-            if !func.blocks.is_empty() {
-                let mut visited = vec![false; func.blocks.len()];
-                let mut work = vec![0usize];
-                while let Some(bi) = work.pop() {
-                    if visited.get(bi).copied().unwrap_or(true) {
-                        continue;
-                    }
-                    visited[bi] = true;
-                    let block = &func.blocks[bi];
-                    if matches!(block.term, RTerm::Throw(_)) {
-                        throws = true;
-                        break;
-                    }
-                    match &block.term {
-                        RTerm::Invoke { normal, unwind } => {
-                            let protected_idx = block.ops.len().saturating_sub(1);
-                            if block.ops[..protected_idx]
-                                .iter()
-                                .any(|op| op_throws(func, op, interns, &may_throw_host))
-                            {
-                                throws = true;
-                                break;
-                            }
-                            work.push(normal.0 .0 as usize);
-                            let last_throws = block
-                                .ops
-                                .last()
-                                .is_some_and(|op| op_throws(func, op, interns, &may_throw_host));
-                            if last_throws {
-                                work.push(unwind.0 .0 as usize);
-                            }
+    fn solve_may_throw(&self, funcs: &BTreeMap<JsName, Result<Func, Decline>>) -> BTreeSet<JsName> {
+        let mut may_throw_host: BTreeSet<JsName> = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for (name, res) in funcs.iter() {
+                if may_throw_host.contains(name) || is_panic_impl_item(self.table, name) {
+                    continue;
+                }
+                let Ok(func) = res else { continue };
+                let Some(interns) = self.interns_map.get(name).copied() else {
+                    may_throw_host.insert(name.clone());
+                    changed = true;
+                    continue;
+                };
+                // Traverse only reachable blocks from entry, following an `Invoke` unwind edge only
+                // when the protected op can actually throw; otherwise dead `RTerm::Throw(None)`
+                // cleanup pads would falsely taint non-throwing callers and block transitive pruning.
+                let mut throws = false;
+                if !func.blocks.is_empty() {
+                    let mut visited = vec![false; func.blocks.len()];
+                    let mut work = vec![0usize];
+                    while let Some(bi) = work.pop() {
+                        if visited.get(bi).copied().unwrap_or(true) {
+                            continue;
                         }
-                        _ => {
-                            if block
-                                .ops
-                                .iter()
-                                .any(|op| op_throws(func, op, interns, &may_throw_host))
-                            {
-                                throws = true;
-                                break;
+                        visited[bi] = true;
+                        let block = &func.blocks[bi];
+                        if matches!(block.term, RTerm::Throw(_)) {
+                            throws = true;
+                            break;
+                        }
+                        match &block.term {
+                            RTerm::Invoke { normal, unwind } => {
+                                let protected_idx = block.protected_op_index().unwrap_or(0);
+                                if block.ops[..protected_idx]
+                                    .iter()
+                                    .any(|op| self.op_throws(func, op, interns, &may_throw_host))
+                                {
+                                    throws = true;
+                                    break;
+                                }
+                                work.push(normal.0 .0 as usize);
+                                let last_throws = block.protected_op().is_some_and(|op| {
+                                    self.op_throws(func, op, interns, &may_throw_host)
+                                });
+                                if last_throws {
+                                    work.push(unwind.0 .0 as usize);
+                                }
                             }
-                            for succ in block.term.successors() {
-                                work.push(succ.0 as usize);
+                            _ => {
+                                if block
+                                    .ops
+                                    .iter()
+                                    .any(|op| self.op_throws(func, op, interns, &may_throw_host))
+                                {
+                                    throws = true;
+                                    break;
+                                }
+                                for succ in block.term.successors() {
+                                    work.push(succ.0 as usize);
+                                }
                             }
                         }
                     }
                 }
+                if throws {
+                    may_throw_host.insert(name.clone());
+                    changed = true;
+                }
             }
-            if throws {
-                may_throw_host.insert(name.clone());
-                changed = true;
+            if !changed {
+                break;
             }
         }
-        if !changed {
-            break;
-        }
+        may_throw_host
     }
 
-    let noop_funcs: BTreeSet<JsName> = funcs
-        .iter()
-        .filter_map(|(name, res)| {
-            let f = res.as_ref().ok()?;
-            (f.blocks.len() == 1
-                && f.blocks[0].ops.is_empty()
-                && matches!(f.blocks[0].term, RTerm::Return(None)))
-            .then(|| name.clone())
-        })
-        .collect();
-
-    let func_names: Vec<JsName> = funcs.keys().cloned().collect();
-    let mut pending: Vec<(JsName, Func, Vec<InvokePrunedSite>, Vec<witness::Witness>)> = Vec::new();
-    for name in func_names {
-        let Some(interns) = interns_map.get(&name).copied() else {
-            continue;
-        };
-        let Some(Ok(func)) = funcs.get(&name) else {
-            continue;
-        };
-        if !func.has_invoke() {
-            continue;
-        }
-        let mut rewritten = func.clone();
+    fn rewrite_prunable_invokes(
+        &self,
+        pre_func: &Func,
+        rewritten: &mut Func,
+        interns: &Interns,
+        may_throw_host: &BTreeSet<JsName>,
+        noop_funcs: &BTreeSet<JsName>,
+    ) -> Option<(Vec<InvokePrunedSite>, Vec<witness::Witness>)> {
         let mut pruned_sites = Vec::new();
         let block_count = rewritten.blocks.len();
         for bi in 0..block_count {
@@ -735,21 +770,21 @@ pub(crate) fn run_checked(
                 RTerm::Invoke { normal, unwind } => (normal.0, normal.1.clone(), unwind.0),
                 _ => continue,
             };
-            let protected_idx = rewritten.blocks[bi].ops.len().saturating_sub(1);
-            let prefix_throws = rewritten.blocks[bi].ops[..protected_idx]
+            let block = &rewritten.blocks[bi];
+            let protected_idx = block.protected_op_index().unwrap_or(0);
+            let prefix_throws = block.ops[..protected_idx]
                 .iter()
-                .any(|op| op_throws(&rewritten, op, interns, &may_throw_host));
-            let last_throws = rewritten.blocks[bi]
-                .ops
-                .last()
-                .is_some_and(|op| op_throws(&rewritten, op, interns, &may_throw_host));
+                .any(|op| self.op_throws(rewritten, op, interns, may_throw_host));
+            let last_throws = block
+                .protected_op()
+                .is_some_and(|op| self.op_throws(rewritten, op, interns, may_throw_host));
             if !prefix_throws && !last_throws {
                 rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
                 pruned_sites.push(InvokePrunedSite {
                     block: RBlockId(bi as u32),
                     reason: InvokePruneReason::ProtectedOpCannotThrow,
                 });
-            } else if is_noop_unwind_chain(func, interns, unwind_target, &noop_funcs) {
+            } else if is_noop_unwind_chain(pre_func, interns, unwind_target, noop_funcs) {
                 rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
                 pruned_sites.push(InvokePrunedSite {
                     block: RBlockId(bi as u32),
@@ -758,7 +793,7 @@ pub(crate) fn run_checked(
             }
         }
         if pruned_sites.is_empty() {
-            continue;
+            return None;
         }
         let dce_opts = crate::opt::dce::Options {
             no_constant_params: false,
@@ -766,54 +801,95 @@ pub(crate) fn run_checked(
             pure_call: None,
         };
         let mut dce_witnesses = Vec::new();
-        let _ = crate::opt::dce::run_with(
-            &mut rewritten,
-            &interns.types,
-            &dce_opts,
-            &mut dce_witnesses,
-        );
-        pending.push((name, rewritten, pruned_sites, dce_witnesses));
+        let _ = crate::opt::dce::run_with(rewritten, &interns.types, &dce_opts, &mut dce_witnesses);
+        Some((pruned_sites, dce_witnesses))
     }
 
-    let mut stats = PruneInvokeStats::default();
-    let mut approved = Vec::with_capacity(pending.len());
-    for (name, rewritten, pruned_sites, dce_witnesses) in pending {
-        let Some(interns) = interns_map.get(&name).copied() else {
-            continue;
-        };
-        let Some(Ok(pre_func)) = funcs.get(&name) else {
-            continue;
-        };
-        let verified = rewritten
-            .verify_carriers(&interns.types, crate::opt::observed_carriers(&rewritten))
-            .is_ok();
-        let checked = if witness::enabled() {
-            witness::check_all(&dce_witnesses, &rewritten, &interns.types).is_ok()
-                && witness::check_invoke_pruning(
-                    pre_func,
-                    interns,
-                    &pruned_sites,
-                    table,
-                    funcs,
-                    live,
-                )
-                .is_ok()
-        } else {
-            true
-        };
-        if !verified || !checked {
-            stats.witnesses_failed += 1;
-            continue;
+    fn commit_verified_prunes(
+        &self,
+        funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+        live: &BTreeSet<JsName>,
+        may_throw_host: &BTreeSet<JsName>,
+    ) -> PruneInvokeStats {
+        let noop_funcs: BTreeSet<JsName> = funcs
+            .iter()
+            .filter_map(|(name, res)| {
+                let f = res.as_ref().ok()?;
+                (f.blocks.len() == 1
+                    && f.blocks[0].ops.is_empty()
+                    && matches!(f.blocks[0].term, RTerm::Return(None)))
+                .then(|| name.clone())
+            })
+            .collect();
+
+        let func_names: Vec<JsName> = funcs.keys().cloned().collect();
+        let mut stats = PruneInvokeStats::default();
+        let mut approved = Vec::new();
+        for name in func_names {
+            let Some(interns) = self.interns_map.get(&name).copied() else {
+                continue;
+            };
+            let Some(Ok(pre_func)) = funcs.get(&name) else {
+                continue;
+            };
+            if !pre_func.has_invoke() {
+                continue;
+            }
+            match super::tx::try_rewrite_func(
+                pre_func,
+                &interns.types,
+                |rewritten| {
+                    self.rewrite_prunable_invokes(
+                        pre_func,
+                        rewritten,
+                        interns,
+                        may_throw_host,
+                        &noop_funcs,
+                    )
+                },
+                |rewritten, (pruned_sites, dce_witnesses)| {
+                    witness::check_all(dce_witnesses, rewritten, &interns.types).is_ok()
+                        && witness::check_invoke_pruning(
+                            pre_func,
+                            interns,
+                            pruned_sites,
+                            self.table,
+                            funcs,
+                            live,
+                        )
+                        .is_ok()
+                },
+            ) {
+                super::tx::TxOutcome::Unchanged => {}
+                super::tx::TxOutcome::RolledBack => {
+                    stats.witnesses_failed += 1;
+                }
+                super::tx::TxOutcome::Committed {
+                    func: rewritten, ..
+                } => {
+                    stats.witnesses_recorded += 1;
+                    approved.push((name, rewritten));
+                }
+            }
         }
-        stats.witnesses_recorded += 1;
-        approved.push((name, rewritten));
-    }
 
-    for (name, rewritten) in approved {
-        funcs.insert(name, Ok(rewritten));
-        stats.modified += 1;
+        for (name, rewritten) in approved {
+            funcs.insert(name, Ok(rewritten));
+            stats.modified += 1;
+        }
+        stats
     }
-    stats
+}
+
+/// Prunes `RTerm::Invoke` terminators with independent witness checking and per-function rollback.
+pub(crate) fn run_checked(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    live: &BTreeSet<JsName>,
+) -> PruneInvokeStats {
+    let analysis = ThrowAnalysis::collect_program_scope(table, funcs, live);
+    let may_throw = analysis.solve_may_throw(funcs);
+    analysis.commit_verified_prunes(funcs, live, &may_throw)
 }
 
 const MAX_NOOP_UNWIND_BLOCKS: usize = 64;
@@ -862,7 +938,7 @@ fn is_noop_unwind_chain(
         let name = interns
             .str(link_name)
             .ok_or_else(|| format!("unresolvable str#{}", link_name.0))?;
-        if noop_funcs.contains(&JsName::new(name.to_owned())) {
+        if noop_funcs.contains(name) {
             Ok(())
         } else {
             Err(format!("unwind callee `{name}` is not an empty return"))
@@ -882,7 +958,23 @@ where
 {
     let is_used = |v: ValueId| -> bool {
         func.blocks.iter().any(|b| {
-            b.ops.iter().any(|op| op.kind.uses().contains(&v)) || b.term.uses().contains(&v)
+            let mut found = false;
+            for op in &b.ops {
+                op.kind.for_each_use(|u| {
+                    if u == v {
+                        found = true;
+                    }
+                });
+                if found {
+                    return true;
+                }
+            }
+            b.term.for_each_use(|u| {
+                if u == v {
+                    found = true;
+                }
+            });
+            found
         })
     };
     let mut escaped_cells: Option<BTreeSet<CellId>> = None;

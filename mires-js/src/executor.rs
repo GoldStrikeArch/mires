@@ -7,127 +7,132 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use crate::{local_waker, microtask};
+use crate::{local_waker, microtask, JsValue};
 
-/// One local future and its scheduling state.
-struct Task<F> {
-    future: RefCell<Option<Pin<Box<F>>>>,
-    scheduled: Cell<bool>,
-    done: Cell<bool>,
+/// Scheduling lifecycle of one [`Task`].
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TaskState {
+    Idle,
+    Scheduled,
+    Done,
 }
 
-/// One result future and the host functions that settle its Promise.
-struct ResultTask<F> {
-    future: RefCell<Option<Pin<Box<F>>>>,
-    resolve: crate::JsValue,
-    reject: crate::JsValue,
-    scheduled: Cell<bool>,
-    done: Cell<bool>,
+/// How a [`Task`] polls its concrete future and delivers its terminal outcome.
+trait Settle<T> {
+    fn poll<F: Future<Output = T>>(future: Pin<&mut F>, waker: Waker) -> Poll<T>;
+
+    fn settle(&self, outcome: Result<T, JsValue>);
 }
 
-impl<F> ResultTask<F>
-where
-    F: Future<Output = Result<crate::JsValue, crate::JsValue>> + 'static,
-{
-    /// Queues one poll, coalescing repeated wakes.
-    fn schedule(self: &Rc<Self>) {
-        if self.done.get() || self.scheduled.replace(true) {
-            return;
+/// Settlement for [`spawn_local`]: rethrows a poll or drop exception on the host.
+struct Spawn;
+
+impl Settle<()> for Spawn {
+    fn poll<F: Future<Output = ()>>(future: Pin<&mut F>, waker: Waker) -> Poll<()> {
+        if poll_once(future, waker) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-        let task = Rc::clone(self);
-        microtask(move || task.poll());
     }
 
-    /// Polls once, dropping the future before settling its Promise.
-    fn poll(self: &Rc<Self>) {
-        self.scheduled.set(false);
-        if self.done.get() {
-            return;
+    fn settle(&self, outcome: Result<(), JsValue>) {
+        if let Err(error) = outcome {
+            crate::throw_value(error);
         }
-        let task = Rc::clone(self);
-        let waker = local_waker(move || task.schedule());
-        let result = {
-            let Ok(mut slot) = self.future.try_borrow_mut() else {
-                return;
-            };
-            let Some(future) = slot.as_mut() else { return };
-            let polled = Cell::new(Poll::Pending);
-            let future = RefCell::new(future.as_mut());
-            match crate::try_host(|| {
-                polled.set(poll_result(future.borrow_mut().as_mut(), waker.clone()));
-                crate::JsValue::undefined()
-            }) {
-                Err(error) => Err(error),
-                Ok(_) => match polled.get() {
-                    Poll::Pending => return,
-                    Poll::Ready(result) => result,
-                },
-            }
-        };
-        self.done.set(true);
-        // Remove the frame before calling drop: a throwing destructor must not leave it
-        // available to a later wake. This protects the driver boundary, not Rust unwinding.
-        let future = Cell::new(self.future.borrow_mut().take());
-        let dropped = crate::try_host(|| {
-            drop(future.take());
-            crate::JsValue::undefined()
-        });
-        let (settle, value) = match dropped.and(result) {
+    }
+}
+
+/// Settlement for [`promise_from_future`]: resolves or rejects the host Promise.
+struct PromiseSettle {
+    resolve: JsValue,
+    reject: JsValue,
+}
+
+impl Settle<Result<JsValue, JsValue>> for PromiseSettle {
+    fn poll<F: Future<Output = Result<JsValue, JsValue>>>(
+        future: Pin<&mut F>,
+        waker: Waker,
+    ) -> Poll<Result<JsValue, JsValue>> {
+        poll_result(future, waker)
+    }
+
+    fn settle(&self, outcome: Result<Result<JsValue, JsValue>, JsValue>) {
+        let (settle, value) = match outcome.and_then(|result| result) {
             Ok(value) => (self.resolve, value),
             Err(value) => (self.reject, value),
         };
-        let _ = crate::invoke(settle, crate::JsValue::undefined(), &[value]);
+        let _ = crate::invoke(settle, JsValue::undefined(), &[value]);
     }
 }
 
-impl<F> Task<F>
+/// One local future, its scheduling state, and its terminal settlement handler.
+struct Task<F, S> {
+    future: RefCell<Option<Pin<Box<F>>>>,
+    state: Cell<TaskState>,
+    settle: S,
+}
+
+impl<F, S> Task<F, S>
 where
-    F: Future<Output = ()> + 'static,
+    F: Future + 'static,
+    S: Settle<F::Output> + 'static,
 {
+    fn new(future: F, settle: S) -> Rc<Self> {
+        Rc::new(Self {
+            future: RefCell::new(Some(Box::pin(future))),
+            state: Cell::new(TaskState::Idle),
+            settle,
+        })
+    }
+
     /// Queues one poll, coalescing repeated wakes.
     fn schedule(self: &Rc<Self>) {
-        if self.done.get() || self.scheduled.replace(true) {
+        if self.state.get() != TaskState::Idle {
             return;
         }
+        self.state.set(TaskState::Scheduled);
         let task = Rc::clone(self);
         microtask(move || task.poll());
     }
 
-    /// Polls once and releases terminal state before propagating a host exception.
+    /// Polls once, dropping the future before settling or propagating a host exception.
     fn poll(self: &Rc<Self>) {
-        self.scheduled.set(false);
-        if self.done.get() {
+        if self.state.get() == TaskState::Done {
             return;
         }
+        self.state.set(TaskState::Idle);
         let task = Rc::clone(self);
         let waker = local_waker(move || task.schedule());
-        let result = {
+        let outcome = {
             let Ok(mut slot) = self.future.try_borrow_mut() else {
                 return;
             };
             let Some(future) = slot.as_mut() else {
                 return;
             };
-            let ready = Cell::new(false);
+            let polled = Cell::new(Poll::Pending);
             let future = RefCell::new(future.as_mut());
-            let result = crate::try_host(|| {
-                ready.set(poll_once(future.borrow_mut().as_mut(), waker.clone()));
-                crate::JsValue::undefined()
-            });
-            if result.is_ok() && !ready.get() {
-                return;
+            match crate::try_host(|| {
+                polled.set(S::poll(future.borrow_mut().as_mut(), waker.clone()));
+                JsValue::undefined()
+            }) {
+                Err(error) => Err(error),
+                Ok(_) => match polled.replace(Poll::Pending) {
+                    Poll::Pending => return,
+                    Poll::Ready(output) => Ok(output),
+                },
             }
-            result
         };
-        self.done.set(true);
+        self.state.set(TaskState::Done);
+        // Remove the frame before calling drop: a throwing destructor must not leave it
+        // available to a later wake. This protects the driver boundary, not Rust unwinding.
         let future = Cell::new(self.future.borrow_mut().take());
         let dropped = crate::try_host(|| {
             drop(future.take());
-            crate::JsValue::undefined()
+            JsValue::undefined()
         });
-        if let Err(error) = dropped.and(result) {
-            crate::throw_value(error);
-        }
+        self.settle.settle(dropped.and(outcome));
     }
 }
 
@@ -169,46 +174,34 @@ fn host_spawn<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    let task = Rc::new(Task {
-        done: Cell::new(false),
-        future: RefCell::new(Some(Box::pin(future))),
-        scheduled: Cell::new(false),
-    });
-    task.poll();
+    Task::new(future, Spawn).poll();
 }
 
 /// Converts one concrete future into a host Promise without an adapter future when optimized.
 #[must_use]
-pub(crate) fn promise_from_future<F>(future: F) -> crate::JsValue
+pub(crate) fn promise_from_future<F>(future: F) -> JsValue
 where
-    F: Future<Output = Result<crate::JsValue, crate::JsValue>> + 'static,
+    F: Future<Output = Result<JsValue, JsValue>> + 'static,
 {
     host_promise_future(future)
 }
 
 /// The opt-in native-async continuation trial behind [`crate::future_to_native_promise`].
-pub(crate) fn native_promise_from_future<F>(future: F) -> crate::JsValue
+pub(crate) fn native_promise_from_future<F>(future: F) -> JsValue
 where
-    F: Future<Output = Result<crate::JsValue, crate::JsValue>> + 'static,
+    F: Future<Output = Result<JsValue, JsValue>> + 'static,
 {
     host_native_promise_future(future)
 }
 
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.futurepromise")]
 #[inline(never)]
-fn host_promise_future<F>(future: F) -> crate::JsValue
+fn host_promise_future<F>(future: F) -> JsValue
 where
-    F: Future<Output = Result<crate::JsValue, crate::JsValue>> + 'static,
+    F: Future<Output = Result<JsValue, JsValue>> + 'static,
 {
     crate::promise_new(move |resolve, reject| {
-        let task = Rc::new(ResultTask {
-            future: RefCell::new(Some(Box::pin(future))),
-            resolve,
-            reject,
-            scheduled: Cell::new(false),
-            done: Cell::new(false),
-        });
-        task.poll();
+        Task::new(future, PromiseSettle { resolve, reject }).poll();
     })
 }
 
@@ -217,9 +210,9 @@ where
     link_section = "rcgjs.host.futurenativepromise"
 )]
 #[inline(never)]
-fn host_native_promise_future<F>(future: F) -> crate::JsValue
+fn host_native_promise_future<F>(future: F) -> JsValue
 where
-    F: Future<Output = Result<crate::JsValue, crate::JsValue>> + 'static,
+    F: Future<Output = Result<JsValue, JsValue>> + 'static,
 {
     // The ordinary Rust executor is the exact fallback whenever the compiler trial is disabled.
     host_promise_future(future)

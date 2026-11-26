@@ -30,14 +30,14 @@ pub fn strip_32bit_wrap(expr: Expr) -> Expr {
     let mut cur = expr;
     loop {
         cur = match cur {
-            Expr::Binary(BinOp::UShr | BinOp::BitOr, lhs, rhs) if is_zero_num(&rhs) => *lhs,
+            Expr::Binary(BinOp::UShr | BinOp::BitOr, lhs, rhs)
+                if super::ast_util::is_zero_num(&rhs) =>
+            {
+                *lhs
+            }
             other => return other,
         };
     }
-}
-
-fn is_zero_num(expr: &Expr) -> bool {
-    matches!(expr, Expr::Num(n) if *n == 0.0) || matches!(expr, Expr::RawNum(s) if s == "0")
 }
 
 fn const_nonneg_i31(expr: &Expr) -> Option<u32> {
@@ -943,12 +943,7 @@ pub fn is_pointer(table: &TypeTable, ty: TypeId) -> bool {
 
 /// The pointee of a pointer type, after peeling.
 pub fn pointee_of(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
-    match table.get(table.peeled(ty)).map(|d| &d.kind) {
-        Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
-            Some(*pointee)
-        }
-        _ => None,
-    }
+    table.pointee(ty)
 }
 
 /// Whether the peeled type is a raw pointer (`ptr.rs::is_raw`).

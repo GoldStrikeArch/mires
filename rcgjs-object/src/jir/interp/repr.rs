@@ -213,13 +213,78 @@ impl<'a> ReprInterpreter<'a> {
         self.heap.slot(&location, Some(&created), self.table)
     }
 
+    fn define_result(&mut self, op: &Op, value: Value) -> Result<(), Trap> {
+        let result = op
+            .result
+            .ok_or(Trap::Malformed("value op without a result"))?;
+        self.define(result, value)
+    }
+
     fn op(&mut self, op: &Op) -> Result<(), Trap> {
+        match &op.kind {
+            OpKind::Const(_)
+            | OpKind::Copy(_)
+            | OpKind::Move(_)
+            | OpKind::Materialize(_)
+            | OpKind::Binary { .. }
+            | OpKind::Unary { .. }
+            | OpKind::Cast { .. } => self.eval_scalar_op(op),
+            OpKind::Aggregate { .. }
+            | OpKind::Repeat { .. }
+            | OpKind::Field { .. }
+            | OpKind::SetField { .. }
+            | OpKind::Discriminant(_)
+            | OpKind::SetDiscriminant { .. } => self.eval_data_op(op),
+            OpKind::CellAlloc(_)
+            | OpKind::CellLoad(_)
+            | OpKind::CellStore { .. }
+            | OpKind::BorrowView { .. }
+            | OpKind::RawView { .. }
+            | OpKind::SliceView { .. }
+            | OpKind::Deref(_)
+            | OpKind::StoreThrough { .. } => self.eval_view_or_cell_op(op),
+            OpKind::Call { .. }
+            | OpKind::Intrinsic { .. }
+            | OpKind::Host { .. }
+            | OpKind::Drop { .. }
+            | OpKind::Assert { .. }
+            | OpKind::Convert { .. }
+            | OpKind::Zombie(_)
+            | OpKind::SpillRead(_)
+            | OpKind::SpillWrite { .. } => self.eval_call_or_intrinsic(op),
+        }
+    }
+
+    fn eval_scalar_op(&mut self, op: &Op) -> Result<(), Trap> {
         let value = match &op.kind {
             OpKind::Const(tree) => {
                 let ty = self.ty(op.result.ok_or(Trap::Malformed("Const without a result"))?)?;
                 eval::const_tree(tree, ty, self.table, self.interns)?
             }
             OpKind::Copy(v) | OpKind::Move(v) | OpKind::Materialize(v) => self.read(*v)?,
+            OpKind::Binary { op: bin, l, r, ty } => {
+                let result_ty = self.ty(op
+                    .result
+                    .ok_or(Trap::Malformed("Binary without a result"))?)?;
+                let l = self.read(*l)?;
+                let r = self.read(*r)?;
+                eval::binary(*bin, &l, &r, *ty, result_ty, self.table)?
+            }
+            OpKind::Unary { op: un, v, .. } => {
+                let v = self.read(*v)?;
+                eval::unary(*un, &v)?
+            }
+            OpKind::Cast { kind, v, to, .. } => {
+                let v = self.read(*v)?;
+                eval::cast(*kind, &v, *to, self.table, self.heap)?
+            }
+            _ => unreachable!("non-scalar op routed to eval_scalar_op"),
+        };
+        self.define_result(op, value)
+    }
+
+    fn eval_data_op(&mut self, op: &Op) -> Result<(), Trap> {
+        let value = match &op.kind {
             OpKind::Aggregate {
                 ty,
                 variant,
@@ -309,6 +374,13 @@ impl<'a> ReprInterpreter<'a> {
                 eval::set_discriminant(&mut slot, *variant, ty, self.table)?;
                 return Ok(());
             }
+            _ => unreachable!("non-data op routed to eval_data_op"),
+        };
+        self.define_result(op, value)
+    }
+
+    fn eval_view_or_cell_op(&mut self, op: &Op) -> Result<(), Trap> {
+        let value = match &op.kind {
             OpKind::CellAlloc(cell) => {
                 let heap = self.heap.alloc(Value::Undef);
                 *self
@@ -391,22 +463,13 @@ impl<'a> ReprInterpreter<'a> {
                 self.heap.write(&location, value)?;
                 return Ok(());
             }
-            OpKind::Binary { op: bin, l, r, ty } => {
-                let result_ty = self.ty(op
-                    .result
-                    .ok_or(Trap::Malformed("Binary without a result"))?)?;
-                let l = self.read(*l)?;
-                let r = self.read(*r)?;
-                eval::binary(*bin, &l, &r, *ty, result_ty, self.table)?
-            }
-            OpKind::Unary { op: un, v, .. } => {
-                let v = self.read(*v)?;
-                eval::unary(*un, &v)?
-            }
-            OpKind::Cast { kind, v, to, .. } => {
-                let v = self.read(*v)?;
-                eval::cast(*kind, &v, *to, self.table, self.heap)?
-            }
+            _ => unreachable!("non-view/cell op routed to eval_view_or_cell_op"),
+        };
+        self.define_result(op, value)
+    }
+
+    fn eval_call_or_intrinsic(&mut self, op: &Op) -> Result<(), Trap> {
+        match &op.kind {
             OpKind::Call { callee, args, .. } => {
                 let args = args
                     .iter()
@@ -442,12 +505,12 @@ impl<'a> ReprInterpreter<'a> {
                     Callee::Virtual { .. } => return Err(Trap::Unsupported("virtual call")),
                 };
                 match op.result {
-                    Some(result) => return self.define(result, returned),
-                    None => return Ok(()),
+                    Some(result) => self.define(result, returned),
+                    None => Ok(()),
                 }
             }
-            OpKind::Intrinsic { .. } => return Err(Trap::Unsupported("intrinsic")),
-            OpKind::Host { .. } => return Err(Trap::Unsupported("host operation")),
+            OpKind::Intrinsic { .. } => Err(Trap::Unsupported("intrinsic")),
+            OpKind::Host { .. } => Err(Trap::Unsupported("host operation")),
             OpKind::Drop { root, path, glue } => {
                 if !matches!(glue, DropGlue::None) {
                     let navigated = self.navigate(root, path, false)?;
@@ -463,7 +526,7 @@ impl<'a> ReprInterpreter<'a> {
                         drop(navigated.ty, &value)?;
                     }
                 }
-                return Ok(());
+                Ok(())
             }
             OpKind::Assert {
                 cond,
@@ -478,20 +541,17 @@ impl<'a> ReprInterpreter<'a> {
                 if cond != *expected {
                     return Err(Trap::Assert(assert_kind(msg)));
                 }
-                return Ok(());
+                Ok(())
             }
-            OpKind::Convert { .. } => return Err(Trap::Unsupported("carrier conversion")),
-            OpKind::Zombie(_) => return Err(Trap::Unsupported("zombie")),
+            OpKind::Convert { .. } => Err(Trap::Unsupported("carrier conversion")),
+            OpKind::Zombie(_) => Err(Trap::Unsupported("zombie")),
             // A spill register is a module-scope `let` the flat call ABI writes; the interpreter
             // runs one function on its own heap and has nowhere to put one.
             OpKind::SpillRead(_) | OpKind::SpillWrite { .. } => {
-                return Err(Trap::Unsupported("spill register"))
+                Err(Trap::Unsupported("spill register"))
             }
-        };
-        let result = op
-            .result
-            .ok_or(Trap::Malformed("value op without a result"))?;
-        self.define(result, value)
+            _ => unreachable!("non-call/effect op routed to eval_call_or_intrinsic"),
+        }
     }
 
     /// Runs the function to its return.

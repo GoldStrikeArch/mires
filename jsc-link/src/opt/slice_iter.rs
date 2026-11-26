@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::jir::repr::{
-    Carrier, Dominators, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root,
-    ValueDef, ValueId,
+    Carrier, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, TypeId, UnaryOp};
 use crate::jir::types::{IntRepr, IteratorIdentity, NominalForm, TypeKind};
 use crate::jir::{OriginId, TypeTable};
+
+use super::cfg::{Cfg, DefUse};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SliceIteratorLoop {
@@ -43,22 +44,22 @@ enum Adapter {
 
 #[derive(Clone, Copy, Debug)]
 struct Site {
-    block: usize,
+    block: RBlockId,
     op: usize,
 }
 
 #[derive(Clone, Debug)]
 struct LoopMatch {
     adapter: Adapter,
-    header: usize,
-    preheader: usize,
-    backedges: Vec<usize>,
-    driver: usize,
-    body: usize,
-    removed_ops: BTreeMap<usize, BTreeSet<usize>>,
+    header: RBlockId,
+    preheader: RBlockId,
+    backedges: Vec<RBlockId>,
+    driver: RBlockId,
+    body: RBlockId,
+    removed_ops: BTreeMap<RBlockId, BTreeSet<usize>>,
     removed_header_params: Vec<usize>,
-    removed_invariant_params: BTreeMap<usize, Vec<usize>>,
-    rewrite_blocks: BTreeSet<usize>,
+    removed_invariant_params: BTreeMap<RBlockId, Vec<usize>>,
+    rewrite_blocks: BTreeSet<RBlockId>,
     pass_item_ref: bool,
     exit: RBlockId,
     source: ValueId,
@@ -75,20 +76,94 @@ struct LoopMatch {
     origin: OriginId,
 }
 
+/// Shared read-only analysis indices for matching scalarized raw-pointer slice loops.
+struct MatchCx<'a> {
+    func: &'a Func,
+    table: &'a TypeTable,
+    def_use: &'a DefUse,
+    defs: &'a [Option<Site>],
+    single_edge: &'a [Option<ValueId>],
+    cfg: &'a Cfg,
+}
+
+struct HeaderShape {
+    header: RBlockId,
+    bool_ty: TypeId,
+    cmp_ty: TypeId,
+    cmp_l: ValueId,
+    cmp_r: ValueId,
+    cmp_origin: OriginId,
+    continue_to: RBlockId,
+    exit_target: RBlockId,
+}
+
+struct LoopRegion {
+    header: RBlockId,
+    preheader: RBlockId,
+    backedges: Vec<RBlockId>,
+    scc: BTreeSet<RBlockId>,
+}
+
+struct CursorBounds {
+    p_idx: usize,
+    ptr_param: ValueId,
+    source: ValueId,
+    len: ValueId,
+    end_param_idx: Option<usize>,
+    elem_ty: TypeId,
+    usize_ty: TypeId,
+}
+
+struct DriverMatch {
+    driver: RBlockId,
+    removed_driver_ops: BTreeSet<usize>,
+    removed_invariant_params: BTreeMap<RBlockId, Vec<usize>>,
+    old_item_ref: Option<ValueId>,
+    old_item: Option<ValueId>,
+    item_ref_ty: TypeId,
+    origin: OriginId,
+}
+
+struct EnumerateMatch {
+    adapter: Adapter,
+    removed_driver_ops: BTreeSet<usize>,
+    removed_header_params: Vec<usize>,
+    old_index: Option<ValueId>,
+}
+
+struct LocalityCheck<'a> {
+    region: &'a LoopRegion,
+    removed_ops: &'a BTreeMap<RBlockId, BTreeSet<usize>>,
+    removed_invariant_params: &'a BTreeMap<RBlockId, Vec<usize>>,
+    bypassed_driver: Option<RBlockId>,
+    removed_params: &'a [usize],
+    exposed: &'a [Option<ValueId>],
+    extra_backedge_roots: &'a [ValueId],
+}
+
 /// Rewrites every scalarized raw-pointer slice loop in `func` to an integer cursor loop.
 pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
-    let defs = definitions(func);
-    let single_edge = single_edge_param_sources(func);
-    let doms = Dominators::of(func);
+    let def_use = DefUse::of(func);
+    let defs = definitions(&def_use);
+    let cfg = Cfg::of(func);
+    let single_edge = single_edge_param_sources(func, &cfg, &def_use);
+    let cx = MatchCx {
+        func,
+        table,
+        def_use: &def_use,
+        defs: &defs,
+        single_edge: &single_edge,
+        cfg: &cfg,
+    };
 
     let mut matches = Vec::new();
-    let mut occupied = BTreeSet::new();
-    for header in 1..func.blocks.len() {
+    let mut occupied: BTreeSet<RBlockId> = BTreeSet::new();
+    for header_idx in 1..func.blocks.len() {
+        let header = RBlockId(header_idx as u32);
         if occupied.contains(&header) {
             continue;
         }
-        let Some(found) = match_scalarized_loop(func, table, &defs, &single_edge, &doms, header)
-        else {
+        let Some(found) = cx.match_scalarized_loop(header) else {
             continue;
         };
         if !reserve_region(&found.rewrite_blocks, found.preheader, &mut occupied) {
@@ -104,9 +179,9 @@ pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
 }
 
 fn reserve_region(
-    rewrite_blocks: &BTreeSet<usize>,
-    preheader: usize,
-    occupied: &mut BTreeSet<usize>,
+    rewrite_blocks: &BTreeSet<RBlockId>,
+    preheader: RBlockId,
+    occupied: &mut BTreeSet<RBlockId>,
 ) -> bool {
     let region = rewrite_blocks
         .iter()
@@ -184,740 +259,806 @@ fn sized_non_zst_slice_element(table: &TypeTable, ty: TypeId) -> Option<TypeId> 
     is_sized_non_zst(table, element).then_some(element)
 }
 
-fn natural_loop_blocks(func: &Func, header_idx: usize, backedges: &[usize]) -> BTreeSet<usize> {
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for succ in block.term.successors() {
-            let si = succ.0 as usize;
-            if si < preds.len() {
-                preds[si].push(bi);
-            }
-        }
+impl<'a> MatchCx<'a> {
+    fn block(&self, id: RBlockId) -> Option<&'a RBlock> {
+        self.func.blocks.get(id.0 as usize)
     }
-    let mut loop_blocks = BTreeSet::new();
-    loop_blocks.insert(header_idx);
-    let mut worklist = Vec::new();
-    for &be in backedges {
-        if loop_blocks.insert(be) {
-            worklist.push(be);
-        }
-    }
-    while let Some(b) = worklist.pop() {
-        for &p in &preds[b] {
-            if loop_blocks.insert(p) {
-                worklist.push(p);
-            }
-        }
-    }
-    loop_blocks
-}
 
-fn match_scalarized_loop(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    doms: &Dominators,
-    header_idx: usize,
-) -> Option<LoopMatch> {
-    let header = func.blocks.get(header_idx)?;
-    if header.params.is_empty() {
-        return None;
+    fn def_site(&self, value: ValueId) -> Option<Site> {
+        self.defs.get(value.0 as usize).copied().flatten()
     }
-    let bool_ty = bool_type(table)?;
-    let RTerm::Switch {
-        scrut,
-        scrut_ty,
-        cases,
-        default,
-    } = &header.term
-    else {
-        return None;
-    };
-    if *scrut_ty != bool_ty || !default.1.is_empty() {
-        return None;
-    }
-    let (case_val, case_target) = match cases.as_slice() {
-        [(val @ (0 | 1), target, args)] if args.is_empty() => (*val, *target),
-        _ => return None,
-    };
-    let cmp_val = strip_copies_local(func, header_idx, *scrut);
-    let cmp_op = header.ops.iter().find(|op| op.result == Some(cmp_val))?;
-    let OpKind::Binary {
-        op: cmp_kind @ (BinaryOp::Eq | BinaryOp::Ne),
-        l,
-        r,
-        ty: cmp_ty,
-    } = cmp_op.kind
-    else {
-        return None;
-    };
-    let (continue_to, exit_target) = match (cmp_kind, case_val) {
-        (BinaryOp::Eq, 0) | (BinaryOp::Ne, 1) => (case_target, default.0),
-        (BinaryOp::Eq, 1) | (BinaryOp::Ne, 0) => (default.0, case_target),
-        _ => return None,
-    };
 
-    let mut predecessors = Vec::new();
-    for block in &func.blocks {
-        if matches!(&block.term, RTerm::Goto(target, args) if *target == header.id && args.len() == header.params.len())
-        {
-            predecessors.push(block.id.0 as usize);
-        } else if block.term.successors().contains(&header.id) {
+    fn definition(&self, value: ValueId) -> Option<&'a Op> {
+        let site = self.def_site(value)?;
+        self.block(site.block)?.ops.get(site.op)
+    }
+
+    fn value_ty(&self, value: ValueId) -> Option<TypeId> {
+        self.func.values.get(value.0 as usize).map(|def| def.ty)
+    }
+
+    fn value_def_block(&self, value: ValueId) -> Option<RBlockId> {
+        if let Some((block, _)) = self.def_use.def_site(value) {
+            return Some(block);
+        }
+        self.def_use.param_site(value).map(|(block, _)| block)
+    }
+
+    fn match_scalarized_loop(&self, header: RBlockId) -> Option<LoopMatch> {
+        let shape = self.match_header_shape(header)?;
+        let region = self.match_loop_region(&shape)?;
+        let bounds = self.match_cursor_bounds(&shape, &region)?;
+        let driver = self.match_driver_step_and_elem(&shape, &region, &bounds)?;
+        let enumerated = self.match_optional_enumerate(&region, &bounds, &driver);
+        self.verify_isolation_and_exit(&shape, region, bounds, driver, enumerated)
+    }
+
+    /// Stage 1: verifies that `header` is a parameterized comparison-switch loop header whose ops
+    /// compute only the branch condition without escaping.
+    fn match_header_shape(&self, header_id: RBlockId) -> Option<HeaderShape> {
+        let header = self.block(header_id)?;
+        if header.params.is_empty() {
             return None;
         }
-    }
-    let outside_preds: Vec<usize> = predecessors
-        .iter()
-        .copied()
-        .filter(|b| !doms.dominates(header.id, RBlockId(*b as u32)))
-        .collect();
-    let [preheader] = outside_preds.as_slice() else {
-        return None;
-    };
-    let preheader = *preheader;
-    let backedges: Vec<usize> = predecessors
-        .into_iter()
-        .filter(|b| doms.dominates(header.id, RBlockId(*b as u32)))
-        .collect();
-    if backedges.is_empty() || !doms.dominates(RBlockId(preheader as u32), header.id) {
-        return None;
-    }
-    let scc = natural_loop_blocks(func, header_idx, &backedges);
-    if !scc.contains(&(continue_to.0 as usize))
-        || scc.contains(&(exit_target.0 as usize))
-        || !scc
-            .iter()
-            .all(|block| doms.dominates(header.id, RBlockId(*block as u32)))
-    {
-        return None;
-    }
-
-    // Header ops must only compute the comparison driving the switch and must not escape header.
-    let header_results: BTreeSet<ValueId> = header.ops.iter().filter_map(|op| op.result).collect();
-    for op in &header.ops {
-        let allowed = matches!(
-            op.kind,
-            OpKind::Copy(_)
-                | OpKind::Move(_)
-                | OpKind::Cast { .. }
-                | OpKind::Field { .. }
-                | OpKind::Aggregate { .. }
-                | OpKind::BorrowView { .. }
-                | OpKind::Binary {
-                    op: BinaryOp::Eq | BinaryOp::Ne,
-                    ..
-                }
-        );
-        if !allowed || op.result.is_none() {
-            return None;
-        }
-    }
-    if header
-        .term
-        .uses()
-        .iter()
-        .any(|u| header_results.contains(u) && *u != *scrut)
-    {
-        return None;
-    }
-
-    // Match (ptr_param, end) from either orientation of cmp_op.
-    let preheader_args = match &func.blocks[preheader].term {
-        RTerm::Goto(_, args) => args.as_slice(),
-        _ => return None,
-    };
-    let match_orientation =
-        |ptr_side: ValueId,
-         end_side: ValueId|
-         -> Option<(usize, ValueId, ValueId, Option<usize>, TypeId, TypeId)> {
-            let ptr_root = strip_ptr_wrapper_stop_params(
-                func,
-                table,
-                defs,
-                single_edge,
-                &header.params,
-                ptr_side,
-            )?;
-            let p_idx = header.params.iter().position(|p| *p == ptr_root)?;
-            let raw = strip_ptr_wrapper(func, table, defs, single_edge, preheader_args[p_idx])?;
-            let source = match definition(func, defs, raw).map(|op| &op.kind) {
-                Some(OpKind::RawView {
-                    root: Root::Value(source),
-                    path,
-                    mutable: false,
-                }) if path.as_slice() == [Proj::Deref] => *source,
-                Some(OpKind::SliceView { .. }) => raw,
-                _ if is_immutable_slice_ref(func, table, raw) => raw,
-                _ => return None,
-            };
-            let source_block = value_def_block(func, defs, source)?;
-            if scc.contains(&source_block)
-                || !doms.dominates(RBlockId(source_block as u32), RBlockId(preheader as u32))
-            {
-                return None;
-            }
-            let elem_ty = sized_non_zst_slice_element(table, value_ty(func, source)?)?;
-            if !is_raw_ptr_to(table, cmp_ty, elem_ty) {
-                return None;
-            }
-            let end_leaf =
-                strip_ptr_wrapper_until(func, table, defs, single_edge, &header.params, end_side)?;
-            let (end_root, end_param_idx) =
-                if let Some(e_idx) = header.params.iter().position(|p| *p == end_leaf) {
-                    if e_idx == p_idx {
-                        return None;
-                    }
-                    for be in &backedges {
-                        let RTerm::Goto(_, args) = &func.blocks[*be].term else {
-                            return None;
-                        };
-                        if args.get(e_idx).copied() != Some(end_leaf) {
-                            return None;
-                        }
-                    }
-                    (
-                        strip_ptr_wrapper(func, table, defs, single_edge, preheader_args[e_idx])?,
-                        Some(e_idx),
-                    )
-                } else {
-                    (end_leaf, None)
-                };
-            let end_site = defs.get(end_root.0 as usize).copied().flatten()?;
-            if scc.contains(&end_site.block)
-                || !doms.dominates(RBlockId(end_site.block as u32), RBlockId(preheader as u32))
-            {
-                return None;
-            }
-            let OpKind::Binary {
-                op: BinaryOp::Offset,
-                l: end_base,
-                r: len,
-                ty: end_ty,
-            } = definition(func, defs, end_root)?.kind
-            else {
-                return None;
-            };
-            if !is_raw_ptr_to(table, end_ty, elem_ty) {
-                return None;
-            }
-            let end_base_root = strip_ptr_wrapper(func, table, defs, single_edge, end_base)?;
-            if end_base_root != raw && end_base_root != source {
-                return None;
-            }
-            if !source_length_matches(func, table, defs, single_edge, source, len) {
-                return None;
-            }
-            let usize_ty = value_ty(func, len)?;
-            if table
-                .int_info(usize_ty)
-                .is_none_or(|(signed, bits)| signed || bits != 32)
-            {
-                return None;
-            }
-            Some((p_idx, source, len, end_param_idx, elem_ty, usize_ty))
-        };
-
-    let (p_idx, source, len, end_param_idx, elem_ty, usize_ty) =
-        match_orientation(l, r).or_else(|| match_orientation(r, l))?;
-    let ptr_param = header.params[p_idx];
-    let driver_idx = continue_to.0 as usize;
-    let driver_block = func.blocks.get(driver_idx)?;
-    if !driver_block.params.is_empty() {
-        return None;
-    }
-
-    // Find next_ptr = Offset(ptr_param, 1) in driver_idx.
-    let mut removed_driver_ops: BTreeSet<usize> = BTreeSet::new();
-    let mut zst_candidates: Vec<ValueId> = Vec::new();
-    let mut next_ptr_op_idx = None;
-    let mut next_ptr_base_val = None;
-    let mut next_ptr_val = None;
-    let mut one_val = None;
-    for (op_idx, op) in driver_block.ops.iter().enumerate() {
-        if let OpKind::Binary {
-            op: BinaryOp::Offset,
-            l: base,
-            r: one,
-            ty: next_ty,
-        } = op.kind
-        {
-            if is_raw_ptr_to(table, next_ty, elem_ty)
-                && strip_ptr_wrapper(func, table, defs, single_edge, base) == Some(ptr_param)
-                && is_scalar(func, defs, single_edge, one, 1)
-            {
-                next_ptr_op_idx = Some(op_idx);
-                next_ptr_base_val = Some(base);
-                next_ptr_val = op.result;
-                one_val = Some(one);
-                break;
-            }
-        }
-    }
-    let next_ptr_idx = next_ptr_op_idx?;
-    let next_ptr_base = next_ptr_base_val?;
-    let next_ptr = next_ptr_val?;
-    let one_val = one_val?;
-    removed_driver_ops.insert(next_ptr_idx);
-    collect_ptr_wrapper_chain_in_block(
-        func,
-        table,
-        defs,
-        driver_idx,
-        next_ptr_base,
-        ptr_param,
-        &mut removed_driver_ops,
-        &mut zst_candidates,
-    );
-    if let Some(site) = defs.get(one_val.0 as usize).copied().flatten() {
-        if site.block == driver_idx {
-            // Only remove `one_val` if unused outside removed_ops.
-            let used_elsewhere = func.blocks.iter().enumerate().any(|(bi, b)| {
-                b.ops.iter().enumerate().any(|(oi, op)| {
-                    !(bi == driver_idx && (oi == next_ptr_idx || removed_driver_ops.contains(&oi)))
-                        && op.kind.uses().contains(&one_val)
-                }) || b.term.uses().contains(&one_val)
-            });
-            if !used_elsewhere {
-                removed_driver_ops.insert(site.op);
-            }
-        }
-    }
-
-    // Check every backedge passes next_ptr (or wrapper of it) at p_idx and is reachable from driver.
-    let driver_reach = distances(func, continue_to);
-    let mut invariant_param_candidates: Vec<(usize, usize, ValueId)> = Vec::new();
-    for be in &backedges {
-        driver_reach[*be]?;
-        let RTerm::Goto(_, args) = &func.blocks[*be].term else {
+        let bool_ty = bool_type(self.table)?;
+        let RTerm::Switch {
+            scrut,
+            scrut_ty,
+            cases,
+            default,
+        } = &header.term
+        else {
             return None;
         };
-        let arg = args[p_idx];
-        if strip_ptr_wrapper(func, table, defs, single_edge, arg) != Some(next_ptr) {
+        if *scrut_ty != bool_ty || !default.1.is_empty() {
             return None;
         }
-        collect_backedge_wrapper_chain(
-            func,
-            table,
-            defs,
-            single_edge,
-            driver_idx,
-            arg,
-            next_ptr,
-            &mut removed_driver_ops,
-            &mut zst_candidates,
-            &mut invariant_param_candidates,
-        )?;
-    }
-    let removed_invariant_params = validate_dead_invariant_params(
-        func,
-        &scc,
-        header_idx,
-        p_idx,
-        &backedges,
-        &invariant_param_candidates,
-    )?;
-
-    // Find old_item_ref and/or old_item in driver_idx.
-    let mut old_item_ref = None;
-    let mut old_item_ref_op = None;
-    let mut old_item = None;
-    let mut old_item_op = None;
-    let mut item_ref_ty = None;
-    let mut origin = cmp_op.origin;
-
-    for (op_idx, op) in driver_block.ops.iter().enumerate() {
-        if let OpKind::BorrowView {
-            root: Root::Value(ptr),
-            path,
-            mutable: false,
-        } = &op.kind
-        {
-            if path.as_slice() == [Proj::Deref]
-                && strip_ptr_wrapper(func, table, defs, single_edge, *ptr) == Some(ptr_param)
-            {
-                if let Some(res) = op.result {
-                    if let Some(ty) = value_ty(func, res) {
-                        if is_ref_to(table, ty, elem_ty) {
-                            old_item_ref = Some(res);
-                            old_item_ref_op = Some(op_idx);
-                            item_ref_ty = Some(ty);
-                            origin = op.origin;
-                            collect_ptr_wrapper_chain_in_block(
-                                func,
-                                table,
-                                defs,
-                                driver_idx,
-                                *ptr,
-                                ptr_param,
-                                &mut removed_driver_ops,
-                                &mut zst_candidates,
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(ref_val) = old_item_ref {
-        removed_driver_ops.insert(old_item_ref_op?);
-        for (op_idx, op) in driver_block.ops.iter().enumerate() {
-            if let OpKind::Deref(target) = op.kind {
-                if strip_copies_local(func, driver_idx, target) == ref_val {
-                    if let Some(res) = op.result {
-                        if value_ty(func, res) == Some(elem_ty) {
-                            old_item = Some(res);
-                            old_item_op = Some(op_idx);
-                            origin = op.origin;
-                            removed_driver_ops.insert(op_idx);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for (op_idx, op) in driver_block.ops.iter().enumerate() {
-            if let OpKind::Deref(ptr) = op.kind {
-                if strip_ptr_wrapper(func, table, defs, single_edge, ptr) == Some(ptr_param) {
-                    if let Some(res) = op.result {
-                        if value_ty(func, res) == Some(elem_ty) {
-                            old_item = Some(res);
-                            old_item_op = Some(op_idx);
-                            origin = op.origin;
-                            removed_driver_ops.insert(op_idx);
-                            collect_ptr_wrapper_chain_in_block(
-                                func,
-                                table,
-                                defs,
-                                driver_idx,
-                                ptr,
-                                ptr_param,
-                                &mut removed_driver_ops,
-                                &mut zst_candidates,
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        item_ref_ty = ref_to_type(table, elem_ty);
-    }
-    let item_ref_ty = item_ref_ty?;
-    if old_item_ref.is_none() && old_item.is_none() {
-        return None;
-    }
-    let _ = old_item_op;
-    collect_unused_zst_ops_in_block(
-        func,
-        table,
-        defs,
-        driver_idx,
-        zst_candidates,
-        &mut removed_driver_ops,
-    );
-
-    // Optional: check for a scalarized Enumerate index counter parameter in header.
-    let mut removed_header_params = vec![p_idx];
-    if let Some(e_idx) = end_param_idx {
-        removed_header_params.push(e_idx);
-    }
-    let mut adapter = Adapter::Plain;
-    let mut old_index = None;
-    for (i_idx, &idx_param) in header.params.iter().enumerate() {
-        if i_idx == p_idx
-            || Some(i_idx) == end_param_idx
-            || value_ty(func, idx_param) != Some(usize_ty)
-        {
-            continue;
-        }
-        if !is_scalar(func, defs, single_edge, preheader_args[i_idx], 0) {
-            continue;
-        }
-        if let Some((counter_ops, next_idx)) = match_scalarized_enumerate_counter(
-            func,
-            defs,
-            single_edge,
-            driver_idx,
-            idx_param,
-            usize_ty,
-            &backedges,
-            i_idx,
-            &scc,
-        ) {
-            let mut candidate_removed = removed_driver_ops.clone();
-            candidate_removed.extend(counter_ops.iter().copied());
-            let mut removed_map = BTreeMap::new();
-            removed_map.insert(header_idx, (0..header.ops.len()).collect());
-            removed_map.insert(driver_idx, candidate_removed);
-            let mut candidate_params = removed_header_params.clone();
-            candidate_params.push(i_idx);
-            if removed_ops_are_local(
-                func,
-                header_idx,
-                &removed_map,
-                &removed_invariant_params,
-                &scc,
-                None,
-                &backedges,
-                &candidate_params,
-                &[Some(idx_param), old_item_ref, old_item],
-                &[next_idx],
-            ) {
-                removed_driver_ops.extend(counter_ops);
-                removed_header_params.push(i_idx);
-                adapter = Adapter::Enumerate;
-                old_index = Some(idx_param);
-                break;
-            }
-        }
-    }
-
-    let mut removed_ops = BTreeMap::new();
-    removed_ops.insert(header_idx, (0..header.ops.len()).collect());
-    removed_ops.insert(driver_idx, removed_driver_ops.clone());
-
-    // Check if driver is a pure forwarding block to `body(item_ref)` or `body()`.
-    let mut body_idx = driver_idx;
-    let mut pass_item_ref = false;
-    let driver_remaining = driver_block
-        .ops
-        .len()
-        .saturating_sub(removed_driver_ops.len());
-    let sole_header_pred = driver_idx != 0
-        && func.blocks.iter().enumerate().all(|(bi, b)| {
-            bi == header_idx
-                || !b
-                    .term
-                    .successors()
-                    .iter()
-                    .any(|succ| succ.0 as usize == driver_idx)
-        });
-    if driver_remaining == 0 && sole_header_pred {
-        if let RTerm::Goto(next_b, args) = &driver_block.term {
-            let next_idx = next_b.0 as usize;
-            if next_idx != header_idx && scc.contains(&next_idx) {
-                let body_block = func.blocks.get(next_idx)?;
-                if args.is_empty() && body_block.params.is_empty() {
-                    body_idx = next_idx;
-                } else if let (Some(ref_val), [arg], [param]) =
-                    (old_item_ref, args.as_slice(), body_block.params.as_slice())
-                {
-                    if *arg == ref_val && old_item.is_none() {
-                        body_idx = next_idx;
-                        pass_item_ref = true;
-                        // When passing via body param, `param` receives `new_item_ref`; `old_item_ref` is not exposed outside driver.
-                        let _ = param;
-                    }
-                }
-            }
-        }
-    }
-
-    let bypassed_driver = (body_idx != driver_idx).then_some(driver_idx);
-    if !removed_ops_are_local(
-        func,
-        header_idx,
-        &removed_ops,
-        &removed_invariant_params,
-        &scc,
-        bypassed_driver,
-        &backedges,
-        &removed_header_params,
-        &[
-            old_index,
-            if pass_item_ref { None } else { old_item_ref },
-            old_item,
-        ],
-        &[],
-    ) {
-        return None;
-    }
-    removed_ops.remove(&header_idx);
-
-    let taint_seeds = vec![ptr_param];
-    if let Some(idx_p) = old_index {
-        let _ = idx_p; // idx_param is rewritten directly to enumerate_index; checked above.
-    }
-    let tainted = tainted_values(func, &taint_seeds, old_index, old_item_ref, old_item);
-    if !non_escaping(func, defs, &scc, &tainted) {
-        return None;
-    }
-
-    let mut exits = BTreeSet::new();
-    for block in &scc {
-        for target in func.blocks[*block].term.successors() {
-            if !scc.contains(&(target.0 as usize)) {
-                exits.insert(target);
-            }
-        }
-    }
-    let exit = common_exit(func, &scc, &exits)?;
-    if !func.blocks.get(exit.0 as usize)?.params.is_empty()
-        || !exits
-            .iter()
-            .all(|start| discardable_exit_chain(func, defs, &tainted, *start, exit))
-    {
-        return None;
-    }
-
-    let (_, usize_bits) = table.int_info(usize_ty)?;
-    let usize_bytes = u8::try_from(usize_bits / 8).ok()?;
-    let (cursor_ty, cursor_bytes) = cursor_type_for_slice(table, usize_ty, usize_bytes);
-
-    Some(LoopMatch {
-        adapter,
-        header: header_idx,
-        preheader,
-        backedges,
-        driver: driver_idx,
-        body: body_idx,
-        removed_ops,
-        removed_header_params,
-        removed_invariant_params,
-        rewrite_blocks: scc,
-        pass_item_ref,
-        exit,
-        source,
-        len,
-        old_index,
-        old_item_ref: if pass_item_ref { None } else { old_item_ref },
-        old_byte: old_item,
-        item_ref_ty,
-        byte_ty: elem_ty,
-        cursor_ty,
-        cursor_bytes,
-        usize_ty,
-        bool_ty,
-        origin,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn match_scalarized_enumerate_counter(
-    func: &Func,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    driver_idx: usize,
-    idx_param: ValueId,
-    usize_ty: TypeId,
-    backedges: &[usize],
-    i_idx: usize,
-    scc: &BTreeSet<usize>,
-) -> Option<(Vec<usize>, ValueId)> {
-    let ops = &func.blocks[driver_idx].ops;
-    let mut next_idx_op = None;
-    let mut next_idx = None;
-    let mut one_val = None;
-    let mut before_val = None;
-    for (op_idx, op) in ops.iter().enumerate() {
-        if let OpKind::Binary {
-            op: BinaryOp::Add | BinaryOp::AddUnchecked,
+        let (case_val, case_target) = match cases.as_slice() {
+            [(val @ (0 | 1), target, args)] if args.is_empty() => (*val, *target),
+            _ => return None,
+        };
+        let cmp_val = self.strip_copies_local(header_id, *scrut);
+        let cmp_op = header.ops.iter().find(|op| op.result == Some(cmp_val))?;
+        let OpKind::Binary {
+            op: cmp_kind @ (BinaryOp::Eq | BinaryOp::Ne),
             l,
             r,
-            ty,
-        } = op.kind
-        {
-            if ty == usize_ty
-                && strip_copies_local(func, driver_idx, l) == idx_param
-                && is_scalar(func, defs, single_edge, r, 1)
-            {
-                next_idx_op = Some(op_idx);
-                next_idx = op.result;
-                before_val = Some(l);
-                one_val = Some(r);
-                break;
-            }
-        }
-    }
-    let next_idx_op = next_idx_op?;
-    let next_idx = next_idx?;
-    let before_val = before_val?;
-    let one_val = one_val?;
-    for be in backedges {
-        let RTerm::Goto(_, args) = &func.blocks[*be].term else {
+            ty: cmp_ty,
+        } = cmp_op.kind
+        else {
             return None;
         };
-        if strip_copies(func, defs, single_edge, args[i_idx])? != next_idx {
-            return None;
+        let (continue_to, exit_target) = match (cmp_kind, case_val) {
+            (BinaryOp::Eq, 0) | (BinaryOp::Ne, 1) => (case_target, default.0),
+            (BinaryOp::Eq, 1) | (BinaryOp::Ne, 0) => (default.0, case_target),
+            _ => return None,
+        };
+
+        // Header ops must only compute the comparison driving the switch and must not escape header.
+        let header_results: BTreeSet<ValueId> =
+            header.ops.iter().filter_map(|op| op.result).collect();
+        for op in &header.ops {
+            let allowed = matches!(
+                op.kind,
+                OpKind::Copy(_)
+                    | OpKind::Move(_)
+                    | OpKind::Cast { .. }
+                    | OpKind::Field { .. }
+                    | OpKind::Aggregate { .. }
+                    | OpKind::BorrowView { .. }
+                    | OpKind::Binary {
+                        op: BinaryOp::Eq | BinaryOp::Ne,
+                        ..
+                    }
+            );
+            if !allowed || op.result.is_none() {
+                return None;
+            }
         }
-    }
-    // Check idx_param does not escape scc.
-    for (bi, b) in func.blocks.iter().enumerate() {
-        if !scc.contains(&bi)
-            && (b.ops.iter().any(|op| op.kind.uses().contains(&idx_param))
-                || b.term.uses().contains(&idx_param))
+        if header
+            .term
+            .uses()
+            .iter()
+            .any(|u| header_results.contains(u) && *u != *scrut)
         {
             return None;
+        }
+
+        Some(HeaderShape {
+            header: header_id,
+            bool_ty,
+            cmp_ty,
+            cmp_l: l,
+            cmp_r: r,
+            cmp_origin: cmp_op.origin,
+            continue_to,
+            exit_target,
+        })
+    }
+
+    /// Stage 2: identifies the single preheader, backedges, and dominated natural loop region.
+    fn match_loop_region(&self, shape: &HeaderShape) -> Option<LoopRegion> {
+        let doms = &self.cfg.doms;
+        let header = self.block(shape.header)?;
+        let mut predecessors = Vec::new();
+        for block in &self.func.blocks {
+            if matches!(&block.term, RTerm::Goto(target, args) if *target == header.id && args.len() == header.params.len())
+            {
+                predecessors.push(block.id);
+            } else if block.term.successors().contains(&header.id) {
+                return None;
+            }
+        }
+        let outside_preds: Vec<RBlockId> = predecessors
+            .iter()
+            .copied()
+            .filter(|&b| !doms.dominates(header.id, b))
+            .collect();
+        let [preheader] = outside_preds.as_slice() else {
+            return None;
+        };
+        let preheader = *preheader;
+        let backedges: Vec<RBlockId> = predecessors
+            .into_iter()
+            .filter(|&b| doms.dominates(header.id, b))
+            .collect();
+        if backedges.is_empty() || !doms.dominates(preheader, header.id) {
+            return None;
+        }
+        let scc: BTreeSet<RBlockId> = self.cfg.natural_loop(header.id);
+        if !scc.contains(&shape.continue_to)
+            || scc.contains(&shape.exit_target)
+            || !scc.iter().all(|&block| doms.dominates(header.id, block))
+        {
+            return None;
+        }
+        Some(LoopRegion {
+            header: shape.header,
+            preheader,
+            backedges,
+            scc,
+        })
+    }
+
+    /// Stage 3: matches `(ptr_param, end)` from either orientation of the header comparison and
+    /// verifies that `end == raw_base + slice.len()` for an immutable non-ZST slice.
+    fn match_cursor_bounds(
+        &self,
+        shape: &HeaderShape,
+        region: &LoopRegion,
+    ) -> Option<CursorBounds> {
+        let header = self.block(region.header)?;
+        let preheader_args = match &self.block(region.preheader)?.term {
+            RTerm::Goto(_, args) => args.as_slice(),
+            _ => return None,
+        };
+        self.match_cursor_orientation(
+            shape,
+            region,
+            header,
+            preheader_args,
+            shape.cmp_l,
+            shape.cmp_r,
+        )
+        .or_else(|| {
+            self.match_cursor_orientation(
+                shape,
+                region,
+                header,
+                preheader_args,
+                shape.cmp_r,
+                shape.cmp_l,
+            )
+        })
+    }
+
+    fn match_cursor_orientation(
+        &self,
+        shape: &HeaderShape,
+        region: &LoopRegion,
+        header: &RBlock,
+        preheader_args: &[ValueId],
+        ptr_side: ValueId,
+        end_side: ValueId,
+    ) -> Option<CursorBounds> {
+        let doms = &self.cfg.doms;
+        let ptr_root = self.strip_ptr_wrapper_stop_params(&header.params, ptr_side)?;
+        let p_idx = header.params.iter().position(|p| *p == ptr_root)?;
+        let raw = self.strip_ptr_wrapper(preheader_args[p_idx])?;
+        let source = match self.definition(raw).map(|op| &op.kind) {
+            Some(OpKind::RawView {
+                root: Root::Value(source),
+                path,
+                mutable: false,
+            }) if path.as_slice() == [Proj::Deref] => *source,
+            Some(OpKind::SliceView { .. }) => raw,
+            _ if is_immutable_slice_ref(self.func, self.table, raw) => raw,
+            _ => return None,
+        };
+        let source_block = self.value_def_block(source)?;
+        if region.scc.contains(&source_block) || !doms.dominates(source_block, region.preheader) {
+            return None;
+        }
+        let elem_ty = sized_non_zst_slice_element(self.table, self.value_ty(source)?)?;
+        if !is_raw_ptr_to(self.table, shape.cmp_ty, elem_ty) {
+            return None;
+        }
+        let end_leaf = self.strip_ptr_wrapper_until(&header.params, end_side)?;
+        let (end_root, end_param_idx) =
+            if let Some(e_idx) = header.params.iter().position(|p| *p == end_leaf) {
+                if e_idx == p_idx {
+                    return None;
+                }
+                for &be in &region.backedges {
+                    let RTerm::Goto(_, args) = &self.block(be)?.term else {
+                        return None;
+                    };
+                    if args.get(e_idx).copied() != Some(end_leaf) {
+                        return None;
+                    }
+                }
+                (self.strip_ptr_wrapper(preheader_args[e_idx])?, Some(e_idx))
+            } else {
+                (end_leaf, None)
+            };
+        let end_site = self.def_site(end_root)?;
+        if region.scc.contains(&end_site.block) || !doms.dominates(end_site.block, region.preheader)
+        {
+            return None;
+        }
+        let OpKind::Binary {
+            op: BinaryOp::Offset,
+            l: end_base,
+            r: len,
+            ty: end_ty,
+        } = self.definition(end_root)?.kind
+        else {
+            return None;
+        };
+        if !is_raw_ptr_to(self.table, end_ty, elem_ty) {
+            return None;
+        }
+        let end_base_root = self.strip_ptr_wrapper(end_base)?;
+        if end_base_root != raw && end_base_root != source {
+            return None;
+        }
+        if !self.source_length_matches(source, len) {
+            return None;
+        }
+        let usize_ty = self.value_ty(len)?;
+        if self
+            .table
+            .int_info(usize_ty)
+            .is_none_or(|(signed, bits)| signed || bits != 32)
+        {
+            return None;
+        }
+        Some(CursorBounds {
+            p_idx,
+            ptr_param: header.params[p_idx],
+            source,
+            len,
+            end_param_idx,
+            elem_ty,
+            usize_ty,
+        })
+    }
+
+    /// Stage 4: matches the driver block's `Offset(ptr, 1)` step, backedge advancement, and
+    /// element borrow/deref ops.
+    fn match_driver_step_and_elem(
+        &self,
+        shape: &HeaderShape,
+        region: &LoopRegion,
+        bounds: &CursorBounds,
+    ) -> Option<DriverMatch> {
+        let driver = shape.continue_to;
+        let driver_block = self.block(driver)?;
+        if !driver_block.params.is_empty() {
+            return None;
+        }
+
+        // Find next_ptr = Offset(ptr_param, 1) in driver.
+        let mut removed_driver_ops: BTreeSet<usize> = BTreeSet::new();
+        let mut zst_candidates: Vec<ValueId> = Vec::new();
+        let mut next_ptr_op_idx = None;
+        let mut next_ptr_base_val = None;
+        let mut next_ptr_val = None;
+        let mut one_val = None;
+        for (op_idx, op) in driver_block.ops.iter().enumerate() {
+            if let OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: base,
+                r: one,
+                ty: next_ty,
+            } = op.kind
+            {
+                if is_raw_ptr_to(self.table, next_ty, bounds.elem_ty)
+                    && self.strip_ptr_wrapper(base) == Some(bounds.ptr_param)
+                    && self.is_scalar(one, 1)
+                {
+                    next_ptr_op_idx = Some(op_idx);
+                    next_ptr_base_val = Some(base);
+                    next_ptr_val = op.result;
+                    one_val = Some(one);
+                    break;
+                }
+            }
+        }
+        let next_ptr_idx = next_ptr_op_idx?;
+        let next_ptr_base = next_ptr_base_val?;
+        let next_ptr = next_ptr_val?;
+        let one_val = one_val?;
+        removed_driver_ops.insert(next_ptr_idx);
+        self.collect_ptr_wrapper_chain_in_block(
+            driver,
+            next_ptr_base,
+            bounds.ptr_param,
+            &mut removed_driver_ops,
+            &mut zst_candidates,
+        );
+        if let Some(site) = self.def_site(one_val) {
+            if site.block == driver {
+                // Only remove `one_val` if unused outside removed_ops.
+                let used_elsewhere = self.func.blocks.iter().any(|b| {
+                    b.ops.iter().enumerate().any(|(oi, op)| {
+                        !(b.id == driver
+                            && (oi == next_ptr_idx || removed_driver_ops.contains(&oi)))
+                            && op.kind.uses().contains(&one_val)
+                    }) || b.term.uses().contains(&one_val)
+                });
+                if !used_elsewhere {
+                    removed_driver_ops.insert(site.op);
+                }
+            }
+        }
+
+        // Check every backedge passes next_ptr (or wrapper of it) at p_idx and is reachable from driver.
+        let driver_reach = distances(self.func, driver);
+        let mut invariant_param_candidates: Vec<(RBlockId, usize, ValueId)> = Vec::new();
+        for &be in &region.backedges {
+            driver_reach[be.0 as usize]?;
+            let RTerm::Goto(_, args) = &self.block(be)?.term else {
+                return None;
+            };
+            let arg = args[bounds.p_idx];
+            if self.strip_ptr_wrapper(arg) != Some(next_ptr) {
+                return None;
+            }
+            self.collect_backedge_wrapper_chain(
+                driver,
+                arg,
+                next_ptr,
+                &mut removed_driver_ops,
+                &mut zst_candidates,
+                &mut invariant_param_candidates,
+            )?;
+        }
+        let removed_invariant_params =
+            self.validate_dead_invariant_params(region, bounds.p_idx, &invariant_param_candidates)?;
+
+        // Find old_item_ref and/or old_item in driver.
+        let mut old_item_ref = None;
+        let mut old_item_ref_op = None;
+        let mut old_item = None;
+        let mut item_ref_ty = None;
+        let mut origin = shape.cmp_origin;
+
+        for (op_idx, op) in driver_block.ops.iter().enumerate() {
+            if let OpKind::BorrowView {
+                root: Root::Value(ptr),
+                path,
+                mutable: false,
+            } = &op.kind
+            {
+                if path.as_slice() == [Proj::Deref]
+                    && self.strip_ptr_wrapper(*ptr) == Some(bounds.ptr_param)
+                {
+                    if let Some(res) = op.result {
+                        if let Some(ty) = self.value_ty(res) {
+                            if is_ref_to(self.table, ty, bounds.elem_ty) {
+                                old_item_ref = Some(res);
+                                old_item_ref_op = Some(op_idx);
+                                item_ref_ty = Some(ty);
+                                origin = op.origin;
+                                self.collect_ptr_wrapper_chain_in_block(
+                                    driver,
+                                    *ptr,
+                                    bounds.ptr_param,
+                                    &mut removed_driver_ops,
+                                    &mut zst_candidates,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref_val) = old_item_ref {
+            removed_driver_ops.insert(old_item_ref_op?);
+            for (op_idx, op) in driver_block.ops.iter().enumerate() {
+                if let OpKind::Deref(target) = op.kind {
+                    if self.strip_copies_local(driver, target) == ref_val {
+                        if let Some(res) = op.result {
+                            if self.value_ty(res) == Some(bounds.elem_ty) {
+                                old_item = Some(res);
+                                origin = op.origin;
+                                removed_driver_ops.insert(op_idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (op_idx, op) in driver_block.ops.iter().enumerate() {
+                if let OpKind::Deref(ptr) = op.kind {
+                    if self.strip_ptr_wrapper(ptr) == Some(bounds.ptr_param) {
+                        if let Some(res) = op.result {
+                            if self.value_ty(res) == Some(bounds.elem_ty) {
+                                old_item = Some(res);
+                                origin = op.origin;
+                                removed_driver_ops.insert(op_idx);
+                                self.collect_ptr_wrapper_chain_in_block(
+                                    driver,
+                                    ptr,
+                                    bounds.ptr_param,
+                                    &mut removed_driver_ops,
+                                    &mut zst_candidates,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            item_ref_ty = ref_to_type(self.table, bounds.elem_ty);
+        }
+        let item_ref_ty = item_ref_ty?;
+        if old_item_ref.is_none() && old_item.is_none() {
+            return None;
+        }
+        self.collect_unused_zst_ops_in_block(driver, zst_candidates, &mut removed_driver_ops);
+
+        Some(DriverMatch {
+            driver,
+            removed_driver_ops,
+            removed_invariant_params,
+            old_item_ref,
+            old_item,
+            item_ref_ty,
+            origin,
+        })
+    }
+
+    /// Stage 5: recognizes an optional scalarized `Enumerate` counter parameter on the header.
+    fn match_optional_enumerate(
+        &self,
+        region: &LoopRegion,
+        bounds: &CursorBounds,
+        driver: &DriverMatch,
+    ) -> EnumerateMatch {
+        let header = &self.func.blocks[region.header.0 as usize];
+        let preheader_args = match &self.func.blocks[region.preheader.0 as usize].term {
+            RTerm::Goto(_, args) => args.as_slice(),
+            _ => &[],
+        };
+        let mut removed_driver_ops = driver.removed_driver_ops.clone();
+        let mut removed_header_params = vec![bounds.p_idx];
+        if let Some(e_idx) = bounds.end_param_idx {
+            removed_header_params.push(e_idx);
+        }
+        let mut adapter = Adapter::Plain;
+        let mut old_index = None;
+
+        for (i_idx, &idx_param) in header.params.iter().enumerate() {
+            if i_idx == bounds.p_idx
+                || Some(i_idx) == bounds.end_param_idx
+                || self.value_ty(idx_param) != Some(bounds.usize_ty)
+            {
+                continue;
+            }
+            if !preheader_args
+                .get(i_idx)
+                .is_some_and(|&arg| self.is_scalar(arg, 0))
+            {
+                continue;
+            }
+            if let Some((counter_ops, next_idx)) = self.match_scalarized_enumerate_counter(
+                region,
+                driver.driver,
+                i_idx,
+                idx_param,
+                bounds.usize_ty,
+            ) {
+                let mut candidate_removed = removed_driver_ops.clone();
+                candidate_removed.extend(counter_ops.iter().copied());
+                let mut removed_map = BTreeMap::new();
+                removed_map.insert(region.header, (0..header.ops.len()).collect());
+                removed_map.insert(driver.driver, candidate_removed);
+                let mut candidate_params = removed_header_params.clone();
+                candidate_params.push(i_idx);
+                if self.removed_ops_are_local(&LocalityCheck {
+                    region,
+                    removed_ops: &removed_map,
+                    removed_invariant_params: &driver.removed_invariant_params,
+                    bypassed_driver: None,
+                    removed_params: &candidate_params,
+                    exposed: &[Some(idx_param), driver.old_item_ref, driver.old_item],
+                    extra_backedge_roots: &[next_idx],
+                }) {
+                    removed_driver_ops.extend(counter_ops);
+                    removed_header_params.push(i_idx);
+                    adapter = Adapter::Enumerate;
+                    old_index = Some(idx_param);
+                    break;
+                }
+            }
+        }
+
+        EnumerateMatch {
+            adapter,
+            removed_driver_ops,
+            removed_header_params,
+            old_index,
         }
     }
 
-    let mut counter_ops = vec![next_idx_op];
-    if let Some(site) = defs.get(before_val.0 as usize).copied().flatten() {
-        if site.block == driver_idx && before_val != idx_param {
-            counter_ops.push(site.op);
+    /// Stage 6: checks forwarding-driver bypass, removed-op locality, non-escape of tainted
+    /// pointer state, and discardable exit chains, then assembles [`LoopMatch`].
+    fn verify_isolation_and_exit(
+        &self,
+        _shape: &HeaderShape,
+        region: LoopRegion,
+        bounds: CursorBounds,
+        driver: DriverMatch,
+        enumerated: EnumerateMatch,
+    ) -> Option<LoopMatch> {
+        let header = self.block(region.header)?;
+        let driver_block = self.block(driver.driver)?;
+        let mut removed_ops = BTreeMap::new();
+        removed_ops.insert(region.header, (0..header.ops.len()).collect());
+        removed_ops.insert(driver.driver, enumerated.removed_driver_ops.clone());
+
+        // Check if driver is a pure forwarding block to `body(item_ref)` or `body()`.
+        let mut body = driver.driver;
+        let mut pass_item_ref = false;
+        let driver_remaining = driver_block
+            .ops
+            .len()
+            .saturating_sub(enumerated.removed_driver_ops.len());
+        let sole_header_pred =
+            driver.driver != RBlockId(0)
+                && self.func.blocks.iter().all(|b| {
+                    b.id == region.header || !b.term.successors().contains(&driver.driver)
+                });
+        if driver_remaining == 0 && sole_header_pred {
+            if let RTerm::Goto(next_b, args) = &driver_block.term {
+                if *next_b != region.header && region.scc.contains(next_b) {
+                    let body_block = self.block(*next_b)?;
+                    if args.is_empty() && body_block.params.is_empty() {
+                        body = *next_b;
+                    } else if let (Some(ref_val), [arg], [_]) = (
+                        driver.old_item_ref,
+                        args.as_slice(),
+                        body_block.params.as_slice(),
+                    ) {
+                        if *arg == ref_val && driver.old_item.is_none() {
+                            body = *next_b;
+                            pass_item_ref = true;
+                        }
+                    }
+                }
+            }
         }
+
+        let bypassed_driver = (body != driver.driver).then_some(driver.driver);
+        if !self.removed_ops_are_local(&LocalityCheck {
+            region: &region,
+            removed_ops: &removed_ops,
+            removed_invariant_params: &driver.removed_invariant_params,
+            bypassed_driver,
+            removed_params: &enumerated.removed_header_params,
+            exposed: &[
+                enumerated.old_index,
+                if pass_item_ref {
+                    None
+                } else {
+                    driver.old_item_ref
+                },
+                driver.old_item,
+            ],
+            extra_backedge_roots: &[],
+        }) {
+            return None;
+        }
+        removed_ops.remove(&region.header);
+
+        let taint_seeds = vec![bounds.ptr_param];
+        let tainted = self.tainted_values(
+            &taint_seeds,
+            enumerated.old_index,
+            driver.old_item_ref,
+            driver.old_item,
+        );
+        if !self.non_escaping(&region.scc, &tainted) {
+            return None;
+        }
+
+        let mut exits = BTreeSet::new();
+        for &block in &region.scc {
+            for target in self.func.blocks[block.0 as usize].term.successors() {
+                if !region.scc.contains(&target) {
+                    exits.insert(target);
+                }
+            }
+        }
+        let exit = self.common_exit(&region.scc, &exits)?;
+        if !self.block(exit)?.params.is_empty()
+            || !exits
+                .iter()
+                .all(|&start| self.discardable_exit_chain(&tainted, start, exit))
+        {
+            return None;
+        }
+
+        let (_, usize_bits) = self.table.int_info(bounds.usize_ty)?;
+        let usize_bytes = u8::try_from(usize_bits / 8).ok()?;
+        let (cursor_ty, cursor_bytes) =
+            cursor_type_for_slice(self.table, bounds.usize_ty, usize_bytes);
+
+        Some(LoopMatch {
+            adapter: enumerated.adapter,
+            header: region.header,
+            preheader: region.preheader,
+            backedges: region.backedges,
+            driver: driver.driver,
+            body,
+            removed_ops,
+            removed_header_params: enumerated.removed_header_params,
+            removed_invariant_params: driver.removed_invariant_params,
+            rewrite_blocks: region.scc,
+            pass_item_ref,
+            exit,
+            source: bounds.source,
+            len: bounds.len,
+            old_index: enumerated.old_index,
+            old_item_ref: if pass_item_ref {
+                None
+            } else {
+                driver.old_item_ref
+            },
+            old_byte: driver.old_item,
+            item_ref_ty: driver.item_ref_ty,
+            byte_ty: bounds.elem_ty,
+            cursor_ty,
+            cursor_bytes,
+            usize_ty: bounds.usize_ty,
+            bool_ty: _shape.bool_ty,
+            origin: driver.origin,
+        })
     }
-    if let Some(site) = defs.get(one_val.0 as usize).copied().flatten() {
-        if site.block == driver_idx {
-            let used_elsewhere = func.blocks.iter().enumerate().any(|(bi, b)| {
-                b.ops.iter().enumerate().any(|(oi, op)| {
-                    !(bi == driver_idx && oi == next_idx_op) && op.kind.uses().contains(&one_val)
-                }) || b.term.uses().contains(&one_val)
-            });
-            if !used_elsewhere {
+
+    fn match_scalarized_enumerate_counter(
+        &self,
+        region: &LoopRegion,
+        driver: RBlockId,
+        i_idx: usize,
+        idx_param: ValueId,
+        usize_ty: TypeId,
+    ) -> Option<(Vec<usize>, ValueId)> {
+        let ops = &self.func.blocks[driver.0 as usize].ops;
+        let mut next_idx_op = None;
+        let mut next_idx = None;
+        let mut one_val = None;
+        let mut before_val = None;
+        for (op_idx, op) in ops.iter().enumerate() {
+            if let OpKind::Binary {
+                op: BinaryOp::Add | BinaryOp::AddUnchecked,
+                l,
+                r,
+                ty,
+            } = op.kind
+            {
+                if ty == usize_ty
+                    && self.strip_copies_local(driver, l) == idx_param
+                    && self.is_scalar(r, 1)
+                {
+                    next_idx_op = Some(op_idx);
+                    next_idx = op.result;
+                    before_val = Some(l);
+                    one_val = Some(r);
+                    break;
+                }
+            }
+        }
+        let next_idx_op = next_idx_op?;
+        let next_idx = next_idx?;
+        let before_val = before_val?;
+        let one_val = one_val?;
+        for &be in &region.backedges {
+            let RTerm::Goto(_, args) = &self.block(be)?.term else {
+                return None;
+            };
+            if self.strip_copies(args[i_idx])? != next_idx {
+                return None;
+            }
+        }
+        // Check idx_param does not escape scc.
+        for b in &self.func.blocks {
+            if !region.scc.contains(&b.id)
+                && (b.ops.iter().any(|op| op.kind.uses().contains(&idx_param))
+                    || b.term.uses().contains(&idx_param))
+            {
+                return None;
+            }
+        }
+
+        let mut counter_ops = vec![next_idx_op];
+        if let Some(site) = self.def_site(before_val) {
+            if site.block == driver && before_val != idx_param {
                 counter_ops.push(site.op);
             }
         }
-    }
-    // Also match optional overflow check ops on (next_idx, before).
-    for (op_idx, op) in ops.iter().enumerate() {
-        if let OpKind::Assert {
-            cond,
-            expected: false,
-            msg:
-                RAssertMessage::Overflow {
-                    op: BinaryOp::Add,
-                    left,
-                    right,
-                },
-            ..
-        } = &op.kind
-        {
-            if is_scalar(func, defs, single_edge, *right, 1)
-                && strip_copies_local(func, driver_idx, *left) == idx_param
+        if let Some(site) = self.def_site(one_val) {
+            if site.block == driver {
+                let used_elsewhere = self.func.blocks.iter().any(|b| {
+                    b.ops.iter().enumerate().any(|(oi, op)| {
+                        !(b.id == driver && oi == next_idx_op) && op.kind.uses().contains(&one_val)
+                    }) || b.term.uses().contains(&one_val)
+                });
+                if !used_elsewhere {
+                    counter_ops.push(site.op);
+                }
+            }
+        }
+        // Also match optional overflow check ops on (next_idx, before).
+        for (op_idx, op) in ops.iter().enumerate() {
+            if let OpKind::Assert {
+                cond,
+                expected: false,
+                msg:
+                    RAssertMessage::Overflow {
+                        op: BinaryOp::Add,
+                        left,
+                        right,
+                    },
+                ..
+            } = &op.kind
             {
-                let cmp = strip_copies_local(func, driver_idx, *cond);
-                if let Some(cmp_site) = defs.get(cmp.0 as usize).copied().flatten() {
-                    if cmp_site.block == driver_idx {
-                        if let OpKind::Binary {
-                            op: BinaryOp::Lt,
-                            l,
-                            r,
-                            ty,
-                        } = ops[cmp_site.op].kind
-                        {
-                            if ty == usize_ty
-                                && l == next_idx
-                                && strip_copies_local(func, driver_idx, r) == idx_param
+                if self.is_scalar(*right, 1) && self.strip_copies_local(driver, *left) == idx_param
+                {
+                    let cmp = self.strip_copies_local(driver, *cond);
+                    if let Some(cmp_site) = self.def_site(cmp) {
+                        if cmp_site.block == driver {
+                            if let OpKind::Binary {
+                                op: BinaryOp::Lt,
+                                l,
+                                r,
+                                ty,
+                            } = ops[cmp_site.op].kind
                             {
-                                counter_ops.push(op_idx);
-                                counter_ops.push(cmp_site.op);
-                                if let Some(cs) = defs.get(cond.0 as usize).copied().flatten() {
-                                    if cs.block == driver_idx {
-                                        counter_ops.push(cs.op);
+                                if ty == usize_ty
+                                    && l == next_idx
+                                    && self.strip_copies_local(driver, r) == idx_param
+                                {
+                                    counter_ops.push(op_idx);
+                                    counter_ops.push(cmp_site.op);
+                                    if let Some(cs) = self.def_site(*cond) {
+                                        if cs.block == driver {
+                                            counter_ops.push(cs.op);
+                                        }
                                     }
-                                }
-                                if let Some(ls) = defs.get(left.0 as usize).copied().flatten() {
-                                    if ls.block == driver_idx && *left != idx_param {
-                                        counter_ops.push(ls.op);
+                                    if let Some(ls) = self.def_site(*left) {
+                                        if ls.block == driver && *left != idx_param {
+                                            counter_ops.push(ls.op);
+                                        }
                                     }
-                                }
-                                if let Some(rs) = defs.get(right.0 as usize).copied().flatten() {
-                                    if rs.block == driver_idx {
-                                        counter_ops.push(rs.op);
+                                    if let Some(rs) = self.def_site(*right) {
+                                        if rs.block == driver {
+                                            counter_ops.push(rs.op);
+                                        }
                                     }
                                 }
                             }
@@ -926,27 +1067,753 @@ fn match_scalarized_enumerate_counter(
                 }
             }
         }
+        counter_ops.sort_unstable();
+        counter_ops.dedup();
+        Some((counter_ops, next_idx))
     }
-    counter_ops.sort_unstable();
-    counter_ops.dedup();
-    Some((counter_ops, next_idx))
-}
 
-fn strip_copies_local(func: &Func, block: usize, mut val: ValueId) -> ValueId {
-    for _ in 0..8 {
-        let Some(op) = func.blocks[block]
-            .ops
-            .iter()
-            .find(|op| op.result == Some(val))
-        else {
-            break;
-        };
-        match op.kind {
-            OpKind::Copy(s) | OpKind::Move(s) => val = s,
-            _ => break,
+    fn strip_copies_local(&self, block: RBlockId, mut val: ValueId) -> ValueId {
+        for _ in 0..8 {
+            let Some(op) = self.func.blocks[block.0 as usize]
+                .ops
+                .iter()
+                .find(|op| op.result == Some(val))
+            else {
+                break;
+            };
+            match op.kind {
+                OpKind::Copy(s) | OpKind::Move(s) => val = s,
+                _ => break,
+            }
+        }
+        val
+    }
+
+    fn strip_ptr_wrapper(&self, value: ValueId) -> Option<ValueId> {
+        self.strip_ptr_wrapper_until(&[], value)
+    }
+
+    fn strip_ptr_wrapper_until(
+        &self,
+        stop_params: &[ValueId],
+        mut value: ValueId,
+    ) -> Option<ValueId> {
+        for _ in 0..24 {
+            if stop_params.contains(&value) {
+                return Some(value);
+            }
+            let Some(op) = self.definition(value) else {
+                if let Some(source) = self.single_edge.get(value.0 as usize).copied().flatten() {
+                    value = source;
+                    continue;
+                }
+                return Some(value);
+            };
+            match &op.kind {
+                OpKind::Copy(source) | OpKind::Move(source) => {
+                    value = *source;
+                }
+                OpKind::Cast {
+                    kind,
+                    v: source,
+                    from,
+                    to,
+                } if is_lossless_ptr_cast(self.table, *kind, *from, *to) => {
+                    value = *source;
+                }
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field,
+                } if self
+                    .value_ty(*base)
+                    .and_then(|ty| ptr_wrapper_field(self.table, ty))
+                    == Some(*field as usize) =>
+                {
+                    value = *base;
+                }
+                OpKind::Aggregate {
+                    ty,
+                    variant: 0,
+                    active_field: None,
+                    fields,
+                    ..
+                } => {
+                    let Some(idx) = ptr_wrapper_aggregate_field(self.table, *ty, fields.len())
+                    else {
+                        return Some(value);
+                    };
+                    value = fields[idx];
+                }
+                _ => return Some(value),
+            }
+        }
+        None
+    }
+
+    fn strip_ptr_wrapper_stop_params(
+        &self,
+        params: &[ValueId],
+        mut value: ValueId,
+    ) -> Option<ValueId> {
+        for _ in 0..24 {
+            if params.contains(&value) {
+                return Some(value);
+            }
+            let Some(op) = self.definition(value) else {
+                value = self.single_edge.get(value.0 as usize).copied().flatten()?;
+                continue;
+            };
+            match &op.kind {
+                OpKind::Copy(source) | OpKind::Move(source) => {
+                    value = *source;
+                }
+                OpKind::Cast {
+                    kind,
+                    v: source,
+                    from,
+                    to,
+                } if is_lossless_ptr_cast(self.table, *kind, *from, *to) => {
+                    value = *source;
+                }
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field,
+                } if self
+                    .value_ty(*base)
+                    .and_then(|ty| ptr_wrapper_field(self.table, ty))
+                    == Some(*field as usize) =>
+                {
+                    value = *base;
+                }
+                OpKind::Aggregate {
+                    ty,
+                    variant: 0,
+                    active_field: None,
+                    fields,
+                    ..
+                } => {
+                    let idx = ptr_wrapper_aggregate_field(self.table, *ty, fields.len())?;
+                    value = fields[idx];
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn collect_ptr_wrapper_chain_in_block(
+        &self,
+        block: RBlockId,
+        mut value: ValueId,
+        stop: ValueId,
+        out: &mut BTreeSet<usize>,
+        zst_candidates: &mut Vec<ValueId>,
+    ) {
+        for _ in 0..16 {
+            if value == stop {
+                break;
+            }
+            let Some(site) = self.def_site(value) else {
+                break;
+            };
+            if site.block != block {
+                break;
+            }
+            let op = &self.func.blocks[block.0 as usize].ops[site.op];
+            let next = match &op.kind {
+                OpKind::Copy(s) | OpKind::Move(s) => *s,
+                OpKind::Cast {
+                    kind,
+                    v: s,
+                    from,
+                    to,
+                } if is_lossless_ptr_cast(self.table, *kind, *from, *to) => *s,
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field,
+                } if self
+                    .value_ty(*base)
+                    .and_then(|ty| ptr_wrapper_field(self.table, ty))
+                    == Some(*field as usize) =>
+                {
+                    *base
+                }
+                OpKind::Aggregate {
+                    ty,
+                    variant: 0,
+                    active_field: None,
+                    fields,
+                    ..
+                } => {
+                    let Some(idx) = ptr_wrapper_aggregate_field(self.table, *ty, fields.len())
+                    else {
+                        break;
+                    };
+                    for (i, &field_val) in fields.iter().enumerate() {
+                        if i != idx {
+                            zst_candidates.push(field_val);
+                        }
+                    }
+                    fields[idx]
+                }
+                _ => break,
+            };
+            out.insert(site.op);
+            value = next;
         }
     }
-    val
+
+    fn collect_backedge_wrapper_chain(
+        &self,
+        driver: RBlockId,
+        arg: ValueId,
+        next_ptr: ValueId,
+        out: &mut BTreeSet<usize>,
+        zst_candidates: &mut Vec<ValueId>,
+        invariant_param_candidates: &mut Vec<(RBlockId, usize, ValueId)>,
+    ) -> Option<()> {
+        let mut cur = arg;
+        for _ in 0..24 {
+            if cur == next_ptr {
+                return Some(());
+            }
+            let Some(site) = self.def_site(cur) else {
+                let (param_block, param_pos) = self.func.blocks.iter().find_map(|b| {
+                    b.params
+                        .iter()
+                        .position(|p| *p == cur)
+                        .map(|pos| (b.id, pos))
+                })?;
+                invariant_param_candidates.push((param_block, param_pos, cur));
+                cur = self.single_edge.get(cur.0 as usize).copied().flatten()?;
+                continue;
+            };
+            if site.block == driver {
+                out.insert(site.op);
+            }
+            cur = match &self.func.blocks[site.block.0 as usize].ops[site.op].kind {
+                OpKind::Copy(s) | OpKind::Move(s) => *s,
+                OpKind::Cast {
+                    kind,
+                    v: s,
+                    from,
+                    to,
+                } if is_lossless_ptr_cast(self.table, *kind, *from, *to) => *s,
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field,
+                } if self
+                    .value_ty(*base)
+                    .and_then(|ty| ptr_wrapper_field(self.table, ty))
+                    == Some(*field as usize) =>
+                {
+                    *base
+                }
+                OpKind::Aggregate {
+                    ty,
+                    variant: 0,
+                    active_field: None,
+                    fields,
+                    ..
+                } => {
+                    let idx = ptr_wrapper_aggregate_field(self.table, *ty, fields.len())?;
+                    if site.block == driver {
+                        for (i, &field_val) in fields.iter().enumerate() {
+                            if i != idx {
+                                zst_candidates.push(field_val);
+                            }
+                        }
+                    }
+                    fields[idx]
+                }
+                _ => return None,
+            };
+        }
+        None
+    }
+
+    fn collect_unused_zst_ops_in_block(
+        &self,
+        block: RBlockId,
+        mut candidates: Vec<ValueId>,
+        removed_ops: &mut BTreeSet<usize>,
+    ) {
+        while let Some(val) = candidates.pop() {
+            if !self.value_ty(val).is_some_and(|ty| self.table.is_zst(ty)) {
+                continue;
+            }
+            let Some(site) = self.def_site(val) else {
+                continue;
+            };
+            if site.block != block || removed_ops.contains(&site.op) {
+                continue;
+            }
+            let op = &self.func.blocks[block.0 as usize].ops[site.op];
+            let is_pure_zst = matches!(
+                op.kind,
+                OpKind::Const(_)
+                    | OpKind::Copy(_)
+                    | OpKind::Move(_)
+                    | OpKind::Aggregate {
+                        active_field: None,
+                        ..
+                    }
+            );
+            if !is_pure_zst {
+                continue;
+            }
+            let used_elsewhere = self.func.blocks.iter().any(|b| {
+                b.ops.iter().enumerate().any(|(oi, other)| {
+                    !(b.id == block && removed_ops.contains(&oi))
+                        && other.kind.uses().contains(&val)
+                }) || b.term.uses().contains(&val)
+            });
+            if !used_elsewhere {
+                removed_ops.insert(site.op);
+                candidates.extend(op.kind.uses());
+            }
+        }
+    }
+
+    fn validate_dead_invariant_params(
+        &self,
+        region: &LoopRegion,
+        p_idx: usize,
+        candidates: &[(RBlockId, usize, ValueId)],
+    ) -> Option<BTreeMap<RBlockId, Vec<usize>>> {
+        let mut map: BTreeMap<RBlockId, Vec<usize>> = BTreeMap::new();
+        if candidates.is_empty() {
+            return Some(map);
+        }
+        let backedge_set: BTreeSet<RBlockId> = region.backedges.iter().copied().collect();
+        let mut candidate_vals = BTreeSet::new();
+        let mut candidate_slots = BTreeSet::new();
+        for &(b_id, pos, val) in candidates {
+            if b_id == region.header || !region.scc.contains(&b_id) {
+                return None;
+            }
+            candidate_vals.insert(val);
+            candidate_slots.insert((b_id, pos));
+            map.entry(b_id).or_default().push(pos);
+        }
+        for positions in map.values_mut() {
+            positions.sort_unstable();
+            positions.dedup();
+        }
+        for block in &self.func.blocks {
+            if block
+                .ops
+                .iter()
+                .any(|op| op.kind.uses().iter().any(|u| candidate_vals.contains(u)))
+            {
+                return None;
+            }
+            let scrut_uses = match &block.term {
+                RTerm::Switch { scrut, .. } => Some(*scrut),
+                RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => Some(*v),
+                _ => None,
+            };
+            if scrut_uses.is_some_and(|u| candidate_vals.contains(&u)) {
+                return None;
+            }
+            for (target, args) in block.term.edges() {
+                if map.contains_key(&target)
+                    && args.len() != self.func.blocks[target.0 as usize].params.len()
+                {
+                    return None;
+                }
+                for (pos, arg) in args.iter().enumerate() {
+                    if !candidate_vals.contains(arg) {
+                        continue;
+                    }
+                    let allowed_edge = (target == region.header
+                        && pos == p_idx
+                        && backedge_set.contains(&block.id))
+                        || candidate_slots.contains(&(target, pos));
+                    if !allowed_edge {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(map)
+    }
+
+    fn removed_ops_are_local(&self, check: &LocalityCheck<'_>) -> bool {
+        let region = check.region;
+        let mut removed = BTreeSet::new();
+        for &param_idx in check.removed_params {
+            if let Some(&param) = self.func.blocks[region.header.0 as usize]
+                .params
+                .get(param_idx)
+            {
+                removed.insert(param);
+            }
+        }
+        for (&block_id, ops) in check.removed_ops {
+            for &op_idx in ops {
+                if let Some(res) = self.func.blocks[block_id.0 as usize].ops[op_idx].result {
+                    removed.insert(res);
+                }
+            }
+        }
+        let mut allowed = BTreeSet::new();
+        for v in check.exposed.iter().copied().flatten() {
+            allowed.insert(v);
+        }
+        let backedge_set: BTreeSet<RBlockId> = region.backedges.iter().copied().collect();
+        let param_set: BTreeSet<usize> = check.removed_params.iter().copied().collect();
+        for block in &self.func.blocks {
+            if block.id == region.header {
+                continue;
+            }
+            let is_bypassed = check.bypassed_driver == Some(block.id);
+            for (op_index, op) in block.ops.iter().enumerate() {
+                if check
+                    .removed_ops
+                    .get(&block.id)
+                    .is_some_and(|set| set.contains(&op_index))
+                {
+                    continue;
+                }
+                if op
+                    .kind
+                    .uses()
+                    .iter()
+                    .any(|value| removed.contains(value) && !allowed.contains(value))
+                {
+                    return false;
+                }
+                if (!region.scc.contains(&block.id) || is_bypassed)
+                    && op.kind.uses().iter().any(|value| allowed.contains(value))
+                {
+                    return false;
+                }
+            }
+            if is_bypassed {
+                if block
+                    .term
+                    .uses()
+                    .iter()
+                    .any(|value| allowed.contains(value))
+                {
+                    return false;
+                }
+                continue;
+            }
+            let non_edge_use = match &block.term {
+                RTerm::Switch { scrut, .. } => Some(*scrut),
+                RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => Some(*v),
+                _ => None,
+            };
+            if let Some(v) = non_edge_use {
+                if (removed.contains(&v) && !allowed.contains(&v))
+                    || (!region.scc.contains(&block.id) && allowed.contains(&v))
+                {
+                    return false;
+                }
+            }
+            let is_backedge = backedge_set.contains(&block.id);
+            for (target, args) in block.term.edges() {
+                let skip_invariant = check.removed_invariant_params.get(&target);
+                for (pos, arg) in args.iter().enumerate() {
+                    if is_backedge && target == region.header && param_set.contains(&pos) {
+                        continue;
+                    }
+                    if skip_invariant.is_some_and(|positions| positions.contains(&pos)) {
+                        continue;
+                    }
+                    if removed.contains(arg) && !allowed.contains(arg) {
+                        return false;
+                    }
+                    if is_backedge
+                        && check.extra_backedge_roots.contains(arg)
+                        && !allowed.contains(arg)
+                    {
+                        return false;
+                    }
+                    if !region.scc.contains(&block.id) && allowed.contains(arg) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn tainted_values(
+        &self,
+        seeds: &[ValueId],
+        old_index: Option<ValueId>,
+        old_item_ref: Option<ValueId>,
+        old_byte: Option<ValueId>,
+    ) -> BTreeSet<ValueId> {
+        let mut tainted: BTreeSet<ValueId> = seeds.iter().copied().collect();
+        for _ in 0..self.func.values.len().max(1) {
+            let before = tainted.len();
+            for block in &self.func.blocks {
+                for (target, args) in block.term.edges() {
+                    for (position, value) in args.iter().enumerate() {
+                        if tainted.contains(value) {
+                            if let Some(param) =
+                                self.func.blocks[target.0 as usize].params.get(position)
+                            {
+                                tainted.insert(*param);
+                            }
+                        }
+                    }
+                }
+                for op in &block.ops {
+                    if op.kind.uses().iter().any(|value| tainted.contains(value)) {
+                        if let Some(result) = op.result {
+                            if Some(result) != old_index
+                                && Some(result) != old_item_ref
+                                && Some(result) != old_byte
+                            {
+                                tainted.insert(result);
+                            }
+                        }
+                    }
+                }
+            }
+            if tainted.len() == before {
+                break;
+            }
+        }
+        tainted
+    }
+
+    fn non_escaping(&self, loop_blocks: &BTreeSet<RBlockId>, tainted: &BTreeSet<ValueId>) -> bool {
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                if !op.kind.uses().iter().any(|value| tainted.contains(value)) {
+                    continue;
+                }
+                let allowed = match &op.kind {
+                    OpKind::Copy(_)
+                    | OpKind::Move(_)
+                    | OpKind::Field { .. }
+                    | OpKind::Discriminant(_)
+                    | OpKind::BorrowView { .. }
+                    | OpKind::RawView { .. }
+                    | OpKind::SliceView { .. }
+                    | OpKind::Deref(_)
+                    | OpKind::Binary { .. }
+                    | OpKind::Unary { .. }
+                    | OpKind::Cast { .. } => op.result.is_some(),
+                    OpKind::Aggregate { .. } => op.result.is_some_and(|r| tainted.contains(&r)),
+                    OpKind::Intrinsic { fallback: None, .. } => op.result.is_some(),
+                    OpKind::SetField { base, .. } => tainted.contains(base),
+                    OpKind::StoreThrough { ptr, .. } => {
+                        tainted.contains(ptr) && self.mutable_borrow(*ptr)
+                    }
+                    OpKind::Assert { .. } => true,
+                    _ => false,
+                };
+                if !allowed {
+                    return false;
+                }
+            }
+            let term_uses_tainted = block
+                .term
+                .uses()
+                .iter()
+                .any(|value| tainted.contains(value));
+            if term_uses_tainted && !loop_blocks.contains(&block.id) {
+                return false;
+            }
+            if matches!(&block.term, RTerm::Return(value) | RTerm::Throw(value)
+                if value.is_some_and(|value| tainted.contains(&value)))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mutable_borrow(&self, mut value: ValueId) -> bool {
+        for _ in 0..8 {
+            match self.definition(value).map(|op| &op.kind) {
+                Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
+                Some(OpKind::BorrowView { mutable: true, .. }) => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn common_exit(
+        &self,
+        scc: &BTreeSet<RBlockId>,
+        exits: &BTreeSet<RBlockId>,
+    ) -> Option<RBlockId> {
+        if exits.is_empty() {
+            return None;
+        }
+        let distances: Vec<Vec<Option<usize>>> = exits
+            .iter()
+            .map(|&start| distances(self.func, start))
+            .collect();
+        (0..self.func.blocks.len())
+            .filter(|&block| {
+                !scc.contains(&RBlockId(block as u32))
+                    && distances.iter().all(|row| row[block].is_some())
+            })
+            .min_by_key(|&block| {
+                let ds: Vec<usize> = distances.iter().filter_map(|row| row[block]).collect();
+                (
+                    ds.iter().copied().max().unwrap_or(usize::MAX),
+                    ds.iter().sum::<usize>(),
+                    block,
+                )
+            })
+            .map(|block| RBlockId(block as u32))
+    }
+
+    fn discardable_exit_chain(
+        &self,
+        tainted: &BTreeSet<ValueId>,
+        mut at: RBlockId,
+        exit: RBlockId,
+    ) -> bool {
+        let mut seen = BTreeSet::new();
+        while at != exit {
+            if !seen.insert(at) {
+                return false;
+            }
+            let Some(block) = self.block(at) else {
+                return false;
+            };
+            let RTerm::Goto(next, args) = &block.term else {
+                return false;
+            };
+            if !block.params.is_empty()
+                || !args.is_empty()
+                || block
+                    .ops
+                    .iter()
+                    .any(|op| !self.discardable_tainted_op(tainted, op))
+            {
+                return false;
+            }
+            at = *next;
+        }
+        true
+    }
+
+    fn discardable_tainted_op(&self, tainted: &BTreeSet<ValueId>, op: &Op) -> bool {
+        match &op.kind {
+            OpKind::Copy(_)
+            | OpKind::Move(_)
+            | OpKind::Field { .. }
+            | OpKind::Discriminant(_)
+            | OpKind::BorrowView { .. }
+            | OpKind::RawView { .. }
+            | OpKind::SliceView { .. }
+            | OpKind::Deref(_)
+            | OpKind::Cast { .. } => op.result.is_some_and(|value| tainted.contains(&value)),
+            OpKind::SetField { base, .. } => op.result.is_none() && tainted.contains(base),
+            OpKind::StoreThrough { ptr, .. } => {
+                op.result.is_none() && tainted.contains(ptr) && self.mutable_borrow(*ptr)
+            }
+            _ => false,
+        }
+    }
+
+    fn strip_copies(&self, mut value: ValueId) -> Option<ValueId> {
+        for _ in 0..16 {
+            let Some(op) = self.definition(value) else {
+                value = self.single_edge.get(value.0 as usize).copied().flatten()?;
+                continue;
+            };
+            match op.kind {
+                OpKind::Copy(source) | OpKind::Move(source) => value = source,
+                _ => return Some(value),
+            }
+        }
+        None
+    }
+
+    fn copy_root(&self, mut value: ValueId) -> Option<ValueId> {
+        for _ in 0..16 {
+            match self.definition(value).map(|op| &op.kind) {
+                Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
+                Some(_) => return Some(value),
+                None => {
+                    if let Some(source) = self.single_edge.get(value.0 as usize).copied().flatten()
+                    {
+                        value = source;
+                    } else {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn source_length_matches(&self, source: ValueId, len: ValueId) -> bool {
+        let Some(source_root) = self.copy_root(source) else {
+            return false;
+        };
+        let Some(len_root) = self.copy_root(len) else {
+            return false;
+        };
+        let len_metadata_target = match self.definition(len_root).map(|op| &op.kind) {
+            Some(OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v,
+                ..
+            }) => self.copy_root(*v),
+            _ => None,
+        };
+        if len_metadata_target == Some(source_root) {
+            return true;
+        }
+        if let Some(op) = self.definition(source_root) {
+            match &op.kind {
+                OpKind::SliceView { len: found, .. }
+                    if self.copy_root(*found) == Some(len_root) =>
+                {
+                    return true;
+                }
+                OpKind::Call {
+                    callee: Callee::Runtime { sysroot: true, .. },
+                    semantic: CallSemantic::RawParts,
+                    args,
+                    ..
+                } if args.len() == 2 && self.copy_root(args[1]) == Some(len_root) => {
+                    return true;
+                }
+                OpKind::Cast {
+                    kind: CastKind::Transmute | CastKind::Subtype | CastKind::PointerCoercion,
+                    v: str_val,
+                    from,
+                    to,
+                } if is_str_ref_to_byte_slice_ref(self.table, *from, *to) => {
+                    if let Some(str_root) = self.copy_root(*str_val) {
+                        if len_metadata_target == Some(str_root) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn is_scalar(&self, value: ValueId, expected: u128) -> bool {
+        self.strip_copies(value)
+            .and_then(|value| self.definition(value))
+            .is_some_and(
+                |op| matches!(op.kind, OpKind::Const(ConstTree::Scalar { bits, .. }) if bits == expected),
+            )
+    }
 }
 
 fn is_raw_ptr_to(table: &TypeTable, ptr: TypeId, pointee: TypeId) -> bool {
@@ -1039,654 +1906,6 @@ fn is_lossless_ptr_cast(table: &TypeTable, kind: CastKind, from: TypeId, to: Typ
             ))
 }
 
-fn strip_ptr_wrapper(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    value: ValueId,
-) -> Option<ValueId> {
-    strip_ptr_wrapper_until(func, table, defs, single_edge, &[], value)
-}
-
-fn strip_ptr_wrapper_until(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    stop_params: &[ValueId],
-    mut value: ValueId,
-) -> Option<ValueId> {
-    for _ in 0..24 {
-        if stop_params.contains(&value) {
-            return Some(value);
-        }
-        let Some(op) = definition(func, defs, value) else {
-            if let Some(source) = single_edge.get(value.0 as usize).copied().flatten() {
-                value = source;
-                continue;
-            }
-            return Some(value);
-        };
-        match &op.kind {
-            OpKind::Copy(source) | OpKind::Move(source) => {
-                value = *source;
-            }
-            OpKind::Cast {
-                kind,
-                v: source,
-                from,
-                to,
-            } if is_lossless_ptr_cast(table, *kind, *from, *to) => {
-                value = *source;
-            }
-            OpKind::Field {
-                base,
-                variant: None,
-                field,
-            } if value_ty(func, *base).and_then(|ty| ptr_wrapper_field(table, ty))
-                == Some(*field as usize) =>
-            {
-                value = *base;
-            }
-            OpKind::Aggregate {
-                ty,
-                variant: 0,
-                active_field: None,
-                fields,
-                ..
-            } => {
-                let Some(idx) = ptr_wrapper_aggregate_field(table, *ty, fields.len()) else {
-                    return Some(value);
-                };
-                value = fields[idx];
-            }
-            _ => return Some(value),
-        }
-    }
-    None
-}
-
-fn strip_ptr_wrapper_stop_params(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    params: &[ValueId],
-    mut value: ValueId,
-) -> Option<ValueId> {
-    for _ in 0..24 {
-        if params.contains(&value) {
-            return Some(value);
-        }
-        let Some(op) = definition(func, defs, value) else {
-            value = single_edge.get(value.0 as usize).copied().flatten()?;
-            continue;
-        };
-        match &op.kind {
-            OpKind::Copy(source) | OpKind::Move(source) => {
-                value = *source;
-            }
-            OpKind::Cast {
-                kind,
-                v: source,
-                from,
-                to,
-            } if is_lossless_ptr_cast(table, *kind, *from, *to) => {
-                value = *source;
-            }
-            OpKind::Field {
-                base,
-                variant: None,
-                field,
-            } if value_ty(func, *base).and_then(|ty| ptr_wrapper_field(table, ty))
-                == Some(*field as usize) =>
-            {
-                value = *base;
-            }
-            OpKind::Aggregate {
-                ty,
-                variant: 0,
-                active_field: None,
-                fields,
-                ..
-            } => {
-                let idx = ptr_wrapper_aggregate_field(table, *ty, fields.len())?;
-                value = fields[idx];
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_ptr_wrapper_chain_in_block(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    block: usize,
-    mut value: ValueId,
-    stop: ValueId,
-    out: &mut BTreeSet<usize>,
-    zst_candidates: &mut Vec<ValueId>,
-) {
-    for _ in 0..16 {
-        if value == stop {
-            break;
-        }
-        let Some(site) = defs.get(value.0 as usize).copied().flatten() else {
-            break;
-        };
-        if site.block != block {
-            break;
-        }
-        let op = &func.blocks[block].ops[site.op];
-        let next = match &op.kind {
-            OpKind::Copy(s) | OpKind::Move(s) => *s,
-            OpKind::Cast {
-                kind,
-                v: s,
-                from,
-                to,
-            } if is_lossless_ptr_cast(table, *kind, *from, *to) => *s,
-            OpKind::Field {
-                base,
-                variant: None,
-                field,
-            } if value_ty(func, *base).and_then(|ty| ptr_wrapper_field(table, ty))
-                == Some(*field as usize) =>
-            {
-                *base
-            }
-            OpKind::Aggregate {
-                ty,
-                variant: 0,
-                active_field: None,
-                fields,
-                ..
-            } => {
-                let Some(idx) = ptr_wrapper_aggregate_field(table, *ty, fields.len()) else {
-                    break;
-                };
-                for (i, &field_val) in fields.iter().enumerate() {
-                    if i != idx {
-                        zst_candidates.push(field_val);
-                    }
-                }
-                fields[idx]
-            }
-            _ => break,
-        };
-        out.insert(site.op);
-        value = next;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_backedge_wrapper_chain(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    driver_idx: usize,
-    arg: ValueId,
-    next_ptr: ValueId,
-    out: &mut BTreeSet<usize>,
-    zst_candidates: &mut Vec<ValueId>,
-    invariant_param_candidates: &mut Vec<(usize, usize, ValueId)>,
-) -> Option<()> {
-    let mut cur = arg;
-    for _ in 0..24 {
-        if cur == next_ptr {
-            return Some(());
-        }
-        let Some(site) = defs.get(cur.0 as usize).copied().flatten() else {
-            let (param_block, param_pos) =
-                func.blocks.iter().enumerate().find_map(|(bi, b)| {
-                    b.params.iter().position(|p| *p == cur).map(|pos| (bi, pos))
-                })?;
-            invariant_param_candidates.push((param_block, param_pos, cur));
-            cur = single_edge.get(cur.0 as usize).copied().flatten()?;
-            continue;
-        };
-        if site.block == driver_idx {
-            out.insert(site.op);
-        }
-        cur = match &func.blocks[site.block].ops[site.op].kind {
-            OpKind::Copy(s) | OpKind::Move(s) => *s,
-            OpKind::Cast {
-                kind,
-                v: s,
-                from,
-                to,
-            } if is_lossless_ptr_cast(table, *kind, *from, *to) => *s,
-            OpKind::Field {
-                base,
-                variant: None,
-                field,
-            } if value_ty(func, *base).and_then(|ty| ptr_wrapper_field(table, ty))
-                == Some(*field as usize) =>
-            {
-                *base
-            }
-            OpKind::Aggregate {
-                ty,
-                variant: 0,
-                active_field: None,
-                fields,
-                ..
-            } => {
-                let idx = ptr_wrapper_aggregate_field(table, *ty, fields.len())?;
-                if site.block == driver_idx {
-                    for (i, &field_val) in fields.iter().enumerate() {
-                        if i != idx {
-                            zst_candidates.push(field_val);
-                        }
-                    }
-                }
-                fields[idx]
-            }
-            _ => return None,
-        };
-    }
-    None
-}
-
-fn collect_unused_zst_ops_in_block(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    block_idx: usize,
-    mut candidates: Vec<ValueId>,
-    removed_ops: &mut BTreeSet<usize>,
-) {
-    while let Some(val) = candidates.pop() {
-        if !value_ty(func, val).is_some_and(|ty| table.is_zst(ty)) {
-            continue;
-        }
-        let Some(site) = defs.get(val.0 as usize).copied().flatten() else {
-            continue;
-        };
-        if site.block != block_idx || removed_ops.contains(&site.op) {
-            continue;
-        }
-        let op = &func.blocks[block_idx].ops[site.op];
-        let is_pure_zst = matches!(
-            op.kind,
-            OpKind::Const(_)
-                | OpKind::Copy(_)
-                | OpKind::Move(_)
-                | OpKind::Aggregate {
-                    active_field: None,
-                    ..
-                }
-        );
-        if !is_pure_zst {
-            continue;
-        }
-        let used_elsewhere = func.blocks.iter().enumerate().any(|(bi, b)| {
-            b.ops.iter().enumerate().any(|(oi, other)| {
-                !(bi == block_idx && removed_ops.contains(&oi)) && other.kind.uses().contains(&val)
-            }) || b.term.uses().contains(&val)
-        });
-        if !used_elsewhere {
-            removed_ops.insert(site.op);
-            candidates.extend(op.kind.uses());
-        }
-    }
-}
-
-fn validate_dead_invariant_params(
-    func: &Func,
-    scc: &BTreeSet<usize>,
-    header_idx: usize,
-    p_idx: usize,
-    backedges: &[usize],
-    candidates: &[(usize, usize, ValueId)],
-) -> Option<BTreeMap<usize, Vec<usize>>> {
-    let mut map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    if candidates.is_empty() {
-        return Some(map);
-    }
-    let backedge_set: BTreeSet<usize> = backedges.iter().copied().collect();
-    let mut candidate_vals = BTreeSet::new();
-    let mut candidate_slots = BTreeSet::new();
-    for &(b_idx, pos, val) in candidates {
-        if b_idx == header_idx || !scc.contains(&b_idx) {
-            return None;
-        }
-        candidate_vals.insert(val);
-        candidate_slots.insert((b_idx, pos));
-        map.entry(b_idx).or_default().push(pos);
-    }
-    for positions in map.values_mut() {
-        positions.sort_unstable();
-        positions.dedup();
-    }
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        if block
-            .ops
-            .iter()
-            .any(|op| op.kind.uses().iter().any(|u| candidate_vals.contains(u)))
-        {
-            return None;
-        }
-        let scrut_uses = match &block.term {
-            RTerm::Switch { scrut, .. } => Some(*scrut),
-            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => Some(*v),
-            _ => None,
-        };
-        if scrut_uses.is_some_and(|u| candidate_vals.contains(&u)) {
-            return None;
-        }
-        for (target, args) in block.term.edges() {
-            let t = target.0 as usize;
-            if map.contains_key(&t) && args.len() != func.blocks[t].params.len() {
-                return None;
-            }
-            for (pos, arg) in args.iter().enumerate() {
-                if !candidate_vals.contains(arg) {
-                    continue;
-                }
-                let allowed_edge =
-                    (t == header_idx && pos == p_idx && backedge_set.contains(&b_idx))
-                        || candidate_slots.contains(&(t, pos));
-                if !allowed_edge {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(map)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn removed_ops_are_local(
-    func: &Func,
-    header_idx: usize,
-    removed_ops: &BTreeMap<usize, BTreeSet<usize>>,
-    removed_invariant_params: &BTreeMap<usize, Vec<usize>>,
-    rewrite_blocks: &BTreeSet<usize>,
-    bypassed_driver: Option<usize>,
-    backedges: &[usize],
-    removed_params: &[usize],
-    exposed: &[Option<ValueId>],
-    extra_backedge_roots: &[ValueId],
-) -> bool {
-    let mut removed = BTreeSet::new();
-    for &param_idx in removed_params {
-        if let Some(&param) = func.blocks[header_idx].params.get(param_idx) {
-            removed.insert(param);
-        }
-    }
-    for (&block_idx, ops) in removed_ops {
-        for &op_idx in ops {
-            if let Some(res) = func.blocks[block_idx].ops[op_idx].result {
-                removed.insert(res);
-            }
-        }
-    }
-    let mut allowed = BTreeSet::new();
-    for v in exposed.iter().copied().flatten() {
-        allowed.insert(v);
-    }
-    let backedge_set: BTreeSet<usize> = backedges.iter().copied().collect();
-    let param_set: BTreeSet<usize> = removed_params.iter().copied().collect();
-    for (block_index, block) in func.blocks.iter().enumerate() {
-        if block_index == header_idx {
-            continue;
-        }
-        let is_bypassed = bypassed_driver == Some(block_index);
-        for (op_index, op) in block.ops.iter().enumerate() {
-            if removed_ops
-                .get(&block_index)
-                .is_some_and(|set| set.contains(&op_index))
-            {
-                continue;
-            }
-            if op
-                .kind
-                .uses()
-                .iter()
-                .any(|value| removed.contains(value) && !allowed.contains(value))
-            {
-                return false;
-            }
-            if (!rewrite_blocks.contains(&block_index) || is_bypassed)
-                && op.kind.uses().iter().any(|value| allowed.contains(value))
-            {
-                return false;
-            }
-        }
-        if is_bypassed {
-            if block
-                .term
-                .uses()
-                .iter()
-                .any(|value| allowed.contains(value))
-            {
-                return false;
-            }
-            continue;
-        }
-        let non_edge_use = match &block.term {
-            RTerm::Switch { scrut, .. } => Some(*scrut),
-            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => Some(*v),
-            _ => None,
-        };
-        if let Some(v) = non_edge_use {
-            if (removed.contains(&v) && !allowed.contains(&v))
-                || (!rewrite_blocks.contains(&block_index) && allowed.contains(&v))
-            {
-                return false;
-            }
-        }
-        let is_backedge = backedge_set.contains(&block_index);
-        for (target, args) in block.term.edges() {
-            let t = target.0 as usize;
-            let skip_invariant = removed_invariant_params.get(&t);
-            for (pos, arg) in args.iter().enumerate() {
-                if is_backedge && t == header_idx && param_set.contains(&pos) {
-                    continue;
-                }
-                if skip_invariant.is_some_and(|positions| positions.contains(&pos)) {
-                    continue;
-                }
-                if removed.contains(arg) && !allowed.contains(arg) {
-                    return false;
-                }
-                if is_backedge && extra_backedge_roots.contains(arg) && !allowed.contains(arg) {
-                    return false;
-                }
-                if !rewrite_blocks.contains(&block_index) && allowed.contains(arg) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-fn tainted_values(
-    func: &Func,
-    seeds: &[ValueId],
-    old_index: Option<ValueId>,
-    old_item_ref: Option<ValueId>,
-    old_byte: Option<ValueId>,
-) -> BTreeSet<ValueId> {
-    let mut tainted: BTreeSet<ValueId> = seeds.iter().copied().collect();
-    for _ in 0..func.values.len().max(1) {
-        let before = tainted.len();
-        for block in &func.blocks {
-            for (target, args) in block.term.edges() {
-                for (position, value) in args.iter().enumerate() {
-                    if tainted.contains(value) {
-                        if let Some(param) = func.blocks[target.0 as usize].params.get(position) {
-                            tainted.insert(*param);
-                        }
-                    }
-                }
-            }
-            for op in &block.ops {
-                if op.kind.uses().iter().any(|value| tainted.contains(value)) {
-                    if let Some(result) = op.result {
-                        if Some(result) != old_index
-                            && Some(result) != old_item_ref
-                            && Some(result) != old_byte
-                        {
-                            tainted.insert(result);
-                        }
-                    }
-                }
-            }
-        }
-        if tainted.len() == before {
-            break;
-        }
-    }
-    tainted
-}
-
-fn non_escaping(
-    func: &Func,
-    defs: &[Option<Site>],
-    loop_blocks: &BTreeSet<usize>,
-    tainted: &BTreeSet<ValueId>,
-) -> bool {
-    for block in &func.blocks {
-        for op in &block.ops {
-            if !op.kind.uses().iter().any(|value| tainted.contains(value)) {
-                continue;
-            }
-            let allowed = match &op.kind {
-                OpKind::Copy(_)
-                | OpKind::Move(_)
-                | OpKind::Field { .. }
-                | OpKind::Discriminant(_)
-                | OpKind::BorrowView { .. }
-                | OpKind::RawView { .. }
-                | OpKind::SliceView { .. }
-                | OpKind::Deref(_)
-                | OpKind::Binary { .. }
-                | OpKind::Unary { .. }
-                | OpKind::Cast { .. } => op.result.is_some(),
-                OpKind::Aggregate { .. } => op.result.is_some_and(|r| tainted.contains(&r)),
-                OpKind::Intrinsic { fallback: None, .. } => op.result.is_some(),
-                OpKind::SetField { base, .. } => tainted.contains(base),
-                OpKind::StoreThrough { ptr, .. } => {
-                    tainted.contains(ptr) && mutable_borrow(func, defs, *ptr)
-                }
-                OpKind::Assert { .. } => true,
-                _ => false,
-            };
-            if !allowed {
-                return false;
-            }
-        }
-        let term_uses_tainted = block
-            .term
-            .uses()
-            .iter()
-            .any(|value| tainted.contains(value));
-        if term_uses_tainted && !loop_blocks.contains(&(block.id.0 as usize)) {
-            return false;
-        }
-        if matches!(&block.term, RTerm::Return(value) | RTerm::Throw(value)
-            if value.is_some_and(|value| tainted.contains(&value)))
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn mutable_borrow(func: &Func, defs: &[Option<Site>], mut value: ValueId) -> bool {
-    for _ in 0..8 {
-        match &definition(func, defs, value).map(|op| &op.kind) {
-            Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
-            Some(OpKind::BorrowView { mutable: true, .. }) => return true,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn common_exit(func: &Func, scc: &BTreeSet<usize>, exits: &BTreeSet<RBlockId>) -> Option<RBlockId> {
-    if exits.is_empty() {
-        return None;
-    }
-    let distances: Vec<Vec<Option<usize>>> =
-        exits.iter().map(|start| distances(func, *start)).collect();
-    (0..func.blocks.len())
-        .filter(|block| !scc.contains(block) && distances.iter().all(|row| row[*block].is_some()))
-        .min_by_key(|block| {
-            let ds: Vec<usize> = distances.iter().filter_map(|row| row[*block]).collect();
-            (
-                ds.iter().copied().max().unwrap_or(usize::MAX),
-                ds.iter().sum::<usize>(),
-                *block,
-            )
-        })
-        .map(|block| RBlockId(block as u32))
-}
-
-fn discardable_exit_chain(
-    func: &Func,
-    defs: &[Option<Site>],
-    tainted: &BTreeSet<ValueId>,
-    mut at: RBlockId,
-    exit: RBlockId,
-) -> bool {
-    let mut seen = BTreeSet::new();
-    while at != exit {
-        if !seen.insert(at) {
-            return false;
-        }
-        let Some(block) = func.blocks.get(at.0 as usize) else {
-            return false;
-        };
-        let RTerm::Goto(next, args) = &block.term else {
-            return false;
-        };
-        if !block.params.is_empty()
-            || !args.is_empty()
-            || block
-                .ops
-                .iter()
-                .any(|op| !discardable_tainted_op(func, defs, tainted, op))
-        {
-            return false;
-        }
-        at = *next;
-    }
-    true
-}
-
-fn discardable_tainted_op(
-    func: &Func,
-    defs: &[Option<Site>],
-    tainted: &BTreeSet<ValueId>,
-    op: &Op,
-) -> bool {
-    match &op.kind {
-        OpKind::Copy(_)
-        | OpKind::Move(_)
-        | OpKind::Field { .. }
-        | OpKind::Discriminant(_)
-        | OpKind::BorrowView { .. }
-        | OpKind::RawView { .. }
-        | OpKind::SliceView { .. }
-        | OpKind::Deref(_)
-        | OpKind::Cast { .. } => op.result.is_some_and(|value| tainted.contains(&value)),
-        OpKind::SetField { base, .. } => op.result.is_none() && tainted.contains(base),
-        OpKind::StoreThrough { ptr, .. } => {
-            op.result.is_none() && tainted.contains(ptr) && mutable_borrow(func, defs, *ptr)
-        }
-        _ => false,
-    }
-}
-
 fn distances(func: &Func, start: RBlockId) -> Vec<Option<usize>> {
     let mut distance = vec![None; func.blocks.len()];
     let Some(slot) = distance.get_mut(start.0 as usize) else {
@@ -1712,7 +1931,7 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
     let body_cursor = fresh_with_type(func, found.cursor_ty, found.origin);
     let bound_len = if found.cursor_ty != found.usize_ty {
         let cast_len = fresh_with_type(func, found.cursor_ty, found.origin);
-        func.blocks[found.preheader].ops.push(Op {
+        func.blocks[found.preheader.0 as usize].ops.push(Op {
             result: Some(cast_len),
             origin: found.origin,
             kind: OpKind::Cast {
@@ -1727,7 +1946,7 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
         found.len
     };
     let initial = fresh_with_type(func, found.cursor_ty, found.origin);
-    func.blocks[found.preheader].ops.push(Op {
+    func.blocks[found.preheader.0 as usize].ops.push(Op {
         result: Some(initial),
         origin: found.origin,
         kind: OpKind::Const(ConstTree::Scalar {
@@ -1765,25 +1984,28 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
     removed_params.sort_unstable();
     removed_params.dedup();
     for &idx in removed_params.iter().rev() {
-        func.blocks[found.header].params.remove(idx);
+        func.blocks[found.header.0 as usize].params.remove(idx);
     }
-    func.blocks[found.header].params.push(cursor);
-    func.blocks[found.header].ops = header_ops;
-    func.blocks[found.header].term = RTerm::Switch {
+    func.blocks[found.header.0 as usize].params.push(cursor);
+    func.blocks[found.header.0 as usize].ops = header_ops;
+    func.blocks[found.header.0 as usize].term = RTerm::Switch {
         scrut: condition,
         scrut_ty: found.bool_ty,
         cases: vec![(0, found.exit, Vec::new())],
         default: (direct, vec![cursor]),
     };
 
-    let preheader_args = edge_to(&mut func.blocks[found.preheader].term, found.header)
-        .expect("a matched preheader edge exists");
+    let preheader_args = edge_to(
+        &mut func.blocks[found.preheader.0 as usize].term,
+        found.header,
+    )
+    .expect("a matched preheader edge exists");
     for &idx in removed_params.iter().rev() {
         preheader_args.remove(idx);
     }
     preheader_args.push(initial);
-    for backedge in &found.backedges {
-        let args = edge_to(&mut func.blocks[*backedge].term, found.header)
+    for &backedge in &found.backedges {
+        let args = edge_to(&mut func.blocks[backedge.0 as usize].term, found.header)
             .expect("a matched backedge exists");
         for &idx in removed_params.iter().rev() {
             args.remove(idx);
@@ -1850,42 +2072,42 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
         id: direct,
         params: vec![body_cursor],
         ops: direct_ops,
-        term: RTerm::Goto(RBlockId(found.body as u32), body_args.clone()),
+        term: RTerm::Goto(found.body, body_args),
     });
 
     if !found.removed_invariant_params.is_empty() {
-        for (&block_idx, positions) in &found.removed_invariant_params {
+        for (&block_id, positions) in &found.removed_invariant_params {
             for &pos in positions.iter().rev() {
-                func.blocks[block_idx].params.remove(pos);
+                func.blocks[block_id.0 as usize].params.remove(pos);
             }
         }
         for block in &mut func.blocks {
-            for (target, args) in term_edge_args_mut(&mut block.term) {
-                if let Some(positions) = found.removed_invariant_params.get(&(target.0 as usize)) {
+            block.term.edges_mut(|target, args| {
+                if let Some(positions) = found.removed_invariant_params.get(target) {
                     for &pos in positions.iter().rev() {
                         if pos < args.len() {
                             args.remove(pos);
                         }
                     }
                 }
-            }
+            });
         }
     }
     if !found.removed_ops.is_empty() {
-        for (block_idx, drop_set) in &found.removed_ops {
-            if *block_idx == found.header {
+        for (&block_id, drop_set) in &found.removed_ops {
+            if block_id == found.header {
                 continue;
             }
-            let kept = std::mem::take(&mut func.blocks[*block_idx].ops)
+            let kept = std::mem::take(&mut func.blocks[block_id.0 as usize].ops)
                 .into_iter()
                 .enumerate()
                 .filter(|(i, _)| !drop_set.contains(i))
                 .map(|(_, op)| op)
                 .collect();
-            func.blocks[*block_idx].ops = kept;
+            func.blocks[block_id.0 as usize].ops = kept;
         }
         if found.driver != found.body {
-            func.blocks[found.driver].term = RTerm::Unreachable;
+            func.blocks[found.driver.0 as usize].term = RTerm::Unreachable;
         }
     }
     let rewrite = |value: ValueId| {
@@ -1899,21 +2121,20 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
             value
         }
     };
-    for block in &found.rewrite_blocks {
-        if *block == found.driver && found.driver != found.body {
+    for &block in &found.rewrite_blocks {
+        if block == found.driver && found.driver != found.body {
             continue;
         }
-        for op in &mut func.blocks[*block].ops {
-            crate::lower::ssa::rewrite_op(&mut op.kind, &rewrite);
+        for op in &mut func.blocks[block.0 as usize].ops {
+            op.kind.visit_values_mut(|v| *v = rewrite(*v));
         }
-        crate::lower::ssa::rewrite_term(&mut func.blocks[*block].term, &rewrite);
+        func.blocks[block.0 as usize]
+            .term
+            .visit_values_mut(|v| *v = rewrite(*v));
     }
 
     // The old adapter remains unreachable until DCE. Keeping structural deletion in the one
     // existing pass means block and value compaction still have a single owner.
-    let _ = (
-        bound_len, initial, condition, item_ref, one, next, body_args,
-    );
     SliceIteratorLoop {
         #[cfg(test)]
         adapter: match found.adapter {
@@ -1921,11 +2142,11 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
             Adapter::Enumerate => IteratorIdentity::Enumerate,
         },
         #[cfg(test)]
-        header: RBlockId(found.header as u32),
+        header: found.header,
         #[cfg(test)]
         direct,
         #[cfg(test)]
-        body: RBlockId(found.body as u32),
+        body: found.body,
         #[cfg(test)]
         cursor,
         #[cfg(test)]
@@ -1939,33 +2160,6 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
         #[cfg(test)]
         cursor_ty: found.cursor_ty,
     }
-}
-
-fn term_edge_args_mut(term: &mut RTerm) -> Vec<(RBlockId, &mut Vec<ValueId>)> {
-    match term {
-        RTerm::Goto(target, args) => vec![(*target, args)],
-        RTerm::Invoke { normal, unwind } => {
-            vec![(normal.0, &mut normal.1), (unwind.0, &mut unwind.1)]
-        }
-        RTerm::Switch { cases, default, .. } => {
-            let mut edges: Vec<(RBlockId, &mut Vec<ValueId>)> = cases
-                .iter_mut()
-                .map(|(_, target, args)| (*target, args))
-                .collect();
-            edges.push((default.0, &mut default.1));
-            edges
-        }
-        RTerm::Return(_) | RTerm::Unreachable | RTerm::Throw(_) => Vec::new(),
-    }
-}
-
-fn value_def_block(func: &Func, defs: &[Option<Site>], value: ValueId) -> Option<usize> {
-    if let Some(site) = defs.get(value.0 as usize).copied().flatten() {
-        return Some(site.block);
-    }
-    func.blocks
-        .iter()
-        .position(|block| block.params.contains(&value))
 }
 
 fn is_immutable_slice_ref(func: &Func, table: &TypeTable, value: ValueId) -> bool {
@@ -2008,78 +2202,44 @@ fn is_str_ref_to_byte_slice_ref(table: &TypeTable, from: TypeId, to: TypeId) -> 
     table.int_info(table.peeled(*elem)) == Some((false, 8))
 }
 
-fn edge_to(term: &mut RTerm, target: usize) -> Option<&mut Vec<ValueId>> {
+fn edge_to(term: &mut RTerm, target: RBlockId) -> Option<&mut Vec<ValueId>> {
     match term {
-        RTerm::Goto(found, args) if found.0 as usize == target => Some(args),
+        RTerm::Goto(found, args) if *found == target => Some(args),
         _ => None,
     }
 }
 
 fn fresh_with_type(func: &mut Func, ty: TypeId, origin: OriginId) -> ValueId {
-    let value = ValueId(func.values.len() as u32);
-    func.values.push(ValueDef {
-        ty,
-        carrier: Carrier::Baseline,
-        origin,
-    });
-    value
+    func.push_value(ty, Carrier::Baseline, origin)
 }
 
 fn fresh_bool(func: &mut Func, ty: TypeId, origin: OriginId) -> ValueId {
     fresh_with_type(func, ty, origin)
 }
 
-fn definitions(func: &Func) -> Vec<Option<Site>> {
-    let mut defs = vec![None; func.values.len()];
-    for (block, data) in func.blocks.iter().enumerate() {
-        for (op, operation) in data.ops.iter().enumerate() {
-            if let Some(result) = operation.result {
-                defs[result.0 as usize] = Some(Site { block, op });
-            }
-        }
-    }
-    defs
+fn definitions(def_use: &DefUse) -> Vec<Option<Site>> {
+    def_use
+        .def_op
+        .iter()
+        .map(|site| site.map(|(block, op)| Site { block, op }))
+        .collect()
 }
 
-fn definition<'a>(func: &'a Func, defs: &[Option<Site>], value: ValueId) -> Option<&'a Op> {
-    let site = defs.get(value.0 as usize).copied().flatten()?;
-    func.blocks.get(site.block)?.ops.get(site.op)
-}
-
-fn single_edge_param_sources(func: &Func) -> Vec<Option<ValueId>> {
+fn single_edge_param_sources(func: &Func, cfg: &Cfg, def_use: &DefUse) -> Vec<Option<ValueId>> {
     let mut sources = vec![None; func.values.len()];
-    let reachable = distances(func, RBlockId(0));
-    let defs = definitions(func);
-    let doms = Dominators::of(func);
-    let mut incoming: Vec<Vec<(usize, Vec<ValueId>)>> = vec![Vec::new(); func.blocks.len()];
-    for (pred_idx, block) in func.blocks.iter().enumerate() {
-        if reachable.get(pred_idx).copied().flatten().is_none() {
-            continue;
-        }
-        for (target, args) in block.term.edges() {
-            let t = target.0 as usize;
-            if t == 0 || t >= func.blocks.len() {
-                continue;
-            }
-            incoming[t].push((pred_idx, args.to_vec()));
-        }
-    }
+    let incoming = cfg.reachable_incoming_args(func);
     for (b_idx, block) in func.blocks.iter().enumerate() {
-        if b_idx == 0 || reachable.get(b_idx).copied().flatten().is_none() {
+        if b_idx == 0 || !cfg.doms.is_reachable(block.id) {
             continue;
         }
         let edges = &incoming[b_idx];
-        if edges.is_empty()
-            || edges
-                .iter()
-                .any(|(_, args)| args.len() != block.params.len())
-        {
+        if edges.is_empty() || edges.iter().any(|args| args.len() != block.params.len()) {
             continue;
         }
         for (pos, &param) in block.params.iter().enumerate() {
             let mut single: Option<ValueId> = None;
             let mut valid = true;
-            for (_, args) in edges {
+            for args in edges {
                 let arg = args[pos];
                 if arg == param {
                     continue;
@@ -2100,10 +2260,14 @@ fn single_edge_param_sources(func: &Func) -> Vec<Option<ValueId>> {
                 continue;
             };
             if edges.len() > 1 {
-                let Some(def_b) = value_def_block(func, &defs, source) else {
+                let def_b = def_use
+                    .def_site(source)
+                    .map(|(b, _)| b)
+                    .or_else(|| def_use.param_site(source).map(|(b, _)| b));
+                let Some(def_b) = def_b else {
                     continue;
                 };
-                if !doms.dominates(RBlockId(def_b as u32), RBlockId(b_idx as u32)) {
+                if !cfg.doms.dominates(def_b, block.id) {
                     continue;
                 }
             }
@@ -2113,123 +2277,6 @@ fn single_edge_param_sources(func: &Func) -> Vec<Option<ValueId>> {
         }
     }
     sources
-}
-
-fn strip_copies(
-    func: &Func,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    mut value: ValueId,
-) -> Option<ValueId> {
-    for _ in 0..16 {
-        let Some(op) = definition(func, defs, value) else {
-            value = single_edge.get(value.0 as usize).copied().flatten()?;
-            continue;
-        };
-        match op.kind {
-            OpKind::Copy(source) | OpKind::Move(source) => value = source,
-            _ => return Some(value),
-        }
-    }
-    None
-}
-
-fn copy_root(
-    func: &Func,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    mut value: ValueId,
-) -> Option<ValueId> {
-    for _ in 0..16 {
-        match definition(func, defs, value).map(|op| &op.kind) {
-            Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
-            Some(_) => return Some(value),
-            None => {
-                if let Some(source) = single_edge.get(value.0 as usize).copied().flatten() {
-                    value = source;
-                } else {
-                    return Some(value);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn source_length_matches(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    source: ValueId,
-    len: ValueId,
-) -> bool {
-    let Some(source_root) = copy_root(func, defs, single_edge, source) else {
-        return false;
-    };
-    let Some(len_root) = copy_root(func, defs, single_edge, len) else {
-        return false;
-    };
-    let len_metadata_target = match definition(func, defs, len_root).map(|op| &op.kind) {
-        Some(OpKind::Unary {
-            op: UnaryOp::PtrMetadata,
-            v,
-            ..
-        }) => copy_root(func, defs, single_edge, *v),
-        _ => None,
-    };
-    if len_metadata_target == Some(source_root) {
-        return true;
-    }
-    if let Some(op) = definition(func, defs, source_root) {
-        match &op.kind {
-            OpKind::SliceView { len: found, .. }
-                if copy_root(func, defs, single_edge, *found) == Some(len_root) =>
-            {
-                return true;
-            }
-            OpKind::Call {
-                callee: Callee::Runtime { sysroot: true, .. },
-                semantic: CallSemantic::RawParts,
-                args,
-                ..
-            } if args.len() == 2
-                && copy_root(func, defs, single_edge, args[1]) == Some(len_root) =>
-            {
-                return true;
-            }
-            OpKind::Cast {
-                kind: CastKind::Transmute | CastKind::Subtype | CastKind::PointerCoercion,
-                v: str_val,
-                from,
-                to,
-            } if is_str_ref_to_byte_slice_ref(table, *from, *to) => {
-                if let Some(str_root) = copy_root(func, defs, single_edge, *str_val) {
-                    if len_metadata_target == Some(str_root) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-fn value_ty(func: &Func, value: ValueId) -> Option<TypeId> {
-    func.values.get(value.0 as usize).map(|def| def.ty)
-}
-
-fn is_scalar(
-    func: &Func,
-    defs: &[Option<Site>],
-    single_edge: &[Option<ValueId>],
-    value: ValueId,
-    expected: u128,
-) -> bool {
-    strip_copies(func, defs, single_edge, value)
-        .and_then(|value| definition(func, defs, value))
-        .is_some_and(|op| matches!(op.kind, OpKind::Const(ConstTree::Scalar { bits, .. }) if bits == expected))
 }
 
 fn is_ref_to(table: &TypeTable, reference: TypeId, pointee: TypeId) -> bool {
@@ -2463,10 +2510,27 @@ mod tests {
     #[test]
     fn complete_rewrite_regions_and_preheaders_cannot_overlap() {
         let mut occupied = BTreeSet::new();
-        assert!(reserve_region(&BTreeSet::from([1, 2, 3]), 0, &mut occupied));
-        assert!(!reserve_region(&BTreeSet::from([3, 4]), 5, &mut occupied));
-        assert!(!reserve_region(&BTreeSet::from([6, 7]), 2, &mut occupied));
-        assert!(reserve_region(&BTreeSet::from([8, 9]), 10, &mut occupied));
+        let b = |id| RBlockId(id);
+        assert!(reserve_region(
+            &BTreeSet::from([b(1), b(2), b(3)]),
+            b(0),
+            &mut occupied
+        ));
+        assert!(!reserve_region(
+            &BTreeSet::from([b(3), b(4)]),
+            b(5),
+            &mut occupied
+        ));
+        assert!(!reserve_region(
+            &BTreeSet::from([b(6), b(7)]),
+            b(2),
+            &mut occupied
+        ));
+        assert!(reserve_region(
+            &BTreeSet::from([b(8), b(9)]),
+            b(10),
+            &mut occupied
+        ));
     }
 
     fn build_scalarized_slice_loop(

@@ -1,8 +1,10 @@
 use std::{
-    env, fs, io,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+use rcgjs_object::opts::normalize_optimizer_passes;
 
 use crate::{BuildError, Fix, Pinned, Result, RustOptLevel, Step, Unmet};
 
@@ -17,9 +19,37 @@ pub const RUST_OPT_LEVEL_ENV: &str = "JSC_RUST_OPT_LEVEL";
 pub const RUST_MIR_INLINE_ENV: &str = "JSC_RUST_MIR_INLINE";
 /// Environment variable selecting the emit-affecting options used to key the sysroot.
 pub const SYSROOT_ARGS_ENV: &str = "JSC_SYSROOT_ARGS";
+/// Environment variable remapping checkout paths in compiler diagnostics and source maps.
+pub const REMAP_ROOT_ENV: &str = "JSC_REMAP_ROOT";
 /// Environment variable selecting the build mode: unset (or `unwind`) is the default
 /// `-Cpanic=unwind` build, `abort` the `-Cpanic=abort` override (`scripts/sysroot-cache.sh`, `jsc_panic`).
 pub const PANIC_ENV: &str = "JSC_PANIC";
+
+/// Inputs identifying a cached sysroot build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysrootKey<'a> {
+    pub emit_args: &'a str,
+    pub opt_level: Option<RustOptLevel>,
+}
+
+impl<'a> SysrootKey<'a> {
+    #[must_use]
+    pub const fn new(emit_args: &'a str, opt_level: Option<RustOptLevel>) -> Self {
+        Self {
+            emit_args,
+            opt_level,
+        }
+    }
+}
+
+/// Settings for one client crate compilation.
+#[derive(Debug, Clone, Copy)]
+pub struct CompileOptions<'a> {
+    pub extra_args: &'a str,
+    pub sysroot_args: Option<&'a str>,
+    pub script_args: &'a [String],
+    pub opt_level: Option<RustOptLevel>,
+}
 
 /// The build mode [`PANIC_ENV`] selects.
 ///
@@ -36,6 +66,7 @@ pub enum PanicMode {
 
 impl PanicMode {
     /// The mode a [`PANIC_ENV`] value names, or `None` for a value that names none.
+    #[must_use]
     pub fn parse(value: Option<&str>) -> Option<Self> {
         match value {
             None | Some("" | "unwind") => Some(Self::Unwind),
@@ -57,6 +88,7 @@ impl PanicMode {
     }
 
     /// The target's name: what the sysroot's `lib/rustlib/<name>/lib` is called.
+    #[must_use]
     pub fn target_name(self) -> &'static str {
         match self {
             Self::Abort => "wasm32-unknown-unknown",
@@ -111,11 +143,13 @@ impl Toolchain {
     }
 
     /// The build mode this toolchain compiles in.
+    #[must_use]
     pub fn panic_mode(&self) -> PanicMode {
         self.panic
     }
 
     /// The unwind mode's target spec.
+    #[must_use]
     pub fn unwind_target_spec(&self) -> PathBuf {
         self.root.join("targets").join("mires32-unwind.json")
     }
@@ -141,11 +175,13 @@ impl Toolchain {
     }
 
     /// The spike checkout root.
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// The codegen backend dylib rustc is pointed at.
+    #[must_use]
     pub fn dylib(&self) -> &Path {
         &self.dylib
     }
@@ -155,6 +191,7 @@ impl Toolchain {
     /// The dylib finds it as its own sibling, so nothing has to be passed on
     /// the command line; this is here so that the setup check can say which of
     /// the two halves is missing, and by name.
+    #[must_use]
     pub fn linker(&self) -> &Path {
         &self.linker
     }
@@ -165,16 +202,19 @@ impl Toolchain {
     }
 
     /// The compatibility path for the default compiler settings' sysroot.
+    #[must_use]
     pub fn sysroot(&self) -> PathBuf {
         self.root.join("build").join("sysroot")
     }
 
     /// The file the sysroot records the emit options it was built with in.
+    #[must_use]
     pub fn sysroot_args(&self) -> PathBuf {
         self.sysroot().join(".js-args")
     }
 
     /// The file recording the explicit rustc optimization level used for the sysroot.
+    #[must_use]
     pub fn sysroot_opt_level(&self) -> PathBuf {
         self.sysroot().join(".rust-opt-level")
     }
@@ -185,12 +225,21 @@ impl Toolchain {
     ///
     /// Returns `Err` when the checkout's key helper cannot identify those inputs.
     pub fn sysroot_for(&self, emit_args: &str, opt_level: Option<RustOptLevel>) -> Result<PathBuf> {
+        self.sysroot_for_key(SysrootKey::new(emit_args, opt_level))
+    }
+
+    /// The immutable sysroot selected by `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the checkout's key helper cannot identify those inputs.
+    pub fn sysroot_for_key(&self, key: SysrootKey<'_>) -> Result<PathBuf> {
         let script = self.script("sysroot-cache.sh");
         let mut command = Command::new("bash");
         command
             .arg(&script)
             .arg("path")
-            .env(SYSROOT_ARGS_ENV, emit_args.trim())
+            .env(SYSROOT_ARGS_ENV, key.emit_args.trim())
             // This Toolchain always targets wasm32, and typed settings must not inherit a
             // selector supplied to the parent build process.
             .env_remove("JSC_TARGET")
@@ -199,7 +248,7 @@ impl Toolchain {
         optional_env(
             &mut command,
             RUST_OPT_LEVEL_ENV,
-            opt_level.map(RustOptLevel::as_str),
+            key.opt_level.map(RustOptLevel::as_str),
         );
         optional_env(&mut command, PANIC_ENV, self.panic.env_value());
         if env::var_os(RUST_MIR_INLINE_ENV).is_none() {
@@ -212,18 +261,20 @@ impl Toolchain {
             source,
         })?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(BuildError::Io {
-                path: script,
-                source: io::Error::other(stderr.trim().to_owned()),
-            });
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail = if stderr.is_empty() {
+                format!("exited with {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(BuildError::SysrootKey { script, detail });
         }
         let path = String::from_utf8_lossy(&output.stdout);
         let path = path.trim();
         if path.is_empty() {
-            return Err(BuildError::Io {
-                path: script,
-                source: io::Error::other("sysroot key helper returned an empty path"),
+            return Err(BuildError::SysrootKey {
+                script,
+                detail: "sysroot key helper returned an empty path".to_owned(),
             });
         }
         Ok(PathBuf::from(path))
@@ -238,63 +289,79 @@ impl Toolchain {
     }
 
     /// The JavaScript runtime shim the compiled program calls into.
+    #[must_use]
     pub fn shim(&self) -> PathBuf {
         self.root.join("runtime").join("shim.js")
     }
 
     /// The toolchain the checkout pins, which every child process that
     /// compiles a client crate asks for by name.
+    #[must_use]
     pub fn pinned(&self) -> Pinned {
         Pinned::read(&self.root)
     }
 
     /// The script named `name` in the checkout.
+    #[must_use]
     pub fn script(&self, name: &str) -> PathBuf {
         self.root.join("scripts").join(name)
     }
 
     /// Every setup step missing before a client crate compiled with
     /// `emit_args` can be built, in the order they have to be performed.
+    #[must_use]
     pub fn preconditions(&self, emit_args: &str) -> Vec<Unmet> {
-        self.preconditions_with_opt_level(emit_args, None)
+        self.preconditions_for(SysrootKey::new(emit_args, None))
     }
 
     /// Every setup step missing for the requested backend and rustc optimization settings.
+    #[must_use]
     pub fn preconditions_with_opt_level(
         &self,
         emit_args: &str,
         opt_level: Option<RustOptLevel>,
     ) -> Vec<Unmet> {
+        self.preconditions_for(SysrootKey::new(emit_args, opt_level))
+    }
+
+    /// Every setup step missing for `key`, in the order they have to be performed.
+    #[must_use]
+    pub fn preconditions_for(&self, key: SysrootKey<'_>) -> Vec<Unmet> {
         Step::ALL
             .into_iter()
-            .filter_map(|step| match step {
-                Step::Sysroot => self.unmet_sysroot_with_opt_level(emit_args, opt_level),
-                _ => self.unmet(step, emit_args),
-            })
+            .filter_map(|step| self.unmet(step, key))
             .collect()
     }
 
     /// Whether `step` is missing, and why.
-    fn unmet(&self, step: Step, emit_args: &str) -> Option<Unmet> {
+    fn unmet(&self, step: Step, key: SysrootKey<'_>) -> Option<Unmet> {
         match step {
             Step::Toolchain => self.unmet_toolchain(),
             Step::Backend => self.unmet_backend(),
-            Step::Sysroot => self.unmet_sysroot(emit_args),
+            Step::Sysroot => self.unmet_sysroot(key),
         }
     }
 
     /// The command that performs `step`, whether or not it is already done.
+    #[must_use]
     pub fn fix(&self, step: Step, emit_args: &str) -> Fix {
-        self.fix_with_opt_level(step, emit_args, None)
+        self.fix_for(step, SysrootKey::new(emit_args, None))
     }
 
     /// The command that performs `step` with an explicit rustc optimization level.
+    #[must_use]
     pub fn fix_with_opt_level(
         &self,
         step: Step,
         emit_args: &str,
         opt_level: Option<RustOptLevel>,
     ) -> Fix {
+        self.fix_for(step, SysrootKey::new(emit_args, opt_level))
+    }
+
+    /// The command that performs `step` for `key`.
+    #[must_use]
+    pub fn fix_for(&self, step: Step, key: SysrootKey<'_>) -> Fix {
         match step {
             Step::Toolchain => Fix::new(step, "rustup").args(self.pinned().install_args()),
             Step::Backend => Fix::new(step, "bash")
@@ -302,8 +369,8 @@ impl Toolchain {
                 .dir(&self.root),
             Step::Sysroot => Fix::new(step, "bash")
                 .arg(path_arg(&self.script("build_sysroot.sh")))
-                .env(EXTRA_ARGS_ENV, emit_args.trim())
-                .maybe_env(RUST_OPT_LEVEL_ENV, opt_level.map(RustOptLevel::as_str))
+                .env(EXTRA_ARGS_ENV, key.emit_args.trim())
+                .maybe_env(RUST_OPT_LEVEL_ENV, key.opt_level.map(RustOptLevel::as_str))
                 .maybe_env(PANIC_ENV, self.panic.env_value())
                 .dir(&self.root),
         }
@@ -344,32 +411,24 @@ impl Toolchain {
     /// The sysroot, when it is missing or was built with other emit options:
     /// `core`'s items and the client crate's have to agree on how they are
     /// spelled.
-    fn unmet_sysroot(&self, emit_args: &str) -> Option<Unmet> {
-        self.unmet_sysroot_with_opt_level(emit_args, None)
-    }
-
-    fn unmet_sysroot_with_opt_level(
-        &self,
-        emit_args: &str,
-        opt_level: Option<RustOptLevel>,
-    ) -> Option<Unmet> {
-        let sysroot = match self.sysroot_for(emit_args, opt_level) {
+    fn unmet_sysroot(&self, key: SysrootKey<'_>) -> Option<Unmet> {
+        let sysroot = match self.sysroot_for_key(key) {
             Ok(sysroot) => sysroot,
             Err(error) => {
                 return Some(Unmet::new(
                     format!("the keyed sysroot cannot be resolved: {error}"),
-                    self.fix_with_opt_level(Step::Sysroot, emit_args, opt_level),
+                    self.fix_for(Step::Sysroot, key),
                 ));
             }
         };
         let wanted_args = match self.panic {
-            PanicMode::Unwind => format!("{emit_args} js-cleanup=off"),
-            PanicMode::Abort => emit_args.to_owned(),
+            PanicMode::Unwind => format!("{} js-cleanup=off", key.emit_args),
+            PanicMode::Abort => key.emit_args.to_owned(),
         };
         let found = fs::read_to_string(sysroot.join(".js-args")).unwrap_or_default();
         let found_opt = fs::read_to_string(sysroot.join(".rust-opt-level")).unwrap_or_default();
         let found_key = fs::read_to_string(sysroot.join(".cache-key")).unwrap_or_default();
-        let wanted_opt = opt_level.map(RustOptLevel::as_str).unwrap_or_default();
+        let wanted_opt = key.opt_level.map(RustOptLevel::as_str).unwrap_or_default();
         let wanted_key = sysroot.file_name().and_then(|name| name.to_str());
         if self.sysroot_lib_for(&sysroot).is_dir()
             && args_match(&found, &wanted_args)
@@ -384,10 +443,7 @@ impl Toolchain {
             sysroot.display()
         );
 
-        Some(Unmet::new(
-            reason,
-            self.fix_with_opt_level(Step::Sysroot, emit_args, opt_level),
-        ))
+        Some(Unmet::new(reason, self.fix_for(Step::Sysroot, key)))
     }
 
     /// Check the backend and a sysroot built with `emit_args` are in place.
@@ -397,13 +453,13 @@ impl Toolchain {
     /// Returns `Err` naming the first unmet precondition and the command that
     /// satisfies it.
     pub fn check(&self, emit_args: &str) -> Result {
-        self.report(self.preconditions(emit_args).into_iter().next())
+        self.check_with_opt_level(emit_args, None)
     }
 
     /// Check the backend and sysroot against both backend and rustc optimization settings.
     pub fn check_with_opt_level(&self, emit_args: &str, opt_level: Option<RustOptLevel>) -> Result {
         self.report(
-            self.preconditions_with_opt_level(emit_args, opt_level)
+            self.preconditions_for(SysrootKey::new(emit_args, opt_level))
                 .into_iter()
                 .next(),
         )
@@ -469,10 +525,7 @@ impl Toolchain {
     /// Returns `Err` if a step cannot be started, exits non-zero, or leaves
     /// its precondition unmet.
     pub fn bootstrap(&self, emit_args: &str) -> Result {
-        for unmet in self.preconditions(emit_args) {
-            self.apply(unmet.fix())?;
-        }
-        self.check(emit_args)
+        self.bootstrap_with_opt_level(emit_args, None)
     }
 
     /// Bootstrap and check the toolchain with an explicit rustc optimization level.
@@ -481,7 +534,7 @@ impl Toolchain {
         emit_args: &str,
         opt_level: Option<RustOptLevel>,
     ) -> Result {
-        for unmet in self.preconditions_with_opt_level(emit_args, opt_level) {
+        for unmet in self.preconditions_for(SysrootKey::new(emit_args, opt_level)) {
             self.apply(unmet.fix())?;
         }
         self.check_with_opt_level(emit_args, opt_level)
@@ -506,7 +559,16 @@ impl Toolchain {
         extra_args: &str,
         script_args: &[String],
     ) -> Result {
-        self.compile_with_opt_level(client_root, out, extra_args, script_args, None)
+        self.compile_with_options(
+            client_root,
+            out,
+            CompileOptions {
+                extra_args,
+                sysroot_args: None,
+                script_args,
+                opt_level: None,
+            },
+        )
     }
 
     /// Compile with an explicit rustc optimization level.
@@ -518,7 +580,16 @@ impl Toolchain {
         script_args: &[String],
         opt_level: Option<RustOptLevel>,
     ) -> Result {
-        self.compile_inner(client_root, out, extra_args, None, script_args, opt_level)
+        self.compile_with_options(
+            client_root,
+            out,
+            CompileOptions {
+                extra_args,
+                sysroot_args: None,
+                script_args,
+                opt_level,
+            },
+        )
     }
 
     /// Compile while selecting the sysroot from only the emit-affecting options.
@@ -531,24 +602,24 @@ impl Toolchain {
         script_args: &[String],
         opt_level: Option<RustOptLevel>,
     ) -> Result {
-        self.compile_inner(
+        self.compile_with_options(
             client_root,
             out,
-            extra_args,
-            Some(sysroot_args),
-            script_args,
-            opt_level,
+            CompileOptions {
+                extra_args,
+                sysroot_args: Some(sysroot_args),
+                script_args,
+                opt_level,
+            },
         )
     }
 
-    fn compile_inner(
+    /// Compile `client_root` to `out` using grouped [`CompileOptions`].
+    pub fn compile_with_options(
         &self,
         client_root: &Path,
         out: &Path,
-        extra_args: &str,
-        sysroot_args: Option<&str>,
-        script_args: &[String],
-        opt_level: Option<RustOptLevel>,
+        options: CompileOptions<'_>,
     ) -> Result {
         let script = self.script("compile_core.sh");
         let mut command = Command::new("bash");
@@ -556,17 +627,17 @@ impl Toolchain {
             .arg(&script)
             .arg(client_root)
             .arg(out)
-            .args(script_args)
-            .env(EXTRA_ARGS_ENV, extra_args)
+            .args(options.script_args)
+            .env(EXTRA_ARGS_ENV, options.extra_args)
             // The script echoes the output path on success, and anything a
             // build script writes to stdout is a cargo directive.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        optional_env(&mut command, SYSROOT_ARGS_ENV, sysroot_args);
+        optional_env(&mut command, SYSROOT_ARGS_ENV, options.sysroot_args);
         optional_env(
             &mut command,
             RUST_OPT_LEVEL_ENV,
-            opt_level.map(RustOptLevel::as_str),
+            options.opt_level.map(RustOptLevel::as_str),
         );
         optional_env(&mut command, PANIC_ENV, self.panic.env_value());
         if env::var_os(RUST_MIR_INLINE_ENV).is_none() {
@@ -574,9 +645,9 @@ impl Toolchain {
         }
         scrub(&mut command);
 
-        if env::var_os("JSC_REMAP_ROOT").is_none() {
+        if env::var_os(REMAP_ROOT_ENV).is_none() {
             if let Some(root) = env::var_os("CARGO_MANIFEST_DIR") {
-                command.env("JSC_REMAP_ROOT", root);
+                command.env(REMAP_ROOT_ENV, root);
             }
         }
 
@@ -711,39 +782,6 @@ fn args_match(found: &str, wanted: &str) -> bool {
         normalized
     }
     normalized(found) == normalized(wanted)
-}
-
-fn normalize_optimizer_passes(value: &str) -> String {
-    // The registered passes in compiler execution order. A normalized list names the selected
-    // ones in that order, so two spellings of one selection share a cache key. This must match
-    // scripts/sysroot-cache.sh's `jsc_normalize_opt_passes`.
-    const ORDERED: [&str; 5] = [
-        "sroa",
-        "ast-dce",
-        "future-poller",
-        "native-representations",
-        "link-dedup",
-    ];
-
-    if matches!(value, "all" | "none") {
-        return value.to_owned();
-    }
-    let mut requested = Vec::new();
-    for pass in value.split(',') {
-        if !ORDERED.contains(&pass) {
-            return value.to_owned();
-        }
-        requested.push(pass);
-    }
-    let selected: Vec<&str> = ORDERED
-        .into_iter()
-        .filter(|pass| requested.contains(pass))
-        .collect();
-    match selected.len() {
-        0 => "none".to_owned(),
-        count if count == ORDERED.len() => "all".to_owned(),
-        _ => selected.join(","),
-    }
 }
 
 /// Sets a typed child-process selector, explicitly masking an inherited value when absent.
@@ -946,11 +984,11 @@ mod tests {
         fs::write(report.join(".rust-opt-level"), "1").unwrap();
         fs::write(report.join(".cache-key"), "report-o1").unwrap();
         assert_eq!(
-            toolchain.unmet_sysroot_with_opt_level("js-opt=report", Some(RustOptLevel::O1),),
+            toolchain.unmet_sysroot(SysrootKey::new("js-opt=report", Some(RustOptLevel::O1))),
             None,
         );
         assert!(toolchain
-            .unmet_sysroot_with_opt_level("js-opt=off", None)
+            .unmet_sysroot(SysrootKey::new("js-opt=off", None))
             .is_some());
 
         let abort_toolchain = toolchain.with_panic_mode(PanicMode::Abort);
@@ -960,7 +998,7 @@ mod tests {
         fs::create_dir_all(abort_toolchain.sysroot_lib_for(&abort_report)).unwrap();
         fs::write(abort_report.join(".js-args"), "js-opt=report").unwrap();
         assert_eq!(
-            abort_toolchain.unmet_sysroot_with_opt_level("js-opt=report", Some(RustOptLevel::O1)),
+            abort_toolchain.unmet_sysroot(SysrootKey::new("js-opt=report", Some(RustOptLevel::O1))),
             None,
         );
     }
@@ -1134,5 +1172,51 @@ mod tests {
             panic!("expected an unmet precondition, got {error}");
         };
         assert!(error.to_string().contains(&unmet.fix().to_string()));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn sysroot_key_script_failures_return_sysroot_key_error() {
+        let dir = TempDir::new("sysroot-key-errors");
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::write(
+            dir.path().join("scripts/sysroot-cache.sh"),
+            "echo 'bad key input' >&2; exit 2\n",
+        )
+        .unwrap();
+        let toolchain = Toolchain::new(dir.path()).unwrap();
+        let error = toolchain.sysroot_for("js-opt=on", None).unwrap_err();
+        assert!(
+            matches!(&error, BuildError::SysrootKey { detail, .. } if detail == "bad key input"),
+            "{error}"
+        );
+
+        fs::write(dir.path().join("scripts/sysroot-cache.sh"), "printf ''\n").unwrap();
+        let empty = toolchain.sysroot_for("js-opt=on", None).unwrap_err();
+        assert!(matches!(empty, BuildError::SysrootKey { .. }), "{empty}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn compile_error_display_includes_stderr() {
+        let dir = TempDir::new("compile-error-display");
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::write(
+            dir.path().join("scripts/compile_core.sh"),
+            "echo 'error[E0425]: cannot find value' >&2; exit 1\n",
+        )
+        .unwrap();
+        let toolchain = Toolchain::new(dir.path()).unwrap();
+        let error = toolchain
+            .compile(Path::new("client.rs"), Path::new("out.js"), "", &[])
+            .unwrap_err();
+
+        assert!(matches!(error, BuildError::Compile { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("error[E0425]: cannot find value"),
+            "{error}"
+        );
     }
 }

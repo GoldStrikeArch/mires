@@ -46,7 +46,7 @@ use rcgjs_object::jsast::{self, BinOp, Expr, UnOp};
 use rcgjs_object::ptr;
 
 use crate::block::{self, Block};
-use crate::descriptor::{Descriptor, Root, Shape};
+use crate::descriptor::{Descriptor, ReturnKind, Root, Shape};
 
 use super::{decline, value, JsCx, Res};
 
@@ -177,7 +177,7 @@ pub fn lower_host(cx: &JsCx<'_>, op: &Op) -> Res<Expr> {
     }
     operation
         .lower_array(arguments)
-        .map_err(|detail| decline(OpClass::Host, detail))
+        .map_err(|detail| decline(OpClass::Host, detail.to_string()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -253,7 +253,7 @@ fn host_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Ex
     if let Some(operation) = rcgjs_object::host::HostOperation::from_marker(marker) {
         return operation
             .lower(values)
-            .map_err(|error| decline(OpClass::Host, error));
+            .map_err(|error| decline(OpClass::Host, error.to_string()));
     }
     let one = || -> Res<Expr> {
         values.first().cloned().ok_or_else(|| {
@@ -388,7 +388,7 @@ pub(super) fn closure_thunk_with(
     };
 
     let convert_params = || -> Res<Vec<Expr>> {
-        if !crate::lower::bstr::enabled() || !convert_params_in {
+        if !cx.bstr_enabled() || !convert_params_in {
             return Ok(params.iter().cloned().map(jsast::id).collect());
         }
         params
@@ -405,7 +405,7 @@ pub(super) fn closure_thunk_with(
             .collect()
     };
     let convert_result = |call_expr: Expr| -> Res<Expr> {
-        if !crate::lower::bstr::enabled() || !convert_result_out {
+        if !cx.bstr_enabled() || !convert_result_out {
             return Ok(call_expr);
         }
         match result_ty {
@@ -526,7 +526,7 @@ fn closure_item(
         .params
         .saturating_sub(usize::from(has_environment))
         .saturating_sub(usize::from(entry.caller_location));
-    if !crate::lower::bstr::enabled() || (!convert_params_in && !convert_result_out) {
+    if !cx.bstr_enabled() || (!convert_params_in && !convert_result_out) {
         return Ok((entry.name.clone(), arity, Vec::new(), None, has_environment));
     }
     let mut result_ty = entry.result;
@@ -713,7 +713,7 @@ fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<
 /// UTF-8 encoded into its byte string, wherever it sits in the value (`bstr::host_convert`), or
 /// the lowering declines with the reason when it cannot be rebuilt exactly.
 fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Res<Expr> {
-    if crate::lower::bstr::enabled() && crate::lower::bstr::reaches_str(cx.table, ty) {
+    if cx.bstr_enabled() && crate::lower::bstr::reaches_str(cx.table, ty) {
         return crossing(cx, ty, value, crate::lower::bstr::Crossing::In);
     }
     Ok(match value::float_bits(cx.table, ty) {
@@ -726,7 +726,7 @@ fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Res<Expr> {
 /// `str` it reaches — or a `String` the plan keeps as its host string — is decoded to the host
 /// text it encodes (`__rt.bstr_out`, `bstr::host_convert`); everything else crosses as it is.
 fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
-    if !crate::lower::bstr::enabled() || cx.is_known_ascii(arg) {
+    if !cx.bstr_enabled() || cx.is_known_ascii(arg) {
         return Ok(value);
     }
     let carrier = cx
@@ -778,7 +778,7 @@ pub(super) fn crossing(
 fn js_block(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| decline(OpClass::Host, "a `js!{}` block section is not UTF-8"))?;
-    let block = Block::decode(text).map_err(|why| decline(OpClass::Host, why))?;
+    let block = Block::decode(text).map_err(|why| decline(OpClass::Host, why.to_string()))?;
     if args.len() != block.slots {
         return Err(decline(
             OpClass::Host,
@@ -802,9 +802,7 @@ fn js_block(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr>
     };
     // The block's value is host JavaScript: a `str` result is host text (`js-str=bytes`).
     match op.result {
-        Some(result) if crate::lower::bstr::enabled() => {
-            boundary_value(cx, cx.ty_of(result)?, value)
-        }
+        Some(result) if cx.bstr_enabled() => boundary_value(cx, cx.ty_of(result)?, value),
         _ => Ok(value),
     }
 }
@@ -825,7 +823,8 @@ fn walk(root: Expr, steps: &[&str]) -> Expr {
 fn js_extern(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| decline(OpClass::Host, "a `#[js_extern]` descriptor is not UTF-8"))?;
-    let descriptor = Descriptor::decode(text).map_err(|why| decline(OpClass::Host, why))?;
+    let descriptor =
+        Descriptor::decode(text).map_err(|why| decline(OpClass::Host, why.to_string()))?;
 
     let required = descriptor.required_arguments();
     if args.len() < required {
@@ -923,40 +922,34 @@ fn js_extern_value(
         None => return Ok(value),
     };
 
-    if descriptor.fallible {
-        if descriptor.nullable {
-            return Err(decline(
-                OpClass::Host,
-                "a `#[js_extern]` declaration cannot be both fallible and nullable",
-            ));
+    match descriptor.return_kind {
+        ReturnKind::Fallible => {
+            // The destination a `#[js(fallible)]` declaration promises
+            // (v1 `js_extern.rs::fallible_result`): a `Result<T, mires_js::JsValue>`, and nothing
+            // else. A lookalike error type would silently receive a JavaScript exception it has no
+            // representation for. The type table says which crate a nominal type belongs to through
+            // `PinnedBoundary::Host`, which is set for every `mires_js` type.
+            let Some(ok_ty) = result_value_ty(cx, result_ty) else {
+                return Ok(cx.zombie(
+                    "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this                  declaration does not"
+                        .to_owned(),
+                ));
+            };
+            if !fallible_error_is_host_value(cx, result_ty) {
+                return Ok(cx.zombie(
+                    "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this                  declaration returns another error type"
+                        .to_owned(),
+                ));
+            }
+            let value = boundary_value(cx, ok_ty, value)?;
+            Ok(jsast::rt_call(
+                "host_try",
+                vec![jsast::arrow(Vec::new(), value)],
+            ))
         }
-        // The destination a `#[js(fallible)]` declaration promises
-        // (v1 `js_extern.rs::fallible_result`): a `Result<T, mires_js::JsValue>`, and nothing
-        // else. A lookalike error type would silently receive a JavaScript exception it has no
-        // representation for. The type table says which crate a nominal type belongs to through
-        // `PinnedBoundary::Host`, which is set for every `mires_js` type.
-        let Some(ok_ty) = result_value_ty(cx, result_ty) else {
-            return Ok(cx.zombie(
-                "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this                  declaration does not"
-                    .to_owned(),
-            ));
-        };
-        if !fallible_error_is_host_value(cx, result_ty) {
-            return Ok(cx.zombie(
-                "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this                  declaration returns another error type"
-                    .to_owned(),
-            ));
-        }
-        let value = boundary_value(cx, ok_ty, value)?;
-        return Ok(jsast::rt_call(
-            "host_try",
-            vec![jsast::arrow(Vec::new(), value)],
-        ));
+        ReturnKind::Nullable => nullable(cx, result_ty, value),
+        ReturnKind::Plain => boundary_value(cx, result_ty, value),
     }
-    if !descriptor.nullable {
-        return boundary_value(cx, result_ty, value);
-    }
-    nullable(cx, result_ty, value)
 }
 
 /// What a `#[js_extern]` path is rooted at when it is not rooted at an argument: the module's
@@ -971,10 +964,10 @@ fn js_binding(descriptor: &Descriptor) -> Expr {
         .copied()
         .unwrap_or_default()
         .to_owned();
-    if descriptor.root() != Root::Module {
-        return jsast::id(head);
+    match (descriptor.root(), descriptor.module()) {
+        (Root::Module, Some(module)) => jsast::id(extern_import(module, &head)),
+        _ => jsast::id(head),
     }
-    jsast::id(extern_import(&descriptor.module, &head))
 }
 
 /// `#[js(nullable)]`: `null` and `undefined` become `None`, anything else `Some`

@@ -208,8 +208,10 @@ fn pointer_tag_variant(
         return Err(TagError::Unreadable);
     }
     let pointer = read_pointer(tcx, alloc, tag_offset, false);
-    match pointer.alloc_id() {
-        Some(alloc_id) if !may_be_null(tcx, alloc_id, pointer.offset) => Ok(*untagged_variant),
+    match (pointer.alloc_id(), pointer.offset) {
+        (Some(alloc_id), Some(offset)) if !may_be_null(tcx, alloc_id, offset) => {
+            Ok(*untagged_variant)
+        }
         _ => Err(TagError::Unreadable),
     }
 }
@@ -236,23 +238,33 @@ pub(crate) fn is_wide_pointee<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> boo
     ) || crate::value::unsized_tail(tcx, pointee).is_some()
 }
 
+/// Metadata carried by a wide pointer's second slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PointerMeta {
+    /// A bare integer metadata slot (slice / `str` length).
+    Scalar(u64),
+    /// A metadata slot carrying provenance (a vtable pointer for `dyn Trait`).
+    Provenance {
+        provenance: CtfeProvenance,
+        offset: u64,
+    },
+}
+
 /// A pointer read out of an allocation: which allocation it names, where into it, and how long the
-/// pointee is when the pointer is wide.
+/// pointee is (or which vtable it carries) when the pointer is wide.
 ///
 /// The bytes at the pointer's own offset are only half of it: they hold the offset *within* the
 /// allocation being pointed at, and the allocation itself comes from the provenance recorded beside
 /// them. No provenance means the bytes are an address and nothing else, which is the address form
 /// of the pointer model: `ptr::null()`, an integer cast to a pointer.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Pointer {
     pub(crate) provenance: Option<CtfeProvenance>,
-    /// The offset into the pointed-at allocation, or the bare address when there is no provenance.
-    pub(crate) offset: Size,
-    /// The length of the pointee (or offset into a vtable), for a wide pointer.
-    pub(crate) meta: Option<u64>,
-    /// The provenance of the metadata slot, for a wide pointer whose metadata is a vtable pointer.
-    pub(crate) meta_provenance: Option<CtfeProvenance>,
-    /// Whether the pointer's own bytes could be read at all.
-    pub(crate) readable: bool,
+    /// The offset into the pointed-at allocation, or the bare address when there is no provenance;
+    /// `None` when the pointer's own bytes could not be read.
+    pub(crate) offset: Option<Size>,
+    /// Metadata from the second slot of a wide pointer, when readable.
+    pub(crate) meta: Option<PointerMeta>,
 }
 
 impl Pointer {
@@ -261,9 +273,13 @@ impl Pointer {
         self.provenance.map(|provenance| provenance.alloc_id())
     }
 
-    /// The allocation the metadata slot names, if it names one (a vtable for `dyn Trait`).
-    pub(crate) fn meta_alloc_id(&self) -> Option<AllocId> {
-        self.meta_provenance.map(|provenance| provenance.alloc_id())
+    /// The scalar length carried by a wide slice/`str` pointer, if its metadata is a bare integer
+    /// without provenance.
+    pub(crate) fn meta_len(&self) -> Option<u64> {
+        match self.meta {
+            Some(PointerMeta::Scalar(len)) => Some(len),
+            Some(PointerMeta::Provenance { .. }) | None => None,
+        }
     }
 }
 
@@ -275,27 +291,27 @@ pub(crate) fn read_pointer(
     wide: bool,
 ) -> Pointer {
     let pointer_size = tcx.data_layout.pointer_size();
-    let bits = read_scalar(tcx, alloc, offset, pointer_size);
-    let (meta, meta_provenance) = match wide {
-        true => (
-            read_scalar(tcx, alloc, offset + pointer_size, pointer_size)
-                .map(|int| int.to_uint(pointer_size) as u64),
-            alloc
-                .provenance()
-                .ptrs()
-                .get(&(offset + pointer_size))
-                .copied(),
-        ),
-        false => (None, None),
+    let ptr_offset = read_scalar(tcx, alloc, offset, pointer_size)
+        .map(|int| Size::from_bytes(int.to_uint(pointer_size) as u64));
+    let meta = if wide {
+        let meta_offset = offset + pointer_size;
+        read_scalar(tcx, alloc, meta_offset, pointer_size).map(|int| {
+            let value = int.to_uint(pointer_size) as u64;
+            match alloc.provenance().ptrs().get(&meta_offset).copied() {
+                Some(provenance) => PointerMeta::Provenance {
+                    provenance,
+                    offset: value,
+                },
+                None => PointerMeta::Scalar(value),
+            }
+        })
+    } else {
+        None
     };
     Pointer {
         provenance: alloc.provenance().ptrs().get(&offset).copied(),
-        offset: bits.map_or(Size::ZERO, |int| {
-            Size::from_bytes(int.to_uint(pointer_size) as u64)
-        }),
+        offset: ptr_offset,
         meta,
-        meta_provenance,
-        readable: bits.is_some(),
     }
 }
 
@@ -306,11 +322,15 @@ pub(crate) fn read_vtable<'tcx>(
     tcx: TyCtxt<'tcx>,
     pointer: &Pointer,
 ) -> Option<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>)> {
-    if pointer.meta != Some(0) {
+    let Some(PointerMeta::Provenance {
+        provenance,
+        offset: 0,
+    }) = pointer.meta
+    else {
         return None;
-    }
-    let vtable_id = pointer.meta_alloc_id()?;
-    let GlobalAlloc::VTable(concrete_ty, dyn_existential) = tcx.global_alloc(vtable_id) else {
+    };
+    let GlobalAlloc::VTable(concrete_ty, dyn_existential) = tcx.global_alloc(provenance.alloc_id())
+    else {
         return None;
     };
     let principal = dyn_existential
@@ -386,6 +406,29 @@ fn checked_sub_size(lhs: Size, rhs: Size) -> Option<Size> {
     lhs.bytes().checked_sub(rhs.bytes()).map(Size::from_bytes)
 }
 
+/// Peels patterns and non-union transparent wrappers while subtracting each peeled wrapper's
+/// field offset from `rem_offset`. Returns `None` if a union boundary or negative offset is hit.
+fn peel_non_union_transparent_at<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cur_ty: Ty<'tcx>,
+    rem_offset: Size,
+) -> Option<(Ty<'tcx>, Size)> {
+    let mut ty = crate::value::peel_pattern(cur_ty);
+    let mut rem = rem_offset;
+    for _ in 0..16 {
+        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+            return None;
+        }
+        let Some((idx, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
+            break;
+        };
+        let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+        rem = checked_sub_size(rem, layout.fields.offset(idx.as_usize()))?;
+        ty = crate::value::peel_pattern(field_ty);
+    }
+    Some((ty, rem))
+}
+
 fn resolve_static_path_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
     cur_ty: Ty<'tcx>,
@@ -413,19 +456,7 @@ fn resolve_static_path_inner<'tcx>(
 
     // Peel patterns and non-union transparent wrappers (e.g. `UnsafeCell`, `Cell`, `ManuallyDrop`,
     // `#[repr(transparent)]` structs) whose JS representation IS the inner aggregate.
-    let mut ty = crate::value::peel_pattern(cur_ty);
-    let mut rem = rem_offset;
-    for _ in 0..16 {
-        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
-            return None;
-        }
-        let Some((idx, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
-            break;
-        };
-        let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
-        rem = checked_sub_size(rem, layout.fields.offset(idx.as_usize()))?;
-        ty = crate::value::peel_pattern(field_ty);
-    }
+    let (ty, rem) = peel_non_union_transparent_at(tcx, cur_ty, rem_offset)?;
 
     let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
     if layout.is_zst() {
@@ -576,185 +607,153 @@ pub(crate) fn resolve_static_slice<'tcx>(
         return None;
     }
     let slice_bytes = length.checked_mul(stride)?;
-    resolve_static_slice_inner(
+    let query = SliceQuery {
         tcx,
-        static_ty,
-        offset,
         element_ty,
         stride,
         length,
         slice_bytes,
-        0,
-    )
+    };
+    query.resolve(static_ty, offset, 0)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn resolve_static_slice_inner<'tcx>(
+#[derive(Clone, Copy)]
+struct SliceQuery<'tcx> {
     tcx: TyCtxt<'tcx>,
-    cur_ty: Ty<'tcx>,
-    rem_offset: Size,
     element_ty: Ty<'tcx>,
     stride: u64,
     length: u64,
     slice_bytes: u64,
-    depth: u32,
-) -> Option<(Vec<StaticPathStep>, u32)> {
-    if depth >= MAX_STATIC_PATH_DEPTH || !crate::value::is_indirect(tcx, cur_ty) {
-        return None;
-    }
-    let cur_layout = tcx.layout_of(typing_env().as_query_input(cur_ty)).ok()?;
-    if cur_layout.is_zst() {
-        return None;
-    }
+}
 
-    let mut ty = crate::value::peel_pattern(cur_ty);
-    let mut rem = rem_offset;
-    for _ in 0..16 {
-        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+impl<'tcx> SliceQuery<'tcx> {
+    fn resolve(
+        &self,
+        cur_ty: Ty<'tcx>,
+        rem_offset: Size,
+        depth: u32,
+    ) -> Option<(Vec<StaticPathStep>, u32)> {
+        let tcx = self.tcx;
+        if depth >= MAX_STATIC_PATH_DEPTH || !crate::value::is_indirect(tcx, cur_ty) {
             return None;
         }
-        let Some((idx, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
-            break;
-        };
+        let cur_layout = tcx.layout_of(typing_env().as_query_input(cur_ty)).ok()?;
+        if cur_layout.is_zst() {
+            return None;
+        }
+
+        let (ty, rem) = peel_non_union_transparent_at(tcx, cur_ty, rem_offset)?;
+
         let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
-        rem = checked_sub_size(rem, layout.fields.offset(idx.as_usize()))?;
-        ty = crate::value::peel_pattern(field_ty);
-    }
-
-    let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
-    if layout.is_zst() {
-        return None;
-    }
-
-    match ty.kind() {
-        ty::Array(arr_elem, count) => {
-            let count = count.try_to_target_usize(tcx)?;
-            if static_types_match(tcx, *arr_elem, element_ty) {
-                if !rem.bytes().is_multiple_of(stride) {
-                    return None;
-                }
-                let start = rem.bytes() / stride;
-                if start.checked_add(length).is_none_or(|end| end > count) {
-                    return None;
-                }
-                let start_u32 = u32::try_from(start).ok()?;
-                return Some((Vec::new(), start_u32));
-            }
-            let outer_layout = tcx.layout_of(typing_env().as_query_input(*arr_elem)).ok()?;
-            let outer_stride = outer_layout.size.bytes();
-            if outer_stride == 0 {
-                return None;
-            }
-            let idx = rem.bytes() / outer_stride;
-            if idx >= count {
-                return None;
-            }
-            let idx_u32 = u32::try_from(idx).ok()?;
-            let sub_offset = Size::from_bytes(rem.bytes() % outer_stride);
-            if sub_offset
-                .bytes()
-                .checked_add(slice_bytes)
-                .is_none_or(|end| end > outer_stride)
-            {
-                return None;
-            }
-            let (mut tail, start) = resolve_static_slice_inner(
-                tcx,
-                *arr_elem,
-                sub_offset,
-                element_ty,
-                stride,
-                length,
-                slice_bytes,
-                depth + 1,
-            )?;
-            let mut path = Vec::with_capacity(1 + tail.len());
-            path.push(StaticPathStep::Index(idx_u32));
-            path.append(&mut tail);
-            Some((path, start))
+        if layout.is_zst() {
+            return None;
         }
-        ty::Adt(def, args) if def.is_struct() => {
-            let variant = def.non_enum_variant();
-            let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
-            for (idx, field) in variant.fields.iter_enumerated() {
-                let field_offset = layout.fields.offset(idx.as_usize());
-                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
-                    continue;
-                };
-                let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
-                let Ok(field_layout) = tcx.layout_of(typing_env().as_query_input(field_ty)) else {
-                    continue;
-                };
-                if sub_offset
-                    .bytes()
-                    .checked_add(slice_bytes)
-                    .is_none_or(|end| end > field_layout.size.bytes())
-                {
-                    continue;
-                }
-                if let Some((mut tail, start)) = resolve_static_slice_inner(
-                    tcx,
-                    field_ty,
-                    sub_offset,
-                    element_ty,
-                    stride,
-                    length,
-                    slice_bytes,
-                    depth + 1,
-                ) {
-                    if matched.is_some() {
+
+        match ty.kind() {
+            ty::Array(arr_elem, count) => {
+                let count = count.try_to_target_usize(tcx)?;
+                if static_types_match(tcx, *arr_elem, self.element_ty) {
+                    if !rem.bytes().is_multiple_of(self.stride) {
                         return None;
                     }
-                    let mut path = Vec::with_capacity(1 + tail.len());
-                    path.push(StaticPathStep::Field(crate::naming::Namer::field_name(
-                        variant, idx,
-                    )));
-                    path.append(&mut tail);
-                    matched = Some((path, start));
-                }
-            }
-            matched
-        }
-        ty::Tuple(elems) => {
-            let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
-            for (idx, elem_ty) in elems.iter().enumerate() {
-                let field_offset = layout.fields.offset(idx);
-                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
-                    continue;
-                };
-                let Ok(elem_layout) = tcx.layout_of(typing_env().as_query_input(elem_ty)) else {
-                    continue;
-                };
-                if sub_offset
-                    .bytes()
-                    .checked_add(slice_bytes)
-                    .is_none_or(|end| end > elem_layout.size.bytes())
-                {
-                    continue;
-                }
-                if let Some((mut tail, start)) = resolve_static_slice_inner(
-                    tcx,
-                    elem_ty,
-                    sub_offset,
-                    element_ty,
-                    stride,
-                    length,
-                    slice_bytes,
-                    depth + 1,
-                ) {
-                    if matched.is_some() {
+                    let start = rem.bytes() / self.stride;
+                    if start.checked_add(self.length).is_none_or(|end| end > count) {
                         return None;
                     }
-                    let idx_u32 = u32::try_from(idx).ok()?;
-                    let mut path = Vec::with_capacity(1 + tail.len());
-                    path.push(StaticPathStep::Index(idx_u32));
-                    path.append(&mut tail);
-                    matched = Some((path, start));
+                    let start_u32 = u32::try_from(start).ok()?;
+                    return Some((Vec::new(), start_u32));
                 }
+                let outer_layout = tcx.layout_of(typing_env().as_query_input(*arr_elem)).ok()?;
+                let outer_stride = outer_layout.size.bytes();
+                if outer_stride == 0 {
+                    return None;
+                }
+                let idx = rem.bytes() / outer_stride;
+                if idx >= count {
+                    return None;
+                }
+                let idx_u32 = u32::try_from(idx).ok()?;
+                let sub_offset = Size::from_bytes(rem.bytes() % outer_stride);
+                if sub_offset
+                    .bytes()
+                    .checked_add(self.slice_bytes)
+                    .is_none_or(|end| end > outer_stride)
+                {
+                    return None;
+                }
+                let (mut tail, start) = self.resolve(*arr_elem, sub_offset, depth + 1)?;
+                let mut path = Vec::with_capacity(1 + tail.len());
+                path.push(StaticPathStep::Index(idx_u32));
+                path.append(&mut tail);
+                Some((path, start))
             }
-            matched
+            ty::Adt(def, args) if def.is_struct() => {
+                let variant = def.non_enum_variant();
+                let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
+                for (idx, field) in variant.fields.iter_enumerated() {
+                    let field_offset = layout.fields.offset(idx.as_usize());
+                    let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                        continue;
+                    };
+                    let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
+                    let Ok(field_layout) = tcx.layout_of(typing_env().as_query_input(field_ty))
+                    else {
+                        continue;
+                    };
+                    if sub_offset
+                        .bytes()
+                        .checked_add(self.slice_bytes)
+                        .is_none_or(|end| end > field_layout.size.bytes())
+                    {
+                        continue;
+                    }
+                    if let Some((mut tail, start)) = self.resolve(field_ty, sub_offset, depth + 1) {
+                        if matched.is_some() {
+                            return None;
+                        }
+                        let mut path = Vec::with_capacity(1 + tail.len());
+                        path.push(StaticPathStep::Field(crate::naming::Namer::field_name(
+                            variant, idx,
+                        )));
+                        path.append(&mut tail);
+                        matched = Some((path, start));
+                    }
+                }
+                matched
+            }
+            ty::Tuple(elems) => {
+                let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
+                for (idx, elem_ty) in elems.iter().enumerate() {
+                    let field_offset = layout.fields.offset(idx);
+                    let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                        continue;
+                    };
+                    let Ok(elem_layout) = tcx.layout_of(typing_env().as_query_input(elem_ty))
+                    else {
+                        continue;
+                    };
+                    if sub_offset
+                        .bytes()
+                        .checked_add(self.slice_bytes)
+                        .is_none_or(|end| end > elem_layout.size.bytes())
+                    {
+                        continue;
+                    }
+                    if let Some((mut tail, start)) = self.resolve(elem_ty, sub_offset, depth + 1) {
+                        if matched.is_some() {
+                            return None;
+                        }
+                        let idx_u32 = u32::try_from(idx).ok()?;
+                        let mut path = Vec::with_capacity(1 + tail.len());
+                        path.push(StaticPathStep::Index(idx_u32));
+                        path.append(&mut tail);
+                        matched = Some((path, start));
+                    }
+                }
+                matched
+            }
+            _ => None,
         }
-        _ => None,
     }
 }
 

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// The current manifest layout. Bumped whenever a field is added, removed, or reordered: postcard
 /// is positional, so a mismatched pair would misread rather than fail.
-pub const MANIFEST_VERSION: u16 = 4;
+pub const MANIFEST_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {

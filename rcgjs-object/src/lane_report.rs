@@ -23,9 +23,6 @@
 //! The file is deterministic: items are sorted by name, the keys are in a fixed order, and nothing
 //! about the writer depends on iteration order or on a hash seed. Two links of one program produce
 //! two byte-identical reports.
-//!
-//! The writer is hand-rolled rather than `serde_json` because this crate's dependencies are the
-//! object format's, and one JSON document with five known keys does not earn a new one.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -195,8 +192,8 @@ pub fn render(items: &[LaneItem]) -> String {
 /// A JSON string literal. Control characters are escaped the short way where JSON has one and as
 /// `\u00XX` otherwise; everything else, non-ASCII included, is written through as UTF-8.
 ///
-/// Public because the lane driver's own sidecar (`jsc-link/src/link/lane.rs`) writes JSON by the
-/// same rules, and two escapers would be two chances to disagree.
+/// Shared across `lane_report`, `jir::conflict`, `sourcemap`, and `jsc-link` so every hand-written
+/// JSON document escapes strings identically.
 pub fn push_string(out: &mut String, value: &str) {
     out.push('"');
     for character in value.chars() {
@@ -279,6 +276,18 @@ mod tests {
             rendered.contains("\"name\":\"a\\\"b\\\\c\\nd\\u0001e\""),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn push_string_matches_serde_json_for_control_and_unicode_chars() {
+        let mut sample = String::new();
+        for code in 0u32..0x20 {
+            sample.push(char::from_u32(code).expect("valid scalar"));
+        }
+        sample.push_str("\"\\hello caf\u{e9} \u{2260} \u{1f600}");
+        let mut out = String::new();
+        push_string(&mut out, &sample);
+        assert_eq!(out, serde_json::to_string(&sample).expect("json string"));
     }
 
     #[test]

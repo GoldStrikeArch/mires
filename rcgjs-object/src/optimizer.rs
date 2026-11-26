@@ -6,10 +6,11 @@
 //! unchanged.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use crate::jsast::{
-    self, walk_expr, walk_expr_mut, walk_stmt, ArrowBody, BinOp, Expr, Stmt, SwitchCase, UnOp,
-    Visit, VisitMut,
+    self, try_walk_expr, try_walk_stmt, walk_expr, walk_expr_mut, walk_stmt, ArrowBody, BinOp,
+    Expr, Stmt, SwitchCase, TryVisit, UnOp, Visit, VisitMut,
 };
 use crate::opts::{OptimizerMode, OptimizerPass};
 
@@ -116,49 +117,45 @@ fn any_stmt_shallow(stmt: &Stmt, pred: fn(&Stmt) -> bool, recurse_try: bool) -> 
     struct Check {
         pred: fn(&Stmt) -> bool,
         recurse_try: bool,
-        found: bool,
     }
-    impl Visit for Check {
-        fn visit_stmt(&mut self, stmt: &Stmt) {
-            if self.found {
-                return;
-            }
+    impl TryVisit for Check {
+        type Break = ();
+
+        fn visit_stmt(&mut self, stmt: &Stmt) -> ControlFlow<()> {
             if (self.pred)(stmt) {
-                self.found = true;
-                return;
+                return ControlFlow::Break(());
             }
             match stmt {
                 Stmt::TryCatch { body, handler, .. } if self.recurse_try => {
-                    self.visit_stmts(body);
-                    self.visit_stmts(handler);
+                    self.visit_stmts(body)?;
+                    self.visit_stmts(handler)
                 }
                 Stmt::If(_, then, els) => {
-                    self.visit_stmts(then);
+                    self.visit_stmts(then)?;
                     if let Some(els) = els {
-                        self.visit_stmts(els);
+                        self.visit_stmts(els)?;
                     }
+                    ControlFlow::Continue(())
                 }
                 Stmt::Switch(_, cases) => {
                     for case in cases {
-                        self.visit_stmts(&case.body);
+                        self.visit_stmts(&case.body)?;
                     }
+                    ControlFlow::Continue(())
                 }
                 Stmt::Labeled(_, inner) => self.visit_stmt(inner),
                 Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::While(_, body) => {
-                    self.visit_stmts(body);
+                    self.visit_stmts(body)
                 }
-                _ => {}
+                _ => ControlFlow::Continue(()),
             }
         }
-        fn visit_expr(&mut self, _: &Expr) {}
+
+        fn visit_expr(&mut self, _: &Expr) -> ControlFlow<()> {
+            ControlFlow::Continue(())
+        }
     }
-    let mut c = Check {
-        pred,
-        recurse_try,
-        found: false,
-    };
-    c.visit_stmt(stmt);
-    c.found
+    Check { pred, recurse_try }.visit_stmt(stmt).is_break()
 }
 
 /// Whether removing this statement could remove a binding visible before it executes.
@@ -536,35 +533,28 @@ fn remove_unused_decls(stmts: Vec<Stmt>) -> Vec<Stmt> {
 
 /// Whether use analysis cannot see every binding this statement might read by name.
 fn has_opaque_scope_use(stmt: &Stmt) -> bool {
-    struct Check(bool);
-    impl Visit for Check {
-        fn visit_stmt(&mut self, stmt: &Stmt) {
-            if self.0 {
-                return;
-            }
+    struct Check;
+    impl TryVisit for Check {
+        type Break = ();
+
+        fn visit_stmt(&mut self, stmt: &Stmt) -> ControlFlow<()> {
             if matches!(stmt, Stmt::Raw(_) | Stmt::TryCatch { .. }) {
-                self.0 = true;
-                return;
+                return ControlFlow::Break(());
             }
-            walk_stmt(self, stmt);
+            try_walk_stmt(self, stmt)
         }
-        fn visit_expr(&mut self, expr: &Expr) {
-            if self.0 {
-                return;
-            }
+
+        fn visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
             match expr {
-                Expr::Raw(_) => self.0 = true,
-                Expr::Call(callee, _) if matches!(&**callee, Expr::Ident(name) if name == "eval") =>
-                {
-                    self.0 = true;
+                Expr::Raw(_) => ControlFlow::Break(()),
+                Expr::Call(callee, _) if matches!(&**callee, Expr::Ident(name) if name == "eval") => {
+                    ControlFlow::Break(())
                 }
-                _ => walk_expr(self, expr),
+                _ => try_walk_expr(self, expr),
             }
         }
     }
-    let mut c = Check(false);
-    c.visit_stmt(stmt);
-    c.0
+    Check.visit_stmt(stmt).is_break()
 }
 
 /// Expressions whose evaluation cannot call user code, trigger a getter, allocate, or mutate.

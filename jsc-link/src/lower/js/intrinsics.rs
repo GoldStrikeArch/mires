@@ -1664,7 +1664,7 @@ impl Intrinsic<'_, '_> {
             return Ok(self.not_a_pointer(name));
         };
         if !volatile
-            && crate::lower::bstr::enabled()
+            && self.cx.bstr_enabled()
             && value::is_u8(self.cx.table, pointee)
             && self
                 .args
@@ -1840,7 +1840,11 @@ impl Intrinsic<'_, '_> {
                             jsast::index(db.clone(), d_idx),
                             jsast::index(sb.clone(), s_idx),
                         ),
-                        jsast::expr_stmt(jsast::compound_assign(BinOp::Add, idx, jsast::num(1))),
+                        jsast::expr_stmt(jsast::compound_assign(
+                            jsast::CompoundOp::Add,
+                            idx,
+                            jsast::num(1),
+                        )),
                     ],
                 ),
             ]

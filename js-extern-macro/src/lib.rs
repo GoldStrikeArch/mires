@@ -20,16 +20,18 @@
 //! ```
 //!
 //! Each declaration becomes a marker function: an ordinary Rust `fn` whose body never runs and
-//! whose `link_section` the backend matches on, exactly as `view-abi`'s markers work. The
-//! declaration is written as a foreign block because that is the shape a reader expects and the
-//! shape the signatures suit; nothing foreign survives the expansion, and it must not, because
-//! rustc has announced that `link_section` on a foreign function will become a hard error.
+//! whose `link_section` the backend matches on. The declaration is written as a foreign block
+//! because that is the shape a reader expects and the shape the signatures suit; nothing foreign
+//! survives the expansion, and it must not, because rustc has announced that `link_section` on a
+//! foreign function will become a hard error.
 //!
-//! See `descriptor` for the encoding and for the shapes.
+//! See [`mires_marker_abi::descriptor`] for the encoding and for the shapes.
 
-mod descriptor;
+use std::collections::BTreeMap;
 
-use descriptor::{Descriptor, Fact, Shape, Slot, SlotFacts};
+use mires_marker_abi::descriptor::{
+    Descriptor, Fact, ReturnKind, RootSpec, Shape, Slot, SlotFacts,
+};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
@@ -74,20 +76,27 @@ pub fn js_bindings(input: TokenStream) -> TokenStream {
 /// Exports a Rust function under its Rust name without an unsafe source-level attribute.
 #[proc_macro_attribute]
 pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "`js_export` takes no arguments",
-        )
-        .to_compile_error()
-        .into();
+    match expand_export(attr.into(), item.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
     }
-    let function = syn::parse_macro_input!(item as ItemFn);
-    quote! {
+}
+
+fn expand_export(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if !attr.is_empty() {
+        return Err(syn::Error::new(
+            attr.span(),
+            "`js_export` takes no arguments",
+        ));
+    }
+    let function: ItemFn = syn::parse2(item)?;
+    Ok(quote! {
         #[unsafe(no_mangle)]
         #function
-    }
-    .into()
+    })
 }
 
 /// A safe JavaScript bindings block.
@@ -126,16 +135,18 @@ struct BindingFn {
     attrs: Vec<Attribute>,
     visibility: Visibility,
     signature: Signature,
-    semicolon: Token![;],
 }
 
 impl Parse for BindingFn {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        let visibility = input.parse()?;
+        let signature = input.parse()?;
+        input.parse::<Token![;]>()?;
         Ok(Self {
-            attrs: input.call(Attribute::parse_outer)?,
-            visibility: input.parse()?,
-            signature: input.parse()?,
-            semicolon: input.parse()?,
+            attrs,
+            visibility,
+            signature,
         })
     }
 }
@@ -144,14 +155,12 @@ impl Parse for BindingFn {
 fn expand_bindings(bindings: &Bindings) -> syn::Result<proc_macro2::TokenStream> {
     let mut out = proc_macro2::TokenStream::new();
     for function in &bindings.functions {
-        let attrs = &function.attrs;
-        let visibility = &function.visibility;
-        let signature = &function.signature;
-        let semicolon = &function.semicolon;
-        let foreign: syn::ForeignItemFn = syn::parse2(quote! {
-            #(#attrs)* #visibility #signature #semicolon
-        })?;
-        out.extend(marker(&bindings.module, &foreign)?);
+        out.extend(marker(
+            &bindings.module,
+            &function.attrs,
+            &function.visibility,
+            &function.signature,
+        )?);
     }
     Ok(out)
 }
@@ -214,10 +223,30 @@ impl Parse for JsAttr {
                     shape = Some(found);
                     name = value;
                 }
-                JsEntry::Nullable => nullable = true,
-                JsEntry::Fallible => fallible = true,
-                JsEntry::Global(span) => global = Some(span),
-                JsEntry::Module(span, value) => module = Some((span, value)),
+                JsEntry::Nullable(span) => {
+                    if nullable {
+                        return Err(syn::Error::new(span, "duplicate `nullable` in `#[js(..)]`"));
+                    }
+                    nullable = true;
+                }
+                JsEntry::Fallible(span) => {
+                    if fallible {
+                        return Err(syn::Error::new(span, "duplicate `fallible` in `#[js(..)]`"));
+                    }
+                    fallible = true;
+                }
+                JsEntry::Global(span) => {
+                    if global.is_some() {
+                        return Err(syn::Error::new(span, "duplicate `global` in `#[js(..)]`"));
+                    }
+                    global = Some(span);
+                }
+                JsEntry::Module(span, value) => {
+                    if module.is_some() {
+                        return Err(syn::Error::new(span, "duplicate `module` in `#[js(..)]`"));
+                    }
+                    module = Some((span, value));
+                }
             }
         }
 
@@ -228,7 +257,7 @@ impl Parse for JsAttr {
             )
         })?;
         // The two name a root each, so a declaration carrying both says two things and means one.
-        // `global` on its own is what clears a block's module; see [`marker`].
+        // `global` on its own is what clears a block's module; see [`ParsedDecl::into_descriptor`].
         if let (Some(span), Some((_, module))) = (global, &module) {
             if !module.is_empty() {
                 return Err(syn::Error::new(
@@ -252,8 +281,8 @@ impl Parse for JsAttr {
 enum JsEntry {
     /// A shape, with the JavaScript name it was given.
     Shape(proc_macro2::Span, Shape, Option<String>),
-    Nullable,
-    Fallible,
+    Nullable(proc_macro2::Span),
+    Fallible(proc_macro2::Span),
     Global(proc_macro2::Span),
     Module(proc_macro2::Span, String),
 }
@@ -261,12 +290,11 @@ enum JsEntry {
 impl Parse for JsEntry {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let key: Ident = input.parse()?;
-        let value = match input.peek(Token![=]) {
-            true => {
-                input.parse::<Token![=]>()?;
-                Some(input.parse::<LitStr>()?.value())
-            }
-            false => None,
+        let value = if input.peek(Token![=]) {
+            input.parse::<Token![=]>()?;
+            Some(input.parse::<LitStr>()?.value())
+        } else {
+            None
         };
 
         let shape = match key.to_string().as_str() {
@@ -283,13 +311,13 @@ impl Parse for JsEntry {
                 if value.is_some() {
                     return Err(syn::Error::new(key.span(), "`nullable` takes no value"));
                 }
-                return Ok(JsEntry::Nullable);
+                return Ok(JsEntry::Nullable(key.span()));
             }
             "fallible" => {
                 if value.is_some() {
                     return Err(syn::Error::new(key.span(), "`fallible` takes no value"));
                 }
-                return Ok(JsEntry::Fallible);
+                return Ok(JsEntry::Fallible(key.span()));
             }
             "global" => {
                 if value.is_some() {
@@ -386,8 +414,8 @@ fn words(facts: impl Iterator<Item = Fact>) -> String {
 ///
 /// The attributes are removed rather than copied through, because what the macro writes is an
 /// ordinary Rust function and `#[js(..)]` is not an attribute rustc knows.
-fn take_slots(signature: &mut Signature) -> syn::Result<Vec<(Slot, SlotFacts)>> {
-    let mut slots = Vec::new();
+fn take_slots(signature: &mut Signature) -> syn::Result<BTreeMap<Slot, SlotFacts>> {
+    let mut slots = BTreeMap::new();
     let inputs = signature.inputs.span();
     for (index, argument) in signature.inputs.iter_mut().enumerate() {
         let attrs = match argument {
@@ -413,7 +441,7 @@ fn take_slots(signature: &mut Signature) -> syn::Result<Vec<(Slot, SlotFacts)>> 
         if let Some(facts) = facts {
             let index = u32::try_from(index)
                 .map_err(|_| syn::Error::new(inputs, "too many parameters to declare"))?;
-            slots.push((Slot::Parameter(index), facts));
+            slots.insert(Slot::Parameter(index), facts);
         }
     }
     Ok(slots)
@@ -429,159 +457,216 @@ fn expand(module: &str, block: &ItemForeignMod) -> syn::Result<proc_macro2::Toke
                 "`js_extern` declares functions and nothing else",
             ));
         };
-        out.extend(marker(module, function)?);
+        out.extend(marker(
+            module,
+            &function.attrs,
+            &function.vis,
+            &function.sig,
+        )?);
     }
     Ok(out)
 }
 
-/// One declaration, as the marker function that carries its descriptor.
-fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro2::TokenStream> {
-    let mut js = None;
-    let mut kept = Vec::new();
-    for attr in &function.attrs {
-        if attr.path().is_ident("js") {
-            if js.is_some() {
+/// Parsed parts of one `#[js_extern]` / `js_bindings!` function declaration before validation.
+struct ParsedDecl<'a> {
+    module: &'a str,
+    js: JsAttr,
+    kept_attrs: Vec<&'a Attribute>,
+    visibility: &'a Visibility,
+    signature: Signature,
+    slots: BTreeMap<Slot, SlotFacts>,
+}
+
+impl<'a> ParsedDecl<'a> {
+    /// Extracts `#[js(..)]` and parameter slot attributes from one declaration's parts.
+    fn from_parts(
+        module: &'a str,
+        attrs: &'a [Attribute],
+        visibility: &'a Visibility,
+        signature: &Signature,
+    ) -> syn::Result<Self> {
+        let mut js = None;
+        let mut kept_attrs = Vec::new();
+        for attr in attrs {
+            if attr.path().is_ident("js") {
+                if js.is_some() {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "a declaration has one `#[js(..)]`",
+                    ));
+                }
+                js = Some(attr.parse_args::<JsAttr>()?);
+            } else {
+                kept_attrs.push(attr);
+            }
+        }
+        let js = js.ok_or_else(|| {
+            syn::Error::new(
+                signature.ident.span(),
+                "every `js_extern` declaration needs a `#[js(..)]` naming its shape",
+            )
+        })?;
+
+        let mut signature = signature.clone();
+        let slots = take_slots(&mut signature)?;
+        if let Some(variadic) = &signature.variadic {
+            return Err(syn::Error::new(
+                variadic.span(),
+                "a declaration is not variadic",
+            ));
+        }
+
+        Ok(Self {
+            module,
+            js,
+            kept_attrs,
+            visibility,
+            signature,
+            slots,
+        })
+    }
+
+    /// Validates shape, return kind, root, name, and arity, returning the wire [`Descriptor`].
+    fn into_descriptor(self) -> syn::Result<Descriptor> {
+        let js = self.js;
+        let signature = &self.signature;
+        let ident = &signature.ident;
+
+        if js.nullable && !js.shape.returns_a_value() {
+            return Err(syn::Error::new(
+                ident.span(),
+                "`nullable` describes a returned value, and this shape returns none",
+            ));
+        }
+        if js.fallible
+            && !matches!(
+                js.shape,
+                Shape::Call | Shape::New | Shape::Method | Shape::ComputedMethod | Shape::Get
+            )
+        {
+            return Err(syn::Error::new(
+                ident.span(),
+                "`fallible` applies to a call, construction, method or property read",
+            ));
+        }
+        let return_kind = match (js.nullable, js.fallible) {
+            (true, true) => {
                 return Err(syn::Error::new(
-                    attr.span(),
-                    "a declaration has one `#[js(..)]`",
+                    ident.span(),
+                    "`fallible` and `nullable` cannot describe the same declaration",
                 ));
             }
-            js = Some(attr.parse_args::<JsAttr>()?);
-        } else {
-            kept.push(attr);
-        }
-    }
-    let js = js.ok_or_else(|| {
-        syn::Error::new(
-            function.sig.ident.span(),
-            "every `js_extern` declaration needs a `#[js(..)]` naming its shape",
-        )
-    })?;
-
-    let mut signature = function.sig.clone();
-    let slots = take_slots(&mut signature)?;
-    let signature = &signature;
-    let visibility = &function.vis;
-    let ident = &signature.ident;
-
-    if let Some(variadic) = &signature.variadic {
-        return Err(syn::Error::new(
-            variadic.span(),
-            "a declaration is not variadic",
-        ));
-    }
-
-    if js.nullable && !js.shape.returns_a_value() {
-        return Err(syn::Error::new(
-            signature.ident.span(),
-            "`nullable` describes a returned value, and this shape returns none",
-        ));
-    }
-    if js.fallible
-        && !matches!(
-            js.shape,
-            Shape::Call | Shape::New | Shape::Method | Shape::ComputedMethod | Shape::Get
-        )
-    {
-        return Err(syn::Error::new(
-            signature.ident.span(),
-            "`fallible` applies to a call, construction, method or property read",
-        ));
-    }
-    if js.fallible && js.nullable {
-        return Err(syn::Error::new(
-            signature.ident.span(),
-            "`fallible` and `nullable` cannot describe the same declaration",
-        ));
-    }
-    if js.fallible && !returns_result_js_value(signature) {
-        return Err(syn::Error::new(
-            signature.output.span(),
-            "a `fallible` declaration returns `Result<T, JsValue>`",
-        ));
-    }
-
-    // An index off the receiver itself needs no path; everything else defaults to the Rust name,
-    // which is what makes the common declaration a one liner.
-    let name = match (js.shape, &js.name) {
-        (Shape::Index | Shape::IndexSet | Shape::Has | Shape::ComputedMethod, None) => {
-            String::new()
-        }
-        (_, Some(name)) => name.clone(),
-        (_, None) => ident.to_string(),
-    };
-    if !name.is_empty() && !is_js_name(&name) {
-        return Err(syn::Error::new(
-            signature.ident.span(),
-            format!("`{name}` is not a JavaScript path"),
-        ));
-    }
-
-    // `global` is a root, so it replaces the block's module rather than sitting beside it: a
-    // browser global inside a block that names a package is exactly what the dashboard declares.
-    let module = match js.global {
-        true => String::new(),
-        false => js.module.as_deref().unwrap_or(module).to_owned(),
-    };
-    let descriptor = Descriptor {
-        shape: js.shape,
-        nullable: js.nullable,
-        fallible: js.fallible,
-        global: js.global,
-        module,
-        name,
-        slots,
-    };
-
-    if !descriptor.acts_on_argument() && descriptor.name.is_empty() {
-        return Err(syn::Error::new(
-            signature.ident.span(),
-            "this shape is rooted at a module binding or a global, so it needs a name",
-        ));
-    }
-
-    // The arity is checked here rather than in the backend alone, so a wrong declaration is a
-    // spanned error on the declaration instead of a zombie at the call site.
-    let arguments = signature.inputs.len();
-    let required = descriptor.required_arguments();
-    if arguments < required {
-        let takes = match (descriptor.acts_on_argument(), js.shape) {
-            (true, Shape::Index) => "the value it indexes and the key",
-            (true, Shape::IndexSet) => "the value it indexes, the key and the value to write",
-            (true, Shape::Has | Shape::ComputedMethod) => "the receiver and the key",
-            (true, Shape::Set) => "the receiver and the value to write",
-            (true, _) => "the receiver",
-            (false, Shape::Has | Shape::ComputedMethod) => "the key",
-            (false, _) => "the value to write",
+            (true, false) => ReturnKind::Nullable,
+            (false, true) => {
+                if !returns_result_js_value(signature) {
+                    return Err(syn::Error::new(
+                        signature.output.span(),
+                        "a `fallible` declaration returns `Result<T, JsValue>`",
+                    ));
+                }
+                ReturnKind::Fallible
+            }
+            (false, false) => ReturnKind::Plain,
         };
-        return Err(syn::Error::new(
-            signature.inputs.span(),
-            format!(
-                "this shape takes {takes}, so it needs at least {required} argument(s) and has \
-                 {arguments}"
-            ),
-        ));
-    }
-    let passed = arguments - required;
-    if js.shape == Shape::Has && passed != 0 {
-        return Err(syn::Error::new(
-            signature.inputs.span(),
-            "a `has` declaration takes only its receiver and key",
-        ));
-    }
-    if js.shape == Shape::ComputedMethod && passed > 2 {
-        return Err(syn::Error::new(
-            signature.inputs.span(),
-            "a `computed_method` declaration takes at most two method arguments",
-        ));
-    }
 
+        // An index off the receiver itself needs no path; everything else defaults to the Rust
+        // name, which is what makes the common declaration a one liner.
+        let name = match (js.shape, js.name) {
+            (Shape::Index | Shape::IndexSet | Shape::Has | Shape::ComputedMethod, None) => {
+                String::new()
+            }
+            (_, Some(name)) => name,
+            (_, None) => ident.to_string(),
+        };
+        if !name.is_empty() && !is_js_name(&name) {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("`{name}` is not a JavaScript path"),
+            ));
+        }
+
+        // `global` is a root, so it replaces the block's module rather than sitting beside it: a
+        // browser global inside a block that names a package is exactly what the dashboard
+        // declares.
+        let root_spec = if js.global {
+            RootSpec::Global
+        } else {
+            let resolved = js.module.as_deref().unwrap_or(self.module);
+            if resolved.is_empty() {
+                RootSpec::Default
+            } else {
+                RootSpec::Module(resolved.to_owned())
+            }
+        };
+
+        let descriptor = Descriptor {
+            shape: js.shape,
+            return_kind,
+            root_spec,
+            name,
+            slots: self.slots,
+        };
+
+        if !descriptor.acts_on_argument() && descriptor.name.is_empty() {
+            return Err(syn::Error::new(
+                ident.span(),
+                "this shape is rooted at a module binding or a global, so it needs a name",
+            ));
+        }
+
+        // The arity is checked here rather than in the backend alone, so a wrong declaration is a
+        // spanned error on the declaration instead of a zombie at the call site.
+        let arguments = signature.inputs.len();
+        let required = descriptor.required_arguments();
+        if arguments < required {
+            let takes = match (descriptor.acts_on_argument(), js.shape) {
+                (true, Shape::Index) => "the value it indexes and the key",
+                (true, Shape::IndexSet) => "the value it indexes, the key and the value to write",
+                (true, Shape::Has | Shape::ComputedMethod) => "the receiver and the key",
+                (true, Shape::Set) => "the receiver and the value to write",
+                (true, _) => "the receiver",
+                (false, Shape::Has | Shape::ComputedMethod) => "the key",
+                (false, _) => "the value to write",
+            };
+            return Err(syn::Error::new(
+                signature.inputs.span(),
+                format!(
+                    "this shape takes {takes}, so it needs at least {required} argument(s) and \
+                     has {arguments}"
+                ),
+            ));
+        }
+        let passed = arguments - required;
+        if js.shape == Shape::Has && passed != 0 {
+            return Err(syn::Error::new(
+                signature.inputs.span(),
+                "a `has` declaration takes only its receiver and key",
+            ));
+        }
+        if js.shape == Shape::ComputedMethod && passed > 2 {
+            return Err(syn::Error::new(
+                signature.inputs.span(),
+                "a `computed_method` declaration takes at most two method arguments",
+            ));
+        }
+
+        Ok(descriptor)
+    }
+}
+
+/// Emits the placeholder marker function carrying `descriptor` in its `link_section`.
+fn emit_marker(
+    kept_attrs: &[&Attribute],
+    visibility: &Visibility,
+    signature: &Signature,
+    descriptor: &Descriptor,
+) -> proc_macro2::TokenStream {
     let section = descriptor.encode();
-
+    let ident = &signature.ident;
     let unreachable =
         format!("`{ident}` is a `#[js_extern]` declaration, which only rustc_codegen_js can lower");
-    Ok(quote! {
-        #(#kept)*
+    quote! {
+        #(#kept_attrs)*
         #[cfg_attr(target_arch = "wasm32", link_section = #section)]
         #[inline(never)]
         // The body names none of the parameters and never can: it is a placeholder for an
@@ -590,9 +675,29 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
         #visibility #signature {
             // Never runs: the backend replaces every call by its `link_section`. Reaching this
             // body means the crate was compiled by a backend that does not know the declaration.
-            unreachable!(#unreachable)
+            ::core::unreachable!(#unreachable)
         }
-    })
+    }
+}
+
+/// One declaration, as the marker function that carries its descriptor.
+fn marker(
+    module: &str,
+    attrs: &[Attribute],
+    visibility: &Visibility,
+    signature: &Signature,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let decl = ParsedDecl::from_parts(module, attrs, visibility, signature)?;
+    let kept_attrs = decl.kept_attrs.clone();
+    let visibility = decl.visibility;
+    let cleaned_signature = decl.signature.clone();
+    let descriptor = decl.into_descriptor()?;
+    Ok(emit_marker(
+        &kept_attrs,
+        visibility,
+        &cleaned_signature,
+        &descriptor,
+    ))
 }
 
 /// Whether a signature spells the boundary type a fallible declaration promises.
@@ -655,7 +760,7 @@ mod tests {
             ForeignItem::Fn(function) => function,
             _ => panic!("the fixture declares a function"),
         };
-        marker(module, function)
+        marker(module, &function.attrs, &function.vis, &function.sig)
             .map(|tokens| {
                 let text = tokens.to_string();
                 let start = text.find("rcgjs.ext.").expect("the section is written");
@@ -774,6 +879,33 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_js_attr_entries_are_refused() {
+        for (attr, why) in [
+            ("get = \"w\", nullable, nullable", "duplicate `nullable`"),
+            ("call = \"f\", fallible, fallible", "duplicate `fallible`"),
+            ("get = \"w\", global, global", "duplicate `global`"),
+            (
+                "call = \"f\", module = \"a.js\", module = \"b.js\"",
+                "duplicate `module`",
+            ),
+        ] {
+            let source = format!(
+                r#"unsafe extern "C" {{ #[js({attr})] fn f(a: u32) -> Result<u32, JsValue>; }}"#
+            );
+            let error = descriptor("", &source).expect_err("duplicate attr is refused");
+            assert!(error.contains(why), "`{attr}` reported `{error}`");
+        }
+    }
+
+    #[test]
+    fn js_export_rejects_arguments() {
+        let attr: proc_macro2::TokenStream = "foo".parse().unwrap();
+        let item: proc_macro2::TokenStream = "pub fn f() {}".parse().unwrap();
+        let err = expand_export(attr, item).unwrap_err();
+        assert!(err.to_string().contains("takes no arguments"), "{err}");
+    }
+
+    #[test]
     fn computed_shapes_take_a_key_and_methods_are_fixed_arity() {
         assert_eq!(
             descriptor(
@@ -878,7 +1010,9 @@ mod tests {
         let ForeignItem::Fn(function) = &block.items[0] else {
             panic!()
         };
-        let error = marker("m.js", function).unwrap_err().to_string();
+        let error = marker("m.js", &function.attrs, &function.vis, &function.sig)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("needs a `#[js(..)]`"), "{error}");
     }
 
@@ -977,7 +1111,9 @@ mod tests {
         let ForeignItem::Fn(function) = &block.items[0] else {
             panic!()
         };
-        let text = marker("chart.js", function).unwrap().to_string();
+        let text = marker("chart.js", &function.attrs, &function.vis, &function.sig)
+            .unwrap()
+            .to_string();
         assert!(
             text.contains("pub fn Chart (canvas : & str) -> u32"),
             "{text}"
@@ -985,6 +1121,7 @@ mod tests {
         assert!(text.contains("doc"), "{text}");
         assert!(text.contains("inline (never)"), "{text}");
         assert!(text.contains("target_arch = \"wasm32\""), "{text}");
+        assert!(text.contains(":: core :: unreachable !"), "{text}");
     }
 
     #[test]

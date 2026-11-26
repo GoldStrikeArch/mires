@@ -12,16 +12,123 @@ use std::io::Write as _;
 use flate2::{Compression, GzBuilder};
 
 use crate::item::{JsName, LinkItem};
-use crate::jir::hash::Hash128;
+use crate::jir::hash::{Hash128, Hasher128};
 use crate::jir::repr::Func;
-use crate::jir::semantic::ItemId;
-use crate::opts::{Opts, Profile};
+use crate::jir::semantic::{ItemId, TypeId};
+use crate::opts::{MinifyMode, Modules, NameStyle, Opts, Profile};
 use crate::plan::abi_flat::AbiPlan;
 
 const COMPRESSED_GROWTH_BPS: u64 = 50;
 const SPEED_GROWTH_BPS: u64 = 5_000;
 const HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES: u64 = 256;
 const SPEED_SMALL_PROGRAM_SLACK_BYTES: u64 = 4_096;
+
+/// Streaming deterministic binary hash builder backed by [`Hasher128`].
+///
+/// Feeds structured tags, little-endian integers, length-prefixed strings, and `serde::Serialize`
+/// values (via `postcard::to_io`) directly into SipHash-1-3-128 with zero `Debug` formatting and
+/// zero intermediate heap buffers.
+pub(crate) struct HashFeed {
+    hasher: Hasher128,
+    bytes: usize,
+}
+
+impl HashFeed {
+    pub(crate) fn new() -> Self {
+        Self {
+            hasher: Hasher128::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn bytes(&mut self, data: &[u8]) {
+        self.hasher.write(data);
+        self.bytes = self.bytes.saturating_add(data.len());
+    }
+
+    pub(crate) fn u8(&mut self, value: u8) {
+        self.bytes(&[value]);
+    }
+
+    pub(crate) fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    pub(crate) fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    pub(crate) fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    pub(crate) fn u128(&mut self, value: u128) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    pub(crate) fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    pub(crate) fn str(&mut self, value: &str) {
+        self.usize(value.len());
+        self.bytes(value.as_bytes());
+    }
+
+    pub(crate) fn item_id(&mut self, id: ItemId) {
+        self.u64(id.definition.crate_id);
+        self.u64(id.definition.local_hash);
+        self.u128(id.instantiation);
+    }
+
+    pub(crate) fn type_id(&mut self, id: TypeId) {
+        self.u128(id.0);
+    }
+
+    pub(crate) fn opt<T>(&mut self, value: Option<T>, f: impl FnOnce(&mut Self, T)) {
+        match value {
+            Some(inner) => {
+                self.u8(1);
+                f(self, inner);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    pub(crate) fn slice<T>(&mut self, items: &[T], mut f: impl FnMut(&mut Self, &T)) {
+        self.usize(items.len());
+        for item in items {
+            f(self, item);
+        }
+    }
+
+    pub(crate) fn func(&mut self, value: &Func) {
+        postcard::to_io(value, self).expect("streaming Func into HashFeed is infallible");
+    }
+
+    pub(crate) fn decline(&mut self, value: &crate::jir::decline::Decline) {
+        postcard::to_io(value, self).expect("streaming Decline into HashFeed is infallible");
+    }
+
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn finish(&self) -> Hash128 {
+        self.hasher.finish()
+    }
+}
+
+impl std::io::Write for HashFeed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Exact metrics of one fully lowered, deduplicated, renamed program and its helper closure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,6 +144,64 @@ pub struct ProgramMetrics {
 impl ProgramMetrics {
     fn balanced_score(self) -> u64 {
         self.min.saturating_add(self.alloc_term)
+    }
+}
+
+/// Typed policy rejection reason mapped onto the physical report's stable string vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RejectReason {
+    PhysicalMeasurement,
+    MinifiedNoImprovement,
+    CompressedNoImprovement,
+    GzipRegression,
+    BrotliRegression,
+    ScoreNoImprovement,
+    CompressedGrowthBudget,
+    AllocationRegression,
+    HotnessEvidenceMissing,
+    SpeedGrowthBudget,
+    GlobalGrowthBudget,
+}
+
+impl RejectReason {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::PhysicalMeasurement => "validation.physical-measurement",
+            Self::MinifiedNoImprovement => "cost.minified-no-improvement",
+            Self::CompressedNoImprovement => "cost.compressed-no-improvement",
+            Self::GzipRegression => "cost.gzip-regression",
+            Self::BrotliRegression => "cost.brotli-regression",
+            Self::ScoreNoImprovement => "cost.score-no-improvement",
+            Self::CompressedGrowthBudget => "cost.compressed-growth-budget",
+            Self::AllocationRegression => "cost.allocation-regression",
+            Self::HotnessEvidenceMissing => "cost.hotness-evidence-missing",
+            Self::SpeedGrowthBudget => "cost.speed-growth-budget",
+            Self::GlobalGrowthBudget => "cost.global-growth-budget",
+        }
+    }
+}
+
+/// Structured outcome of evaluating one physical ABI candidate against a policy profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PolicyOutcome {
+    accepted: bool,
+    reason: Option<RejectReason>,
+    hotness_source: Option<&'static str>,
+    budget_consumed_bps: u64,
+}
+
+impl PolicyOutcome {
+    fn rejected(reason: RejectReason, budget_consumed_bps: u64) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason),
+            hotness_source: None,
+            budget_consumed_bps,
+        }
+    }
+
+    fn reason_string(self) -> Option<String> {
+        self.reason.map(|r| r.code().to_owned())
     }
 }
 
@@ -70,21 +235,6 @@ pub struct DecisionEvaluation {
     pub budget_consumed_bps: u64,
 }
 
-impl Evaluation {
-    /// The surviving program after a verification retry removed the physical plan.
-    pub fn after_retry(&self) -> Evaluation {
-        Evaluation {
-            validated: self.before,
-            final_metrics: self.before,
-            accepted: false,
-            reason: Some("validation.plan-retry".to_owned()),
-            hotness_source: None,
-            budget_consumed_bps: 0,
-            ..self.clone()
-        }
-    }
-}
-
 /// One-link cache. A complete input digest owns each measurement, so a hit cannot cross programs,
 /// physical label vectors, profiles, minifier settings, or helper-affecting item bodies.
 #[derive(Default)]
@@ -97,10 +247,7 @@ struct Cache {
 struct Trial {
     items: BTreeSet<ItemId>,
     after: Option<ProgramMetrics>,
-    accepted: bool,
-    reason: Option<String>,
-    hotness_source: Option<&'static str>,
-    budget_consumed_bps: u64,
+    outcome: PolicyOutcome,
     benefit: u64,
 }
 
@@ -122,12 +269,60 @@ impl Cache {
     }
 }
 
+struct SelectionRecorder<'a> {
+    candidate: &'a AbiPlan,
+    selected: BTreeSet<ItemId>,
+    reasons: BTreeMap<ItemId, String>,
+    decision_economics: BTreeMap<JsName, DecisionEvaluation>,
+}
+
+impl<'a> SelectionRecorder<'a> {
+    fn new(candidate: &'a AbiPlan) -> Self {
+        Self {
+            candidate,
+            selected: BTreeSet::new(),
+            reasons: BTreeMap::new(),
+            decision_economics: BTreeMap::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        trial: &Trial,
+        outcome: PolicyOutcome,
+        before: Option<ProgramMetrics>,
+        after: Option<ProgramMetrics>,
+    ) {
+        let reason = outcome.reason_string();
+        let evidence = DecisionEvaluation {
+            before,
+            after,
+            reason: reason.clone(),
+            hotness_source: outcome.hotness_source,
+            budget_consumed_bps: outcome.budget_consumed_bps,
+        };
+        for item in &trial.items {
+            let source = self
+                .candidate
+                .source_name(*item)
+                .expect("an economic item has a source name")
+                .clone();
+            self.decision_economics.insert(source, evidence.clone());
+            if outcome.accepted {
+                self.selected.insert(*item);
+            } else {
+                self.reasons.insert(
+                    *item,
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| RejectReason::PhysicalMeasurement.code().to_owned()),
+                );
+            }
+        }
+    }
+}
+
 /// Prices each ABI-connected group and returns the exact economically selected union.
-///
-/// Standalone group wins are ordered by their protected policy benefit, then admitted
-/// incrementally against the already selected program and the original global growth cap. This
-/// keeps unrelated cold ABI candidates from masking a profitable hot graph while preserving one
-/// transactional plan for every connected caller/callee region.
 pub fn evaluate_groups(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
@@ -138,43 +333,37 @@ pub fn evaluate_groups(
 ) -> (AbiPlan, Evaluation) {
     let profile = release_profile(opts);
     let mut cache = Cache::default();
-    // `table`, `funcs`, the profile and the options are borrowed unchanged for the whole
-    // evaluation: every measurement below differs from the others only in its ABI plan.
     let program = program_key(table, funcs, profile, opts);
     let baseline = AbiPlan::default();
     let before = measure_cached(&mut cache, program, &baseline, &mut measure);
     let full_after = measure_cached(&mut cache, program, candidate, &mut measure);
+
     let mut trials = Vec::new();
     for items in candidate.economic_groups() {
         let plan = candidate.subset(&items);
         let after = measure_cached(&mut cache, program, &plan, &mut measure);
-        let (accepted, reason, hotness_source, budget_consumed_bps) =
-            decide_for_plan(profile, &plan, before, after);
+        let outcome = decide_for_plan(profile, &plan, before, after);
         trials.push(Trial {
             items,
             after,
-            accepted,
-            reason,
-            hotness_source,
-            budget_consumed_bps,
+            outcome,
             benefit: policy_benefit(profile, before, after),
         });
     }
     trials.sort_by(|left, right| {
         right
+            .outcome
             .accepted
-            .cmp(&left.accepted)
+            .cmp(&left.outcome.accepted)
             .then_with(|| right.benefit.cmp(&left.benefit))
             .then_with(|| left.items.cmp(&right.items))
     });
 
-    let mut selected = BTreeSet::new();
-    let mut reasons = BTreeMap::new();
-    let mut decision_economics = BTreeMap::new();
+    let mut recorder = SelectionRecorder::new(candidate);
     let mut current = before;
     let individually_selected: BTreeSet<ItemId> = trials
         .iter()
-        .filter(|trial| trial.accepted)
+        .filter(|trial| trial.outcome.accepted)
         .flat_map(|trial| trial.items.iter().copied())
         .collect();
     let combined = candidate.subset(&individually_selected);
@@ -182,75 +371,46 @@ pub fn evaluate_groups(
         .then(|| measure_cached(&mut cache, program, &combined, &mut measure));
     let combined_accepted = combined_metrics
         .flatten()
-        .is_some_and(|after| decide_for_plan(profile, &combined, before, Some(after)).0);
+        .is_some_and(|after| decide_for_plan(profile, &combined, before, Some(after)).accepted);
 
     if combined_accepted {
-        selected = individually_selected;
+        recorder.selected = individually_selected;
         current = combined_metrics.flatten();
         for trial in trials {
-            record_trial(
-                candidate,
-                &trial,
-                trial.accepted,
-                before,
-                trial.after,
-                trial.reason.clone(),
-                trial.hotness_source,
-                trial.budget_consumed_bps,
-                &mut selected,
-                &mut reasons,
-                &mut decision_economics,
-            );
+            recorder.record(&trial, trial.outcome, before, trial.after);
         }
     } else {
         for trial in trials {
-            let evidence_before = if trial.accepted { current } else { before };
-            let (accepted, reason, hotness_source, budget_consumed_bps, next) = if trial.accepted {
-                let mut proposed = selected.clone();
+            let evidence_before = if trial.outcome.accepted {
+                current
+            } else {
+                before
+            };
+            let (outcome, next) = if trial.outcome.accepted {
+                let mut proposed = recorder.selected.clone();
                 proposed.extend(&trial.items);
                 let proposed_plan = candidate.subset(&proposed);
                 let step_plan = candidate.subset(&trial.items);
                 let next = measure_cached(&mut cache, program, &proposed_plan, &mut measure);
-                let (accepted, reason, hotness_source, budget_consumed_bps) =
-                    decide_incremental(profile, &step_plan, before, current, next);
-                (accepted, reason, hotness_source, budget_consumed_bps, next)
+                let outcome = decide_incremental(profile, &step_plan, before, current, next);
+                (outcome, next)
             } else {
-                (
-                    false,
-                    trial.reason.clone(),
-                    trial.hotness_source,
-                    trial.budget_consumed_bps,
-                    trial.after,
-                )
+                (trial.outcome, trial.after)
             };
-            record_trial(
-                candidate,
-                &trial,
-                accepted,
-                evidence_before,
-                next,
-                reason,
-                hotness_source,
-                budget_consumed_bps,
-                &mut selected,
-                &mut reasons,
-                &mut decision_economics,
-            );
-            if accepted {
+            recorder.record(&trial, outcome, evidence_before, next);
+            if outcome.accepted {
                 current = next;
             }
         }
     }
 
-    // Replay the selected key through the cache. Besides guarding key completeness in every real
-    // link, this makes the receipt prove that a hit returns the decision's exact final metrics.
-    let replay_plan = candidate.subset(&selected);
+    // Replay the selected key through the cache to guard key completeness.
+    let replay_plan = candidate.subset(&recorder.selected);
     let replay = measure_cached(&mut cache, program, &replay_plan, &mut measure);
     debug_assert_eq!(replay, current);
     current = replay;
-    let selected_plan = candidate.with_economic_selection(&selected, &reasons);
-    let (all_accepted, all_reason, all_hotness, all_budget) =
-        decide_for_plan(profile, candidate, before, full_after);
+    let selected_plan = candidate.with_economic_selection(&recorder.selected, &recorder.reasons);
+    let all_outcome = decide_for_plan(profile, candidate, before, full_after);
     let final_metrics = if applied { current } else { before };
     (
         selected_plan,
@@ -260,55 +420,17 @@ pub fn evaluate_groups(
             after: full_after,
             validated: current,
             final_metrics,
-            accepted: !selected.is_empty(),
+            accepted: !recorder.selected.is_empty(),
             applied,
-            reason: (!all_accepted).then_some(all_reason).flatten(),
-            hotness_source: all_hotness,
-            budget_consumed_bps: all_budget,
+            reason: (!all_outcome.accepted)
+                .then(|| all_outcome.reason_string())
+                .flatten(),
+            hotness_source: all_outcome.hotness_source,
+            budget_consumed_bps: all_outcome.budget_consumed_bps,
             cache_hits: cache.hits,
-            decisions: decision_economics,
+            decisions: recorder.decision_economics,
         },
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_trial(
-    candidate: &AbiPlan,
-    trial: &Trial,
-    accepted: bool,
-    before: Option<ProgramMetrics>,
-    after: Option<ProgramMetrics>,
-    reason: Option<String>,
-    hotness_source: Option<&'static str>,
-    budget_consumed_bps: u64,
-    selected: &mut BTreeSet<ItemId>,
-    reasons: &mut BTreeMap<ItemId, String>,
-    decision_economics: &mut BTreeMap<JsName, DecisionEvaluation>,
-) {
-    let evidence = DecisionEvaluation {
-        before,
-        after,
-        reason: reason.clone(),
-        hotness_source,
-        budget_consumed_bps,
-    };
-    for item in &trial.items {
-        let source = candidate
-            .source_name(*item)
-            .expect("an economic item has a source name")
-            .clone();
-        decision_economics.insert(source, evidence.clone());
-        if accepted {
-            selected.insert(*item);
-        } else {
-            reasons.insert(
-                *item,
-                reason
-                    .clone()
-                    .unwrap_or_else(|| "validation.physical-measurement".to_owned()),
-            );
-        }
-    }
 }
 
 fn measure_cached(
@@ -347,31 +469,28 @@ fn decide_for_plan(
     plan: &AbiPlan,
     before: Option<ProgramMetrics>,
     after: Option<ProgramMetrics>,
-) -> (bool, Option<String>, Option<&'static str>, u64) {
-    let (mut accepted, mut reason, mut hotness_source, budget_consumed_bps) =
-        decide(profile, before, after);
-    // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`
-    // or `(buf, len)` when `off === 0` is proven whole-program) removes property loads
-    // (`s.buf[s.off + i]` -> `a[i]`) inside tight loops, flattening an `i64`/`u64` parameter or
-    // return (`(lo, hi)`) eliminates BigInt heap allocations, and `SentinelResult` eliminates
-    // `{ TAG, _0 }` wrapper allocations across recursive `Result<T, E>` call trees. Accept
-    // whenever it does not regress object allocations and stays within the speed budget.
-    if !accepted
+) -> PolicyOutcome {
+    let mut outcome = decide(profile, before, after);
+    // Under ReleaseSpeed, scalarizing a slice parameter, flattening `i64`/`u64`, specializing
+    // read-only byte-strings, or using `SentinelResult` removes property loads or wrapper
+    // allocations across tight loops/recursive call trees. Accept whenever it does not regress
+    // object allocations and stays within the speed budget.
+    if !outcome.accepted
         && profile == Profile::ReleaseSpeed
         && (plan.has_slice_param()
             || plan.has_off_zero_slice()
             || plan.has_i64_pair_abi()
             || plan.has_byte_str_abi()
             || plan.has_sentinel_result())
-        && (reason.as_deref() == Some("cost.hotness-evidence-missing") || plan.has_byte_str_abi())
+        && (outcome.reason == Some(RejectReason::HotnessEvidenceMissing) || plan.has_byte_str_abi())
     {
         if let (Some(b), Some(a)) = (before, after) {
             let allocs_ok = plan.has_byte_str_abi()
                 || (a.loop_allocations <= b.loop_allocations && a.allocations <= b.allocations);
             if allocs_ok && speed_within_budget(b, a) {
-                accepted = true;
-                reason = None;
-                hotness_source = Some(if plan.has_byte_str_abi() {
+                outcome.accepted = true;
+                outcome.reason = None;
+                outcome.hotness_source = Some(if plan.has_byte_str_abi() {
                     "bstr-slice-specialization"
                 } else if plan.has_sentinel_result() {
                     "sentinel-result-abi"
@@ -383,7 +502,7 @@ fn decide_for_plan(
             }
         }
     }
-    (accepted, reason, hotness_source, budget_consumed_bps)
+    outcome
 }
 
 fn decide_incremental(
@@ -392,18 +511,13 @@ fn decide_incremental(
     baseline: Option<ProgramMetrics>,
     current: Option<ProgramMetrics>,
     after: Option<ProgramMetrics>,
-) -> (bool, Option<String>, Option<&'static str>, u64) {
+) -> PolicyOutcome {
     let decision = decide_for_plan(profile, step_plan, current, after);
-    if !decision.0 {
+    if !decision.accepted {
         return decision;
     }
     let (Some(baseline), Some(after)) = (baseline, after) else {
-        return (
-            false,
-            Some("validation.physical-measurement".to_owned()),
-            None,
-            0,
-        );
+        return PolicyOutcome::rejected(RejectReason::PhysicalMeasurement, 0);
     };
     let global_ok = match profile {
         Profile::ReleaseSpeed => speed_within_budget(baseline, after),
@@ -418,10 +532,8 @@ fn decide_incremental(
     if global_ok {
         decision
     } else {
-        (
-            false,
-            Some("cost.global-growth-budget".to_owned()),
-            None,
+        PolicyOutcome::rejected(
+            RejectReason::GlobalGrowthBudget,
             growth_bps(after.min, baseline.min)
                 .max(growth_bps(after.gzip, baseline.gzip))
                 .max(growth_bps(after.brotli, baseline.brotli)),
@@ -478,14 +590,9 @@ fn decide(
     profile: Profile,
     before: Option<ProgramMetrics>,
     after: Option<ProgramMetrics>,
-) -> (bool, Option<String>, Option<&'static str>, u64) {
+) -> PolicyOutcome {
     let (Some(before), Some(after)) = (before, after) else {
-        return (
-            false,
-            Some("validation.physical-measurement".to_owned()),
-            None,
-            0,
-        );
+        return PolicyOutcome::rejected(RejectReason::PhysicalMeasurement, 0);
     };
     let budget = growth_bps(after.min, before.min)
         .max(growth_bps(after.gzip, before.gzip))
@@ -494,50 +601,61 @@ fn decide(
     match profile {
         Profile::ReleaseSize => {
             let reason = if after.min >= before.min {
-                Some("cost.minified-no-improvement".to_owned())
+                Some(RejectReason::MinifiedNoImprovement)
             } else if after.gzip >= before.gzip && after.brotli >= before.brotli {
-                Some("cost.compressed-no-improvement".to_owned())
+                Some(RejectReason::CompressedNoImprovement)
             } else if !within_growth(after.gzip, before.gzip, COMPRESSED_GROWTH_BPS) {
-                Some("cost.gzip-regression".to_owned())
+                Some(RejectReason::GzipRegression)
             } else if !within_growth(after.brotli, before.brotli, COMPRESSED_GROWTH_BPS) {
-                Some("cost.brotli-regression".to_owned())
+                Some(RejectReason::BrotliRegression)
             } else {
                 None
             };
-            (reason.is_none(), reason, None, budget)
+            PolicyOutcome {
+                accepted: reason.is_none(),
+                reason,
+                hotness_source: None,
+                budget_consumed_bps: budget,
+            }
         }
         Profile::ReleaseBalanced | Profile::Dev | Profile::Report => {
             let reason = if after.balanced_score() >= before.balanced_score() {
-                Some("cost.score-no-improvement".to_owned())
+                Some(RejectReason::ScoreNoImprovement)
             } else if !balanced_compressed_within_budget(before, after) {
-                Some("cost.compressed-growth-budget".to_owned())
+                Some(RejectReason::CompressedGrowthBudget)
             } else if after.allocations > before.allocations
                 || after.loop_allocations > before.loop_allocations
             {
-                Some("cost.allocation-regression".to_owned())
+                Some(RejectReason::AllocationRegression)
             } else {
                 None
             };
-            (reason.is_none(), reason, None, budget)
+            PolicyOutcome {
+                accepted: reason.is_none(),
+                reason,
+                hotness_source: None,
+                budget_consumed_bps: budget,
+            }
         }
         Profile::ReleaseSpeed => {
             let hot = after.loop_allocations < before.loop_allocations;
             let alloc_win = after.allocations < before.allocations;
             let bounded = speed_within_budget(before, after);
             let reason = if !hot && !alloc_win {
-                Some("cost.hotness-evidence-missing".to_owned())
+                Some(RejectReason::HotnessEvidenceMissing)
             } else if !bounded {
-                Some("cost.speed-growth-budget".to_owned())
+                Some(RejectReason::SpeedGrowthBudget)
             } else {
                 None
             };
-            (
-                reason.is_none(),
+            PolicyOutcome {
+                accepted: reason.is_none(),
                 reason,
-                hot.then_some("final-js-loop-allocation")
+                hotness_source: hot
+                    .then_some("final-js-loop-allocation")
                     .or_else(|| alloc_win.then_some("final-js-allocation")),
-                budget,
-            )
+                budget_consumed_bps: budget,
+            }
         }
     }
 }
@@ -548,9 +666,6 @@ fn balanced_compressed_within_budget(before: ProgramMetrics, after: ProgramMetri
     if strict {
         return true;
     }
-    // On small kernels/benchmarks, eliminating loop allocations by flattening mutable references
-    // can cut total allocation weight heavily while adding ~100-200B of switch plumbing that looks
-    // large only against a tiny program denominator.
     let major_hot_alloc_win = after.loop_allocations < before.loop_allocations
         && after.alloc_term.saturating_mul(4) <= before.alloc_term.saturating_mul(3);
     major_hot_alloc_win
@@ -606,8 +721,8 @@ fn growth_bps(after: u64, before: u64) -> u64 {
 }
 
 /// The digest of every key input that one [`evaluate_groups`] holds fixed: the release profile,
-/// the naming and minifier settings, every item, and every function body. Only the ABI plan
-/// varies between its measurements, so this is computed once and [`cache_key`] adds the plan.
+/// the naming and minifier settings, every item, and every function body. Uses deterministic
+/// binary hashing with zero `Debug` formatting.
 fn program_key(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
@@ -615,44 +730,66 @@ fn program_key(
     opts: &Opts,
 ) -> Hash128 {
     let _scope = crate::profile::scope("physical_cache.program_key");
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(profile.as_str().as_bytes());
-    bytes.extend_from_slice(
-        format!(
-            "|{:?}|{:?}|{}|{}",
-            opts.names, opts.modules, opts.minify, opts.minify_items
-        )
-        .as_bytes(),
-    );
+    let mut feed = HashFeed::new();
+    feed.u8(0x50); // domain tag
+    feed.str(profile.as_str());
+    feed.u8(match opts.names {
+        NameStyle::Readable => 1,
+        NameStyle::Mangled => 2,
+    });
+    feed.u8(match opts.modules {
+        Modules::Esm => 1,
+        Modules::Script => 2,
+    });
+    feed.u8(match opts.minify {
+        MinifyMode::Off => 0,
+        MinifyMode::Locals => 1,
+        MinifyMode::All => 2,
+    });
+
+    feed.u8(0x01);
+    feed.usize(table.len());
     for (name, item) in table {
-        bytes.extend_from_slice(name.as_str().as_bytes());
-        bytes.push(0);
-        if let Some(summary) = &item.jir.summary {
-            bytes.extend_from_slice(
-                format!("{:?}|{:?}", summary.key.item, summary.semantic_hash).as_bytes(),
-            );
-        }
-        bytes.extend_from_slice(&Hash128::of(item.js.as_bytes()).lo.to_le_bytes());
+        feed.str(name.as_str());
+        feed.opt(item.jir.summary.as_ref(), |f, summary| {
+            f.opt(summary.key.item, |f, item_id| f.item_id(item_id));
+            f.opt(summary.semantic_hash, |f, h| {
+                f.u64(h.lo);
+                f.u64(h.hi);
+            });
+        });
+        feed.u64(Hash128::of(item.js.as_bytes()).lo);
     }
+
+    feed.u8(0x02);
+    feed.usize(funcs.len());
     for (name, func) in funcs {
-        bytes.extend_from_slice(name.as_str().as_bytes());
-        bytes.extend_from_slice(format!("{func:?}").as_bytes());
+        feed.str(name.as_str());
+        match func {
+            Ok(func) => {
+                feed.u8(1);
+                feed.func(func);
+            }
+            Err(decline) => {
+                feed.u8(0);
+                feed.decline(decline);
+            }
+        }
     }
-    crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
-    Hash128::of(&bytes)
+
+    crate::profile::add(crate::profile::Counter::CacheKeyBytes, feed.bytes_written());
+    feed.finish()
 }
 
 /// The cache key of one measurement: the evaluation's fixed [`program_key`] and the ABI plan.
-///
-/// Within one evaluation `program` is constant, so two keys are equal exactly when the plans'
-/// cost keys are, as when the fixed inputs were spelled out in front of every plan.
 fn cache_key(program: Hash128, abi: &AbiPlan) -> Hash128 {
     crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
     let _scope = crate::profile::scope("physical_cache.key");
-    let mut bytes = program.to_bytes().to_vec();
-    abi.extend_cost_key(&mut bytes);
-    crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
-    Hash128::of(&bytes)
+    let mut feed = HashFeed::new();
+    feed.bytes(&program.to_bytes());
+    abi.extend_cost_key(&mut feed);
+    crate::profile::add(crate::profile::Counter::CacheKeyBytes, feed.bytes_written());
+    feed.finish()
 }
 
 #[cfg(test)]
@@ -679,7 +816,7 @@ mod tests {
                 Some(before),
                 Some(metrics(990, 499, 401, 0))
             )
-            .0
+            .accepted
         );
         assert_eq!(
             decide(
@@ -687,9 +824,8 @@ mod tests {
                 Some(before),
                 Some(metrics(1001, 490, 390, 0))
             )
-            .1
-            .as_deref(),
-            Some("cost.minified-no-improvement")
+            .reason,
+            Some(RejectReason::MinifiedNoImprovement)
         );
     }
 
@@ -701,17 +837,16 @@ mod tests {
             Some(before),
             Some(metrics(1040, 520, 415, 1)),
         );
-        assert!(accepted.0);
-        assert_eq!(accepted.2, Some("final-js-loop-allocation"));
+        assert!(accepted.accepted);
+        assert_eq!(accepted.hotness_source, Some("final-js-loop-allocation"));
         assert_eq!(
             decide(
                 Profile::ReleaseSpeed,
                 Some(before),
                 Some(metrics(990, 490, 390, 2)),
             )
-            .1
-            .as_deref(),
-            Some("cost.hotness-evidence-missing")
+            .reason,
+            Some(RejectReason::HotnessEvidenceMissing)
         );
     }
 
@@ -747,7 +882,7 @@ mod tests {
             loop_allocations: 8,
             alloc_term: 768,
         };
-        assert!(decide(Profile::ReleaseBalanced, Some(before), Some(major_win)).0);
+        assert!(decide(Profile::ReleaseBalanced, Some(before), Some(major_win)).accepted);
 
         let minor_before = ProgramMetrics {
             min: 15983,
@@ -771,9 +906,8 @@ mod tests {
                 Some(minor_before),
                 Some(minor_after)
             )
-            .1
-            .as_deref(),
-            Some("cost.compressed-growth-budget")
+            .reason,
+            Some(RejectReason::CompressedGrowthBudget)
         );
     }
 }

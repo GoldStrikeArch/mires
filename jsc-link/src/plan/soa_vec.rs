@@ -13,16 +13,15 @@
 //! `abi_flat` slice flattening, `value::clone_expr_with`, and `loop_opt` column-array LICM working
 //! seamlessly with zero per-element JS object allocations.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::analysis::heap::{
     filter_live_for_repr, global_vec_elem_ty, is_direct_global_vec_ty, HeapPlan,
 };
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
-use crate::jir::interns::Interns;
+use crate::jir::interns::{Interns, StrId};
 use crate::jir::repr::{Carrier, Func, Op, OpKind, Proj, Root, ValueId};
 use crate::jir::semantic::{
     Body, BodyKind, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, DropGlue,
@@ -35,11 +34,17 @@ use crate::jir::types::{
 };
 use crate::lower::js::value;
 use crate::opts::{OptimizerMode, Opts, Profile};
+use crate::plan::names::NamePool;
 
 /// Minimum number of non-ZST scalar fields for an element type to benefit from SoA.
 const MIN_SOA_FIELDS: usize = 2;
 /// Maximum number of non-ZST scalar fields for an element type to use SoA.
 const MAX_SOA_FIELDS: usize = 12;
+
+fn soa_debug() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("RCGJS_SOA_DEBUG").is_some())
+}
 
 /// TypedArray column storage kind for one scalar field of an SoA element type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -179,11 +184,18 @@ impl SoaPlan {
             return true;
         };
         if let Some(body) = &item.jir.body {
-            let mut visited = BTreeSet::new();
             let mut touched = false;
             for ty in body_mentioned_types(body) {
-                if type_mentions_any_layout(&interns.types, ty, &self.layouts, &mut visited) {
-                    touched = true;
+                interns.types.visit_types(
+                    ty,
+                    rcgjs_object::jir::types::TypeWalk::WithAdtArgs,
+                    &mut |current| {
+                        if !touched && self.layouts.contains_key(&interns.types.peeled(current)) {
+                            touched = true;
+                        }
+                    },
+                );
+                if touched {
                     break;
                 }
             }
@@ -193,35 +205,6 @@ impl SoaPlan {
             .keys()
             .any(|ty| interns.types.get(*ty).is_some())
     }
-}
-
-thread_local! {
-    static ACTIVE_SOA_PLAN: RefCell<Option<Arc<SoaPlan>>> = const { RefCell::new(None) };
-}
-
-/// RAII scope guard that activates a [`SoaPlan`] for the duration of Phase C lowering on the
-/// current thread, restoring any previous plan on drop (including unwinds).
-pub struct SoaPlanGuard {
-    prev: Option<Arc<SoaPlan>>,
-}
-
-impl Drop for SoaPlanGuard {
-    fn drop(&mut self) {
-        ACTIVE_SOA_PLAN.with(|slot| {
-            *slot.borrow_mut() = self.prev.take();
-        });
-    }
-}
-
-/// Installs `plan` as the active thread-local SoA plan until the returned guard is dropped.
-pub fn enter_active_plan(plan: Arc<SoaPlan>) -> SoaPlanGuard {
-    let prev = ACTIVE_SOA_PLAN.with(|slot| slot.borrow_mut().replace(plan));
-    SoaPlanGuard { prev }
-}
-
-/// Returns the currently active thread-local SoA plan, if any.
-pub fn current_plan() -> Option<Arc<SoaPlan>> {
-    ACTIVE_SOA_PLAN.with(|slot| slot.borrow().clone())
 }
 
 /// Structural shape extracted from one `TypeTable` before helper-name assignment.
@@ -234,6 +217,76 @@ struct CandidateShape {
     elem_size: u64,
 }
 
+#[derive(Default)]
+struct CandidateSet {
+    candidates: BTreeMap<TypeId, CandidateShape>,
+    disqualified: BTreeSet<TypeId>,
+}
+
+impl CandidateSet {
+    fn disqualify(&mut self, ty: TypeId) {
+        self.disqualified.insert(ty);
+        self.candidates.remove(&ty);
+    }
+
+    fn disqualify_body_mentions(
+        &mut self,
+        name: &JsName,
+        body: &Body,
+        types: &TypeTable,
+        reason: &str,
+    ) {
+        let mut mentioned = BTreeSet::new();
+        for ty in body_mentioned_types(body) {
+            collect_any_soa_mentions(types, ty, &self.candidates, &mut mentioned);
+        }
+        for ty in mentioned {
+            if soa_debug() {
+                eprintln!("[soa] disqualify {:?} ({reason} in {name})", ty);
+            }
+            self.disqualify(ty);
+        }
+    }
+
+    fn disqualify_func_mentions(
+        &mut self,
+        name: &JsName,
+        func: &Func,
+        types: &TypeTable,
+        reason: &str,
+    ) {
+        let mut mentioned = BTreeSet::new();
+        for ty in func_referenced_types(func) {
+            collect_any_soa_mentions(types, ty, &self.candidates, &mut mentioned);
+        }
+        for ty in mentioned {
+            if soa_debug() {
+                eprintln!("[soa] disqualify {:?} ({reason} in {name})", ty);
+            }
+            self.disqualify(ty);
+        }
+    }
+
+    fn disqualify_non_jir_item(
+        &mut self,
+        name: &JsName,
+        item: &LinkItem,
+        funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+        reason: &str,
+    ) {
+        if let (Some(body), Some(interns)) = (&item.jir.body, item.jir.interns()) {
+            self.disqualify_body_mentions(name, body, &interns.types, reason);
+        } else if let (Some(Ok(func)), Some(interns)) = (funcs.get(name), item.jir.interns()) {
+            self.disqualify_func_mentions(name, func, &interns.types, reason);
+        } else {
+            if soa_debug() {
+                eprintln!("[soa] CLEAR ALL ({reason} {name} lacks body/func metadata)");
+            }
+            self.candidates.clear();
+        }
+    }
+}
+
 /// Computes the whole-program fail-closed SoA plan over `table` and post-rewrite `funcs`.
 pub fn plan<V>(
     table: &BTreeMap<JsName, LinkItem>,
@@ -243,8 +296,7 @@ pub fn plan<V>(
     opts: &Opts,
     heap: &HeapPlan,
 ) -> SoaPlan {
-    let debug = std::env::var_os("RCGJS_SOA_DEBUG").is_some();
-
+    let debug = soa_debug();
     if opts.optimizer != OptimizerMode::On
         || opts.profile != Some(Profile::ReleaseSpeed)
         || !heap.native_vec_enabled
@@ -260,12 +312,49 @@ pub fn plan<V>(
 
     let effective_live = filter_live_for_repr(table, funcs, live, opts, heap);
 
-    // Phase 1: discover every structurally eligible `T` that actually appears as `Vec<T, Global>`
-    // in an effective-live JIR function.
-    let mut candidates: BTreeMap<TypeId, CandidateShape> = BTreeMap::new();
-    let mut disqualified: BTreeSet<TypeId> = BTreeSet::new();
+    let mut state = discover_candidates(table, funcs, repr_bodies, &effective_live, heap);
+    if state.candidates.is_empty() {
+        if debug {
+            eprintln!(
+                "[soa] no candidates discovered (effective_live={})",
+                effective_live.len()
+            );
+        }
+        return SoaPlan::default();
+    }
 
-    for name in &effective_live {
+    audit_live_items(
+        table,
+        funcs,
+        repr_bodies,
+        &effective_live,
+        opts,
+        heap,
+        &mut state,
+    );
+    if state.candidates.is_empty() {
+        if debug {
+            eprintln!("[soa] 0 candidates survived Phase 2 audit");
+        }
+        return SoaPlan::default();
+    }
+
+    assign_soa_layouts(table, state.candidates)
+}
+
+/// Phase 1: discover every structurally eligible `T` appearing as `Vec<T, Global>` in an
+/// effective-live JIR function.
+fn discover_candidates<V>(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    repr_bodies: &BTreeMap<JsName, V>,
+    effective_live: &BTreeSet<JsName>,
+    heap: &HeapPlan,
+) -> CandidateSet {
+    let debug = soa_debug();
+    let mut state = CandidateSet::default();
+
+    for name in effective_live {
         let Some(item) = table.get(name) else {
             continue;
         };
@@ -290,12 +379,12 @@ pub fn plan<V>(
                 continue;
             };
             let elem_ty = types.peeled(raw_elem);
-            if disqualified.contains(&elem_ty) {
+            if state.disqualified.contains(&elem_ty) {
                 continue;
             }
             match extract_candidate_shape(types, interns, elem_ty, heap) {
                 Some(shape) => {
-                    if let Some(existing) = candidates.get(&elem_ty) {
+                    if let Some(existing) = state.candidates.get(&elem_ty) {
                         if existing != &shape {
                             if debug {
                                 eprintln!(
@@ -303,8 +392,7 @@ pub fn plan<V>(
                                     elem_ty, name
                                 );
                             }
-                            disqualified.insert(elem_ty);
-                            candidates.remove(&elem_ty);
+                            state.disqualify(elem_ty);
                         }
                     } else {
                         if debug {
@@ -327,83 +415,56 @@ pub fn plan<V>(
                                 fields_dbg.join(", ")
                             );
                         }
-                        candidates.insert(elem_ty, shape);
+                        state.candidates.insert(elem_ty, shape);
                     }
                 }
-                None => {
-                    disqualified.insert(elem_ty);
-                    candidates.remove(&elem_ty);
-                }
+                None => state.disqualify(elem_ty),
             }
         }
     }
 
-    if candidates.is_empty() {
-        if debug {
-            eprintln!(
-                "[soa] no candidates discovered (effective_live={})",
-                effective_live.len()
-            );
-        }
-        return SoaPlan::default();
-    }
+    state
+}
 
-    // Phase 2: whole-program fail-closed audit across every effective-live item.
-    for name in &effective_live {
-        if candidates.is_empty() {
+/// Phase 2: whole-program fail-closed audit across every effective-live item.
+fn audit_live_items<V>(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    repr_bodies: &BTreeMap<JsName, V>,
+    effective_live: &BTreeSet<JsName>,
+    opts: &Opts,
+    heap: &HeapPlan,
+    state: &mut CandidateSet,
+) {
+    let debug = soa_debug();
+    for name in effective_live {
+        if state.candidates.is_empty() {
             break;
         }
         let Some(item) = table.get(name) else {
             continue;
         };
 
-        // Pre-rendered native representation bodies assume non-SoA carriers.
         if repr_bodies.contains_key(name) {
-            disqualify_non_jir_item(
-                name,
-                item,
-                funcs,
-                &mut candidates,
-                &mut disqualified,
-                debug,
-                "repr_body",
-            );
+            state.disqualify_non_jir_item(name, item, funcs, "repr_body");
             continue;
         }
 
         match item.kind {
             ItemKind::Alloc | ItemKind::Import | ItemKind::Const => {
-                // Allocator shims, host imports, and hoisted scalar/location constants have no
-                // SoA values of their own; any JIR function referencing them via `Host`,
-                // `Foreign`, or `Const(ConstTree)` is audited directly inside `audit_func`.
                 if let (Some(body), Some(interns)) = (&item.jir.body, item.jir.interns()) {
-                    disqualify_body_mentions(
-                        name,
-                        body,
-                        &interns.types,
-                        &mut candidates,
-                        &mut disqualified,
-                        debug,
-                        "non_fn_body",
-                    );
+                    state.disqualify_body_mentions(name, body, &interns.types, "non_fn_body");
                 }
                 continue;
             }
             ItemKind::Static | ItemKind::Vtable => {
                 if let (Some(body), Some(interns)) = (&item.jir.body, item.jir.interns()) {
-                    disqualify_body_mentions(
-                        name,
-                        body,
-                        &interns.types,
-                        &mut candidates,
-                        &mut disqualified,
-                        debug,
-                        if item.kind == ItemKind::Static {
-                            "static"
-                        } else {
-                            "vtable"
-                        },
-                    );
+                    let reason = if item.kind == ItemKind::Static {
+                        "static"
+                    } else {
+                        "vtable"
+                    };
+                    state.disqualify_body_mentions(name, body, &interns.types, reason);
                 } else if !is_known_synthesized_static(name.as_str(), item) {
                     if debug {
                         eprintln!(
@@ -411,7 +472,7 @@ pub fn plan<V>(
                             item.kind, name
                         );
                     }
-                    candidates.clear();
+                    state.candidates.clear();
                     break;
                 }
                 continue;
@@ -420,25 +481,13 @@ pub fn plan<V>(
         }
 
         let Some(Ok(func)) = funcs.get(name) else {
-            // A live function not lowered on the JIR lane (declined or baseline-only): inspect
-            // its own JIR-S body when present so unrelated items sharing the crate TypeTable are
-            // not falsely disqualified; fail closed if no body metadata exists and it is not a
-            // known linker-synthesized helper.
             if let (Some(body), Some(interns)) = (&item.jir.body, item.jir.interns()) {
-                disqualify_body_mentions(
-                    name,
-                    body,
-                    &interns.types,
-                    &mut candidates,
-                    &mut disqualified,
-                    debug,
-                    "declined_fn",
-                );
+                state.disqualify_body_mentions(name, body, &interns.types, "declined_fn");
             } else if !is_known_synthesized_fn(name.as_str()) {
                 if debug {
                     eprintln!("[soa] CLEAR ALL: non-JIR fn {} has no JIR body", name);
                 }
-                candidates.clear();
+                state.candidates.clear();
                 break;
             }
             continue;
@@ -448,13 +497,14 @@ pub fn plan<V>(
             if debug {
                 eprintln!("[soa] CLEAR ALL: fn {} missing interns", name);
             }
-            candidates.clear();
+            state.candidates.clear();
             break;
         };
         let types = &interns.types;
 
         // Consistency check across every live item whose TypeTable defines a candidate `elem_ty`.
-        let mismatch: Vec<TypeId> = candidates
+        let mismatch: Vec<TypeId> = state
+            .candidates
             .iter()
             .filter_map(|(&elem_ty, expected)| {
                 types.get(elem_ty)?;
@@ -469,9 +519,9 @@ pub fn plan<V>(
                     ty, name
                 );
             }
-            disqualify(ty, &mut candidates, &mut disqualified);
+            state.disqualify(ty);
         }
-        if candidates.is_empty() {
+        if state.candidates.is_empty() {
             break;
         }
 
@@ -479,58 +529,45 @@ pub fn plan<V>(
         if item.linkage.exported || opts.roots.iter().any(|r| r == name.as_str()) {
             let mut mentioned = BTreeSet::new();
             for &arg_ty in &func.sig.arguments {
-                collect_any_soa_mentions(types, arg_ty, &candidates, &mut mentioned);
+                collect_any_soa_mentions(types, arg_ty, &state.candidates, &mut mentioned);
             }
-            collect_any_soa_mentions(types, func.sig.result, &candidates, &mut mentioned);
+            collect_any_soa_mentions(types, func.sig.result, &state.candidates, &mut mentioned);
             for ty in mentioned {
                 if debug {
                     eprintln!("[soa] disqualify {:?} (export/root ABI of {})", ty, name);
                 }
-                disqualify(ty, &mut candidates, &mut disqualified);
+                state.disqualify(ty);
             }
         }
 
-        // Standard-op `SliceSort` / `SliceSortCmp` bodies are lowered by read-only `function.rs`
-        // directly to `__rt.slice_sort(v.buf, ...)`, which assumes an element array. Only
-        // disqualify candidates actually referenced by THIS sort specialization.
         if let Some(BodySemantic::Standard(
             StandardOperation::SliceSort | StandardOperation::SliceSortCmp,
         )) = item.jir.body.as_ref().map(|b| b.semantic)
         {
-            disqualify_func_mentions(
-                name,
-                func,
-                types,
-                &mut candidates,
-                &mut disqualified,
-                debug,
-                "slice_sort_body",
-            );
+            state.disqualify_func_mentions(name, func, types, "slice_sort_body");
             continue;
         }
 
-        audit_func(
-            name,
+        SoaFuncAuditor {
+            fn_name: name,
             func,
             types,
             interns,
             table,
             funcs,
             repr_bodies,
-            &mut candidates,
-            &mut disqualified,
-            debug,
-        );
-    }
-
-    if candidates.is_empty() {
-        if debug {
-            eprintln!("[soa] 0 candidates survived Phase 2 audit");
+            state,
         }
-        return SoaPlan::default();
+        .audit();
     }
+}
 
-    if debug {
+/// Phase 3: allocate collision-free helper names via [`NamePool`] and build [`SoaPlan`].
+fn assign_soa_layouts(
+    table: &BTreeMap<JsName, LinkItem>,
+    candidates: BTreeMap<TypeId, CandidateShape>,
+) -> SoaPlan {
+    if soa_debug() {
         for (ty, shape) in &candidates {
             let fields_dbg: Vec<String> = shape
                 .fields
@@ -547,8 +584,7 @@ pub fn plan<V>(
         }
     }
 
-    // Phase 3: allocate collision-free helper names and build `SoaPlan`.
-    let prefix = allocate_helper_prefix(table);
+    let prefix = NamePool::from_table(table).alloc_unused_prefix("$__mires_soa_");
     let mut layouts = BTreeMap::new();
     for (idx, (elem_ty, shape)) in candidates.into_iter().enumerate() {
         let id = idx as u32;
@@ -591,28 +627,11 @@ pub fn plan<V>(
     SoaPlan { layouts }
 }
 
-fn allocate_helper_prefix(table: &BTreeMap<JsName, LinkItem>) -> String {
-    let base = "$__mires_soa_";
-    if !table.keys().any(|n| n.as_str().starts_with(base)) {
-        return base.to_owned();
-    }
-    let mut suffix = 1u32;
-    loop {
-        let cand = format!("$__mires_soa_{suffix}_");
-        if !table.keys().any(|n| n.as_str().starts_with(&cand)) {
-            return cand;
-        }
-        suffix += 1;
-    }
-}
-
 fn is_known_synthesized_fn(name: &str) -> bool {
     crate::lower::js::i64_pair::HELPER_NAMES.contains(&name)
 }
 
 fn is_known_synthesized_static(name: &str, item: &LinkItem) -> bool {
-    // Linker-synthesized helpers (`i64_pair`, hoisted/ABI statics with no object summary) never
-    // hold user SoA values.
     crate::lower::js::i64_pair::HELPER_NAMES.contains(&name)
         || (item.jir.summary.is_none() && item.jir.interns().is_none())
 }
@@ -675,8 +694,6 @@ fn extract_candidate_shape(
         if types.is_zst(field.ty) {
             continue;
         }
-        // Inspect the UNPEELED field descriptor so interior mutability (`UnsafeCell`/`Cell`/
-        // atomics), `repr(transparent)` wrappers, and pinned boundaries are strictly rejected.
         let f_desc = types.get(field.ty)?;
         let scalar = classify_raw_scalar(f_desc, elem_ty, fi as u32, heap)?;
         let js_key_name = if is_tuple {
@@ -768,15 +785,6 @@ fn classify_raw_scalar(
     }
 }
 
-fn disqualify(
-    ty: TypeId,
-    candidates: &mut BTreeMap<TypeId, CandidateShape>,
-    disqualified: &mut BTreeSet<TypeId>,
-) {
-    disqualified.insert(ty);
-    candidates.remove(&ty);
-}
-
 fn collect_operand_types(op: &Operand, out: &mut BTreeSet<TypeId>) {
     out.insert(op.ty);
     match &op.kind {
@@ -799,8 +807,7 @@ fn collect_place_types(place: &Place, out: &mut BTreeSet<TypeId>) {
     }
 }
 
-/// Collects every [`TypeId`] referenced directly by a single JIR-S [`Body`] (never scanning the
-/// crate-wide `TypeTable`).
+/// Collects every [`TypeId`] referenced directly by a single JIR-S [`Body`].
 fn body_mentioned_types(body: &Body) -> BTreeSet<TypeId> {
     let mut out = BTreeSet::new();
     for &arg in &body.signature.arguments {
@@ -886,145 +893,6 @@ fn body_mentioned_types(body: &Body) -> BTreeSet<TypeId> {
         }
     }
     out
-}
-
-fn type_mentions_any_layout(
-    types: &TypeTable,
-    ty: TypeId,
-    layouts: &BTreeMap<TypeId, SoaLayout>,
-    visited: &mut BTreeSet<TypeId>,
-) -> bool {
-    if !visited.insert(ty) {
-        return false;
-    }
-    let peeled = types.peeled(ty);
-    if layouts.contains_key(&peeled) {
-        return true;
-    }
-    let Some(desc) = types.get(ty) else {
-        return false;
-    };
-    if let Some(inner) = desc.js.transparent {
-        if type_mentions_any_layout(types, inner.ty, layouts, visited) {
-            return true;
-        }
-    }
-    match &desc.kind {
-        TypeKind::Reference { pointee, .. }
-        | TypeKind::RawPointer { pointee, .. }
-        | TypeKind::Slice(pointee)
-        | TypeKind::Array {
-            element: pointee, ..
-        }
-        | TypeKind::Pattern(pointee) => type_mentions_any_layout(types, *pointee, layouts, visited),
-        TypeKind::Tuple(elems) => elems
-            .iter()
-            .any(|&e| type_mentions_any_layout(types, e, layouts, visited)),
-        TypeKind::Adt { args, variants, .. } => {
-            args.iter()
-                .any(|&a| type_mentions_any_layout(types, a, layouts, visited))
-                || variants.iter().any(|v| {
-                    v.fields
-                        .iter()
-                        .any(|f| type_mentions_any_layout(types, f.ty, layouts, visited))
-                })
-        }
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => upvars
-            .iter()
-            .any(|&u| type_mentions_any_layout(types, u, layouts, visited)),
-        TypeKind::Coroutine {
-            upvars,
-            saved_locals,
-            ..
-        } => {
-            upvars
-                .iter()
-                .any(|&t| type_mentions_any_layout(types, t, layouts, visited))
-                || saved_locals
-                    .iter()
-                    .any(|&(_, t)| type_mentions_any_layout(types, t, layouts, visited))
-        }
-        _ => false,
-    }
-}
-
-fn disqualify_body_mentions(
-    name: &JsName,
-    body: &Body,
-    types: &TypeTable,
-    candidates: &mut BTreeMap<TypeId, CandidateShape>,
-    disqualified: &mut BTreeSet<TypeId>,
-    debug: bool,
-    reason: &str,
-) {
-    let mut mentioned = BTreeSet::new();
-    for ty in body_mentioned_types(body) {
-        collect_any_soa_mentions(types, ty, candidates, &mut mentioned);
-    }
-    for ty in mentioned {
-        if debug {
-            eprintln!("[soa] disqualify {:?} ({reason} in {name})", ty);
-        }
-        disqualify(ty, candidates, disqualified);
-    }
-}
-
-fn disqualify_func_mentions(
-    name: &JsName,
-    func: &Func,
-    types: &TypeTable,
-    candidates: &mut BTreeMap<TypeId, CandidateShape>,
-    disqualified: &mut BTreeSet<TypeId>,
-    debug: bool,
-    reason: &str,
-) {
-    let mut mentioned = BTreeSet::new();
-    for ty in func_referenced_types(func) {
-        collect_any_soa_mentions(types, ty, candidates, &mut mentioned);
-    }
-    for ty in mentioned {
-        if debug {
-            eprintln!("[soa] disqualify {:?} ({reason} in {name})", ty);
-        }
-        disqualify(ty, candidates, disqualified);
-    }
-}
-
-fn disqualify_non_jir_item(
-    name: &JsName,
-    item: &LinkItem,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    candidates: &mut BTreeMap<TypeId, CandidateShape>,
-    disqualified: &mut BTreeSet<TypeId>,
-    debug: bool,
-    reason: &str,
-) {
-    if let (Some(body), Some(interns)) = (&item.jir.body, item.jir.interns()) {
-        disqualify_body_mentions(
-            name,
-            body,
-            &interns.types,
-            candidates,
-            disqualified,
-            debug,
-            reason,
-        );
-    } else if let (Some(Ok(func)), Some(interns)) = (funcs.get(name), item.jir.interns()) {
-        disqualify_func_mentions(
-            name,
-            func,
-            &interns.types,
-            candidates,
-            disqualified,
-            debug,
-            reason,
-        );
-    } else {
-        if debug {
-            eprintln!("[soa] CLEAR ALL ({reason} {name} lacks body/func metadata)");
-        }
-        candidates.clear();
-    }
 }
 
 fn func_referenced_types(func: &Func) -> BTreeSet<TypeId> {
@@ -1116,80 +984,20 @@ fn collect_any_soa_mentions(
     candidates: &BTreeMap<TypeId, CandidateShape>,
     out: &mut BTreeSet<TypeId>,
 ) {
-    let mut visited = BTreeSet::new();
-    collect_any_soa_mentions_rec(types, ty, candidates, &mut visited, out);
-}
-
-fn collect_any_soa_mentions_rec(
-    types: &TypeTable,
-    ty: TypeId,
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    visited: &mut BTreeSet<TypeId>,
-    out: &mut BTreeSet<TypeId>,
-) {
-    if !visited.insert(ty) {
-        return;
-    }
-    let peeled = types.peeled(ty);
-    if candidates.contains_key(&peeled) {
-        out.insert(peeled);
-        return;
-    }
-    let Some(desc) = types.get(ty) else {
-        return;
-    };
-    if let Some(inner) = desc.js.transparent {
-        collect_any_soa_mentions_rec(types, inner.ty, candidates, visited, out);
-    }
-    match &desc.kind {
-        TypeKind::Reference { pointee, .. }
-        | TypeKind::RawPointer { pointee, .. }
-        | TypeKind::Slice(pointee)
-        | TypeKind::Array {
-            element: pointee, ..
-        }
-        | TypeKind::Pattern(pointee) => {
-            collect_any_soa_mentions_rec(types, *pointee, candidates, visited, out);
-        }
-        TypeKind::Tuple(elems) => {
-            for &e in elems {
-                collect_any_soa_mentions_rec(types, e, candidates, visited, out);
+    types.visit_types(
+        ty,
+        rcgjs_object::jir::types::TypeWalk::WithAdtArgs,
+        &mut |current| {
+            let peeled = types.peeled(current);
+            if candidates.contains_key(&peeled) {
+                out.insert(peeled);
             }
-        }
-        TypeKind::Adt { args, variants, .. } => {
-            for &a in args {
-                collect_any_soa_mentions_rec(types, a, candidates, visited, out);
-            }
-            for v in variants {
-                for f in &v.fields {
-                    collect_any_soa_mentions_rec(types, f.ty, candidates, visited, out);
-                }
-            }
-        }
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
-            for &u in upvars {
-                collect_any_soa_mentions_rec(types, u, candidates, visited, out);
-            }
-        }
-        TypeKind::Coroutine {
-            upvars,
-            saved_locals,
-            ..
-        } => {
-            for &t in upvars {
-                collect_any_soa_mentions_rec(types, t, candidates, visited, out);
-            }
-            for &(_, t) in saved_locals {
-                collect_any_soa_mentions_rec(types, t, candidates, visited, out);
-            }
-        }
-        _ => {}
-    }
+        },
+    );
 }
 
 /// Collects every candidate `T` appearing in `ty` through an SoA-represented form (`Vec<T>`,
-/// `[T]`, `&T`, `&mut T`, `*const T`, `*mut T`), excluding standalone by-value `T` (which retains
-/// its canonical JS object/tuple representation).
+/// `[T]`, `&T`, `&mut T`, `*const T`, `*mut T`), excluding standalone by-value `T`.
 fn collect_soa_container_or_ptr_mentions(
     types: &TypeTable,
     ty: TypeId,
@@ -1240,8 +1048,6 @@ fn collect_soa_container_or_ptr_rec(
             }
         }
         TypeKind::Adt { args, variants, .. } => {
-            // Non-Global `Vec<T, A>` or `Box<T>`/`Box<[T]>`/`Rc`/`Arc` containers are audited
-            // separately in `audit_forbidden_types`, but also flag container args here.
             if desc.meta.candidate == RepresentationCandidate::Vec
                 || desc.meta.candidate == RepresentationCandidate::Box
             {
@@ -1305,340 +1111,8 @@ fn call_vec_ty(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn audit_func<V>(
-    fn_name: &JsName,
-    func: &Func,
-    types: &TypeTable,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    repr_bodies: &BTreeMap<JsName, V>,
-    candidates: &mut BTreeMap<TypeId, CandidateShape>,
-    disqualified: &mut BTreeSet<TypeId>,
-    debug: bool,
-) {
-    // 1. Check all referenced types for forbidden containers (`Vec<T, Custom>`, `Box<T>`,
-    //    `Box<[T]>`, unsized struct tails `[T]`).
-    let mut bad_types = BTreeSet::new();
-    for ty in func_referenced_types(func) {
-        let Some(desc) = types.get(ty) else {
-            continue;
-        };
-        if desc.meta.candidate == RepresentationCandidate::Vec
-            && desc.meta.allocator != AllocatorIdentity::Global
-        {
-            if let TypeKind::Adt { args, .. } = &desc.kind {
-                if let Some(&elem) = args.first() {
-                    if let Some(t) = is_soa_elem(types, elem, candidates) {
-                        bad_types.insert(t);
-                    }
-                }
-            }
-        }
-        if desc.meta.candidate == RepresentationCandidate::Box {
-            if let TypeKind::Adt { args, .. } = &desc.kind {
-                if let Some(&inner) = args.first() {
-                    if let Some(t) = is_soa_elem(types, inner, candidates)
-                        .or_else(|| is_soa_slice(types, inner, candidates))
-                    {
-                        bad_types.insert(t);
-                    }
-                }
-            }
-        }
-        if let Some(tail) = desc.js.unsized_tail {
-            if let Some(t) = is_soa_slice(types, tail.ty, candidates) {
-                bad_types.insert(t);
-            }
-        }
-    }
-    for t in bad_types {
-        if debug {
-            eprintln!(
-                "[soa] disqualify {:?} (forbidden container in {fn_name})",
-                t
-            );
-        }
-        disqualify(t, candidates, disqualified);
-    }
-    if candidates.is_empty() {
-        return;
-    }
-
-    // 2. Every value touching an SoA container/pointer must stay on `Carrier::Baseline`.
-    let mut non_baseline = BTreeSet::new();
-    for v in &func.values {
-        if v.carrier != Carrier::Baseline {
-            collect_soa_container_or_ptr_mentions(types, v.ty, candidates, &mut non_baseline);
-        }
-    }
-    for t in non_baseline {
-        if debug {
-            eprintln!(
-                "[soa] disqualify {:?} (non-baseline carrier in {fn_name})",
-                t
-            );
-        }
-        disqualify(t, candidates, disqualified);
-    }
-    if candidates.is_empty() {
-        return;
-    }
-
-    // Pre-index value uses and terminator uses for validating `bool` field borrows.
-    let mut value_uses: BTreeMap<ValueId, Vec<(usize, usize)>> = BTreeMap::new();
-    let mut term_uses: BTreeSet<ValueId> = BTreeSet::new();
-    let mut const_scalars: BTreeSet<ValueId> = BTreeSet::new();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for v in block.term.uses() {
-            term_uses.insert(v);
-        }
-        for (oi, op) in block.ops.iter().enumerate() {
-            if let (Some(res), OpKind::Const(ConstTree::Scalar { .. } | ConstTree::Address(_))) =
-                (op.result, &op.kind)
-            {
-                const_scalars.insert(res);
-            }
-            for u in op.kind.uses() {
-                value_uses.entry(u).or_default().push((bi, oi));
-            }
-        }
-    }
-
-    // 3. Audit every op in every block (fail-closed).
-    let mut bool_views: Vec<(TypeId, Option<ValueId>)> = Vec::new();
-    let mut to_disqualify: BTreeSet<TypeId> = BTreeSet::new();
-
-    for block in &func.blocks {
-        for op in &block.ops {
-            if candidates.is_empty() {
-                return;
-            }
-            let before_len = to_disqualify.len();
-            match &op.kind {
-                OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                    audit_place_view(
-                        func,
-                        types,
-                        root,
-                        path,
-                        op.result,
-                        candidates,
-                        &mut to_disqualify,
-                        &mut bool_views,
-                    );
-                }
-                OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
-                    if *field == 0 {
-                        if let Some(base_def) = func.values.get(base.0 as usize) {
-                            if let Some(t) = is_soa_vec(types, base_def.ty, candidates) {
-                                to_disqualify.insert(t);
-                            }
-                        }
-                    }
-                }
-                OpKind::Aggregate { ty, .. } => {
-                    if let Some(t) = is_soa_vec(types, *ty, candidates) {
-                        to_disqualify.insert(t);
-                    }
-                }
-                OpKind::Const(tree) => {
-                    if let Some(res) = op.result {
-                        if let Some(res_def) = func.values.get(res.0 as usize) {
-                            audit_const_tree(
-                                tree,
-                                res_def.ty,
-                                0,
-                                types,
-                                interns,
-                                table,
-                                candidates,
-                                &mut to_disqualify,
-                            );
-                        }
-                    }
-                }
-                OpKind::SliceView { ptr, .. } => {
-                    if let Some(res) = op.result {
-                        if let Some(res_def) = func.values.get(res.0 as usize) {
-                            if let Some(t) = is_soa_slice_ptr(types, res_def.ty, candidates) {
-                                let ptr_ok = func
-                                    .values
-                                    .get(ptr.0 as usize)
-                                    .and_then(|d| is_soa_elem_ptr(types, d.ty, candidates))
-                                    == Some(t);
-                                if !ptr_ok {
-                                    to_disqualify.insert(t);
-                                }
-                            }
-                        }
-                    }
-                }
-                OpKind::Cast { kind, v, from, to } => {
-                    audit_cast(
-                        *kind,
-                        *v,
-                        *from,
-                        *to,
-                        types,
-                        &const_scalars,
-                        candidates,
-                        &mut to_disqualify,
-                    );
-                }
-                OpKind::Call {
-                    callee,
-                    args,
-                    semantic,
-                    host,
-                    ..
-                } => {
-                    audit_call(
-                        func,
-                        types,
-                        interns,
-                        table,
-                        funcs,
-                        repr_bodies,
-                        op,
-                        callee,
-                        args,
-                        *semantic,
-                        host.is_some(),
-                        candidates,
-                        &mut to_disqualify,
-                    );
-                }
-                OpKind::Intrinsic {
-                    name,
-                    types: inst_tys,
-                    args,
-                    ..
-                } => {
-                    audit_intrinsic(
-                        func,
-                        types,
-                        interns,
-                        op,
-                        *name,
-                        inst_tys,
-                        args,
-                        candidates,
-                        &mut to_disqualify,
-                    );
-                }
-                OpKind::Host { args, .. } => {
-                    for &arg in args {
-                        if let Some(d) = func.values.get(arg.0 as usize) {
-                            collect_any_soa_mentions(types, d.ty, candidates, &mut to_disqualify);
-                        }
-                    }
-                    if let Some(res) = op.result {
-                        if let Some(d) = func.values.get(res.0 as usize) {
-                            collect_any_soa_mentions(types, d.ty, candidates, &mut to_disqualify);
-                        }
-                    }
-                }
-                OpKind::Drop {
-                    root,
-                    path,
-                    glue: DropGlue::Dynamic,
-                } => {
-                    if let Some(final_ty) = place_final_ty(func, types, root, path) {
-                        collect_soa_container_or_ptr_mentions(
-                            types,
-                            final_ty,
-                            candidates,
-                            &mut to_disqualify,
-                        );
-                    }
-                }
-                OpKind::Convert { v, .. } => {
-                    if let Some(d) = func.values.get(v.0 as usize) {
-                        collect_soa_container_or_ptr_mentions(
-                            types,
-                            d.ty,
-                            candidates,
-                            &mut to_disqualify,
-                        );
-                    }
-                    if let Some(res) = op.result {
-                        if let Some(d) = func.values.get(res.0 as usize) {
-                            collect_soa_container_or_ptr_mentions(
-                                types,
-                                d.ty,
-                                candidates,
-                                &mut to_disqualify,
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if debug && to_disqualify.len() > before_len {
-                eprintln!(
-                    "[soa] op in {fn_name} flagged {:?}: {:?}",
-                    to_disqualify, op.kind
-                );
-            }
-        }
-    }
-
-    // 4. Validate every SoA `bool` field borrow: never allowed to escape beyond direct
-    //    `Deref(view)` / `StoreThrough { ptr: view, .. }` / `Drop(None)`.
-    for (elem_ty, view_opt) in bool_views {
-        if to_disqualify.contains(&elem_ty) {
-            continue;
-        }
-        let Some(view_v) = view_opt else {
-            to_disqualify.insert(elem_ty);
-            continue;
-        };
-        if term_uses.contains(&view_v) {
-            to_disqualify.insert(elem_ty);
-            continue;
-        }
-        let Some(uses) = value_uses.get(&view_v) else {
-            continue;
-        };
-        let all_direct = uses.iter().all(|&(bi, oi)| {
-            let use_op = &func.blocks[bi].ops[oi];
-            match &use_op.kind {
-                OpKind::Deref(p) if *p == view_v => true,
-                OpKind::StoreThrough { ptr, v } if *ptr == view_v && *v != view_v => true,
-                OpKind::Drop {
-                    glue: DropGlue::None,
-                    ..
-                } => true,
-                _ => false,
-            }
-        });
-        if !all_direct {
-            if debug {
-                eprintln!(
-                    "[soa] bool field view escaped in {fn_name} for {:?}",
-                    elem_ty
-                );
-            }
-            to_disqualify.insert(elem_ty);
-        }
-    }
-
-    for t in to_disqualify {
-        disqualify(t, candidates, disqualified);
-    }
-}
-
-fn root_ty(func: &Func, root: &Root) -> Option<TypeId> {
-    match root {
-        Root::Value(v) => func.values.get(v.0 as usize).map(|d| d.ty),
-        Root::Cell(c) => func.cells.get(c.0 as usize).map(|d| d.ty),
-    }
-}
-
-fn place_final_ty(func: &Func, types: &TypeTable, root: &Root, path: &[Proj]) -> Option<TypeId> {
-    let mut cur = root_ty(func, root)?;
+fn place_final_ty(func: &Func, types: &TypeTable, root: Root, path: &[Proj]) -> Option<TypeId> {
+    let mut cur = func.root_ty(root)?;
     for step in path {
         match step {
             Proj::Deref => cur = value::pointee_of(types, cur)?,
@@ -1655,691 +1129,1000 @@ fn place_final_ty(func: &Func, types: &TypeTable, root: &Root, path: &[Proj]) ->
     Some(cur)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn audit_place_view(
-    func: &Func,
-    types: &TypeTable,
-    root: &Root,
-    path: &[Proj],
-    result: Option<ValueId>,
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    to_disqualify: &mut BTreeSet<TypeId>,
-    bool_views: &mut Vec<(TypeId, Option<ValueId>)>,
-) {
-    let Some(mut cur_ty) = root_ty(func, root) else {
-        return;
-    };
-    let mut from_soa_elem: Option<TypeId> = None;
-    let mut from_soa_slice: Option<TypeId> = None;
-
-    for step in path {
-        match step {
-            Proj::Deref => {
-                let Some(pointee) = value::pointee_of(types, cur_ty) else {
-                    return;
-                };
-                if let Some(t) = is_soa_elem(types, pointee, candidates) {
-                    from_soa_elem = Some(t);
-                    from_soa_slice = None;
-                } else if let Some(t) = is_soa_slice(types, pointee, candidates) {
-                    from_soa_slice = Some(t);
-                    from_soa_elem = None;
-                } else {
-                    from_soa_elem = None;
-                    from_soa_slice = None;
-                }
-                cur_ty = pointee;
-            }
-            Proj::Index(_) | Proj::ConstantIndex { .. } => {
-                if let Some(t) = is_soa_slice(types, cur_ty, candidates) {
-                    from_soa_elem = Some(t);
-                    from_soa_slice = None;
-                    cur_ty = t;
-                } else {
-                    from_soa_elem = None;
-                    from_soa_slice = None;
-                    cur_ty = match value::kind(types, types.peeled(cur_ty)) {
-                        Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
-                            *element
-                        }
-                        _ => return,
-                    };
-                }
-            }
-            Proj::Subslice { .. } | Proj::Downcast { .. } => {}
-            Proj::Field {
-                field,
-                ty: field_ty,
-            } => {
-                if *field == 0 {
-                    if let Some(t) = is_soa_vec(types, cur_ty, candidates) {
-                        to_disqualify.insert(t);
-                    }
-                }
-                if let Some(elem_t) = from_soa_elem {
-                    if let Some(shape) = candidates.get(&elem_t) {
-                        if shape
-                            .fields
-                            .iter()
-                            .any(|f| f.field_idx == *field && f.scalar.is_bool())
-                        {
-                            bool_views.push((elem_t, result));
-                        }
-                    }
-                }
-                from_soa_elem = None;
-                from_soa_slice = None;
-                cur_ty = *field_ty;
-            }
-        }
-    }
-
-    if let Some(t) = is_soa_elem(types, cur_ty, candidates) {
-        if from_soa_elem != Some(t) {
-            to_disqualify.insert(t);
-        }
-    }
-    if let Some(t) = is_soa_slice(types, cur_ty, candidates) {
-        if from_soa_slice != Some(t) {
-            to_disqualify.insert(t);
-        }
-    }
+/// Fail-closed intra-function SoA auditor for one JIR-R [`Func`].
+struct SoaFuncAuditor<'a, V> {
+    fn_name: &'a JsName,
+    func: &'a Func,
+    types: &'a TypeTable,
+    interns: &'a Interns,
+    table: &'a BTreeMap<JsName, LinkItem>,
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    repr_bodies: &'a BTreeMap<JsName, V>,
+    state: &'a mut CandidateSet,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn audit_const_tree(
-    tree: &ConstTree,
-    ty: TypeId,
-    depth: u32,
-    types: &TypeTable,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    to_disqualify: &mut BTreeSet<TypeId>,
-) {
-    if depth > 64 {
-        return;
-    }
-    let peeled = types.peeled(ty);
-
-    // Top-level empty `Vec<T, Global>` constant is handled directly in `emit.rs`.
-    if let Some(t) = is_soa_vec(types, peeled, candidates) {
-        if depth > 0 {
-            to_disqualify.insert(t);
+impl<V> SoaFuncAuditor<'_, V> {
+    fn audit(&mut self) {
+        self.audit_forbidden_containers();
+        if self.state.candidates.is_empty() {
+            return;
         }
-        return;
-    }
-
-    // Top-level empty `&[T]` / `*const [T]` slice constant is handled directly in `emit.rs`.
-    if let Some(t) = is_soa_slice_ptr(types, peeled, candidates) {
-        let is_top_empty = depth == 0
-            && match tree {
-                ConstTree::Slice(elems) => elems.is_empty(),
-                ConstTree::SliceAddress { length, .. } => *length == 0,
-                _ => false,
-            };
-        if !is_top_empty {
-            to_disqualify.insert(t);
+        self.audit_non_baseline_carriers();
+        if self.state.candidates.is_empty() {
+            return;
         }
-        return;
-    }
 
-    // Null / dangling raw pointer `*const T` / `*mut T` (numeric address, never dereferenced).
-    if let Some(t) = is_soa_elem_ptr(types, peeled, candidates) {
-        let is_dangling_raw = value::is_raw(types, ty)
-            && matches!(tree, ConstTree::Address(_) | ConstTree::Scalar { .. });
-        if !is_dangling_raw {
-            to_disqualify.insert(t);
-        }
-        return;
-    }
-
-    let Some(desc) = types.get(peeled) else {
-        return;
-    };
-
-    match tree {
-        ConstTree::Aggregate(fields) => match &desc.kind {
-            TypeKind::Adt {
-                form: NominalForm::Struct,
-                variants,
-                ..
-            } => {
-                if let Some(variant) = variants.first() {
-                    for (field, sub) in variant.fields.iter().zip(fields) {
-                        audit_const_tree(
-                            sub,
-                            field.ty,
-                            depth + 1,
-                            types,
-                            interns,
-                            table,
-                            candidates,
-                            to_disqualify,
-                        );
+        // Pre-index value uses and terminator uses in dense Vecs indexed by `ValueId.0`.
+        let n_vals = self.func.values.len();
+        let mut value_uses: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_vals];
+        let mut term_uses: Vec<bool> = vec![false; n_vals];
+        let mut const_scalars: Vec<bool> = vec![false; n_vals];
+        for (bi, block) in self.func.blocks.iter().enumerate() {
+            for v in block.term.uses() {
+                if let Some(slot) = term_uses.get_mut(v.0 as usize) {
+                    *slot = true;
+                }
+            }
+            for (oi, op) in block.ops.iter().enumerate() {
+                if let (
+                    Some(res),
+                    OpKind::Const(ConstTree::Scalar { .. } | ConstTree::Address(_)),
+                ) = (op.result, &op.kind)
+                {
+                    if let Some(slot) = const_scalars.get_mut(res.0 as usize) {
+                        *slot = true;
+                    }
+                }
+                for u in op.kind.uses() {
+                    if let Some(slot) = value_uses.get_mut(u.0 as usize) {
+                        slot.push((bi, oi));
                     }
                 }
             }
-            TypeKind::Tuple(elems) => {
-                for (&elem, sub) in elems.iter().zip(fields) {
-                    audit_const_tree(
-                        sub,
-                        elem,
-                        depth + 1,
-                        types,
-                        interns,
-                        table,
-                        candidates,
-                        to_disqualify,
-                    );
+        }
+
+        // 3. Audit every op in every block (fail-closed).
+        let mut bool_views: Vec<(TypeId, Option<ValueId>)> = Vec::new();
+        let mut to_disqualify: BTreeSet<TypeId> = BTreeSet::new();
+        let debug = soa_debug();
+
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                if self.state.candidates.is_empty() {
+                    return;
                 }
-            }
-            TypeKind::Array { element, .. } => {
-                for sub in fields {
-                    audit_const_tree(
-                        sub,
-                        *element,
-                        depth + 1,
-                        types,
-                        interns,
-                        table,
-                        candidates,
-                        to_disqualify,
-                    );
+                let before_len = to_disqualify.len();
+                match &op.kind {
+                    OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+                        self.audit_place_view(
+                            *root,
+                            path,
+                            op.result,
+                            &mut to_disqualify,
+                            &mut bool_views,
+                        );
+                    }
+                    OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
+                        if *field == 0 {
+                            if let Some(base_def) = self.func.values.get(base.0 as usize) {
+                                if let Some(t) =
+                                    is_soa_vec(self.types, base_def.ty, &self.state.candidates)
+                                {
+                                    to_disqualify.insert(t);
+                                }
+                            }
+                        }
+                    }
+                    OpKind::Aggregate { ty, .. } => {
+                        if let Some(t) = is_soa_vec(self.types, *ty, &self.state.candidates) {
+                            to_disqualify.insert(t);
+                        }
+                    }
+                    OpKind::Const(tree) => {
+                        if let Some(res) = op.result {
+                            if let Some(res_def) = self.func.values.get(res.0 as usize) {
+                                self.audit_const_tree(tree, res_def.ty, 0, &mut to_disqualify);
+                            }
+                        }
+                    }
+                    OpKind::SliceView { ptr, .. } => {
+                        if let Some(res) = op.result {
+                            if let Some(res_def) = self.func.values.get(res.0 as usize) {
+                                if let Some(t) =
+                                    is_soa_slice_ptr(self.types, res_def.ty, &self.state.candidates)
+                                {
+                                    let ptr_ok =
+                                        self.func.values.get(ptr.0 as usize).and_then(|d| {
+                                            is_soa_elem_ptr(
+                                                self.types,
+                                                d.ty,
+                                                &self.state.candidates,
+                                            )
+                                        }) == Some(t);
+                                    if !ptr_ok {
+                                        to_disqualify.insert(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OpKind::Cast { kind, v, from, to } => {
+                        self.audit_cast(*kind, *v, *from, *to, &const_scalars, &mut to_disqualify);
+                    }
+                    OpKind::Call {
+                        callee,
+                        args,
+                        semantic,
+                        host,
+                        ..
+                    } => {
+                        self.audit_call(
+                            op,
+                            callee,
+                            args,
+                            *semantic,
+                            host.is_some(),
+                            &mut to_disqualify,
+                        );
+                    }
+                    OpKind::Intrinsic {
+                        name,
+                        types: inst_tys,
+                        args,
+                        ..
+                    } => {
+                        self.audit_intrinsic(op, *name, inst_tys, args, &mut to_disqualify);
+                    }
+                    OpKind::Host { args, .. } => {
+                        for &arg in args {
+                            if let Some(d) = self.func.values.get(arg.0 as usize) {
+                                collect_any_soa_mentions(
+                                    self.types,
+                                    d.ty,
+                                    &self.state.candidates,
+                                    &mut to_disqualify,
+                                );
+                            }
+                        }
+                        if let Some(res) = op.result {
+                            if let Some(d) = self.func.values.get(res.0 as usize) {
+                                collect_any_soa_mentions(
+                                    self.types,
+                                    d.ty,
+                                    &self.state.candidates,
+                                    &mut to_disqualify,
+                                );
+                            }
+                        }
+                    }
+                    OpKind::Drop {
+                        root,
+                        path,
+                        glue: DropGlue::Dynamic,
+                    } => {
+                        if let Some(final_ty) = place_final_ty(self.func, self.types, *root, path) {
+                            collect_soa_container_or_ptr_mentions(
+                                self.types,
+                                final_ty,
+                                &self.state.candidates,
+                                &mut to_disqualify,
+                            );
+                        }
+                    }
+                    OpKind::Convert { v, .. } => {
+                        if let Some(d) = self.func.values.get(v.0 as usize) {
+                            collect_soa_container_or_ptr_mentions(
+                                self.types,
+                                d.ty,
+                                &self.state.candidates,
+                                &mut to_disqualify,
+                            );
+                        }
+                        if let Some(res) = op.result {
+                            if let Some(d) = self.func.values.get(res.0 as usize) {
+                                collect_soa_container_or_ptr_mentions(
+                                    self.types,
+                                    d.ty,
+                                    &self.state.candidates,
+                                    &mut to_disqualify,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-            }
-            TypeKind::Closure { upvars, .. } => {
-                for (&upvar, sub) in upvars.iter().zip(fields) {
-                    audit_const_tree(
-                        sub,
-                        upvar,
-                        depth + 1,
-                        types,
-                        interns,
-                        table,
-                        candidates,
-                        to_disqualify,
-                    );
-                }
-            }
-            _ => {
-                collect_soa_container_or_ptr_mentions(types, ty, candidates, to_disqualify);
-            }
-        },
-        ConstTree::Variant { variant, fields } => {
-            if let Some(vdesc) = types.variants(peeled).get(*variant as usize) {
-                for (field, sub) in vdesc.fields.iter().zip(fields) {
-                    audit_const_tree(
-                        sub,
-                        field.ty,
-                        depth + 1,
-                        types,
-                        interns,
-                        table,
-                        candidates,
-                        to_disqualify,
+                if debug && to_disqualify.len() > before_len {
+                    eprintln!(
+                        "[soa] op in {} flagged {:?}: {:?}",
+                        self.fn_name, to_disqualify, op.kind
                     );
                 }
             }
         }
-        ConstTree::Reference(inner) => {
-            if let Some(pointee) = value::pointee_of(types, peeled) {
-                audit_const_tree(
-                    inner,
-                    pointee,
-                    depth + 1,
-                    types,
-                    interns,
-                    table,
-                    candidates,
-                    to_disqualify,
+
+        // 4. Validate every SoA `bool` field borrow.
+        for (elem_ty, view_opt) in bool_views {
+            if to_disqualify.contains(&elem_ty) {
+                continue;
+            }
+            let Some(view_v) = view_opt else {
+                to_disqualify.insert(elem_ty);
+                continue;
+            };
+            if term_uses.get(view_v.0 as usize).copied().unwrap_or(false) {
+                to_disqualify.insert(elem_ty);
+                continue;
+            }
+            let Some(uses) = value_uses.get(view_v.0 as usize) else {
+                continue;
+            };
+            let all_direct = uses.iter().all(|&(bi, oi)| {
+                let use_op = &self.func.blocks[bi].ops[oi];
+                match &use_op.kind {
+                    OpKind::Deref(p) if *p == view_v => true,
+                    OpKind::StoreThrough { ptr, v } if *ptr == view_v && *v != view_v => true,
+                    OpKind::Drop {
+                        glue: DropGlue::None,
+                        ..
+                    } => true,
+                    _ => false,
+                }
+            });
+            if !all_direct {
+                if debug {
+                    eprintln!(
+                        "[soa] bool field view escaped in {} for {:?}",
+                        self.fn_name, elem_ty
+                    );
+                }
+                to_disqualify.insert(elem_ty);
+            }
+        }
+
+        for t in to_disqualify {
+            self.state.disqualify(t);
+        }
+    }
+
+    fn audit_forbidden_containers(&mut self) {
+        let mut bad_types = BTreeSet::new();
+        for ty in func_referenced_types(self.func) {
+            let Some(desc) = self.types.get(ty) else {
+                continue;
+            };
+            if desc.meta.candidate == RepresentationCandidate::Vec
+                && desc.meta.allocator != AllocatorIdentity::Global
+            {
+                if let TypeKind::Adt { args, .. } = &desc.kind {
+                    if let Some(&elem) = args.first() {
+                        if let Some(t) = is_soa_elem(self.types, elem, &self.state.candidates) {
+                            bad_types.insert(t);
+                        }
+                    }
+                }
+            }
+            if desc.meta.candidate == RepresentationCandidate::Box {
+                if let TypeKind::Adt { args, .. } = &desc.kind {
+                    if let Some(&inner) = args.first() {
+                        if let Some(t) = is_soa_elem(self.types, inner, &self.state.candidates)
+                            .or_else(|| is_soa_slice(self.types, inner, &self.state.candidates))
+                        {
+                            bad_types.insert(t);
+                        }
+                    }
+                }
+            }
+            if let Some(tail) = desc.js.unsized_tail {
+                if let Some(t) = is_soa_slice(self.types, tail.ty, &self.state.candidates) {
+                    bad_types.insert(t);
+                }
+            }
+        }
+        for t in bad_types {
+            if soa_debug() {
+                eprintln!(
+                    "[soa] disqualify {:?} (forbidden container in {})",
+                    t, self.fn_name
+                );
+            }
+            self.state.disqualify(t);
+        }
+    }
+
+    fn audit_non_baseline_carriers(&mut self) {
+        let mut non_baseline = BTreeSet::new();
+        for v in &self.func.values {
+            if v.carrier != Carrier::Baseline {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    v.ty,
+                    &self.state.candidates,
+                    &mut non_baseline,
                 );
             }
         }
-        ConstTree::Slice(elems) => {
-            if let Some(pointee) = value::pointee_of(types, peeled) {
-                if let Some(TypeKind::Slice(elem)) = value::kind(types, types.peeled(pointee)) {
-                    for sub in elems {
-                        audit_const_tree(
-                            sub,
-                            *elem,
-                            depth + 1,
-                            types,
-                            interns,
-                            table,
-                            candidates,
-                            to_disqualify,
-                        );
+        for t in non_baseline {
+            if soa_debug() {
+                eprintln!(
+                    "[soa] disqualify {:?} (non-baseline carrier in {})",
+                    t, self.fn_name
+                );
+            }
+            self.state.disqualify(t);
+        }
+    }
+
+    fn audit_place_view(
+        &self,
+        root: Root,
+        path: &[Proj],
+        result: Option<ValueId>,
+        to_disqualify: &mut BTreeSet<TypeId>,
+        bool_views: &mut Vec<(TypeId, Option<ValueId>)>,
+    ) {
+        let Some(mut cur_ty) = self.func.root_ty(root) else {
+            return;
+        };
+        let mut from_soa_elem: Option<TypeId> = None;
+        let mut from_soa_slice: Option<TypeId> = None;
+
+        for step in path {
+            match step {
+                Proj::Deref => {
+                    let Some(pointee) = value::pointee_of(self.types, cur_ty) else {
+                        return;
+                    };
+                    if let Some(t) = is_soa_elem(self.types, pointee, &self.state.candidates) {
+                        from_soa_elem = Some(t);
+                        from_soa_slice = None;
+                    } else if let Some(t) =
+                        is_soa_slice(self.types, pointee, &self.state.candidates)
+                    {
+                        from_soa_slice = Some(t);
+                        from_soa_elem = None;
+                    } else {
+                        from_soa_elem = None;
+                        from_soa_slice = None;
+                    }
+                    cur_ty = pointee;
+                }
+                Proj::Index(_) | Proj::ConstantIndex { .. } => {
+                    if let Some(t) = is_soa_slice(self.types, cur_ty, &self.state.candidates) {
+                        from_soa_elem = Some(t);
+                        from_soa_slice = None;
+                        cur_ty = t;
+                    } else {
+                        from_soa_elem = None;
+                        from_soa_slice = None;
+                        cur_ty = match value::kind(self.types, self.types.peeled(cur_ty)) {
+                            Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
+                                *element
+                            }
+                            _ => return,
+                        };
+                    }
+                }
+                Proj::Subslice { .. } | Proj::Downcast { .. } => {}
+                Proj::Field {
+                    field,
+                    ty: field_ty,
+                } => {
+                    if *field == 0 {
+                        if let Some(t) = is_soa_vec(self.types, cur_ty, &self.state.candidates) {
+                            to_disqualify.insert(t);
+                        }
+                    }
+                    if let Some(elem_t) = from_soa_elem {
+                        if let Some(shape) = self.state.candidates.get(&elem_t) {
+                            if shape
+                                .fields
+                                .iter()
+                                .any(|f| f.field_idx == *field && f.scalar.is_bool())
+                            {
+                                bool_views.push((elem_t, result));
+                            }
+                        }
+                    }
+                    from_soa_elem = None;
+                    from_soa_slice = None;
+                    cur_ty = *field_ty;
+                }
+            }
+        }
+
+        if let Some(t) = is_soa_elem(self.types, cur_ty, &self.state.candidates) {
+            if from_soa_elem != Some(t) {
+                to_disqualify.insert(t);
+            }
+        }
+        if let Some(t) = is_soa_slice(self.types, cur_ty, &self.state.candidates) {
+            if from_soa_slice != Some(t) {
+                to_disqualify.insert(t);
+            }
+        }
+    }
+
+    fn audit_const_tree(
+        &self,
+        tree: &ConstTree,
+        ty: TypeId,
+        depth: u32,
+        to_disqualify: &mut BTreeSet<TypeId>,
+    ) {
+        if depth > 64 {
+            return;
+        }
+        let peeled = self.types.peeled(ty);
+
+        if let Some(t) = is_soa_vec(self.types, peeled, &self.state.candidates) {
+            if depth > 0 {
+                to_disqualify.insert(t);
+            }
+            return;
+        }
+
+        if let Some(t) = is_soa_slice_ptr(self.types, peeled, &self.state.candidates) {
+            let is_top_empty = depth == 0
+                && match tree {
+                    ConstTree::Slice(elems) => elems.is_empty(),
+                    ConstTree::SliceAddress { length, .. } => *length == 0,
+                    _ => false,
+                };
+            if !is_top_empty {
+                to_disqualify.insert(t);
+            }
+            return;
+        }
+
+        if let Some(t) = is_soa_elem_ptr(self.types, peeled, &self.state.candidates) {
+            let is_dangling_raw = value::is_raw(self.types, ty)
+                && matches!(tree, ConstTree::Address(_) | ConstTree::Scalar { .. });
+            if !is_dangling_raw {
+                to_disqualify.insert(t);
+            }
+            return;
+        }
+
+        let Some(desc) = self.types.get(peeled) else {
+            return;
+        };
+
+        match tree {
+            ConstTree::Aggregate(fields) => match &desc.kind {
+                TypeKind::Adt {
+                    form: NominalForm::Struct,
+                    variants,
+                    ..
+                } => {
+                    if let Some(variant) = variants.first() {
+                        for (field, sub) in variant.fields.iter().zip(fields) {
+                            self.audit_const_tree(sub, field.ty, depth + 1, to_disqualify);
+                        }
+                    }
+                }
+                TypeKind::Tuple(elems) => {
+                    for (&elem, sub) in elems.iter().zip(fields) {
+                        self.audit_const_tree(sub, elem, depth + 1, to_disqualify);
+                    }
+                }
+                TypeKind::Array { element, .. } => {
+                    for sub in fields {
+                        self.audit_const_tree(sub, *element, depth + 1, to_disqualify);
+                    }
+                }
+                TypeKind::Closure { upvars, .. } => {
+                    for (&upvar, sub) in upvars.iter().zip(fields) {
+                        self.audit_const_tree(sub, upvar, depth + 1, to_disqualify);
+                    }
+                }
+                _ => {
+                    collect_soa_container_or_ptr_mentions(
+                        self.types,
+                        ty,
+                        &self.state.candidates,
+                        to_disqualify,
+                    );
+                }
+            },
+            ConstTree::Variant { variant, fields } => {
+                if let Some(vdesc) = self.types.variants(peeled).get(*variant as usize) {
+                    for (field, sub) in vdesc.fields.iter().zip(fields) {
+                        self.audit_const_tree(sub, field.ty, depth + 1, to_disqualify);
+                    }
+                }
+            }
+            ConstTree::Reference(inner) => {
+                if let Some(pointee) = value::pointee_of(self.types, peeled) {
+                    self.audit_const_tree(inner, pointee, depth + 1, to_disqualify);
+                }
+            }
+            ConstTree::Slice(elems) => {
+                if let Some(pointee) = value::pointee_of(self.types, peeled) {
+                    if let Some(TypeKind::Slice(elem)) =
+                        value::kind(self.types, self.types.peeled(pointee))
+                    {
+                        for sub in elems {
+                            self.audit_const_tree(sub, *elem, depth + 1, to_disqualify);
+                        }
+                    }
+                }
+            }
+            ConstTree::Global { target, .. } => {
+                if let GlobalReference::Function { link_name, .. } = target {
+                    if let Some(s) = self.interns.str(*link_name) {
+                        if let Some(ti) = self.table.get(s) {
+                            if is_intercepted_native_vec_body(ti) {
+                                if let (Some(ti_body), Some(ti_interns)) =
+                                    (&ti.jir.body, ti.jir.interns())
+                                {
+                                    for mty in body_mentioned_types(ti_body) {
+                                        collect_any_soa_mentions(
+                                            &ti_interns.types,
+                                            mty,
+                                            &self.state.candidates,
+                                            to_disqualify,
+                                        );
+                                    }
+                                } else {
+                                    to_disqualify.extend(self.state.candidates.keys().copied());
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    ty,
+                    &self.state.candidates,
+                    to_disqualify,
+                );
+            }
+            ConstTree::StaticField { .. }
+            | ConstTree::StaticSlice { .. }
+            | ConstTree::Dyn { .. } => {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    ty,
+                    &self.state.candidates,
+                    to_disqualify,
+                );
+            }
+            ConstTree::Unit
+            | ConstTree::Scalar { .. }
+            | ConstTree::Str(_)
+            | ConstTree::Address(_)
+            | ConstTree::SliceAddress { .. } => {}
+        }
+    }
+
+    fn audit_cast(
+        &self,
+        kind: CastKind,
+        v: ValueId,
+        from: TypeId,
+        to: TypeId,
+        const_scalars: &[bool],
+        to_disqualify: &mut BTreeSet<TypeId>,
+    ) {
+        let mut from_m = BTreeSet::new();
+        let mut to_m = BTreeSet::new();
+        collect_soa_container_or_ptr_mentions(
+            self.types,
+            from,
+            &self.state.candidates,
+            &mut from_m,
+        );
+        collect_soa_container_or_ptr_mentions(self.types, to, &self.state.candidates, &mut to_m);
+        if from_m.is_empty() && to_m.is_empty() {
+            return;
+        }
+
+        match kind {
+            CastKind::PointerCoercion => {
+                if let (Some(t1), Some(t2)) = (
+                    is_soa_elem_ptr(self.types, from, &self.state.candidates),
+                    is_soa_elem_ptr(self.types, to, &self.state.candidates),
+                ) {
+                    if t1 == t2 {
+                        return;
+                    }
+                }
+                if let (Some(t1), Some(t2)) = (
+                    is_soa_slice_ptr(self.types, from, &self.state.candidates),
+                    is_soa_slice_ptr(self.types, to, &self.state.candidates),
+                ) {
+                    if t1 == t2 {
+                        return;
+                    }
+                }
+                to_disqualify.extend(from_m);
+                to_disqualify.extend(to_m);
+            }
+            CastKind::PtrToPtr => {
+                let from_soa = is_soa_elem_ptr(self.types, from, &self.state.candidates)
+                    .map(|t| (t, false))
+                    .or_else(|| {
+                        is_soa_slice_ptr(self.types, from, &self.state.candidates)
+                            .map(|t| (t, true))
+                    });
+                let to_soa = is_soa_elem_ptr(self.types, to, &self.state.candidates)
+                    .map(|t| (t, false))
+                    .or_else(|| {
+                        is_soa_slice_ptr(self.types, to, &self.state.candidates).map(|t| (t, true))
+                    });
+                let allowed = match (from_soa, to_soa) {
+                    (Some((t1, false)), Some((t2, false))) => t1 == t2,
+                    (Some((t1, true)), Some((t2, true))) => t1 == t2,
+                    (Some((t1, true)), Some((t2, false))) => t1 == t2,
+                    _ => false,
+                };
+                if !allowed {
+                    to_disqualify.extend(from_m);
+                    to_disqualify.extend(to_m);
+                }
+            }
+            CastKind::Transmute => {
+                let allowed = match (
+                    is_soa_elem_ptr(self.types, from, &self.state.candidates),
+                    is_soa_elem_ptr(self.types, to, &self.state.candidates),
+                ) {
+                    (Some(t1), Some(t2)) if t1 == t2 => true,
+                    _ => matches!(
+                        (
+                            is_soa_slice_ptr(self.types, from, &self.state.candidates),
+                            is_soa_slice_ptr(self.types, to, &self.state.candidates),
+                        ),
+                        (Some(t1), Some(t2)) if t1 == t2
+                    ),
+                };
+                if !allowed {
+                    to_disqualify.extend(from_m);
+                    to_disqualify.extend(to_m);
+                }
+            }
+            CastKind::PointerWithExposedProvenance => {
+                if from_m.is_empty()
+                    && is_soa_elem_ptr(self.types, to, &self.state.candidates).is_some()
+                    && value::is_raw(self.types, to)
+                    && const_scalars.get(v.0 as usize).copied().unwrap_or(false)
+                {
+                    return;
+                }
+                to_disqualify.extend(from_m);
+                to_disqualify.extend(to_m);
+            }
+            CastKind::PointerExposeProvenance => {
+                if to_m.is_empty()
+                    && is_soa_elem_ptr(self.types, from, &self.state.candidates).is_some()
+                {
+                    return;
+                }
+                to_disqualify.extend(from_m);
+                to_disqualify.extend(to_m);
+            }
+            CastKind::Subtype => {
+                if self.types.peeled(from) == self.types.peeled(to) {
+                    return;
+                }
+                to_disqualify.extend(from_m);
+                to_disqualify.extend(to_m);
+            }
+            _ => {
+                to_disqualify.extend(from_m);
+                to_disqualify.extend(to_m);
+            }
+        }
+    }
+
+    fn audit_call(
+        &self,
+        op: &Op,
+        callee: &Callee,
+        args: &[ValueId],
+        semantic: CallSemantic,
+        has_host: bool,
+        to_disqualify: &mut BTreeSet<TypeId>,
+    ) {
+        if has_host {
+            for &arg in args {
+                if let Some(d) = self.func.values.get(arg.0 as usize) {
+                    collect_any_soa_mentions(
+                        self.types,
+                        d.ty,
+                        &self.state.candidates,
+                        to_disqualify,
+                    );
+                }
+            }
+            if let Some(res) = op.result {
+                if let Some(d) = self.func.values.get(res.0 as usize) {
+                    collect_any_soa_mentions(
+                        self.types,
+                        d.ty,
+                        &self.state.candidates,
+                        to_disqualify,
+                    );
+                }
+            }
+            return;
+        }
+
+        if let CallSemantic::Standard(std_op) = semantic {
+            match std_op {
+                StandardOperation::NativeVecNew
+                | StandardOperation::NativeVecWithCapacity
+                | StandardOperation::NativeVecFromElemZeroed
+                | StandardOperation::NativeVecFromArray
+                | StandardOperation::NativeVecCapacity
+                | StandardOperation::NativeVecAsPtr
+                | StandardOperation::NativeVecAsMutPtr
+                | StandardOperation::NativeVecAsSlice
+                | StandardOperation::NativeVecAsMutSlice
+                | StandardOperation::NativeVecReserve
+                | StandardOperation::NativeVecReserveExact
+                | StandardOperation::NativeVecTryReserve
+                | StandardOperation::NativeVecTryReserveExact
+                | StandardOperation::NativeVecShrinkTo
+                | StandardOperation::NativeVecTryShrinkTo
+                | StandardOperation::NativeVecGrowOne
+                | StandardOperation::NativeVecPush
+                | StandardOperation::NativeVecPushMut
+                | StandardOperation::NativeVecPop
+                | StandardOperation::VecAsSlice
+                | StandardOperation::VecResize => {
+                    if let Some(vt) = call_vec_ty(self.func, self.types, op, std_op, args) {
+                        if is_soa_vec(self.types, vt, &self.state.candidates).is_some() {
+                            return;
+                        }
+                    }
+                }
+                StandardOperation::NativeVecFromRawParts
+                | StandardOperation::NativeVecIntoBoxedSlice
+                | StandardOperation::SliceSort
+                | StandardOperation::SliceSortCmp
+                | StandardOperation::TypedAlloc
+                | StandardOperation::TypedRealloc
+                | StandardOperation::TypedDealloc
+                | StandardOperation::TypedDeallocRaw
+                | StandardOperation::BoxNew
+                | StandardOperation::BoxDrop
+                | StandardOperation::RcAllocSlice
+                | StandardOperation::ArcAllocSlice => {
+                    for &arg in args {
+                        if let Some(d) = self.func.values.get(arg.0 as usize) {
+                            collect_any_soa_mentions(
+                                self.types,
+                                d.ty,
+                                &self.state.candidates,
+                                to_disqualify,
+                            );
+                        }
+                    }
+                    if let Some(res) = op.result {
+                        if let Some(d) = self.func.values.get(res.0 as usize) {
+                            collect_any_soa_mentions(
+                                self.types,
+                                d.ty,
+                                &self.state.candidates,
+                                to_disqualify,
+                            );
+                        }
+                    }
+                    return;
+                }
+                _ => {
+                    let mut touched = BTreeSet::new();
+                    for &arg in args {
+                        if let Some(d) = self.func.values.get(arg.0 as usize) {
+                            collect_soa_container_or_ptr_mentions(
+                                self.types,
+                                d.ty,
+                                &self.state.candidates,
+                                &mut touched,
+                            );
+                        }
+                    }
+                    if let Some(res) = op.result {
+                        if let Some(d) = self.func.values.get(res.0 as usize) {
+                            collect_soa_container_or_ptr_mentions(
+                                self.types,
+                                d.ty,
+                                &self.state.candidates,
+                                &mut touched,
+                            );
+                        }
+                    }
+                    if !touched.is_empty() {
+                        to_disqualify.extend(touched);
+                        return;
                     }
                 }
             }
         }
-        ConstTree::Global { target, .. } => {
-            if let GlobalReference::Function { link_name, .. } = target {
-                if let Some(s) = interns.str(*link_name) {
-                    let target_name = JsName::new(s.to_owned());
-                    if let Some(ti) = table.get(&target_name) {
-                        if is_intercepted_native_vec_body(ti) {
-                            if let (Some(ti_body), Some(ti_interns)) =
-                                (&ti.jir.body, ti.jir.interns())
-                            {
-                                for mty in body_mentioned_types(ti_body) {
-                                    collect_any_soa_mentions(
-                                        &ti_interns.types,
-                                        mty,
-                                        candidates,
-                                        to_disqualify,
-                                    );
-                                }
-                            } else {
-                                to_disqualify.extend(candidates.keys().copied());
+
+        let mut touched = BTreeSet::new();
+        for &arg in args {
+            if let Some(d) = self.func.values.get(arg.0 as usize) {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    d.ty,
+                    &self.state.candidates,
+                    &mut touched,
+                );
+            }
+        }
+        if let Some(res) = op.result {
+            if let Some(d) = self.func.values.get(res.0 as usize) {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    d.ty,
+                    &self.state.candidates,
+                    &mut touched,
+                );
+            }
+        }
+        if touched.is_empty() {
+            return;
+        }
+
+        match callee {
+            Callee::Direct { link_name, .. } => {
+                let Some(name_str) = self.interns.str(*link_name) else {
+                    to_disqualify.extend(touched);
+                    return;
+                };
+                if self.repr_bodies.contains_key(name_str)
+                    || !self.table.contains_key(name_str)
+                    || !matches!(self.funcs.get(name_str), Some(Ok(_)))
+                {
+                    to_disqualify.extend(touched);
+                }
+            }
+            Callee::Nop => {}
+            Callee::Runtime { .. }
+            | Callee::Foreign { .. }
+            | Callee::Indirect { .. }
+            | Callee::Virtual { .. }
+            | Callee::Intrinsic { .. } => {
+                to_disqualify.extend(touched);
+            }
+        }
+    }
+
+    fn audit_intrinsic(
+        &self,
+        op: &Op,
+        name: StrId,
+        inst_tys: &[TypeId],
+        args: &[ValueId],
+        to_disqualify: &mut BTreeSet<TypeId>,
+    ) {
+        let mut touched = BTreeSet::new();
+        for &arg in args {
+            if let Some(d) = self.func.values.get(arg.0 as usize) {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    d.ty,
+                    &self.state.candidates,
+                    &mut touched,
+                );
+            }
+        }
+        if let Some(res) = op.result {
+            if let Some(d) = self.func.values.get(res.0 as usize) {
+                collect_soa_container_or_ptr_mentions(
+                    self.types,
+                    d.ty,
+                    &self.state.candidates,
+                    &mut touched,
+                );
+            }
+        }
+        for &ty in inst_tys {
+            collect_soa_container_or_ptr_mentions(
+                self.types,
+                ty,
+                &self.state.candidates,
+                &mut touched,
+            );
+            if let Some(t) = is_soa_elem(self.types, ty, &self.state.candidates) {
+                touched.insert(t);
+            }
+        }
+        if touched.is_empty() {
+            return;
+        }
+
+        let Some(iname) = self.interns.str(name) else {
+            to_disqualify.extend(touched);
+            return;
+        };
+        match iname {
+            "slice_get_unchecked"
+            | "typed_swap_nonoverlapping"
+            | "copy"
+            | "copy_nonoverlapping"
+            | "volatile_copy_memory"
+            | "volatile_copy_nonoverlapping_memory"
+            | "read_via_copy"
+            | "volatile_load"
+            | "unaligned_volatile_load"
+            | "write_via_move"
+            | "volatile_store"
+            | "unaligned_volatile_store"
+            | "offset"
+            | "arith_offset"
+            | "ptr_offset_from"
+            | "ptr_offset_from_unsigned"
+            | "ptr_metadata"
+            | "size_of"
+            | "min_align_of"
+            | "align_of"
+            | "needs_drop"
+            | "type_id"
+            | "type_name"
+            | "forget"
+            | "assume"
+            | "black_box"
+            | "likely"
+            | "unlikely"
+            | "const_eval_select" => {}
+            "aggregate_raw_ptr" => {
+                if let Some(res) = op.result {
+                    if let Some(res_def) = self.func.values.get(res.0 as usize) {
+                        if let Some(t) =
+                            is_soa_slice_ptr(self.types, res_def.ty, &self.state.candidates)
+                        {
+                            let data_ok = args
+                                .first()
+                                .and_then(|a| self.func.values.get(a.0 as usize))
+                                .and_then(|d| {
+                                    is_soa_elem_ptr(self.types, d.ty, &self.state.candidates)
+                                })
+                                == Some(t);
+                            if !data_ok {
+                                to_disqualify.insert(t);
                             }
                         }
                     }
                 }
             }
-            collect_soa_container_or_ptr_mentions(types, ty, candidates, to_disqualify);
-        }
-        ConstTree::StaticField { .. } | ConstTree::StaticSlice { .. } | ConstTree::Dyn { .. } => {
-            collect_soa_container_or_ptr_mentions(types, ty, candidates, to_disqualify);
-        }
-        ConstTree::Unit
-        | ConstTree::Scalar { .. }
-        | ConstTree::Str(_)
-        | ConstTree::Address(_)
-        | ConstTree::SliceAddress { .. } => {}
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn audit_cast(
-    kind: CastKind,
-    v: ValueId,
-    from: TypeId,
-    to: TypeId,
-    types: &TypeTable,
-    const_scalars: &BTreeSet<ValueId>,
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    to_disqualify: &mut BTreeSet<TypeId>,
-) {
-    let mut from_m = BTreeSet::new();
-    let mut to_m = BTreeSet::new();
-    collect_soa_container_or_ptr_mentions(types, from, candidates, &mut from_m);
-    collect_soa_container_or_ptr_mentions(types, to, candidates, &mut to_m);
-    if from_m.is_empty() && to_m.is_empty() {
-        return;
-    }
-
-    match kind {
-        CastKind::PointerCoercion => {
-            // Allow mut-to-const on same SoA element or slice pointer; reject array->slice
-            // unsizing (`&[T; N] -> &[T]`) and unsizing to `dyn Trait`.
-            if let (Some(t1), Some(t2)) = (
-                is_soa_elem_ptr(types, from, candidates),
-                is_soa_elem_ptr(types, to, candidates),
-            ) {
-                if t1 == t2 {
-                    return;
-                }
-            }
-            if let (Some(t1), Some(t2)) = (
-                is_soa_slice_ptr(types, from, candidates),
-                is_soa_slice_ptr(types, to, candidates),
-            ) {
-                if t1 == t2 {
-                    return;
-                }
-            }
-            to_disqualify.extend(from_m);
-            to_disqualify.extend(to_m);
-        }
-        CastKind::PtrToPtr => {
-            let from_soa = is_soa_elem_ptr(types, from, candidates)
-                .map(|t| (t, false))
-                .or_else(|| is_soa_slice_ptr(types, from, candidates).map(|t| (t, true)));
-            let to_soa = is_soa_elem_ptr(types, to, candidates)
-                .map(|t| (t, false))
-                .or_else(|| is_soa_slice_ptr(types, to, candidates).map(|t| (t, true)));
-            // Allow `*const/*mut/&/&mut T` <-> `*const/*mut T`, slice <-> slice, and
-            // `*const [T] -> *const T` (`slice::as_ptr`).
-            let allowed = match (from_soa, to_soa) {
-                (Some((t1, false)), Some((t2, false))) => t1 == t2,
-                (Some((t1, true)), Some((t2, true))) => t1 == t2,
-                (Some((t1, true)), Some((t2, false))) => t1 == t2,
-                _ => false,
-            };
-            if !allowed {
-                to_disqualify.extend(from_m);
-                to_disqualify.extend(to_m);
-            }
-        }
-        CastKind::Transmute => {
-            let allowed = match (
-                is_soa_elem_ptr(types, from, candidates),
-                is_soa_elem_ptr(types, to, candidates),
-            ) {
-                (Some(t1), Some(t2)) if t1 == t2 => true,
-                _ => matches!(
-                    (
-                        is_soa_slice_ptr(types, from, candidates),
-                        is_soa_slice_ptr(types, to, candidates),
-                    ),
-                    (Some(t1), Some(t2)) if t1 == t2
-                ),
-            };
-            if !allowed {
-                to_disqualify.extend(from_m);
-                to_disqualify.extend(to_m);
-            }
-        }
-        CastKind::PointerWithExposedProvenance => {
-            // Allow constant null/dangling pointers (`0 as *const T`, `align as *mut T`).
-            if from_m.is_empty()
-                && is_soa_elem_ptr(types, to, candidates).is_some()
-                && value::is_raw(types, to)
-                && const_scalars.contains(&v)
-            {
-                return;
-            }
-            to_disqualify.extend(from_m);
-            to_disqualify.extend(to_m);
-        }
-        CastKind::PointerExposeProvenance => {
-            // `ptr.addr()` on an SoA pointer calls `__rt.addr(p, size)`, which works on any
-            // `{ buf, off }` object without exposing backing column layout.
-            if to_m.is_empty() && is_soa_elem_ptr(types, from, candidates).is_some() {
-                return;
-            }
-            to_disqualify.extend(from_m);
-            to_disqualify.extend(to_m);
-        }
-        CastKind::Subtype => {
-            if types.peeled(from) == types.peeled(to) {
-                return;
-            }
-            to_disqualify.extend(from_m);
-            to_disqualify.extend(to_m);
-        }
-        _ => {
-            to_disqualify.extend(from_m);
-            to_disqualify.extend(to_m);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn audit_call<V>(
-    func: &Func,
-    types: &TypeTable,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    repr_bodies: &BTreeMap<JsName, V>,
-    op: &Op,
-    callee: &Callee,
-    args: &[ValueId],
-    semantic: CallSemantic,
-    has_host: bool,
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    to_disqualify: &mut BTreeSet<TypeId>,
-) {
-    if has_host {
-        for &arg in args {
-            if let Some(d) = func.values.get(arg.0 as usize) {
-                collect_any_soa_mentions(types, d.ty, candidates, to_disqualify);
-            }
-        }
-        if let Some(res) = op.result {
-            if let Some(d) = func.values.get(res.0 as usize) {
-                collect_any_soa_mentions(types, d.ty, candidates, to_disqualify);
-            }
-        }
-        return;
-    }
-
-    if let CallSemantic::Standard(std_op) = semantic {
-        match std_op {
-            StandardOperation::NativeVecNew
-            | StandardOperation::NativeVecWithCapacity
-            | StandardOperation::NativeVecFromElemZeroed
-            | StandardOperation::NativeVecFromArray
-            | StandardOperation::NativeVecCapacity
-            | StandardOperation::NativeVecAsPtr
-            | StandardOperation::NativeVecAsMutPtr
-            | StandardOperation::NativeVecAsSlice
-            | StandardOperation::NativeVecAsMutSlice
-            | StandardOperation::NativeVecReserve
-            | StandardOperation::NativeVecReserveExact
-            | StandardOperation::NativeVecTryReserve
-            | StandardOperation::NativeVecTryReserveExact
-            | StandardOperation::NativeVecShrinkTo
-            | StandardOperation::NativeVecTryShrinkTo
-            | StandardOperation::NativeVecGrowOne
-            | StandardOperation::NativeVecPush
-            | StandardOperation::NativeVecPushMut
-            | StandardOperation::NativeVecPop
-            | StandardOperation::VecAsSlice
-            | StandardOperation::VecResize => {
-                if let Some(vt) = call_vec_ty(func, types, op, std_op, args) {
-                    if is_soa_vec(types, vt, candidates).is_some() {
-                        // Intercepted and lowered directly by `lower/js/soa.rs`.
-                        return;
+            "transmute" | "transmute_unchecked" => {
+                let from_ty = args
+                    .first()
+                    .and_then(|a| self.func.values.get(a.0 as usize))
+                    .map(|d| d.ty);
+                let to_ty = op
+                    .result
+                    .and_then(|r| self.func.values.get(r.0 as usize))
+                    .map(|d| d.ty);
+                let allowed = match (from_ty, to_ty) {
+                    (Some(f), Some(t)) => {
+                        let same_elem_ptr = matches!(
+                            (
+                                is_soa_elem_ptr(self.types, f, &self.state.candidates),
+                                is_soa_elem_ptr(self.types, t, &self.state.candidates),
+                            ),
+                            (Some(a), Some(b)) if a == b
+                        );
+                        let same_slice_ptr = matches!(
+                            (
+                                is_soa_slice_ptr(self.types, f, &self.state.candidates),
+                                is_soa_slice_ptr(self.types, t, &self.state.candidates),
+                            ),
+                            (Some(a), Some(b)) if a == b
+                        );
+                        same_elem_ptr || same_slice_ptr
                     }
+                    _ => false,
+                };
+                if !allowed {
+                    to_disqualify.extend(touched);
                 }
-            }
-            StandardOperation::NativeVecFromRawParts
-            | StandardOperation::NativeVecIntoBoxedSlice
-            | StandardOperation::SliceSort
-            | StandardOperation::SliceSortCmp
-            | StandardOperation::TypedAlloc
-            | StandardOperation::TypedRealloc
-            | StandardOperation::TypedDealloc
-            | StandardOperation::TypedDeallocRaw
-            | StandardOperation::BoxNew
-            | StandardOperation::BoxDrop
-            | StandardOperation::RcAllocSlice
-            | StandardOperation::ArcAllocSlice => {
-                for &arg in args {
-                    if let Some(d) = func.values.get(arg.0 as usize) {
-                        collect_any_soa_mentions(types, d.ty, candidates, to_disqualify);
-                    }
-                }
-                if let Some(res) = op.result {
-                    if let Some(d) = func.values.get(res.0 as usize) {
-                        collect_any_soa_mentions(types, d.ty, candidates, to_disqualify);
-                    }
-                }
-                return;
             }
             _ => {
-                // Any other standard op touching an SoA container/ptr is conservatively rejected.
-                let mut touched = BTreeSet::new();
-                for &arg in args {
-                    if let Some(d) = func.values.get(arg.0 as usize) {
-                        collect_soa_container_or_ptr_mentions(
-                            types,
-                            d.ty,
-                            candidates,
-                            &mut touched,
-                        );
-                    }
-                }
-                if let Some(res) = op.result {
-                    if let Some(d) = func.values.get(res.0 as usize) {
-                        collect_soa_container_or_ptr_mentions(
-                            types,
-                            d.ty,
-                            candidates,
-                            &mut touched,
-                        );
-                    }
-                }
-                if !touched.is_empty() {
-                    to_disqualify.extend(touched);
-                    return;
-                }
-            }
-        }
-    }
-
-    let mut touched = BTreeSet::new();
-    for &arg in args {
-        if let Some(d) = func.values.get(arg.0 as usize) {
-            collect_soa_container_or_ptr_mentions(types, d.ty, candidates, &mut touched);
-        }
-    }
-    if let Some(res) = op.result {
-        if let Some(d) = func.values.get(res.0 as usize) {
-            collect_soa_container_or_ptr_mentions(types, d.ty, candidates, &mut touched);
-        }
-    }
-    if touched.is_empty() {
-        return;
-    }
-
-    match callee {
-        Callee::Direct { link_name, .. } => {
-            let Some(name_str) = interns.str(*link_name) else {
-                to_disqualify.extend(touched);
-                return;
-            };
-            let target = JsName::new(name_str.to_owned());
-            if repr_bodies.contains_key(&target)
-                || !table.contains_key(&target)
-                || !matches!(funcs.get(&target), Some(Ok(_)))
-            {
                 to_disqualify.extend(touched);
             }
-        }
-        Callee::Nop => {}
-        Callee::Runtime { .. }
-        | Callee::Foreign { .. }
-        | Callee::Indirect { .. }
-        | Callee::Virtual { .. }
-        | Callee::Intrinsic { .. } => {
-            to_disqualify.extend(touched);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn audit_intrinsic(
-    func: &Func,
-    types: &TypeTable,
-    interns: &Interns,
-    op: &Op,
-    name: rcgjs_object::jir::interns::StrId,
-    inst_tys: &[TypeId],
-    args: &[ValueId],
-    candidates: &BTreeMap<TypeId, CandidateShape>,
-    to_disqualify: &mut BTreeSet<TypeId>,
-) {
-    let mut touched = BTreeSet::new();
-    for &arg in args {
-        if let Some(d) = func.values.get(arg.0 as usize) {
-            collect_soa_container_or_ptr_mentions(types, d.ty, candidates, &mut touched);
-        }
-    }
-    if let Some(res) = op.result {
-        if let Some(d) = func.values.get(res.0 as usize) {
-            collect_soa_container_or_ptr_mentions(types, d.ty, candidates, &mut touched);
-        }
-    }
-    for &ty in inst_tys {
-        collect_soa_container_or_ptr_mentions(types, ty, candidates, &mut touched);
-        if let Some(t) = is_soa_elem(types, ty, candidates) {
-            touched.insert(t);
-        }
-    }
-    if touched.is_empty() {
-        return;
-    }
-
-    let Some(iname) = interns.str(name) else {
-        to_disqualify.extend(touched);
-        return;
-    };
-    match iname {
-        "slice_get_unchecked"
-        | "typed_swap_nonoverlapping"
-        | "copy"
-        | "copy_nonoverlapping"
-        | "volatile_copy_memory"
-        | "volatile_copy_nonoverlapping_memory"
-        | "read_via_copy"
-        | "volatile_load"
-        | "unaligned_volatile_load"
-        | "write_via_move"
-        | "volatile_store"
-        | "unaligned_volatile_store"
-        | "offset"
-        | "arith_offset"
-        | "ptr_offset_from"
-        | "ptr_offset_from_unsigned"
-        | "ptr_metadata"
-        | "size_of"
-        | "min_align_of"
-        | "align_of"
-        | "needs_drop"
-        | "type_id"
-        | "type_name"
-        | "forget"
-        | "assume"
-        | "black_box"
-        | "likely"
-        | "unlikely"
-        | "const_eval_select" => {}
-        "aggregate_raw_ptr" => {
-            if let Some(res) = op.result {
-                if let Some(res_def) = func.values.get(res.0 as usize) {
-                    if let Some(t) = is_soa_slice_ptr(types, res_def.ty, candidates) {
-                        let data_ok = args
-                            .first()
-                            .and_then(|a| func.values.get(a.0 as usize))
-                            .and_then(|d| is_soa_elem_ptr(types, d.ty, candidates))
-                            == Some(t);
-                        if !data_ok {
-                            to_disqualify.insert(t);
-                        }
-                    }
-                }
-            }
-        }
-        "transmute" | "transmute_unchecked" => {
-            let from_ty = args
-                .first()
-                .and_then(|a| func.values.get(a.0 as usize))
-                .map(|d| d.ty);
-            let to_ty = op
-                .result
-                .and_then(|r| func.values.get(r.0 as usize))
-                .map(|d| d.ty);
-            let allowed = match (from_ty, to_ty) {
-                (Some(f), Some(t)) => {
-                    let same_elem_ptr = matches!(
-                        (
-                            is_soa_elem_ptr(types, f, candidates),
-                            is_soa_elem_ptr(types, t, candidates),
-                        ),
-                        (Some(a), Some(b)) if a == b
-                    );
-                    let same_slice_ptr = matches!(
-                        (
-                            is_soa_slice_ptr(types, f, candidates),
-                            is_soa_slice_ptr(types, t, candidates),
-                        ),
-                        (Some(a), Some(b)) if a == b
-                    );
-                    same_elem_ptr || same_slice_ptr
-                }
-                _ => false,
-            };
-            if !allowed {
-                to_disqualify.extend(touched);
-            }
-        }
-        _ => {
-            to_disqualify.extend(touched);
         }
     }
 }
@@ -3923,13 +3706,7 @@ mod tests {
 
         let opts = speed_opts();
         let heap = enabled_heap(Some(f.t_node));
-        let soa = Arc::new(run_plan(
-            func.clone(),
-            f.interns.clone(),
-            &opts,
-            &heap,
-            true,
-        ));
+        let soa = run_plan(func.clone(), f.interns.clone(), &opts, &heap, true);
         assert!(soa.layouts.contains_key(&f.t_node));
 
         let plan_fn = crate::lower::fuse::plan(&func, None, &f.interns.types, &f.interns, &opts);
@@ -3971,7 +3748,7 @@ mod tests {
             None,
         )
         .with_heap(Some(&heap))
-        .with_soa(Some(Arc::clone(&soa)));
+        .with_soa(Some(&soa));
         let (body, _tmps) = crate::lower::js::emit::emit(&cx, structured.region).expect("emit");
         let mut prelude = Vec::new();
         for v in &plan_fn.declared_order {

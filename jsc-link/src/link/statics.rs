@@ -481,79 +481,27 @@ impl<'a> Declaration<'a> {
     }
 }
 
-/// Whether `text`, a literal [`literal_len`] accepted, has a `__proto__` key anywhere: the bare
-/// name or the string `"__proto__"` directly after `{` or `,` and directly before `:`.
-///
-/// In an object literal that one key sets the object's prototype instead of creating a property,
-/// so `Object.assign` (which copies own properties) would drop it. A Rust field named `__proto__`
-/// prints as exactly that key. The scan is the printer's token shape: double quoted strings are
-/// skipped as tokens (the only quotes [`literal_len`] lets through), and a name after `.` is a
-/// property read, not a key.
-fn has_proto_key(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let next_significant = |mut at: usize| {
-        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        bytes.get(at).copied()
-    };
-    let is_key = |previous: u8, after: usize| {
-        matches!(previous, b'{' | b',') && next_significant(after) == Some(b':')
-    };
-    let mut previous = 0u8;
-    let mut at = 0;
-    while at < bytes.len() {
-        let start = at;
-        match bytes[at] {
-            b'"' => {
-                at += 1;
-                while at < bytes.len() {
-                    match bytes[at] {
-                        b'\\' => at += 2,
-                        b'"' => {
-                            at += 1;
-                            break;
-                        }
-                        _ => at += 1,
-                    }
-                }
-                let at = at.min(bytes.len());
-                if &text[start..at] == "\"__proto__\"" && is_key(previous, at) {
-                    return true;
-                }
-                previous = b'"';
-            }
-            byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
-                while at < bytes.len()
-                    && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'$'))
-                {
-                    at += 1;
-                }
-                let read = start > 0 && bytes[start - 1] == b'.';
-                if &text[start..at] == "__proto__" && !read && is_key(previous, at) {
-                    return true;
-                }
-                previous = bytes[at - 1];
-            }
-            byte if byte.is_ascii_whitespace() => at += 1,
-            byte => {
-                previous = byte;
-                at += 1;
-            }
-        }
-    }
-    false
+enum LiteralToken<'a> {
+    String(&'a str),
+    Ident(&'a str),
 }
 
-/// Whether `text`, a literal [`literal_len`] accepted, reads a property or element (`.` or `[`)
-/// off any identifier in `cycle_names`.
-///
-/// During two-step cycle initialization (`let A = {}; let B = {}; Object.assign(A, <litA>);`),
-/// every cycle member starts as an empty object or array. Capturing a cycle member by reference
-/// (`next: B`, `{ buf: B, off: "x" }`, `{ buf: B, off: 0, len: 3 }`) is sound because no property
-/// of `B` is read yet; reading a nested property or element (`B.inner`, `S.inner`, `S.arr`,
-/// `B[0]`) would evaluate to `undefined` before `B`/`S` is populated.
-fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool {
+struct LiteralTokenCtx<'a> {
+    token: LiteralToken<'a>,
+    previous: u8,
+    next: Option<u8>,
+}
+
+impl LiteralTokenCtx<'_> {
+    fn is_object_key(&self) -> bool {
+        matches!(self.previous, b'{' | b',') && self.next == Some(b':')
+    }
+}
+
+/// Scans double-quoted strings and identifiers in `text` (a literal [`literal_len`] accepted),
+/// invoking `predicate` with each token and its immediately surrounding non-whitespace bytes.
+/// Returns `true` on the first token for which `predicate` returns `true`.
+fn any_literal_token(text: &str, mut predicate: impl FnMut(LiteralTokenCtx<'_>) -> bool) -> bool {
     let bytes = text.as_bytes();
     let next_significant = |mut at: usize| {
         while at < bytes.len() && bytes[at].is_ascii_whitespace() {
@@ -579,6 +527,13 @@ fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool 
                     }
                 }
                 at = at.min(bytes.len());
+                if predicate(LiteralTokenCtx {
+                    token: LiteralToken::String(&text[start..at]),
+                    previous,
+                    next: next_significant(at),
+                }) {
+                    return true;
+                }
                 previous = b'"';
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
@@ -587,15 +542,11 @@ fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool 
                 {
                     at += 1;
                 }
-                let ident = &text[start..at];
-                let after_dot = previous == b'.';
-                let next = next_significant(at);
-                let is_key = matches!(previous, b'{' | b',') && next == Some(b':');
-                if !after_dot
-                    && !is_key
-                    && cycle_names.contains(ident)
-                    && matches!(next, Some(b'.' | b'['))
-                {
+                if predicate(LiteralTokenCtx {
+                    token: LiteralToken::Ident(&text[start..at]),
+                    previous,
+                    next: next_significant(at),
+                }) {
                     return true;
                 }
                 previous = bytes[at - 1];
@@ -608,6 +559,44 @@ fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool 
         }
     }
     false
+}
+
+/// Whether `text`, a literal [`literal_len`] accepted, has a `__proto__` key anywhere: the bare
+/// name or the string `"__proto__"` directly after `{` or `,` and directly before `:`.
+///
+/// In an object literal that one key sets the object's prototype instead of creating a property,
+/// so `Object.assign` (which copies own properties) would drop it. A Rust field named `__proto__`
+/// prints as exactly that key. The scan is the printer's token shape: double quoted strings are
+/// skipped as tokens (the only quotes [`literal_len`] lets through), and a name after `.` is a
+/// property read, not a key.
+fn has_proto_key(text: &str) -> bool {
+    any_literal_token(text, |tok| {
+        tok.is_object_key()
+            && matches!(
+                tok.token,
+                LiteralToken::String("\"__proto__\"") | LiteralToken::Ident("__proto__")
+            )
+    })
+}
+
+/// Whether `text`, a literal [`literal_len`] accepted, reads a property or element (`.` or `[`)
+/// off any identifier in `cycle_names`.
+///
+/// During two-step cycle initialization (`let A = {}; let B = {}; Object.assign(A, <litA>);`),
+/// every cycle member starts as an empty object or array. Capturing a cycle member by reference
+/// (`next: B`, `{ buf: B, off: "x" }`, `{ buf: B, off: 0, len: 3 }`) is sound because no property
+/// of `B` is read yet; reading a nested property or element (`B.inner`, `S.inner`, `S.arr`,
+/// `B[0]`) would evaluate to `undefined` before `B`/`S` is populated.
+fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool {
+    any_literal_token(text, |tok| match tok.token {
+        LiteralToken::Ident(ident) => {
+            tok.previous != b'.'
+                && !tok.is_object_key()
+                && cycle_names.contains(ident)
+                && matches!(tok.next, Some(b'.' | b'['))
+        }
+        LiteralToken::String(_) => false,
+    })
 }
 
 /// The byte length of the object or array literal `text` starts with, or `None` if it is not

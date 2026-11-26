@@ -21,6 +21,7 @@
 //!      `_blk_get`, zero `_boxes` WeakMap lookup/insert).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::ControlFlow;
 
 use rcgjs_object::item::AllocatorProvider;
 use rcgjs_object::jir::decline::Decline;
@@ -32,10 +33,10 @@ use rcgjs_object::jir::semantic::{
 use rcgjs_object::jir::types::{
     AllocatorIdentity, FieldKey, RepresentationCandidate, TypeId, TypeKind, TypeTable,
 };
-use rcgjs_object::jsast;
 use rcgjs_object::object::ItemKind;
 
 use crate::analysis::byte_views::ByteViewPlan;
+use crate::analysis::reach::{self, ReachPolicy};
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
 use crate::opts::{Opts, Profile, StrRepr};
@@ -192,13 +193,89 @@ impl HeapPlan {
     pub fn is_packed_arr_vec(&self, table: &TypeTable, vec_ty: TypeId) -> bool {
         self.native_vec_enabled && self.packed_arr_vec_types.contains(&table.peeled(vec_ty))
     }
+
+    /// Whether any Tier-A native heap/string/vec lowering mode is enabled.
+    fn any_native_enabled(&self) -> bool {
+        self.typed_heap_enabled || self.native_string_enabled || self.native_vec_enabled
+    }
+
+    /// Whether `item` is a hook or no-op drop glue bypassed under this plan's enabled modes.
+    fn skips_hook(&self, item: Option<&LinkItem>) -> bool {
+        (self.typed_heap_enabled && is_typed_heap_hook_item(item))
+            || (self.native_string_enabled
+                && (is_native_string_hook_item(item) || is_string_drop_glue(item)))
+            || (self.native_vec_enabled
+                && (is_native_vec_hook_item(item)
+                    || is_noop_global_vec_drop_glue(
+                        item,
+                        self.native_string_enabled,
+                        self.native_vec_enabled,
+                    )))
+    }
 }
 
-fn is_host_delegated_body(item: &LinkItem) -> bool {
-    matches!(
-        item.jir.body.as_ref().map(|b| b.semantic),
-        Some(BodySemantic::Standard(op)) if crate::lower::semantic_ops::num::is_float_from_str(op)
-    )
+struct FilterReprPolicy<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    live: &'a BTreeSet<JsName>,
+    heap: &'a HeapPlan,
+}
+
+impl ReachPolicy<JsName> for FilterReprPolicy<'_> {
+    fn expand(&mut self, name: &JsName, enqueue: &mut dyn FnMut(JsName)) {
+        let Some(item) = self.table.get(name) else {
+            return;
+        };
+        if self.heap.skips_hook(Some(item)) || reach::is_host_delegated_body(item, false) {
+            return;
+        }
+        let skip_typed = self.heap.typed_heap_enabled;
+        let skip_nstr = self.heap.native_string_enabled;
+        let skip_nvec = self.heap.native_vec_enabled;
+        let func_opt = self.funcs.get(name).and_then(|r| r.as_ref().ok());
+        if let (Some(func), Some(interns)) = (func_opt, item.jir.interns()) {
+            for callee in jir_callees(func, interns, skip_typed, skip_nstr, skip_nvec) {
+                let target_item = self.table.get(callee);
+                if skip_nvec
+                    && is_global_vec_drop_glue(Some(item))
+                    && is_raw_vec_drop_glue(target_item)
+                {
+                    continue;
+                }
+                if !self.heap.skips_hook(target_item) {
+                    if let Some(live_name) = self.live.get(callee) {
+                        enqueue(live_name.clone());
+                    }
+                }
+            }
+            for r in &item.refs {
+                if !self.live.contains(r) || self.heap.skips_hook(self.table.get(r)) {
+                    continue;
+                }
+                if skip_nvec
+                    && is_global_vec_drop_glue(Some(item))
+                    && is_raw_vec_drop_glue(self.table.get(r))
+                {
+                    continue;
+                }
+                if skip_typed
+                    && (is_global_alloc_impl_item_opt(self.table.get(r))
+                        || is_raw_alloc_shim_name(r.as_str()))
+                    && !is_rc_or_sync_item(item)
+                    && !is_global_alloc_impl_item(item)
+                {
+                    continue;
+                }
+                enqueue(r.clone());
+            }
+        } else {
+            for r in &item.refs {
+                if self.live.contains(r) && !self.heap.skips_hook(self.table.get(r)) {
+                    enqueue(r.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Filters `live` down to items reachable when intercepted Tier A typed-heap / native-`String` /
@@ -211,97 +288,39 @@ pub fn filter_live_for_repr(
     opts: &Opts,
     heap: &HeapPlan,
 ) -> BTreeSet<JsName> {
-    let skip_typed = heap.typed_heap_enabled;
-    let skip_nstr = heap.native_string_enabled;
-    let skip_nvec = heap.native_vec_enabled;
-    if !skip_typed && !skip_nstr && !skip_nvec {
+    if !heap.any_native_enabled() {
         return live.clone();
     }
-    let is_skipped_hook = |item: Option<&LinkItem>| {
-        (skip_typed && is_typed_heap_hook_item(item))
-            || (skip_nstr && (is_native_string_hook_item(item) || is_string_drop_glue(item)))
-            || (skip_nvec
-                && (is_native_vec_hook_item(item)
-                    || is_noop_global_vec_drop_glue(item, skip_nstr, skip_nvec)))
-    };
 
-    let mut visited: BTreeSet<JsName> = BTreeSet::new();
-    let mut queue: VecDeque<JsName> = VecDeque::new();
-    for name in live {
-        let Some(item) = table.get(name) else {
-            continue;
-        };
-        if (item.linkage.root
-            || item.linkage.exported
-            || opts.roots.iter().any(|r| r == name.as_str()))
-            && !is_skipped_hook(Some(item))
-            && visited.insert(name.clone())
-        {
-            queue.push_back(name.clone());
-        }
-    }
-    if visited.is_empty() {
+    let seeds: Vec<JsName> = live
+        .iter()
+        .filter(|name| {
+            let Some(item) = table.get(*name) else {
+                return false;
+            };
+            (item.linkage.root
+                || item.linkage.exported
+                || opts.roots.iter().any(|r| r == name.as_str()))
+                && !heap.skips_hook(Some(item))
+        })
+        .cloned()
+        .collect();
+    if seeds.is_empty() {
         // Standalone test graphs with no root/exported flags: strip only the hook items.
         return live
             .iter()
-            .filter(|name| !is_skipped_hook(table.get(*name)))
+            .filter(|name| !heap.skips_hook(table.get(*name)))
             .cloned()
             .collect();
     }
-    while let Some(name) = queue.pop_front() {
-        let Some(item) = table.get(&name) else {
-            continue;
-        };
-        if is_skipped_hook(Some(item)) || is_host_delegated_body(item) {
-            continue;
-        }
-        let func_opt = funcs.get(&name).and_then(|r| r.as_ref().ok());
-        if let (Some(func), Some(interns)) = (func_opt, item.jir.interns()) {
-            for callee in jir_callees(func, interns, skip_typed, skip_nstr, skip_nvec) {
-                if skip_nvec
-                    && is_global_vec_drop_glue(Some(item))
-                    && is_raw_vec_drop_glue(table.get(&callee))
-                {
-                    continue;
-                }
-                if live.contains(&callee)
-                    && !is_skipped_hook(table.get(&callee))
-                    && visited.insert(callee.clone())
-                {
-                    queue.push_back(callee);
-                }
-            }
-            for r in &item.refs {
-                if !live.contains(r) || is_skipped_hook(table.get(r)) {
-                    continue;
-                }
-                if skip_nvec
-                    && is_global_vec_drop_glue(Some(item))
-                    && is_raw_vec_drop_glue(table.get(r))
-                {
-                    continue;
-                }
-                if skip_typed
-                    && (is_global_alloc_impl_item_opt(table.get(r))
-                        || is_raw_alloc_shim_name(r.as_str()))
-                    && !is_rc_or_sync_item(item)
-                    && !is_global_alloc_impl_item(item)
-                {
-                    continue;
-                }
-                if visited.insert(r.clone()) {
-                    queue.push_back(r.clone());
-                }
-            }
-        } else {
-            for r in &item.refs {
-                if live.contains(r) && !is_skipped_hook(table.get(r)) && visited.insert(r.clone()) {
-                    queue.push_back(r.clone());
-                }
-            }
-        }
-    }
-    visited
+
+    let mut policy = FilterReprPolicy {
+        table,
+        funcs,
+        live,
+        heap,
+    };
+    reach::walk_reachable(seeds, &mut policy)
 }
 
 /// Computes the conservative whole-program [`HeapPlan`] over items reachable from program roots.
@@ -348,6 +367,315 @@ pub fn analyze_reachable(
     }
 }
 
+/// Two-colour reachability worklist distinguishing items reached solely inside `alloc::rc` /
+/// `alloc::sync` (`from_non_rc = false`) from items reached from general / user code
+/// (`from_non_rc = true`).
+struct TwoColorBfs {
+    visited_rc: BTreeSet<JsName>,
+    visited_non_rc: BTreeSet<JsName>,
+    queue: VecDeque<(JsName, bool)>,
+}
+
+impl TwoColorBfs {
+    fn new(seeds: impl IntoIterator<Item = JsName>) -> Self {
+        let mut bfs = Self {
+            visited_rc: BTreeSet::new(),
+            visited_non_rc: BTreeSet::new(),
+            queue: VecDeque::new(),
+        };
+        for seed in seeds {
+            bfs.enqueue(&seed, true);
+        }
+        bfs
+    }
+
+    fn enqueue(&mut self, callee: &JsName, from_non_rc: bool) {
+        if from_non_rc {
+            if self.visited_non_rc.insert(callee.clone()) {
+                self.queue.push_back((callee.clone(), true));
+            }
+        } else if !self.visited_non_rc.contains(callee) && self.visited_rc.insert(callee.clone()) {
+            self.queue.push_back((callee.clone(), false));
+        }
+    }
+
+    fn pop(&mut self) -> Option<(JsName, bool)> {
+        self.queue.pop_front()
+    }
+}
+
+struct HeapReachState<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    native_bodies: &'a BTreeMap<JsName, NativeBody>,
+    typed_heap_enabled: bool,
+    skip_native_string: bool,
+    skip_native_vec: bool,
+    bfs: TwoColorBfs,
+    raw_alloc_reachable: bool,
+    non_rc_raw_alloc_reachable: bool,
+    boxed: BoxedSet,
+    copy_one_boxed: BoxedSet,
+    tail_adts: BoxedSet,
+    string_internally_accessed: bool,
+    vec_internally_accessed: bool,
+    packed_arr_candidates: BTreeSet<TypeId>,
+    packed_arr_disqualified: BTreeSet<TypeId>,
+    all_packed_arr_disqualified: bool,
+    scanned_funcs: BTreeSet<JsName>,
+}
+
+#[derive(Clone, Copy)]
+struct ItemReachRole {
+    next_non_rc: bool,
+    in_rc_or_sync: bool,
+    in_alloc_global_impl: bool,
+}
+
+impl<'a> HeapReachState<'a> {
+    fn visit_native_body(&mut self, body: &NativeBody, from_non_rc: bool) {
+        for ident in reach::native_body_idents(body) {
+            if let Some((key, _)) = self.table.get_key_value(ident.as_str()) {
+                self.bfs.enqueue(key, from_non_rc);
+            }
+        }
+    }
+
+    fn visit_jir_item(
+        &mut self,
+        name: &JsName,
+        item: &LinkItem,
+        func: &Func,
+        interns: &Interns,
+        role: ItemReachRole,
+    ) {
+        let ItemReachRole {
+            next_non_rc,
+            in_rc_or_sync,
+            in_alloc_global_impl,
+        } = role;
+        if self.scanned_funcs.insert(name.clone()) {
+            scan_func_for_boxes(
+                func,
+                &interns.types,
+                interns,
+                &mut self.boxed,
+                &mut self.copy_one_boxed,
+                &mut self.tail_adts,
+            );
+            if self.skip_native_string && func_uses_string_internals(func, &interns.types, interns)
+            {
+                self.string_internally_accessed = true;
+            }
+            if self.skip_native_vec {
+                if !is_global_vec_drop_glue(Some(item))
+                    && func_uses_vec_internals(func, &interns.types, interns)
+                {
+                    self.vec_internally_accessed = true;
+                }
+                scan_func_for_packed_arr_vecs(
+                    func,
+                    &interns.types,
+                    &mut self.packed_arr_candidates,
+                    &mut self.packed_arr_disqualified,
+                );
+            }
+        }
+        // Traverse callees from JIR so we skip dead fallback bodies of intercepted
+        // `StandardOperation::is_typed_heap()` / `is_native_string()` / `is_native_vec()` calls when enabled.
+        for callee in jir_callees(
+            func,
+            interns,
+            self.typed_heap_enabled,
+            self.skip_native_string,
+            self.skip_native_vec,
+        ) {
+            let target_entry = self.table.get_key_value(callee);
+            let target_item = target_entry.map(|(_, v)| v);
+            if self.skip_native_string && is_string_drop_glue(target_item) {
+                continue;
+            }
+            if self.skip_native_vec
+                && is_noop_global_vec_drop_glue(
+                    target_item,
+                    self.skip_native_string,
+                    self.skip_native_vec,
+                )
+            {
+                continue;
+            }
+            if is_raw_alloc_shim_name(callee) {
+                self.raw_alloc_reachable = true;
+                if next_non_rc {
+                    self.non_rc_raw_alloc_reachable = true;
+                }
+            }
+            if let Some((key, _)) = target_entry {
+                self.bfs.enqueue(key, next_non_rc);
+            }
+        }
+        // Also follow non-call references (vtables, statics, fn pointers, drop glue) recorded
+        // on the item, excluding intercepted fallback hook symbols.
+        for r in &item.refs {
+            let Some(ref_item) = self.table.get(r) else {
+                continue;
+            };
+            if self.typed_heap_enabled && is_typed_heap_hook_item(Some(ref_item)) {
+                continue;
+            }
+            if self.skip_native_string
+                && (is_native_string_hook_item(Some(ref_item))
+                    || is_string_drop_glue(Some(ref_item)))
+            {
+                continue;
+            }
+            if self.skip_native_vec
+                && (is_native_vec_hook_item(Some(ref_item))
+                    || is_noop_global_vec_drop_glue(
+                        Some(ref_item),
+                        self.skip_native_string,
+                        self.skip_native_vec,
+                    )
+                    || (is_global_vec_drop_glue(Some(item))
+                        && is_raw_vec_drop_glue(Some(ref_item))))
+            {
+                continue;
+            }
+            if self.typed_heap_enabled
+                && is_global_alloc_impl_item(ref_item)
+                && !in_rc_or_sync
+                && !in_alloc_global_impl
+            {
+                // Only follow `Global::alloc_impl_*` / `grow_impl_*` / `shrink_impl_*` if
+                // actually referenced in the JIR body (already covered by `jir_callees`).
+                continue;
+            }
+            if self.typed_heap_enabled && is_raw_alloc_shim_name(r.as_str()) {
+                // Only count raw alloc shims that actually appear in `jir_callees` (avoid
+                // stale item.refs from dead branches / pruned hooks).
+                continue;
+            }
+            self.bfs.enqueue(r, next_non_rc);
+        }
+    }
+
+    fn visit_fallback_item(&mut self, name: &JsName, item: &LinkItem, next_non_rc: bool) {
+        // Non-JIR or declined item: scan JS conservatively.
+        if self.scanned_funcs.insert(name.clone()) {
+            if item.js.contains("__rt.alloc(")
+                || item.js.contains("__rt.alloc_zeroed(")
+                || item.js.contains("__rt.realloc(")
+                || item.js.contains("__rt.dealloc(")
+            {
+                self.raw_alloc_reachable = true;
+                if next_non_rc {
+                    self.non_rc_raw_alloc_reachable = true;
+                }
+            }
+            if item.js.contains("__rt.box(")
+                || item.js.contains("__rt.unref(")
+                || item.js.contains("__rt.tail_ref(")
+                || item.js.contains("__rt.tail_slice(")
+            {
+                self.boxed.all_adts_boxed = true;
+                self.boxed.all_non_adt_boxed = true;
+            }
+            if self.skip_native_string
+                && item.kind == ItemKind::Fn
+                && (item.debug_path.contains("alloc::string")
+                    || item.name.as_str().contains("alloc$string$")
+                    || item.js.contains(".vec"))
+            {
+                self.string_internally_accessed = true;
+            }
+            if self.skip_native_vec {
+                if item.kind == ItemKind::Fn {
+                    self.all_packed_arr_disqualified = true;
+                    if item.debug_path.contains("alloc::vec")
+                        || item.name.as_str().contains("alloc$vec$")
+                        || item.js.contains(".buf")
+                    {
+                        self.vec_internally_accessed = true;
+                    }
+                } else if item.kind == ItemKind::Static {
+                    if let (Some(body), Some(interns)) =
+                        (item.jir.body.as_ref(), item.jir.interns())
+                    {
+                        collect_embedded_arr_vecs(
+                            &interns.types,
+                            body.signature.result,
+                            &mut self.packed_arr_disqualified,
+                        );
+                    } else if item.js.contains("_nv_ea") || item.js.contains(".buf") {
+                        self.all_packed_arr_disqualified = true;
+                    }
+                }
+            }
+        }
+        for r in &item.refs {
+            let Some(ref_item) = self.table.get(r) else {
+                continue;
+            };
+            if self.skip_native_string
+                && (is_native_string_hook_item(Some(ref_item))
+                    || is_string_drop_glue(Some(ref_item)))
+            {
+                continue;
+            }
+            if self.skip_native_vec
+                && (is_native_vec_hook_item(Some(ref_item))
+                    || is_noop_global_vec_drop_glue(
+                        Some(ref_item),
+                        self.skip_native_string,
+                        self.skip_native_vec,
+                    ))
+            {
+                continue;
+            }
+            self.bfs.enqueue(r, next_non_rc);
+        }
+    }
+
+    fn into_plan(mut self) -> (HeapPlan, bool, bool) {
+        if !self.typed_heap_enabled || self.non_rc_raw_alloc_reachable {
+            self.boxed.merge(self.copy_one_boxed);
+        }
+        if self.raw_alloc_reachable {
+            self.boxed.merge(self.tail_adts);
+        }
+        let any_boxed = self.boxed.any_boxed();
+        let native_vec_enabled = self.skip_native_vec
+            && !self.vec_internally_accessed
+            && !self.non_rc_raw_alloc_reachable;
+        let packed_arr_vec_types = if native_vec_enabled && !self.all_packed_arr_disqualified {
+            self.packed_arr_candidates
+                .into_iter()
+                .filter(|ty| !self.packed_arr_disqualified.contains(ty))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        (
+            HeapPlan {
+                typed_heap_enabled: self.typed_heap_enabled,
+                native_string_enabled: self.skip_native_string && !self.string_internally_accessed,
+                native_vec_enabled,
+                raw_alloc_reachable: self.raw_alloc_reachable,
+                non_rc_raw_alloc_reachable: self.non_rc_raw_alloc_reachable,
+                any_boxed,
+                boxed_defs: self.boxed.boxed_defs,
+                boxed_non_adt_keys: self.boxed.boxed_non_adt_keys,
+                all_non_adt_boxed: self.boxed.all_non_adt_boxed,
+                all_adts_boxed: self.boxed.all_adts_boxed,
+                smi_u32_fields: BTreeSet::new(),
+                packed_arr_vec_types,
+            },
+            self.string_internally_accessed,
+            self.vec_internally_accessed,
+        )
+    }
+}
+
 fn run_reachability(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
@@ -357,78 +685,60 @@ fn run_reachability(
     skip_native_string: bool,
     skip_native_vec: bool,
 ) -> (HeapPlan, bool, bool) {
-    // Two-colour reachability: `(item, from_non_rc)` so we distinguish raw alloc calls that
-    // originate solely inside `alloc::rc` / `alloc::sync` (`Rc<[T]>`) from user / general raw
-    // allocations (`alloc::alloc::alloc`, `Vec::from_raw_parts`, etc.).
-    let mut visited_rc: BTreeSet<JsName> = BTreeSet::new();
-    let mut visited_non_rc: BTreeSet<JsName> = BTreeSet::new();
-    let mut queue: VecDeque<(JsName, bool)> = VecDeque::new();
+    let mut state = HeapReachState {
+        table,
+        funcs,
+        native_bodies,
+        typed_heap_enabled,
+        skip_native_string,
+        skip_native_vec,
+        bfs: TwoColorBfs::new(reach::root_seeds(table, &opts.roots, false)),
+        raw_alloc_reachable: false,
+        non_rc_raw_alloc_reachable: false,
+        boxed: BoxedSet::default(),
+        copy_one_boxed: BoxedSet::default(),
+        tail_adts: BoxedSet::default(),
+        string_internally_accessed: false,
+        vec_internally_accessed: false,
+        packed_arr_candidates: BTreeSet::new(),
+        packed_arr_disqualified: BTreeSet::new(),
+        all_packed_arr_disqualified: false,
+        scanned_funcs: BTreeSet::new(),
+    };
 
-    for (name, item) in table {
-        if (item.linkage.root || opts.roots.iter().any(|r| r == name.as_str()))
-            && visited_non_rc.insert(name.clone())
-        {
-            queue.push_back((name.clone(), true));
-        }
-    }
-
-    let mut raw_alloc_reachable = false;
-    let mut non_rc_raw_alloc_reachable = false;
-    let mut boxed = BoxedSet::default();
-    let mut copy_one_boxed = BoxedSet::default();
-    let mut tail_adts = BoxedSet::default();
-    let mut string_internally_accessed = false;
-    let mut vec_internally_accessed = false;
-    let mut packed_arr_candidates: BTreeSet<TypeId> = BTreeSet::new();
-    let mut packed_arr_disqualified: BTreeSet<TypeId> = BTreeSet::new();
-    let mut all_packed_arr_disqualified = false;
-    let mut scanned_funcs: BTreeSet<JsName> = BTreeSet::new();
-
-    while let Some((name, from_non_rc)) = queue.pop_front() {
-        if let Some(body) = native_bodies.get(&name) {
-            let mut idents = BTreeSet::new();
-            for stmt in &body.statements {
-                jsast::visit_idents(stmt, &mut |id| {
-                    idents.insert(JsName::new(id.to_owned()));
-                });
-            }
-            for r in idents {
-                if table.contains_key(&r) {
-                    enqueue(
-                        &r,
-                        from_non_rc,
-                        &mut visited_rc,
-                        &mut visited_non_rc,
-                        &mut queue,
-                    );
-                }
-            }
+    while let Some((name, from_non_rc)) = state.bfs.pop() {
+        if let Some(body) = state.native_bodies.get(&name) {
+            state.visit_native_body(body, from_non_rc);
             continue;
         }
-        let Some(item) = table.get(&name) else {
+        let Some(item) = state.table.get(&name) else {
             continue;
         };
-        if skip_native_string
+        if state.skip_native_string
             && (is_native_string_hook_item(Some(item)) || is_string_drop_glue(Some(item)))
         {
             continue;
         }
-        if skip_native_vec
+        if state.skip_native_vec
             && (is_native_vec_hook_item(Some(item))
-                || is_noop_global_vec_drop_glue(Some(item), skip_native_string, skip_native_vec))
+                || is_noop_global_vec_drop_glue(
+                    Some(item),
+                    state.skip_native_string,
+                    state.skip_native_vec,
+                ))
         {
             continue;
         }
         if item.kind == ItemKind::Alloc {
             if is_raw_alloc_shim_name(name.as_str()) {
-                raw_alloc_reachable = true;
+                state.raw_alloc_reachable = true;
                 if from_non_rc {
-                    non_rc_raw_alloc_reachable = true;
+                    state.non_rc_raw_alloc_reachable = true;
                 }
             }
             continue;
         }
-        if is_host_delegated_body(item) {
+        if reach::is_host_delegated_body(item, false) {
             continue;
         }
 
@@ -446,246 +756,25 @@ fn run_reachability(
             true
         };
 
-        let func_opt = funcs.get(&name).and_then(|r| r.as_ref().ok());
-
+        let func_opt = state.funcs.get(&name).and_then(|r| r.as_ref().ok());
         if let (Some(func), Some(interns)) = (func_opt, item.jir.interns()) {
-            if scanned_funcs.insert(name.clone()) {
-                scan_func_for_boxes(
-                    func,
-                    &interns.types,
-                    interns,
-                    &mut boxed,
-                    &mut copy_one_boxed,
-                    &mut tail_adts,
-                );
-                if skip_native_string && func_uses_string_internals(func, &interns.types, interns) {
-                    string_internally_accessed = true;
-                }
-                if skip_native_vec {
-                    if !is_global_vec_drop_glue(Some(item))
-                        && func_uses_vec_internals(func, &interns.types, interns)
-                    {
-                        vec_internally_accessed = true;
-                    }
-                    scan_func_for_packed_arr_vecs(
-                        func,
-                        &interns.types,
-                        &mut packed_arr_candidates,
-                        &mut packed_arr_disqualified,
-                    );
-                }
-            }
-            // Traverse callees from JIR so we skip dead fallback bodies of intercepted
-            // `StandardOperation::is_typed_heap()` / `is_native_string()` / `is_native_vec()` calls when enabled.
-            for callee in jir_callees(
+            state.visit_jir_item(
+                &name,
+                item,
                 func,
                 interns,
-                typed_heap_enabled,
-                skip_native_string,
-                skip_native_vec,
-            ) {
-                if skip_native_string && is_string_drop_glue(table.get(&callee)) {
-                    continue;
-                }
-                if skip_native_vec
-                    && is_noop_global_vec_drop_glue(
-                        table.get(&callee),
-                        skip_native_string,
-                        skip_native_vec,
-                    )
-                {
-                    continue;
-                }
-                if is_raw_alloc_shim_name(callee.as_str()) {
-                    raw_alloc_reachable = true;
-                    if next_non_rc {
-                        non_rc_raw_alloc_reachable = true;
-                    }
-                }
-                if !table.contains_key(&callee) {
-                    continue;
-                }
-                enqueue(
-                    &callee,
+                ItemReachRole {
                     next_non_rc,
-                    &mut visited_rc,
-                    &mut visited_non_rc,
-                    &mut queue,
-                );
-            }
-            // Also follow non-call references (vtables, statics, fn pointers, drop glue) recorded
-            // on the item, excluding intercepted fallback hook symbols.
-            for r in &item.refs {
-                if !table.contains_key(r) {
-                    continue;
-                }
-                if typed_heap_enabled && is_typed_heap_hook_item(table.get(r)) {
-                    continue;
-                }
-                if skip_native_string
-                    && (is_native_string_hook_item(table.get(r))
-                        || is_string_drop_glue(table.get(r)))
-                {
-                    continue;
-                }
-                if skip_native_vec
-                    && (is_native_vec_hook_item(table.get(r))
-                        || is_noop_global_vec_drop_glue(
-                            table.get(r),
-                            skip_native_string,
-                            skip_native_vec,
-                        )
-                        || (is_global_vec_drop_glue(Some(item))
-                            && is_raw_vec_drop_glue(table.get(r))))
-                {
-                    continue;
-                }
-                if typed_heap_enabled
-                    && is_global_alloc_impl_item_opt(table.get(r))
-                    && !in_rc_or_sync
-                    && !in_alloc_global_impl
-                {
-                    // Only follow `Global::alloc_impl_*` / `grow_impl_*` / `shrink_impl_*` if
-                    // actually referenced in the JIR body (already covered by `jir_callees`).
-                    continue;
-                }
-                if typed_heap_enabled && is_raw_alloc_shim_name(r.as_str()) {
-                    // Only count raw alloc shims that actually appear in `jir_callees` (avoid
-                    // stale item.refs from dead branches / pruned hooks).
-                    continue;
-                }
-                enqueue(
-                    r,
-                    next_non_rc,
-                    &mut visited_rc,
-                    &mut visited_non_rc,
-                    &mut queue,
-                );
-            }
+                    in_rc_or_sync,
+                    in_alloc_global_impl,
+                },
+            );
         } else {
-            // Non-JIR or declined item: scan JS conservatively.
-            if scanned_funcs.insert(name.clone()) {
-                if item.js.contains("__rt.alloc(")
-                    || item.js.contains("__rt.alloc_zeroed(")
-                    || item.js.contains("__rt.realloc(")
-                    || item.js.contains("__rt.dealloc(")
-                {
-                    raw_alloc_reachable = true;
-                    if next_non_rc {
-                        non_rc_raw_alloc_reachable = true;
-                    }
-                }
-                if item.js.contains("__rt.box(")
-                    || item.js.contains("__rt.unref(")
-                    || item.js.contains("__rt.tail_ref(")
-                    || item.js.contains("__rt.tail_slice(")
-                {
-                    boxed.all_adts_boxed = true;
-                    boxed.all_non_adt_boxed = true;
-                }
-                if skip_native_string
-                    && item.kind == ItemKind::Fn
-                    && (item.debug_path.contains("alloc::string")
-                        || item.name.as_str().contains("alloc$string$")
-                        || item.js.contains(".vec"))
-                {
-                    string_internally_accessed = true;
-                }
-                if skip_native_vec {
-                    if item.kind == ItemKind::Fn {
-                        all_packed_arr_disqualified = true;
-                        if item.debug_path.contains("alloc::vec")
-                            || item.name.as_str().contains("alloc$vec$")
-                            || item.js.contains(".buf")
-                        {
-                            vec_internally_accessed = true;
-                        }
-                    } else if item.kind == ItemKind::Static {
-                        if let (Some(body), Some(interns)) =
-                            (item.jir.body.as_ref(), item.jir.interns())
-                        {
-                            let mut seen = BTreeSet::new();
-                            collect_embedded_arr_vecs(
-                                &interns.types,
-                                body.signature.result,
-                                &mut packed_arr_disqualified,
-                                &mut seen,
-                            );
-                        } else if item.js.contains("_nv_ea") || item.js.contains(".buf") {
-                            all_packed_arr_disqualified = true;
-                        }
-                    }
-                }
-            }
-            for r in &item.refs {
-                if !table.contains_key(r) {
-                    continue;
-                }
-                if skip_native_string
-                    && (is_native_string_hook_item(table.get(r))
-                        || is_string_drop_glue(table.get(r)))
-                {
-                    continue;
-                }
-                if skip_native_vec
-                    && (is_native_vec_hook_item(table.get(r))
-                        || is_noop_global_vec_drop_glue(
-                            table.get(r),
-                            skip_native_string,
-                            skip_native_vec,
-                        ))
-                {
-                    continue;
-                }
-                enqueue(
-                    r,
-                    next_non_rc,
-                    &mut visited_rc,
-                    &mut visited_non_rc,
-                    &mut queue,
-                );
-            }
+            state.visit_fallback_item(&name, item, next_non_rc);
         }
     }
 
-    if !typed_heap_enabled || non_rc_raw_alloc_reachable {
-        boxed.merge(copy_one_boxed);
-    }
-    if raw_alloc_reachable {
-        boxed.merge(tail_adts);
-    }
-    let any_boxed = boxed.all_adts_boxed
-        || boxed.all_non_adt_boxed
-        || !boxed.boxed_defs.is_empty()
-        || !boxed.boxed_non_adt_keys.is_empty();
-    let native_vec_enabled =
-        skip_native_vec && !vec_internally_accessed && !non_rc_raw_alloc_reachable;
-    let packed_arr_vec_types = if native_vec_enabled && !all_packed_arr_disqualified {
-        packed_arr_candidates
-            .into_iter()
-            .filter(|ty| !packed_arr_disqualified.contains(ty))
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
-    (
-        HeapPlan {
-            typed_heap_enabled,
-            native_string_enabled: skip_native_string && !string_internally_accessed,
-            native_vec_enabled,
-            raw_alloc_reachable,
-            non_rc_raw_alloc_reachable,
-            any_boxed,
-            boxed_defs: boxed.boxed_defs,
-            boxed_non_adt_keys: boxed.boxed_non_adt_keys,
-            all_non_adt_boxed: boxed.all_non_adt_boxed,
-            all_adts_boxed: boxed.all_adts_boxed,
-            smi_u32_fields: BTreeSet::new(),
-            packed_arr_vec_types,
-        },
-        string_internally_accessed,
-        vec_internally_accessed,
-    )
+    state.into_plan()
 }
 
 /// Resolves the `(peeled_struct_ty, field_idx)` targeted by the final `Proj::Field` of a
@@ -696,10 +785,7 @@ pub fn view_final_struct_field(
     root: &Root,
     path: &[Proj],
 ) -> Option<(TypeId, u32)> {
-    let mut cur_ty = match root {
-        Root::Value(v) => func.values.get(v.0 as usize)?.ty,
-        Root::Cell(c) => func.cells.get(c.0 as usize)?.ty,
-    };
+    let mut cur_ty = func.root_ty(*root)?;
     let mut last_field = None;
     let mut downcast = false;
     for proj in path {
@@ -752,7 +838,8 @@ pub fn filter_smi_u32_fields_post_ssa(
             continue;
         };
         let types = &interns.types;
-        let mut field_views: BTreeMap<ValueId, (TypeId, u32)> = BTreeMap::new();
+        let mut field_views: Vec<Option<(TypeId, u32)>> = vec![None; func.values.len()];
+        let mut any_views = false;
         for block in &func.blocks {
             for op in &block.ops {
                 let (
@@ -764,23 +851,24 @@ pub fn filter_smi_u32_fields_post_ssa(
                 };
                 if let Some(pair) = view_final_struct_field(func, types, root, path) {
                     if surviving.contains(&pair) {
-                        field_views.insert(res_v, pair);
+                        field_views[res_v.0 as usize] = Some(pair);
+                        any_views = true;
                     }
                 }
             }
         }
-        if field_views.is_empty() {
+        if !any_views {
             continue;
         }
         for block in &func.blocks {
             for u in block.term.uses() {
-                if let Some(pair) = field_views.get(&u) {
-                    surviving.remove(pair);
+                if let Some(pair) = field_views[u.0 as usize] {
+                    surviving.remove(&pair);
                 }
             }
             for op in &block.ops {
                 for u in op.kind.uses() {
-                    let Some(&pair) = field_views.get(&u) else {
+                    let Some(pair) = field_views[u.0 as usize] else {
                         continue;
                     };
                     let ok = match &op.kind {
@@ -800,22 +888,6 @@ pub fn filter_smi_u32_fields_post_ssa(
         }
     }
     surviving
-}
-
-fn enqueue(
-    callee: &JsName,
-    from_non_rc: bool,
-    visited_rc: &mut BTreeSet<JsName>,
-    visited_non_rc: &mut BTreeSet<JsName>,
-    queue: &mut VecDeque<(JsName, bool)>,
-) {
-    if from_non_rc {
-        if visited_non_rc.insert(callee.clone()) {
-            queue.push_back((callee.clone(), true));
-        }
-    } else if !visited_non_rc.contains(callee) && visited_rc.insert(callee.clone()) {
-        queue.push_back((callee.clone(), false));
-    }
 }
 
 fn is_raw_alloc_shim_name(name: &str) -> bool {
@@ -930,21 +1002,16 @@ pub fn is_string_drop_glue(item: Option<&LinkItem>) -> bool {
     }
 }
 
-fn root_ty(func: &Func, root: &Root) -> Option<TypeId> {
-    match root {
-        Root::Value(v) => func.values.get(v.0 as usize).map(|d| d.ty),
-        Root::Cell(c) => func.cells.get(c.0 as usize).map(|d| d.ty),
-    }
-}
-
-fn place_ty_and_forbidden_field_proj(
+/// Walks a place projection path from `root`, invoking `on_field(container_ty, field_idx)` at
+/// each [`Proj::Field`] step. Returns `(final_ty, stopped_early)`.
+fn walk_place_fields(
     func: &Func,
     table: &TypeTable,
     root: &Root,
     path: &[Proj],
-    is_forbidden: impl Fn(TypeId, u32) -> bool,
+    mut on_field: impl FnMut(TypeId, u32) -> ControlFlow<()>,
 ) -> (Option<TypeId>, bool) {
-    let Some(mut cur) = root_ty(func, root) else {
+    let Some(mut cur) = func.root_ty(*root) else {
         return (None, false);
     };
     for proj in path {
@@ -958,7 +1025,7 @@ fn place_ty_and_forbidden_field_proj(
             }
             Proj::Downcast { .. } => {}
             Proj::Field { field, ty } => {
-                if is_forbidden(cur, *field) {
+                if on_field(cur, *field).is_break() {
                     return (None, true);
                 }
                 cur = *ty;
@@ -981,40 +1048,39 @@ fn place_ty_and_forbidden_field_proj(
     (Some(cur), false)
 }
 
+fn place_ty_and_forbidden_field_proj(
+    func: &Func,
+    table: &TypeTable,
+    root: &Root,
+    path: &[Proj],
+    is_forbidden: impl Fn(TypeId, u32) -> bool,
+) -> (Option<TypeId>, bool) {
+    walk_place_fields(func, table, root, path, |cur, field| {
+        if is_forbidden(cur, field) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+}
+
 /// Whether `ty` contains a type matching `pred` directly by value (not behind a reference or raw pointer).
 fn ty_contains_by_value(
     table: &TypeTable,
     ty: TypeId,
     pred: fn(&TypeTable, TypeId) -> bool,
-    seen: &mut BTreeSet<TypeId>,
 ) -> bool {
-    let peeled = table.peeled(ty);
-    if !seen.insert(peeled) {
-        return false;
-    }
-    if pred(table, peeled) {
-        return true;
-    }
-    let Some(desc) = table.get(peeled) else {
-        return false;
-    };
-    match &desc.kind {
-        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-            ty_contains_by_value(table, *element, pred, seen)
-        }
-        TypeKind::Tuple(elems) => elems
-            .iter()
-            .any(|e| ty_contains_by_value(table, *e, pred, seen)),
-        TypeKind::Adt { variants, .. } => variants.iter().any(|v| {
-            v.fields
-                .iter()
-                .any(|f| ty_contains_by_value(table, f.ty, pred, seen))
-        }),
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => upvars
-            .iter()
-            .any(|u| ty_contains_by_value(table, *u, pred, seen)),
-        _ => false,
-    }
+    let mut found = false;
+    table.visit_types(
+        ty,
+        rcgjs_object::jir::types::TypeWalk::ByValue,
+        &mut |cur| {
+            if !found && pred(table, table.peeled(cur)) {
+                found = true;
+            }
+        },
+    );
+    found
 }
 
 /// Peels pointer/ref/single-field-wrapper layers (`&T`, `&mut T`, `*const T`, `*mut T`,
@@ -1059,12 +1125,7 @@ fn transmute_exposes_layout(
     if f == t {
         return false;
     }
-    let mut seen = BTreeSet::new();
-    if ty_contains_by_value(table, f, pred, &mut seen) {
-        return true;
-    }
-    seen.clear();
-    if ty_contains_by_value(table, t, pred, &mut seen) {
+    if ty_contains_by_value(table, f, pred) || ty_contains_by_value(table, t, pred) {
         return true;
     }
     // Check pointer/ref transmute between `&C`/`*const C` and a different concrete non-ZST
@@ -1146,7 +1207,10 @@ fn func_uses_container_internals(
         for op in &block.ops {
             match &op.kind {
                 OpKind::Field { base, field, .. } | OpKind::SetField { base, field, .. } => {
-                    if val_ty(func, *base).is_some_and(|ty| is_forbidden_field(ty, *field)) {
+                    if func
+                        .ty(*base)
+                        .is_some_and(|ty| is_forbidden_field(ty, *field))
+                    {
                         return true;
                     }
                 }
@@ -1189,8 +1253,7 @@ fn func_uses_container_internals(
                             }
                         } else {
                             for &t in types {
-                                let mut seen = BTreeSet::new();
-                                if ty_contains_by_value(table, t, is_peeled, &mut seen) {
+                                if ty_contains_by_value(table, t, is_peeled) {
                                     return true;
                                 }
                             }
@@ -1199,7 +1262,7 @@ fn func_uses_container_internals(
                 }
                 OpKind::Const(tree) => {
                     if let Some(res) = op.result {
-                        if let Some(ty) = val_ty(func, res) {
+                        if let Some(ty) = func.ty(res) {
                             if const_has_nonempty_container(table, tree, ty, is_peeled) {
                                 return true;
                             }
@@ -1469,48 +1532,16 @@ fn arr_global_vec_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
     Some(peeled)
 }
 
-fn collect_embedded_arr_vecs(
-    table: &TypeTable,
-    ty: TypeId,
-    out: &mut BTreeSet<TypeId>,
-    seen: &mut BTreeSet<TypeId>,
-) {
-    let peeled = table.peeled(ty);
-    if !seen.insert(peeled) {
-        return;
-    }
-    if let Some(vec_ty) = arr_global_vec_ty(table, peeled) {
-        out.insert(vec_ty);
-    }
-    let Some(desc) = table.get(peeled) else {
-        return;
-    };
-    match &desc.kind {
-        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-            collect_embedded_arr_vecs(table, *pointee, out, seen);
-        }
-        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-            collect_embedded_arr_vecs(table, *element, out, seen);
-        }
-        TypeKind::Tuple(elems) => {
-            for &e in elems {
-                collect_embedded_arr_vecs(table, e, out, seen);
+fn collect_embedded_arr_vecs(table: &TypeTable, ty: TypeId, out: &mut BTreeSet<TypeId>) {
+    table.visit_types(
+        ty,
+        rcgjs_object::jir::types::TypeWalk::ThroughPointers,
+        &mut |cur| {
+            if let Some(vec_ty) = arr_global_vec_ty(table, cur) {
+                out.insert(vec_ty);
             }
-        }
-        TypeKind::Adt { variants, .. } => {
-            for v in variants {
-                for f in &v.fields {
-                    collect_embedded_arr_vecs(table, f.ty, out, seen);
-                }
-            }
-        }
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
-            for &u in upvars {
-                collect_embedded_arr_vecs(table, u, out, seen);
-            }
-        }
-        _ => {}
-    }
+        },
+    );
 }
 
 fn native_vec_call_vec_ty(
@@ -1526,10 +1557,10 @@ fn native_vec_call_vec_ty(
         | SO::NativeVecWithCapacity
         | SO::NativeVecFromElemZeroed
         | SO::NativeVecFromArray
-        | SO::NativeVecFromRawParts => val_ty(func, op_result?),
-        SO::NativeVecIntoBoxedSlice => val_ty(func, *args.first()?),
+        | SO::NativeVecFromRawParts => func.ty(op_result?),
+        SO::NativeVecIntoBoxedSlice => func.ty(*args.first()?),
         _ => {
-            let arg_ty = val_ty(func, *args.first()?)?;
+            let arg_ty = func.ty(*args.first()?)?;
             value::pointee_of(table, arg_ty)
         }
     }
@@ -1542,42 +1573,14 @@ fn record_place_arr_vec_field_crossings(
     path: &[Proj],
     disqualified: &mut BTreeSet<TypeId>,
 ) {
-    let Some(mut cur) = root_ty(func, root) else {
-        return;
-    };
-    for proj in path {
-        let peeled = table.peeled(cur);
-        match proj {
-            Proj::Deref => {
-                let Some(pt) = value::pointee_of(table, peeled) else {
-                    return;
-                };
-                cur = pt;
+    walk_place_fields(func, table, root, path, |cur, _| {
+        if is_direct_global_vec_ty(table, cur) {
+            if let Some(vec_ty) = arr_global_vec_ty(table, cur) {
+                disqualified.insert(vec_ty);
             }
-            Proj::Downcast { .. } => {}
-            Proj::Field { ty, .. } => {
-                if is_direct_global_vec_ty(table, cur) {
-                    if let Some(vec_ty) = arr_global_vec_ty(table, cur) {
-                        disqualified.insert(vec_ty);
-                    }
-                }
-                cur = *ty;
-            }
-            Proj::Index(_) | Proj::ConstantIndex { .. } => {
-                let next = match table.get(peeled).map(|d| &d.kind) {
-                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
-                        Some(*element)
-                    }
-                    _ => None,
-                };
-                let Some(next) = next else {
-                    return;
-                };
-                cur = next;
-            }
-            Proj::Subslice { .. } => {}
         }
-    }
+        ControlFlow::Continue(())
+    });
 }
 
 fn scan_func_for_packed_arr_vecs(
@@ -1622,21 +1625,20 @@ fn scan_func_for_packed_arr_vecs(
                         callee,
                         Callee::Foreign { .. } | Callee::Runtime { sysroot: false, .. }
                     ) {
-                        let mut seen = BTreeSet::new();
                         for &arg in args {
-                            if let Some(ty) = val_ty(func, arg) {
-                                collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                            if let Some(ty) = func.ty(arg) {
+                                collect_embedded_arr_vecs(table, ty, disqualified);
                             }
                         }
                         if let Some(res) = op.result {
-                            if let Some(ty) = val_ty(func, res) {
-                                collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                            if let Some(ty) = func.ty(res) {
+                                collect_embedded_arr_vecs(table, ty, disqualified);
                             }
                         }
                     }
                 }
                 OpKind::SetField { base, .. } => {
-                    if let Some(ty) = val_ty(func, *base) {
+                    if let Some(ty) = func.ty(*base) {
                         if is_direct_global_vec_ty(table, ty) {
                             if let Some(vec_ty) = arr_global_vec_ty(table, ty) {
                                 disqualified.insert(vec_ty);
@@ -1654,9 +1656,8 @@ fn scan_func_for_packed_arr_vecs(
                 }
                 OpKind::Const(_) => {
                     if let Some(res) = op.result {
-                        if let Some(ty) = val_ty(func, res) {
-                            let mut seen = BTreeSet::new();
-                            collect_embedded_arr_vecs(table, ty, disqualified, &mut seen);
+                        if let Some(ty) = func.ty(res) {
+                            collect_embedded_arr_vecs(table, ty, disqualified);
                         }
                     }
                 }
@@ -1670,7 +1671,7 @@ fn vec_resize_is_ta(func: &Func, table: &TypeTable, args: &[ValueId]) -> bool {
     let Some(&v0) = args.first() else {
         return false;
     };
-    let Some(arg_ty) = val_ty(func, v0) else {
+    let Some(arg_ty) = func.ty(v0) else {
         return false;
     };
     let Some(vec_ty) = value::pointee_of(table, arg_ty) else {
@@ -1683,13 +1684,13 @@ fn vec_resize_is_ta(func: &Func, table: &TypeTable, args: &[ValueId]) -> bool {
         && native_vec_ta_kind(table, elem_ty).is_some()
 }
 
-fn jir_callees(
+fn jir_callees<'a>(
     func: &Func,
-    interns: &Interns,
+    interns: &'a Interns,
     skip_typed_heap_hooks: bool,
     skip_native_string: bool,
     skip_native_vec: bool,
-) -> Vec<JsName> {
+) -> Vec<&'a str> {
     let mut out = Vec::new();
     for block in &func.blocks {
         for op in &block.ops {
@@ -1729,19 +1730,19 @@ fn jir_callees(
                     match callee {
                         Callee::Direct { link_name, .. } => {
                             if let Some(s) = interns.str(*link_name) {
-                                out.push(JsName::new(s.to_owned()));
+                                out.push(s);
                             }
                         }
                         Callee::Foreign { symbol, .. } => {
                             if let Some(s) = interns.str(*symbol) {
-                                out.push(JsName::new(s.to_owned()));
+                                out.push(s);
                             }
                         }
                         Callee::Intrinsic {
                             fallback: Some(d), ..
                         } => {
                             if let Some(s) = interns.str(d.link_name) {
-                                out.push(JsName::new(s.to_owned()));
+                                out.push(s);
                             }
                         }
                         _ => {}
@@ -1771,14 +1772,14 @@ fn jir_callees(
                         continue;
                     }
                     if let Some(s) = interns.str(*link_name) {
-                        out.push(JsName::new(s.to_owned()));
+                        out.push(s);
                     }
                 }
                 OpKind::Intrinsic {
                     fallback: Some(d), ..
                 } => {
                     if let Some(s) = interns.str(d.link_name) {
-                        out.push(JsName::new(s.to_owned()));
+                        out.push(s);
                     }
                 }
                 _ => {}
@@ -1797,6 +1798,13 @@ struct BoxedSet {
 }
 
 impl BoxedSet {
+    fn any_boxed(&self) -> bool {
+        self.all_adts_boxed
+            || self.all_non_adt_boxed
+            || !self.boxed_defs.is_empty()
+            || !self.boxed_non_adt_keys.is_empty()
+    }
+
     fn merge(&mut self, other: BoxedSet) {
         self.boxed_defs.extend(other.boxed_defs);
         self.boxed_non_adt_keys.extend(other.boxed_non_adt_keys);
@@ -1851,13 +1859,14 @@ pub fn direct_ref_copy_one_casts(
     table: &TypeTable,
     interns: &Interns,
 ) -> BTreeSet<ValueId> {
-    let mut defs: BTreeMap<ValueId, &OpKind> = BTreeMap::new();
-    let mut bad_uses: BTreeSet<ValueId> = BTreeSet::new();
-    let mut good_uses: BTreeMap<ValueId, u32> = BTreeMap::new();
+    let n = func.values.len();
+    let mut defs: Vec<Option<&OpKind>> = vec![None; n];
+    let mut bad_uses: Vec<bool> = vec![false; n];
+    let mut good_uses: Vec<u32> = vec![0; n];
     for block in &func.blocks {
         for op in &block.ops {
             if let Some(res) = op.result {
-                defs.insert(res, &op.kind);
+                defs[res.0 as usize] = Some(&op.kind);
             }
         }
     }
@@ -1865,66 +1874,67 @@ pub fn direct_ref_copy_one_casts(
         for op in &block.ops {
             match &op.kind {
                 OpKind::Deref(ptr) => {
-                    *good_uses.entry(*ptr).or_insert(0) += 1;
+                    good_uses[ptr.0 as usize] += 1;
                 }
                 OpKind::StoreThrough { ptr, v } => {
-                    *good_uses.entry(*ptr).or_insert(0) += 1;
-                    bad_uses.insert(*v);
+                    good_uses[ptr.0 as usize] += 1;
+                    bad_uses[v.0 as usize] = true;
                 }
                 OpKind::Intrinsic { name, args, .. } => match interns.str(*name) {
                     Some("copy_nonoverlapping" | "copy") if args.len() >= 3 => {
                         let count_is_one = matches!(
-                            defs.get(&args[2]),
+                            defs[args[2].0 as usize],
                             Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
                         );
                         if count_is_one {
-                            *good_uses.entry(args[0]).or_insert(0) += 1;
+                            good_uses[args[0].0 as usize] += 1;
                             for &other in &args[1..] {
-                                bad_uses.insert(other);
+                                bad_uses[other.0 as usize] = true;
                             }
                         } else {
                             for &u in args {
-                                bad_uses.insert(u);
+                                bad_uses[u.0 as usize] = true;
                             }
                         }
                     }
                     Some("typed_swap_nonoverlapping") if args.len() >= 2 => {
-                        *good_uses.entry(args[0]).or_insert(0) += 1;
-                        *good_uses.entry(args[1]).or_insert(0) += 1;
+                        good_uses[args[0].0 as usize] += 1;
+                        good_uses[args[1].0 as usize] += 1;
                         for &other in &args[2..] {
-                            bad_uses.insert(other);
+                            bad_uses[other.0 as usize] = true;
                         }
                     }
                     Some("read_via_copy") if !args.is_empty() => {
-                        *good_uses.entry(args[0]).or_insert(0) += 1;
+                        good_uses[args[0].0 as usize] += 1;
                         for &other in &args[1..] {
-                            bad_uses.insert(other);
+                            bad_uses[other.0 as usize] = true;
                         }
                     }
                     _ => {
                         for u in op.kind.uses() {
-                            bad_uses.insert(u);
+                            bad_uses[u.0 as usize] = true;
                         }
                     }
                 },
                 _ => {
                     for u in op.kind.uses() {
-                        bad_uses.insert(u);
+                        bad_uses[u.0 as usize] = true;
                     }
                 }
             }
         }
         for u in block.term.uses() {
-            bad_uses.insert(u);
+            bad_uses[u.0 as usize] = true;
         }
     }
 
     let mut out = BTreeSet::new();
-    for (&cand, &count) in &good_uses {
-        if count == 0 || bad_uses.contains(&cand) {
+    for (idx, &count) in good_uses.iter().enumerate() {
+        if count == 0 || bad_uses[idx] {
             continue;
         }
-        let (ref_val, from_ty, to_ty) = match defs.get(&cand) {
+        let cand = ValueId(idx as u32);
+        let (ref_val, from_ty, to_ty) = match defs[idx] {
             Some(OpKind::Cast {
                 kind: CastKind::PtrToPtr | CastKind::PointerCoercion,
                 v,
@@ -1936,7 +1946,7 @@ pub fn direct_ref_copy_one_casts(
                 path,
                 ..
             }) if matches!(path.as_slice(), [Proj::Deref]) => {
-                let (Some(from), Some(to)) = (val_ty(func, *v), val_ty(func, cand)) else {
+                let (Some(from), Some(to)) = (func.ty(*v), func.ty(cand)) else {
                     continue;
                 };
                 (*v, from, to)
@@ -1945,7 +1955,7 @@ pub fn direct_ref_copy_one_casts(
         };
         if func
             .values
-            .get(cand.0 as usize)
+            .get(idx)
             .is_none_or(|d| d.carrier != Carrier::Baseline)
             || func
                 .values
@@ -2044,10 +2054,6 @@ fn target_is_dynamic(table: &TypeTable, ty: TypeId) -> bool {
     })
 }
 
-fn val_ty(func: &Func, v: ValueId) -> Option<TypeId> {
-    func.values.get(v.0 as usize).map(|d| d.ty)
-}
-
 /// Exact abstract mirror of `lower/js/place.rs::{walk_place, raw_view}` to determine whether an
 /// `OpKind::RawView { root, path, .. }` can emit `__rt.box(...)` or `ref_to_raw(...)` on a bare
 /// indirect object (requiring `_boxes` registration), as opposed to constructing a `{ buf, off }`
@@ -2064,7 +2070,7 @@ fn raw_view_may_box(func: &Func, table: &TypeTable, root: &Root, path: &[Proj]) 
             (cell.ty, cell.boxed, false)
         }
         Root::Value(v) => {
-            let Some(t) = val_ty(func, *v) else {
+            let Some(t) = func.ty(*v) else {
                 return true;
             };
             (t, false, is_object_ty(t))
@@ -2263,8 +2269,7 @@ fn scan_func_for_boxes(
                 OpKind::RawView { root, path, .. } => {
                     if let Some(res) = op.result {
                         if raw_view_may_box(func, table, root, path) {
-                            if let Some(pt) =
-                                val_ty(func, res).and_then(|t| value::pointee_of(table, t))
+                            if let Some(pt) = func.ty(res).and_then(|t| value::pointee_of(table, t))
                             {
                                 if direct_copy_casts.contains(&res) {
                                     copy_one_boxed.record(table, pt);
@@ -2278,7 +2283,7 @@ fn scan_func_for_boxes(
                 OpKind::SliceView { ptr, .. } => {
                     // `ptr.rs:386` calls `ref_to_raw` when `ptr` is a reference to an indirect
                     // non-array/slice/str pointee.
-                    if let Some(dt) = val_ty(func, *ptr) {
+                    if let Some(dt) = func.ty(*ptr) {
                         if matches!(value::kind(table, dt), Some(TypeKind::Reference { .. })) {
                             if let Some(pt) = value::pointee_of(table, dt) {
                                 mark!(pt);
@@ -2315,7 +2320,7 @@ fn scan_func_for_boxes(
                                 | "sub_ptr"
                         ) {
                             for &arg in args {
-                                if let Some(dt) = val_ty(func, arg) {
+                                if let Some(dt) = func.ty(arg) {
                                     if !value::is_raw(table, dt) {
                                         if let Some(pt) = value::pointee_of(table, dt) {
                                             mark!(pt);

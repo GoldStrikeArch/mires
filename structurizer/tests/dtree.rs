@@ -243,3 +243,19 @@ fn a_scrutinee_read_twice_is_bound_once() {
     "#]]
     .assert_eq(&out);
 }
+
+#[test]
+fn u128_max_band_compiles_without_overflow() {
+    let out = run(switch_cfg(&[(u128::MAX - 1, 1), (u128::MAX, 1)], 2, 2));
+    expect![[r#"
+        b0;
+        if (340282366920938463463374607431768211454 <= c0) {
+          b1;
+          return;
+        } else {
+          b2;
+          return;
+        }
+    "#]]
+    .assert_eq(&out);
+}

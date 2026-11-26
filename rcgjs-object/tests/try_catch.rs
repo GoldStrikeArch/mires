@@ -79,7 +79,7 @@ fn fixture() -> Vec<Stmt> {
                         js::binary(js::BinOp::Lt, js::id("count"), js::num(3)),
                         vec![
                             js::expr_stmt(js::compound_assign(
-                                js::BinOp::Add,
+                                js::CompoundOp::Add,
                                 js::id("count"),
                                 js::num(1),
                             )),

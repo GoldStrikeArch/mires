@@ -4,7 +4,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{PanicMode, Result, RustOptLevel, Toolchain, PANIC_ENV, SPIKE_ROOT_ENV};
+use crate::{
+    PanicMode, Result, RustOptLevel, Toolchain, PANIC_ENV, REMAP_ROOT_ENV, RUST_MIR_INLINE_ENV,
+    SPIKE_ROOT_ENV,
+};
+
+const WATCHED_ENV_VARS: [&str; 5] = [
+    SPIKE_ROOT_ENV,
+    "JSC_SPIKE_ROOT",
+    PANIC_ENV,
+    RUST_MIR_INLINE_ENV,
+    REMAP_ROOT_ENV,
+];
 
 /// The inputs a compiled client program depends on, printed as
 /// `cargo:rerun-if-changed` directives.
@@ -22,6 +33,7 @@ pub struct Rerun {
 impl Rerun {
     /// The client crate's sources plus the toolchain files that decide what
     /// they compile to.
+    #[must_use]
     pub fn new(client_root: &Path, toolchain: &Toolchain) -> Self {
         let client_dir = client_root.parent().unwrap_or(Path::new("."));
         // The directory itself covers a source file being added or removed,
@@ -30,17 +42,7 @@ impl Rerun {
         collect_inputs(client_dir, &mut paths);
         collect_path_modules(&mut paths);
         let patch_dir = toolchain.root().join("patches");
-        let mut patches: Vec<_> = fs::read_dir(&patch_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "patch")
-            })
-            .collect();
-        patches.sort();
+        let patches = collect_patches(&patch_dir);
         paths.extend([
             toolchain.dylib().to_path_buf(),
             toolchain.linker().to_path_buf(),
@@ -57,17 +59,7 @@ impl Rerun {
         // The unwind build mode's own inputs: its target spec, and the patches only it applies.
         if toolchain.panic_mode() == PanicMode::Unwind {
             let unwind_patches = toolchain.root().join("patches").join("unwind");
-            let mut patches: Vec<_> = fs::read_dir(&unwind_patches)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "patch")
-                })
-                .collect();
-            patches.sort();
+            let patches = collect_patches(&unwind_patches);
             paths.push(toolchain.unwind_target_spec());
             paths.push(unwind_patches);
             paths.extend(patches);
@@ -98,9 +90,9 @@ impl Rerun {
     /// Print the directives.
     pub fn emit(&self) {
         self.emit_paths();
-        println!("cargo:rerun-if-env-changed={SPIKE_ROOT_ENV}");
-        println!("cargo:rerun-if-env-changed=JSC_SPIKE_ROOT");
-        println!("cargo:rerun-if-env-changed={PANIC_ENV}");
+        for var in WATCHED_ENV_VARS {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
     }
 
     pub(crate) fn emit_paths(&self) {
@@ -110,9 +102,26 @@ impl Rerun {
     }
 
     /// The watched paths, in the order they are printed.
+    #[must_use]
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
     }
+}
+
+/// Collect every `.patch` file directly inside `dir`, sorted for stable directives.
+fn collect_patches(dir: &Path) -> Vec<PathBuf> {
+    let mut patches: Vec<_> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "patch")
+        })
+        .collect();
+    patches.sort();
+    patches
 }
 
 /// Append every file under `dir` that decides what a crate compiles to: its
@@ -402,5 +411,33 @@ mod tests {
         let mut paths = Vec::new();
         collect_inputs(Path::new("/mires-build/does/not/exist"), &mut paths);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn watches_unwind_patches_and_build_affecting_env_vars() {
+        let spike = TempDir::new("rerun-unwind-patches");
+        fs::create_dir_all(spike.path().join("patches/unwind")).unwrap();
+        fs::write(spike.path().join("patches/unwind/z.patch"), "").unwrap();
+        fs::write(spike.path().join("patches/unwind/a.patch"), "").unwrap();
+        let toolchain = Toolchain::new(spike.path())
+            .unwrap()
+            .with_panic_mode(PanicMode::Unwind);
+
+        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain);
+        let unwind_patches: Vec<_> = rerun
+            .paths()
+            .iter()
+            .filter(|path| path.starts_with(spike.path().join("patches/unwind")) && path.is_file())
+            .cloned()
+            .collect();
+        assert_eq!(
+            unwind_patches,
+            [
+                spike.path().join("patches/unwind/a.patch"),
+                spike.path().join("patches/unwind/z.patch"),
+            ]
+        );
+        assert!(WATCHED_ENV_VARS.contains(&RUST_MIR_INLINE_ENV));
+        assert!(WATCHED_ENV_VARS.contains(&REMAP_ROOT_ENV));
     }
 }

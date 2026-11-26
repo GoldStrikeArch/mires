@@ -61,4 +61,4 @@ pub use summary::{
     Availability, ItemClass, ItemSummary, PhysicalSummary, PhysicalSummaryValidation, SemanticKey,
 };
 pub use types::{SigDescriptor, SigTable, TypeDescriptor, TypeTable};
-pub use verify::VerifyError;
+pub use verify::{VerifyError, VerifyErrorKind};

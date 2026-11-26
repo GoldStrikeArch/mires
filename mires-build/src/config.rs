@@ -1,12 +1,18 @@
 use std::{
     collections::BTreeSet,
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
-use rcgjs_object::artifact::{self, ArtifactManifest, EntryRole};
+use rcgjs_object::{
+    artifact::{self, ArtifactManifest, EntryRole},
+    opts::{Lane, OptimizerMode, OptimizerPass, Profile},
+};
 
-use crate::{shimcheck::SHIM_MODULE_ARG, BuildError, Chunk, Chunking, Rerun, Result, Toolchain};
+use crate::{
+    shimcheck::SHIM_MODULE_ARG, BuildError, Chunk, Chunking, CompileOptions, Rerun, Result,
+    Toolchain,
+};
 
 /// File name of the default [`output_name`](BuildConfig::output_name) inside
 /// `OUT_DIR`.
@@ -23,139 +29,29 @@ const STAGING_DIR: &str = ".mires-build";
 /// Space-free report name passed through rustc's whitespace-split backend option channel.
 const STAGED_OPTIMIZATION_REPORT_NAME: &str = "optimization-report.json";
 
-/// Whether the backend optimizer is disabled, analyzed only, or applied.
+/// How the runtime shim is published alongside the compiled output.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum OptimizerMode {
-    /// Preserve the current compiler output.
+pub enum ShimMode {
+    /// Do not publish a runtime shim (use when an external provider supplies `__rt`).
+    None,
+    /// Publish the complete runtime shim (the default).
     #[default]
-    Off,
-    /// Run analyses and report decisions without changing compiler output.
-    Report,
-    /// Emit optimizations whose safety proof succeeds.
-    On,
+    Full,
+    /// Publish only the runtime members transitively reached by the emitted program.
+    Minimal,
 }
 
-impl OptimizerMode {
-    fn backend_arg(self) -> Option<&'static str> {
-        match self {
-            Self::Off => None,
-            Self::Report => Some("js-opt=report"),
-            Self::On => Some("js-opt=on"),
-        }
+fn optimizer_mode_arg(mode: OptimizerMode) -> Option<&'static str> {
+    match mode {
+        OptimizerMode::Off => None,
+        OptimizerMode::Report => Some("js-opt=report"),
+        OptimizerMode::On => Some("js-opt=on"),
     }
 }
 
-/// One optimizer pass selectable by the developer attribution controls.
-///
-/// This is an experimental compiler interface and may change without notice.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub enum OptimizerPass {
-    Sroa,
-    AstDce,
-    FuturePoller,
-    NativeRepresentations,
-    LinkDedup,
-}
-
-impl OptimizerPass {
-    /// Every registered pass in compiler execution order. Mirrors the backend's
-    /// `OptimizerPass::ORDERED`.
-    const ORDERED: [Self; 5] = [
-        Self::Sroa,
-        Self::AstDce,
-        Self::FuturePoller,
-        Self::NativeRepresentations,
-        Self::LinkDedup,
-    ];
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sroa => "sroa",
-            Self::AstDce => "ast-dce",
-            Self::FuturePoller => "future-poller",
-            Self::NativeRepresentations => "native-representations",
-            Self::LinkDedup => "link-dedup",
-        }
-    }
-}
-
-/// Which lowering the link step prints an item from. Mirrors the backend's `js-lane`.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum Lane {
-    /// Print from JIR-S (the sole lowering lane).
-    #[default]
-    Jir,
-}
-
-impl Lane {
-    fn backend_arg(self) -> &'static str {
-        match self {
-            Self::Jir => "js-lane=jir",
-        }
-    }
-}
-
-/// A named bundle of compiler settings. Mirrors the backend's `js-profile`.
-///
-/// A profile is an alias for the three or four options a build actually wants together, so that
-/// the combination has one spelling that cannot drift. It is expanded here into the individual
-/// options for the sysroot key. The client link also receives `js-profile=` as policy identity:
-/// size and balanced deliberately share object bytes, but their carrier economics differ.
-///
-/// A setting spelled out alongside the profile wins, however it was spelled — [`emit_arg`] and
-/// the typed setters are applied after the expansion, and the backend reads the last value given
-/// for an option.
-///
-/// [`emit_arg`]: BuildConfig::emit_arg
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Profile {
-    /// The fastest compile, and the output a golden was taken from.
-    Dev,
-    /// Analyses run and are reported; nothing is rewritten.
-    Report,
-    /// Compiler-side size policy.
-    ReleaseSize,
-    /// The default release policy, runtime first.
-    ReleaseBalanced,
-    /// Item names kept, so a CPU profile of the result still reads.
-    ReleaseSpeed,
-}
-
-impl Profile {
-    fn backend_arg(self) -> &'static str {
-        match self {
-            Self::Dev => "js-profile=dev",
-            Self::Report => "js-profile=report",
-            Self::ReleaseSize => "js-profile=release-size",
-            Self::ReleaseBalanced => "js-profile=release-balanced",
-            Self::ReleaseSpeed => "js-profile=release-speed",
-        }
-    }
-
-    /// The emit-affecting options this profile names, in the order the backend reads them.
-    ///
-    /// These are what the sysroot is keyed on, so this list and
-    /// `scripts/sysroot-cache.sh`'s `jsc_profile_emit_args` have to agree exactly: a build
-    /// driven from a build script and the same build driven from `$JS_EXTRA_ARGS` must land on
-    /// one cache entry.
-    fn emit_args(self) -> &'static [&'static str] {
-        match self {
-            Self::Dev => &["js-opt=off"],
-            Self::Report => &["js-opt=report"],
-            Self::ReleaseSize | Self::ReleaseBalanced => &[
-                "js-cleanup=on",
-                "js-ecma-target=2018",
-                "js-minify=on",
-                "js-opt=on",
-            ],
-            Self::ReleaseSpeed => &[
-                "js-cleanup=on",
-                "js-ecma-target=2018",
-                "js-minify=locals",
-                "js-opt=on",
-            ],
-        }
+fn lane_arg(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Jir => "js-lane=jir",
     }
 }
 
@@ -200,10 +96,10 @@ pub struct BuildConfig {
     client_root: PathBuf,
     output_name: String,
     source_map: bool,
-    shim: bool,
-    minimal_shim: bool,
+    shim_mode: ShimMode,
     emit_args: Vec<String>,
     crate_args: Vec<String>,
+    entry_role: Option<EntryRole>,
     cfgs: Vec<String>,
     chunking: Option<Chunking>,
     spike_root: Option<PathBuf>,
@@ -238,10 +134,10 @@ impl BuildConfig {
             client_root: client_root.into(),
             output_name: DEFAULT_OUTPUT_NAME.to_owned(),
             source_map: true,
-            shim: true,
-            minimal_shim: false,
+            shim_mode: ShimMode::Full,
             emit_args: Vec::new(),
             crate_args: Vec::new(),
+            entry_role: None,
             cfgs: Vec::new(),
             chunking: None,
             spike_root: None,
@@ -297,13 +193,28 @@ impl BuildConfig {
         self
     }
 
+    /// Select how the runtime shim is published alongside the entries that import it.
+    /// Defaults to [`ShimMode::Full`].
+    #[must_use]
+    pub fn shim_mode(mut self, mode: ShimMode) -> Self {
+        self.shim_mode = mode;
+        self
+    }
+
     /// Publish the runtime shim beside the entries that import it. Defaults to `true`.
     ///
     /// The manifest determines whether the provider is a script or an ES module. Disable this
     /// when the application supplies an external provider through its own import map.
     #[must_use]
     pub fn shim(mut self, on: bool) -> Self {
-        self.shim = on;
+        self.shim_mode = if on {
+            match self.shim_mode {
+                ShimMode::None => ShimMode::Full,
+                other => other,
+            }
+        } else {
+            ShimMode::None
+        };
         self
     }
 
@@ -313,7 +224,11 @@ impl BuildConfig {
     /// runs `scripts/minimal-shim.mjs` after linking and publishes its closed subset instead.
     #[must_use]
     pub fn minimal_shim(mut self, on: bool) -> Self {
-        self.minimal_shim = on;
+        self.shim_mode = match (self.shim_mode, on) {
+            (_, true) => ShimMode::Minimal,
+            (ShimMode::Minimal, false) => ShimMode::Full,
+            (other, false) => other,
+        };
         self
     }
 
@@ -341,8 +256,9 @@ impl BuildConfig {
 
     /// Declare whether the compiled entry runs as a main module, worker, island, or procedure.
     #[must_use]
-    pub fn entry_role(self, role: EntryRole) -> Self {
-        self.crate_arg(format!("js-entry-role={}", role.as_str()))
+    pub fn entry_role(mut self, role: EntryRole) -> Self {
+        self.entry_role = Some(role);
+        self
     }
 
     /// Carry the JIR-S body of each item in the emitted objects. Defaults to `true`.
@@ -538,18 +454,21 @@ impl BuildConfig {
             script_args.extend(["--cfg".to_owned(), cfg.clone()]);
         }
         let workspace_root = self.backend_workspace_root(&toolchain);
-        toolchain.compile_with_settings(
+        let extra_args = self.extra_args_for(
+            staged_report
+                .as_ref()
+                .map(|_| Path::new(STAGED_OPTIMIZATION_REPORT_NAME)),
+            workspace_root.as_deref(),
+        );
+        toolchain.compile_with_options(
             &self.client_root,
             &staged,
-            &self.extra_args_for(
-                staged_report
-                    .as_ref()
-                    .map(|_| Path::new(STAGED_OPTIMIZATION_REPORT_NAME)),
-                workspace_root.as_deref(),
-            ),
-            &emit_args,
-            &script_args,
-            self.rust_opt_level,
+            CompileOptions {
+                extra_args: &extra_args,
+                sysroot_args: Some(&emit_args),
+                script_args: &script_args,
+                opt_level: self.rust_opt_level,
+            },
         )?;
 
         let (chunks, shared, artifact_manifest) =
@@ -578,7 +497,7 @@ impl BuildConfig {
 
     /// Refuses a report whose byte totals would describe the discarded unsplit staging program.
     fn check_report_shape(&self) -> Result {
-        if self.optimization_report && self.chunking.is_some() {
+        if self.optimization_report && self.chunking.as_ref().is_some_and(|c| !c.is_empty()) {
             return Err(BuildError::ChunkedOptimizationReport);
         }
         Ok(())
@@ -587,58 +506,74 @@ impl BuildConfig {
     /// Generate the runtime at the location imported by the published entry graph, then
     /// bind that provider's bytes into the manifest.
     fn publish_shim(&self, toolchain: &Toolchain, manifest_path: &Path) -> Result<Option<PathBuf>> {
-        if !self.shim {
-            return Ok(None);
-        }
-        let io = |source| BuildError::Io {
-            path: manifest_path.to_path_buf(),
-            source,
+        let minimal = match self.shim_mode {
+            ShimMode::None => return Ok(None),
+            ShimMode::Full => false,
+            ShimMode::Minimal => true,
         };
-        let manifest = ArtifactManifest::read(manifest_path).map_err(io)?;
-        let directory = manifest_path.parent().unwrap();
-        manifest.verify(directory).map_err(io)?;
-        let requirements = manifest
+        let manifest = ArtifactManifest::read(manifest_path)
+            .map_err(|source| manifest_error(manifest_path, source))?;
+        let directory = manifest_path
+            .parent()
+            .ok_or_else(|| BuildError::ManifestInvalid {
+                path: manifest_path.to_path_buf(),
+                reason: "manifest path has no parent directory".to_owned(),
+            })?;
+        manifest
+            .verify(directory)
+            .map_err(|source| manifest_error(manifest_path, source))?;
+        let mut modules = manifest
             .artifacts
             .values()
             .filter_map(|artifact| artifact.runtime.as_ref())
-            .collect::<Vec<_>>();
-        if requirements.is_empty() {
-            return Ok(None);
-        }
-        let modules = requirements
-            .iter()
             .map(|runtime| runtime.module.clone())
-            .collect::<BTreeSet<_>>();
-        if modules.len() != 1 {
-            return Err(io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "one runtime publication cannot supply different entry providers",
-            )));
-        }
-        let module = modules.first().unwrap();
-        let name = match module {
-            None => SHIM_NAME,
-            Some(module) => module.strip_prefix("./").filter(|name| {
-                !name.is_empty() && !name.contains('\\')
-                    && Path::new(name).components().all(|part| matches!(part, std::path::Component::Normal(_)))
-            }).ok_or_else(|| io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "generated runtime needs a local module specifier; use shim(false) for an external provider")))?,
+            .collect::<BTreeSet<_>>()
+            .into_iter();
+        let Some(module) = modules.next() else {
+            return Ok(None);
         };
-        let published = directory.join(name);
-        fs::create_dir_all(published.parent().unwrap()).map_err(io)?;
-        if manifest.artifacts.contains_key(name) {
-            return Err(io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "runtime provider collides with a compiler artifact",
-            )));
+        if modules.next().is_some() {
+            return Err(BuildError::RuntimeProviderMismatch {
+                path: manifest_path.to_path_buf(),
+            });
         }
-        toolchain.runtime_from_manifest(
-            manifest_path,
-            &published,
-            module.is_some(),
-            self.minimal_shim,
-        )?;
-        let manifest = ArtifactManifest::read(manifest_path).map_err(io)?;
-        manifest.verify(directory).map_err(io)?;
+        let name = match &module {
+            None => SHIM_NAME,
+            Some(specifier) => specifier
+                .strip_prefix("./")
+                .filter(|name| {
+                    !name.is_empty()
+                        && !name.contains('\\')
+                        && Path::new(name)
+                            .components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_)))
+                })
+                .ok_or_else(|| BuildError::ExternalRuntimeRequiresNoShim {
+                    specifier: specifier.clone(),
+                })?,
+        };
+        if manifest.artifacts.contains_key(name) {
+            return Err(BuildError::RuntimeProviderCollision {
+                name: name.to_owned(),
+            });
+        }
+        let published = directory.join(name);
+        let parent = published
+            .parent()
+            .ok_or_else(|| BuildError::ManifestInvalid {
+                path: published.clone(),
+                reason: "runtime provider path has no parent directory".to_owned(),
+            })?;
+        fs::create_dir_all(parent).map_err(|source| BuildError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        toolchain.runtime_from_manifest(manifest_path, &published, module.is_some(), minimal)?;
+        let manifest = ArtifactManifest::read(manifest_path)
+            .map_err(|source| manifest_error(manifest_path, source))?;
+        manifest
+            .verify(directory)
+            .map_err(|source| manifest_error(manifest_path, source))?;
         Ok(Some(published))
     }
 
@@ -672,12 +607,11 @@ impl BuildConfig {
         out_dir: &Path,
     ) -> Result<(Vec<Chunk>, Option<Chunk>, PathBuf)> {
         let manifest_path = artifact::manifest_path(staged);
-        let io = |source| BuildError::Io {
-            path: manifest_path.clone(),
-            source,
-        };
-        let mut manifest = ArtifactManifest::read(&manifest_path).map_err(io)?;
-        manifest.verify(staging).map_err(io)?;
+        let mut manifest = ArtifactManifest::read(&manifest_path)
+            .map_err(|source| manifest_error(&manifest_path, source))?;
+        manifest
+            .verify(staging)
+            .map_err(|source| manifest_error(&manifest_path, source))?;
         let chunking = self
             .chunking
             .as_ref()
@@ -690,38 +624,9 @@ impl BuildConfig {
             path: directory.clone(),
             source,
         })?;
-        let requested = chunking.map_or_else(
-            || vec!["program".to_owned()],
-            |chunking| chunking.names().map(str::to_owned).collect::<Vec<_>>(),
-        );
-        let mut selected = requested.iter().cloned().collect::<BTreeSet<_>>();
-        let shared_name = chunking.and_then(|chunking| {
-            manifest
-                .entries
-                .get(chunking.shared_name())
-                .filter(|entry| entry.role == EntryRole::Shared)
-                .map(|_| chunking.shared_name().to_owned())
-        });
-        selected.extend(shared_name.iter().cloned());
-        if manifest
-            .entries
-            .keys()
-            .any(|entry| !selected.contains(entry))
-        {
-            return Err(io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "linker manifest contains an unrequested entry",
-            )));
-        }
-        let mut needed = BTreeSet::new();
-        for entry in &selected {
-            if !manifest.entries.contains_key(entry) {
-                return Err(BuildError::MissingOutput {
-                    path: staging.join(format!("{entry}.js")),
-                });
-            }
-            needed.extend(manifest.reachable(entry).map_err(io)?);
-        }
+        let resolved = resolve_entries(chunking, &manifest, &manifest_path)?;
+        let needed =
+            collect_reachable_artifacts(&manifest, &resolved.selected, staging, &manifest_path)?;
         // The compiler also retains an unsplit inspection program when it emits chunks.
         // That auxiliary program is not in the deployed entry closure.
         manifest.artifacts.retain(|name, _| needed.contains(name));
@@ -737,7 +642,8 @@ impl BuildConfig {
                 map: program.source_map.as_ref().map(|name| directory.join(name)),
             }
         };
-        let chunks = requested
+        let chunks = resolved
+            .requested
             .iter()
             .map(|name| {
                 let public_name = if chunking.is_none() {
@@ -748,10 +654,11 @@ impl BuildConfig {
                 chunk(name, public_name)
             })
             .collect();
-        let shared = shared_name.as_ref().map(|name| chunk(name, name.clone()));
-        let published_manifest = directory.join(manifest_path.file_name().unwrap());
-        manifest.write(&published_manifest).map_err(io)?;
-        manifest.verify(&directory).map_err(io)?;
+        let shared = resolved
+            .shared_name
+            .as_ref()
+            .map(|name| chunk(name, name.clone()));
+        let published_manifest = write_published_manifest(&manifest, &manifest_path, &directory)?;
         Ok((chunks, shared, published_manifest))
     }
 
@@ -805,7 +712,7 @@ impl BuildConfig {
             args.push("js-jir=off".to_owned());
         }
         args.extend(self.emit_args.iter().cloned());
-        if let Some(arg) = self.optimizer.backend_arg() {
+        if let Some(arg) = optimizer_mode_arg(self.optimizer) {
             args.push(arg.to_owned());
         }
         if let Some(arg) = self.optimizer_passes_arg() {
@@ -854,16 +761,20 @@ impl BuildConfig {
         let profile_args = self.profile_emit_args();
         let profile = self.profile.map(Profile::backend_arg);
         let jir = (!self.jir).then_some("js-jir=off");
-        let lane = self.lane.map(Lane::backend_arg);
+        let entry_role = self
+            .entry_role
+            .map(|role| format!("js-entry-role={}", role.as_str()));
+        let lane = self.lane.map(lane_arg);
         let args = profile_args
             .iter()
             .map(String::as_str)
             .chain(profile)
             .chain(jir)
             .chain(self.emit_args.iter().map(String::as_str))
-            .chain(self.optimizer.backend_arg())
+            .chain(optimizer_mode_arg(self.optimizer))
             .chain(optimizer_passes.as_deref())
             .chain(self.crate_args.iter().map(String::as_str))
+            .chain(entry_role.as_deref())
             .chain(lane)
             .chain(chunks.iter().map(String::as_str))
             .chain(warnings)
@@ -939,6 +850,104 @@ impl Artifacts {
     }
 }
 
+struct ResolvedEntries {
+    requested: Vec<String>,
+    shared_name: Option<String>,
+    selected: BTreeSet<String>,
+}
+
+fn manifest_error(path: &Path, source: io::Error) -> BuildError {
+    if source.kind() == io::ErrorKind::InvalidData {
+        BuildError::ManifestInvalid {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    } else {
+        BuildError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+fn resolve_entries(
+    chunking: Option<&Chunking>,
+    manifest: &ArtifactManifest,
+    manifest_path: &Path,
+) -> Result<ResolvedEntries> {
+    let requested = chunking.map_or_else(
+        || vec!["program".to_owned()],
+        |chunking| chunking.names().map(str::to_owned).collect::<Vec<_>>(),
+    );
+    let mut selected = requested.iter().cloned().collect::<BTreeSet<_>>();
+    let shared_name = chunking.and_then(|chunking| {
+        manifest
+            .entries
+            .get(chunking.shared_name())
+            .filter(|entry| entry.role == EntryRole::Shared)
+            .map(|_| chunking.shared_name().to_owned())
+    });
+    selected.extend(shared_name.iter().cloned());
+    if manifest
+        .entries
+        .keys()
+        .any(|entry| !selected.contains(entry))
+    {
+        return Err(BuildError::ManifestInvalid {
+            path: manifest_path.to_path_buf(),
+            reason: "linker manifest contains an unrequested entry".to_owned(),
+        });
+    }
+    Ok(ResolvedEntries {
+        requested,
+        shared_name,
+        selected,
+    })
+}
+
+fn collect_reachable_artifacts(
+    manifest: &ArtifactManifest,
+    selected: &BTreeSet<String>,
+    staging: &Path,
+    manifest_path: &Path,
+) -> Result<BTreeSet<String>> {
+    let mut needed = BTreeSet::new();
+    for entry in selected {
+        if !manifest.entries.contains_key(entry) {
+            return Err(BuildError::MissingOutput {
+                path: staging.join(format!("{entry}.js")),
+            });
+        }
+        needed.extend(
+            manifest
+                .reachable(entry)
+                .map_err(|source| manifest_error(manifest_path, source))?,
+        );
+    }
+    Ok(needed)
+}
+
+fn write_published_manifest(
+    manifest: &ArtifactManifest,
+    manifest_path: &Path,
+    directory: &Path,
+) -> Result<PathBuf> {
+    let manifest_name = manifest_path
+        .file_name()
+        .ok_or_else(|| BuildError::ManifestInvalid {
+            path: manifest_path.to_path_buf(),
+            reason: "manifest path has no file name".to_owned(),
+        })?;
+    let published_manifest = directory.join(manifest_name);
+    manifest
+        .write(&published_manifest)
+        .map_err(|source| manifest_error(&published_manifest, source))?;
+    manifest
+        .verify(directory)
+        .map_err(|source| manifest_error(&published_manifest, source))?;
+    Ok(published_manifest)
+}
+
 /// Copy `from` to `to`, leaving `to` alone when it already holds those bytes.
 fn publish(from: &Path, to: &Path) -> Result {
     if !from.is_file() {
@@ -982,16 +991,54 @@ mod tests {
         let config = BuildConfig::new("client/app.rs");
         assert_eq!(config.output_name, DEFAULT_OUTPUT_NAME);
         assert_eq!(config.extra_args(), "js-source-map=on");
-        assert!(!config.minimal_shim);
+        assert_eq!(config.shim_mode, ShimMode::Full);
     }
 
     #[test]
     fn the_minimal_runtime_is_opt_in() {
-        assert!(
+        assert_eq!(
             BuildConfig::new("client/app.rs")
                 .minimal_shim(true)
-                .minimal_shim
+                .shim_mode,
+            ShimMode::Minimal
         );
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .minimal_shim(true)
+                .shim(false)
+                .shim_mode,
+            ShimMode::None
+        );
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .shim(false)
+                .minimal_shim(false)
+                .shim_mode,
+            ShimMode::None
+        );
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .minimal_shim(true)
+                .minimal_shim(false)
+                .shim_mode,
+            ShimMode::Full
+        );
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .shim_mode(ShimMode::Minimal)
+                .shim_mode,
+            ShimMode::Minimal
+        );
+    }
+
+    #[test]
+    fn entry_role_emits_only_the_final_configured_role() {
+        let config = BuildConfig::new("client/app.rs")
+            .source_map(false)
+            .entry_role(EntryRole::Worker)
+            .entry_role(EntryRole::Island);
+
+        assert_eq!(config.extra_args(), "js-entry-role=island");
     }
 
     #[test]
@@ -1134,6 +1181,11 @@ mod tests {
             config.check_report_shape(),
             Err(BuildError::ChunkedOptimizationReport)
         ));
+
+        let empty_chunks = BuildConfig::new("client/app.rs")
+            .chunks(Chunking::new())
+            .optimization_report(true);
+        assert!(empty_chunks.check_report_shape().is_ok());
     }
 
     #[test]
@@ -1663,5 +1715,75 @@ mod tests {
         publish(&from, &to).unwrap();
 
         assert_eq!(fs::read(&to).unwrap(), b"program");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn publish_shim_reports_domain_errors_for_invalid_runtime_providers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let toolchain = Toolchain::new(root).unwrap();
+        let shim_sha = artifact::sha256(&fs::read(toolchain.shim()).unwrap());
+        let make_runtime = |module: Option<&str>| artifact::RuntimeRequirement {
+            module: module.map(str::to_owned),
+            source_sha256: shim_sha.clone(),
+            direct: BTreeSet::from(["host_task".to_owned()]),
+            closure: BTreeSet::from(["host_task".to_owned()]),
+            external: BTreeSet::new(),
+            artifact: None,
+        };
+
+        // External bare specifier requires shim(false).
+        let dir = TempDir::new("shim-external");
+        let program = staged(dir.path(), &["islands.js"]);
+        let manifest_path = artifact::manifest_path(&program);
+        let mut manifest = ArtifactManifest::read(&manifest_path).unwrap();
+        let prog = manifest.artifacts.get_mut("islands.js").unwrap();
+        prog.imports.insert("topcoat-island-rt".to_owned(), None);
+        prog.runtime = Some(make_runtime(Some("topcoat-island-rt")));
+        manifest.write(&manifest_path).unwrap();
+        let error = BuildConfig::new("client/app.rs")
+            .publish_shim(&toolchain, &manifest_path)
+            .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::ExternalRuntimeRequiresNoShim { specifier } if specifier == "topcoat-island-rt"),
+            "{error}"
+        );
+
+        // Local specifier colliding with an emitted artifact.
+        let dir = TempDir::new("shim-collision");
+        let program = staged(dir.path(), &["islands.js"]);
+        let manifest_path = artifact::manifest_path(&program);
+        let mut manifest = ArtifactManifest::read(&manifest_path).unwrap();
+        let prog = manifest.artifacts.get_mut("islands.js").unwrap();
+        prog.imports.insert("./islands.js".to_owned(), None);
+        prog.runtime = Some(make_runtime(Some("./islands.js")));
+        manifest.write(&manifest_path).unwrap();
+        let error = BuildConfig::new("client/app.rs")
+            .publish_shim(&toolchain, &manifest_path)
+            .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::RuntimeProviderCollision { name } if name == "islands.js"),
+            "{error}"
+        );
+
+        // Two entries declaring conflicting runtime providers.
+        let dir = TempDir::new("shim-mismatch");
+        let program = staged(dir.path(), &["islands.js", "counter.js", "search.js"]);
+        let manifest_path = artifact::manifest_path(&program);
+        let mut manifest = ArtifactManifest::read(&manifest_path).unwrap();
+        let counter = manifest.artifacts.get_mut("counter.js").unwrap();
+        counter.imports.insert("./a.js".to_owned(), None);
+        counter.runtime = Some(make_runtime(Some("./a.js")));
+        let search = manifest.artifacts.get_mut("search.js").unwrap();
+        search.imports.insert("./b.js".to_owned(), None);
+        search.runtime = Some(make_runtime(Some("./b.js")));
+        manifest.write(&manifest_path).unwrap();
+        let error = BuildConfig::new("client/app.rs")
+            .publish_shim(&toolchain, &manifest_path)
+            .unwrap_err();
+        assert!(
+            matches!(error, BuildError::RuntimeProviderMismatch { .. }),
+            "{error}"
+        );
     }
 }

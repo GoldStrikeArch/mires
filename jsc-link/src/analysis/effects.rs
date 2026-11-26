@@ -17,8 +17,6 @@
 //! caller-reachable storage, `Effect` may write it or perform host effects.
 //! Panics are tracked separately by `may_unwind`.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::callgraph::{self, Callgraph};
@@ -80,6 +78,7 @@ impl Summary {
     }
 
     /// Pointwise order: whether every claim of `self` is at least as strong as `other`'s.
+    #[cfg(test)]
     pub fn le(&self, other: &Summary) -> bool {
         self.purity <= other.purity && (!self.may_unwind || other.may_unwind)
     }
@@ -93,6 +92,7 @@ pub struct Summaries {
 
 impl Summaries {
     /// The raw entry, top included. Prefer [`Summaries::usable`] for decisions.
+    #[cfg(test)]
     pub fn get(&self, name: &JsName) -> Option<&Summary> {
         self.by_name.get(name)
     }
@@ -106,16 +106,12 @@ impl Summaries {
     /// The usable summary of a direct callee, resolved by its `link_name` through the calling
     /// object's interns.
     pub fn callee(&self, interns: &Interns, link_name: StrId) -> Option<&Summary> {
-        let name = JsName::new(interns.str(link_name)?.to_owned());
-        self.usable(&name)
+        let name = interns.str(link_name)?;
+        self.by_name.get(name).filter(|summary| !summary.is_top())
     }
 
     pub fn len(&self) -> usize {
         self.by_name.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&JsName, &Summary)> {
@@ -123,6 +119,7 @@ impl Summaries {
     }
 
     /// A deterministic one-line-per-item rendering, for tests and debugging.
+    #[cfg(test)]
     pub fn dump(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -290,7 +287,7 @@ impl<'a> Cx<'a> {
                 .sig
                 .arguments
                 .iter()
-                .any(|ty| types.is_none_or(|t| type_has_fn_ptr(*ty, t, &mut BTreeSet::new())))
+                .any(|ty| types.is_none_or(|t| type_has_fn_ptr(*ty, t)))
             {
                 return true;
             }
@@ -307,7 +304,7 @@ impl<'a> Cx<'a> {
                             return true;
                         }
                         OpKind::Cast { from, to, .. } => {
-                            if types.is_none_or(|t| type_has_fn_ptr(*to, t, &mut BTreeSet::new())) {
+                            if types.is_none_or(|t| type_has_fn_ptr(*to, t)) {
                                 let closed_reify = types.is_some_and(|t| {
                                     let to_peeled = t.peeled(*to);
                                     let from_peeled = t.peeled(*from);
@@ -361,7 +358,7 @@ impl<'a> Cx<'a> {
                                 let Some(ty) = func.ty(val) else {
                                     return true;
                                 };
-                                types.is_none_or(|t| type_has_fn_ptr(ty, t, &mut BTreeSet::new()))
+                                types.is_none_or(|t| type_has_fn_ptr(ty, t))
                             };
                             if op.result.is_some_and(touches_fn_ptr)
                                 || args.iter().copied().any(touches_fn_ptr)
@@ -386,28 +383,24 @@ impl<'a> Cx<'a> {
     }
 }
 
-fn type_has_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeId>) -> bool {
-    if !seen.insert(ty) {
-        return false;
-    }
-    let Some(desc) = types.get(ty) else {
-        return true;
-    };
-    match &desc.kind {
-        TypeKind::FnPtr { .. } => true,
-        TypeKind::Reference { pointee, .. }
-        | TypeKind::RawPointer { pointee, .. }
-        | TypeKind::Pattern(pointee) => type_has_fn_ptr(*pointee, types, seen),
-        TypeKind::Slice(elem) | TypeKind::Array { element: elem, .. } => {
-            type_has_fn_ptr(*elem, types, seen)
-        }
-        TypeKind::Tuple(fields) => fields.iter().any(|f| type_has_fn_ptr(*f, types, seen)),
-        TypeKind::Closure { upvars, .. } => upvars.iter().any(|f| type_has_fn_ptr(*f, types, seen)),
-        TypeKind::Adt { variants, .. } => variants
-            .iter()
-            .any(|v| v.fields.iter().any(|f| type_has_fn_ptr(f.ty, types, seen))),
-        _ => false,
-    }
+fn type_has_fn_ptr(ty: TypeId, types: &TypeTable) -> bool {
+    let mut found = false;
+    types.visit_types(
+        ty,
+        rcgjs_object::jir::types::TypeWalk::ThroughPointers,
+        &mut |cur| {
+            if found {
+                return;
+            }
+            if matches!(
+                types.get(cur).map(|d| &d.kind),
+                None | Some(TypeKind::FnPtr { .. })
+            ) {
+                found = true;
+            }
+        },
+    );
+    found
 }
 
 fn const_has_fn_ptr(tree: &ConstTree) -> bool {
@@ -457,8 +450,7 @@ fn op_const_has_fn_ptr(
         return true;
     }
     const_has_static_global(tree)
-        && result_ty
-            .is_none_or(|ty| types.is_none_or(|t| type_has_fn_ptr(ty, t, &mut BTreeSet::new())))
+        && result_ty.is_none_or(|ty| types.is_none_or(|t| type_has_fn_ptr(ty, t)))
 }
 
 /// How a call site contributes, decided once and shared by the taint and facts passes.
@@ -473,7 +465,7 @@ enum CallKind<'a> {
     Host(Option<Descriptor>),
     /// A plain direct call: the callee's summary answers, under its resolved link name.
     /// `None` where the caller's interns cannot spell the name: nothing can be known.
-    Direct(Option<JsName>),
+    Direct(Option<&'a str>),
     /// An indirect call, bounded by the program's reified targets where possible.
     Indirect(Option<&'a BTreeSet<ItemId>>),
     Virtual,
@@ -481,51 +473,58 @@ enum CallKind<'a> {
     Opaque,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn classify<'a>(
-    graph: &'a Callgraph,
-    interns: Option<&Interns>,
-    func: &Func,
-    result: Option<ValueId>,
-    args: &[ValueId],
-    callee: &Callee,
-    semantic: &CallSemantic,
-    host: &Option<HostPayload>,
-) -> CallKind<'a> {
-    if let CallSemantic::Standard(operation) = semantic {
-        let types = interns.map(|interns| &interns.types);
-        if let Some(effects) =
-            semantic_ops::call_effects_entry(*operation, types, func, result, args)
-        {
-            return CallKind::Registry(*operation, effects);
+/// Shared per-function context passed through effect scanning of ops, calls, and drops.
+struct EffectScanCx<'a> {
+    cx: &'a Cx<'a>,
+    interns: Option<&'a Interns>,
+    types: Option<&'a TypeTable>,
+    func: &'a Func,
+    local_ptrs: &'a [bool],
+    current: &'a BTreeMap<JsName, Summary>,
+}
+
+impl<'a> EffectScanCx<'a> {
+    fn classify(
+        &self,
+        result: Option<ValueId>,
+        args: &[ValueId],
+        callee: &Callee,
+        semantic: &CallSemantic,
+        host: &Option<HostPayload>,
+    ) -> CallKind<'a> {
+        if let CallSemantic::Standard(operation) = semantic {
+            if let Some(effects) =
+                semantic_ops::call_effects_entry(*operation, self.types, self.func, result, args)
+            {
+                return CallKind::Registry(*operation, effects);
+            }
         }
-    }
-    if matches!(semantic, CallSemantic::GlobalAllocator) {
-        return CallKind::GlobalAllocator;
-    }
-    if host.is_some() || matches!(semantic, CallSemantic::Host | CallSemantic::RawJavaScript) {
-        let descriptor = match host {
-            Some(HostPayload::Extern(bytes)) => interns
-                .and_then(|interns| interns.bytes.get(bytes.0 as usize))
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .and_then(|text| Descriptor::decode(text).ok()),
-            _ => None,
-        };
-        return CallKind::Host(descriptor);
-    }
-    match callee {
-        Callee::Direct { link_name, .. } => CallKind::Direct(
-            interns
-                .and_then(|interns| interns.str(*link_name))
-                .map(|name| JsName::new(name.to_owned())),
-        ),
-        Callee::Nop => CallKind::Nop,
-        Callee::Indirect { signature } => {
-            CallKind::Indirect(graph.fn_pointer_targets.get(signature))
+        if matches!(semantic, CallSemantic::GlobalAllocator) {
+            return CallKind::GlobalAllocator;
         }
-        Callee::Virtual { .. } => CallKind::Virtual,
-        Callee::Foreign { .. } | Callee::Runtime { .. } | Callee::Intrinsic { .. } => {
-            CallKind::Opaque
+        if host.is_some() || matches!(semantic, CallSemantic::Host | CallSemantic::RawJavaScript) {
+            let descriptor = match host {
+                Some(HostPayload::Extern(bytes)) => self
+                    .interns
+                    .and_then(|interns| interns.bytes.get(bytes.0 as usize))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .and_then(|text| Descriptor::decode(text).ok()),
+                _ => None,
+            };
+            return CallKind::Host(descriptor);
+        }
+        match callee {
+            Callee::Direct { link_name, .. } => {
+                CallKind::Direct(self.interns.and_then(|interns| interns.str(*link_name)))
+            }
+            Callee::Nop => CallKind::Nop,
+            Callee::Indirect { signature } => {
+                CallKind::Indirect(self.cx.graph.fn_pointer_targets.get(signature))
+            }
+            Callee::Virtual { .. } => CallKind::Virtual,
+            Callee::Foreign { .. } | Callee::Runtime { .. } | Callee::Intrinsic { .. } => {
+                CallKind::Opaque
+            }
         }
     }
 }
@@ -602,12 +601,20 @@ fn summarize(
     let interns = cx.interns_of(name);
     let types = interns.map(|interns| &interns.types);
     let local_ptrs = compute_local_ptrs(func);
+    let scan = EffectScanCx {
+        cx,
+        interns,
+        types,
+        func,
+        local_ptrs: &local_ptrs,
+        current,
+    };
     let mut facts = Facts {
         summary: Summary::bottom(),
     };
     for block in &func.blocks {
         for op in &block.ops {
-            facts.op(cx, interns, types, func, &local_ptrs, op, current);
+            facts.op(&scan, op);
         }
         facts.term(&block.term);
     }
@@ -628,25 +635,15 @@ impl Facts {
         self.summary.may_unwind = true;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn op(
-        &mut self,
-        cx: &Cx<'_>,
-        interns: Option<&Interns>,
-        types: Option<&TypeTable>,
-        func: &Func,
-        local_ptrs: &[bool],
-        op: &crate::jir::repr::Op,
-        current: &BTreeMap<JsName, Summary>,
-    ) {
+    fn op(&mut self, scan: &EffectScanCx<'_>, op: &crate::jir::repr::Op) {
         match &op.kind {
             OpKind::Deref(ptr) => {
-                if !local_ptrs[ptr.0 as usize] {
+                if !scan.local_ptrs[ptr.0 as usize] {
                     self.purity(Purity::Read);
                 }
             }
             OpKind::StoreThrough { ptr, .. } => {
-                if !local_ptrs[ptr.0 as usize] {
+                if !scan.local_ptrs[ptr.0 as usize] {
                     self.purity(Purity::Effect);
                 }
             }
@@ -655,7 +652,7 @@ impl Facts {
             OpKind::SpillRead(_) => self.purity(Purity::Read),
             OpKind::SpillWrite { .. } => self.purity(Purity::Effect),
             OpKind::Intrinsic { .. } | OpKind::Host { .. } => self.opaque(),
-            OpKind::Drop { glue, .. } => self.drop_glue(interns, glue, current),
+            OpKind::Drop { glue, .. } => self.drop_glue(scan, glue),
             OpKind::Call {
                 callee,
                 semantic,
@@ -663,28 +660,22 @@ impl Facts {
                 args,
                 ..
             } => {
-                let kind = classify(
-                    cx.graph, interns, func, op.result, args, callee, semantic, host,
-                );
-                self.call(cx, types, func, &kind, &cx.graph.by_item, args, current);
+                let kind = scan.classify(op.result, args, callee, semantic, host);
+                self.call(scan, &kind, args);
             }
             _ => {}
         }
     }
 
-    fn drop_glue(
-        &mut self,
-        interns: Option<&Interns>,
-        glue: &DropGlue,
-        current: &BTreeMap<JsName, Summary>,
-    ) {
+    fn drop_glue(&mut self, scan: &EffectScanCx<'_>, glue: &DropGlue) {
         match glue {
             DropGlue::None => {}
             DropGlue::Direct { link_name, .. } => {
-                let resolved = interns
+                match scan
+                    .interns
                     .and_then(|interns| interns.str(*link_name))
-                    .map(|name| JsName::new(name.to_owned()));
-                match resolved.as_ref().and_then(|name| current.get(name)) {
+                    .and_then(|name| scan.current.get(name))
+                {
                     Some(summary) => {
                         self.purity(summary.purity);
                         self.summary.may_unwind |= summary.may_unwind;
@@ -696,17 +687,7 @@ impl Facts {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn call(
-        &mut self,
-        cx: &Cx<'_>,
-        types: Option<&TypeTable>,
-        func: &Func,
-        kind: &CallKind<'_>,
-        by_item: &BTreeMap<ItemId, BTreeSet<JsName>>,
-        args: &[ValueId],
-        current: &BTreeMap<JsName, Summary>,
-    ) {
+    fn call(&mut self, scan: &EffectScanCx<'_>, kind: &CallKind<'_>, args: &[ValueId]) {
         match kind {
             CallKind::Nop => {}
             CallKind::Registry(operation, effects) => {
@@ -716,34 +697,34 @@ impl Facts {
                     Purity::Read
                 });
                 self.summary.may_unwind |= effects.can_throw
-                    || cx.has_custom_allocator
-                    || registry_drop_may_unwind(*operation, types, func, args);
+                    || scan.cx.has_custom_allocator
+                    || registry_drop_may_unwind(*operation, scan.types, scan.func, args);
             }
             CallKind::GlobalAllocator => self.opaque(),
             CallKind::Host(descriptor) => {
                 self.purity(Purity::Effect);
                 match descriptor {
                     Some(descriptor) => {
-                        self.summary.may_unwind |= descriptor.fallible
+                        self.summary.may_unwind |= descriptor.is_fallible()
                             || descriptor
                                 .slots
-                                .iter()
-                                .any(|(_, facts)| facts.has(Fact::Throws));
+                                .values()
+                                .any(|facts| facts.has(Fact::Throws));
                     }
                     None => self.summary.may_unwind = true,
                 }
             }
             CallKind::Direct(name) => match name {
-                Some(name) => self.direct(name, current),
+                Some(name) => self.direct(name, scan.current),
                 None => self.opaque(),
             },
             CallKind::Indirect(targets) => match targets {
-                Some(targets) if !targets.is_empty() && !cx.indirect_unclosed => {
+                Some(targets) if !targets.is_empty() && !scan.cx.indirect_unclosed => {
                     for target in targets.iter() {
-                        match by_item.get(target) {
+                        match scan.cx.graph.by_item.get(target) {
                             Some(names) => {
                                 for name in names {
-                                    self.direct(name, current);
+                                    self.direct(name.as_str(), scan.current);
                                 }
                             }
                             None => self.opaque(),
@@ -756,7 +737,7 @@ impl Facts {
         }
     }
 
-    fn direct(&mut self, name: &JsName, current: &BTreeMap<JsName, Summary>) {
+    fn direct(&mut self, name: &str, current: &BTreeMap<JsName, Summary>) {
         match current.get(name) {
             Some(summary) => {
                 self.purity(summary.purity);
@@ -828,7 +809,7 @@ fn registry_drop_may_unwind(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{Fact as DFact, Shape, Slot as DSlot, SlotFacts};
+    use crate::descriptor::{Fact as DFact, ReturnKind, RootSpec, Shape, Slot as DSlot, SlotFacts};
     use crate::jir::interns::{BytesId, StrId};
     use crate::jir::origin::OriginId;
     use crate::jir::repr::{FuncBuilder, OpKind, RTerm};
@@ -1125,12 +1106,10 @@ mod tests {
             let mut prog = Prog::new();
             let desc = Descriptor {
                 shape: Shape::Method,
-                nullable: false,
-                fallible: false,
-                global: false,
-                module: String::new(),
+                return_kind: ReturnKind::Plain,
+                root_spec: RootSpec::Default,
                 name: "write".to_owned(),
-                slots: vec![(DSlot::Parameter(0), facts)],
+                slots: BTreeMap::from([(DSlot::Parameter(0), facts)]),
             };
             let encoded = desc.encode();
             let body = encoded.strip_prefix(crate::descriptor::PREFIX).unwrap();
@@ -2239,7 +2218,7 @@ mod corpus {
             .enumerate()
             .filter_map(|(index, name)| {
                 funcs
-                    .get(&JsName::new(name.clone()))
+                    .get(name.as_str())
                     .and_then(|func| func.as_ref().ok())
                     .map(|func| (StrId(index as u32), func))
             })
@@ -2278,35 +2257,40 @@ mod corpus {
             let Some(sets) = ssa::check::argument_sets(&body.signature.arguments, table) else {
                 continue;
             };
+            let fuzz_env = FuzzEnv {
+                label,
+                table,
+                interns,
+                callees: &callees,
+            };
             counts.fuzzed += 1;
             for set in sets.iter().take(SETS) {
-                fuzz_one(
-                    label,
-                    name.as_str(),
-                    func,
-                    summary,
-                    table,
-                    interns,
-                    &callees,
-                    set,
-                    counts,
-                );
+                fuzz_one(&fuzz_env, name.as_str(), func, summary, set, counts);
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    struct FuzzEnv<'a> {
+        label: &'a str,
+        table: &'a TypeTable,
+        interns: &'a Interns,
+        callees: &'a BTreeMap<StrId, &'a Func>,
+    }
+
     fn fuzz_one(
-        label: &str,
+        env: &FuzzEnv<'_>,
         name: &str,
         func: &Func,
         summary: &Summary,
-        table: &TypeTable,
-        interns: &Interns,
-        callees: &BTreeMap<StrId, &Func>,
         set: &[(Value, Option<Value>)],
         counts: &mut Counts,
     ) {
+        let FuzzEnv {
+            label,
+            table,
+            interns,
+            callees,
+        } = *env;
         let hook = |_: &DirectItemRef, _: Vec<Value>| -> Result<Value, Trap> {
             Err(Trap::Hook("callee body unavailable".to_owned()))
         };
@@ -2662,6 +2646,12 @@ mod corpus {
                     exit,
                     "unsupported" | "hook" | "steps" | "unsupported-before-write"
                 );
+                let fuzz_env = FuzzEnv {
+                    label: "direct call control",
+                    table: &interns.types,
+                    interns: &interns,
+                    callees: &callees,
+                };
                 for (claim, summary, violations) in [
                     ("unknown effects", summary, false),
                     ("pure", pure, observed_write),
@@ -2669,17 +2659,7 @@ mod corpus {
                     ("no unwind", no_unwind, matches!(exit, "throw" | "assert")),
                 ] {
                     let mut counts = Counts::default();
-                    fuzz_one(
-                        "direct call control",
-                        claim,
-                        &caller,
-                        &summary,
-                        &interns.types,
-                        &interns,
-                        &callees,
-                        &set,
-                        &mut counts,
-                    );
+                    fuzz_one(&fuzz_env, claim, &caller, &summary, &set, &mut counts);
                     assert_eq!(counts.skipped, usize::from(incomplete));
                     let checks_write = matches!(claim, "pure" | "read only");
                     assert_eq!(

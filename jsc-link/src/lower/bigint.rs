@@ -233,9 +233,7 @@ fn link_item<const N: usize>(
         dts: None,
         optimization: Default::default(),
         allocator_provider: Default::default(),
-        jir: None,
-        jir_decline: None,
-        jir_item: None,
+        jir: Default::default(),
     };
     let (js, mappings) = printed.to_js_mapped(crate::opts::get().comments);
     LinkItem {

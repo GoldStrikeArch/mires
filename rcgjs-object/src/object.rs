@@ -94,30 +94,6 @@ impl ItemKind {
     pub fn is_binding(self) -> bool {
         matches!(self, ItemKind::Static | ItemKind::Vtable | ItemKind::Const)
     }
-
-    /// The format 19 tag. Append only: a value already written into an object file keeps it.
-    pub fn tag(self) -> u8 {
-        match self {
-            ItemKind::Fn => 0,
-            ItemKind::Static => 1,
-            ItemKind::Vtable => 2,
-            ItemKind::Alloc => 3,
-            ItemKind::Const => 4,
-            ItemKind::Import => 5,
-        }
-    }
-
-    pub fn from_tag(tag: u8) -> Option<ItemKind> {
-        Some(match tag {
-            0 => ItemKind::Fn,
-            1 => ItemKind::Static,
-            2 => ItemKind::Vtable,
-            3 => ItemKind::Alloc,
-            4 => ItemKind::Const,
-            5 => ItemKind::Import,
-            _ => return None,
-        })
-    }
 }
 
 /// Where a declaration whose *order* is part of what it means came from.
@@ -756,11 +732,12 @@ impl Object {
     /// The item's baseline JavaScript.
     pub fn text_of(&self, item: &ItemSummary) -> Result<&str, ObjectError> {
         let start = item.fallback.offset as usize;
-        let end = start + item.fallback.clen as usize;
-        self.text.get(start..end).ok_or_else(|| ObjectError::Item {
-            name: item.key.link_name.clone(),
-            message: "points outside the object body".to_owned(),
-        })
+        let end = start.checked_add(item.fallback.clen as usize);
+        end.and_then(|end| self.text.get(start..end))
+            .ok_or_else(|| ObjectError::Item {
+                name: item.key.link_name.clone(),
+                message: "points outside the object body".to_owned(),
+            })
     }
 
     /// Takes the text section out, for a reader that has sliced every item's JavaScript and does

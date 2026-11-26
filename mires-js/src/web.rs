@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{js_bindings, HostValue, JsString, JsValue};
+use crate::{js_bindings, HostHandle, HostValue, JsString, JsValue};
 
 /// A native JavaScript `Uint8Array`.
 ///
@@ -34,7 +34,7 @@ use crate::{js_bindings, HostValue, JsString, JsValue};
 #[derive(Clone, Copy)]
 pub struct JsUint8Array {
     #[allow(dead_code)]
-    handle: u32,
+    handle: HostHandle,
 }
 
 impl crate::host::sealed::Sealed for JsUint8Array {}
@@ -176,10 +176,7 @@ impl TryFrom<JsValue> for JsUint8Array {
     type Error = JsValue;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        match Self::accepts(value) {
-            true => Ok(value.read()),
-            false => Err(value),
-        }
+        value.try_read()
     }
 }
 
@@ -233,125 +230,100 @@ impl CompressionFormat {
     }
 }
 
-/// A native browser `CompressionStream` transform.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JsCompressionStream {
-    #[allow(dead_code)]
-    handle: u32,
-}
-
-impl crate::host::sealed::Sealed for JsCompressionStream {}
-impl HostValue for JsCompressionStream {
-    fn accepts(value: JsValue) -> bool {
-        compression_stream_supported()
-            && value.is_object()
-            && value_constructor(value).strictly_equals(compression_stream_constructor())
-    }
-}
-
-impl JsCompressionStream {
-    /// Constructs the requested native compression transform.
-    ///
-    /// Unsupported browsers and unsupported formats return their original JavaScript exception.
-    pub fn new(format: CompressionFormat) -> Result<Self, JsValue> {
-        compression_stream_new(format.host_name())
-    }
-
-    /// The readable side of the transform.
-    #[must_use]
-    pub fn readable(&self) -> JsValue {
-        compression_stream_readable(*self)
-    }
-
-    /// The writable side of the transform.
-    #[must_use]
-    pub fn writable(&self) -> JsValue {
-        compression_stream_writable(*self)
-    }
-
-    /// Erases the transform to an opaque host value.
-    #[must_use]
-    pub fn as_value(self) -> JsValue {
-        JsValue::erase(self)
-    }
-}
-
-impl From<JsCompressionStream> for JsValue {
-    fn from(value: JsCompressionStream) -> Self {
-        value.as_value()
-    }
-}
-
-impl TryFrom<JsValue> for JsCompressionStream {
-    type Error = JsValue;
-
-    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        match Self::accepts(value) {
-            true => Ok(value.read()),
-            false => Err(value),
+macro_rules! compression_stream_type {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident {
+            js_name: $js_name:literal,
+            new_doc: $new_doc:literal,
+            ctor: $ctor:ident,
+            new: $new_fn:ident,
+            readable: $readable_fn:ident,
+            writable: $writable_fn:ident,
         }
-    }
-}
-
-/// A native browser `DecompressionStream` transform.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JsDecompressionStream {
-    #[allow(dead_code)]
-    handle: u32,
-}
-
-impl crate::host::sealed::Sealed for JsDecompressionStream {}
-impl HostValue for JsDecompressionStream {
-    fn accepts(value: JsValue) -> bool {
-        compression_stream_supported()
-            && value.is_object()
-            && value_constructor(value).strictly_equals(decompression_stream_constructor())
-    }
-}
-
-impl JsDecompressionStream {
-    /// Constructs the requested native decompression transform.
-    ///
-    /// Unsupported browsers and unsupported formats return their original JavaScript exception.
-    pub fn new(format: CompressionFormat) -> Result<Self, JsValue> {
-        decompression_stream_new(format.host_name())
-    }
-
-    /// The readable side of the transform.
-    #[must_use]
-    pub fn readable(&self) -> JsValue {
-        decompression_stream_readable(*self)
-    }
-
-    /// The writable side of the transform.
-    #[must_use]
-    pub fn writable(&self) -> JsValue {
-        decompression_stream_writable(*self)
-    }
-
-    /// Erases the transform to an opaque host value.
-    #[must_use]
-    pub fn as_value(self) -> JsValue {
-        JsValue::erase(self)
-    }
-}
-
-impl From<JsDecompressionStream> for JsValue {
-    fn from(value: JsDecompressionStream) -> Self {
-        value.as_value()
-    }
-}
-
-impl TryFrom<JsValue> for JsDecompressionStream {
-    type Error = JsValue;
-
-    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        match Self::accepts(value) {
-            true => Ok(value.read()),
-            false => Err(value),
+    ) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy)]
+        pub struct $name {
+            #[allow(dead_code)]
+            handle: HostHandle,
         }
+
+        impl crate::host::sealed::Sealed for $name {}
+        impl HostValue for $name {
+            fn accepts(value: JsValue) -> bool {
+                value.is_object()
+                    && reflect_has(global_this(), JsString::new($js_name))
+                    && value_constructor(value).strictly_equals($ctor())
+            }
+        }
+
+        impl $name {
+            #[doc = $new_doc]
+            ///
+            /// Unsupported browsers and unsupported formats return their original JavaScript
+            /// exception.
+            pub fn new(format: CompressionFormat) -> Result<Self, JsValue> {
+                $new_fn(format.host_name())
+            }
+
+            /// The readable side of the transform.
+            #[must_use]
+            pub fn readable(&self) -> JsValue {
+                $readable_fn(*self)
+            }
+
+            /// The writable side of the transform.
+            #[must_use]
+            pub fn writable(&self) -> JsValue {
+                $writable_fn(*self)
+            }
+
+            /// Erases the transform to an opaque host value.
+            #[must_use]
+            pub fn as_value(self) -> JsValue {
+                JsValue::erase(self)
+            }
+        }
+
+        impl From<$name> for JsValue {
+            fn from(value: $name) -> Self {
+                value.as_value()
+            }
+        }
+
+        impl TryFrom<JsValue> for $name {
+            type Error = JsValue;
+
+            fn try_from(value: JsValue) -> Result<Self, Self::Error> {
+                value.try_read()
+            }
+        }
+    };
+}
+
+compression_stream_type! {
+    /// A native browser `CompressionStream` transform.
+    pub struct JsCompressionStream {
+        js_name: "CompressionStream",
+        new_doc: "Constructs the requested native compression transform.",
+        ctor: compression_stream_constructor,
+        new: compression_stream_new,
+        readable: compression_stream_readable,
+        writable: compression_stream_writable,
+    }
+}
+
+compression_stream_type! {
+    /// A native browser `DecompressionStream` transform.
+    pub struct JsDecompressionStream {
+        js_name: "DecompressionStream",
+        new_doc: "Constructs the requested native decompression transform.",
+        ctor: decompression_stream_constructor,
+        new: decompression_stream_new,
+        readable: decompression_stream_readable,
+        writable: decompression_stream_writable,
     }
 }
 

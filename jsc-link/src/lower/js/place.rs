@@ -16,6 +16,45 @@ use rcgjs_object::ptr::{self, BUF, META, OFF, PTR};
 use super::value::{self, field_expr, is_slot, is_slot_pointee};
 use super::{decline, JsCx, Res};
 
+/// Byte-aliasing access mode for a [`JsPlace::Slot`] dereference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotByteAccess {
+    /// Regular slot element access (`pointer.buf[pointer.off]`).
+    None,
+    /// Aliasing unsigned byte read/write (`__rt.read_byte(p)` / `__rt.write_byte(p, v)`).
+    Unsigned,
+    /// Aliasing signed byte read/write (`__rt.read_byte(p, true)` / `__rt.write_byte(p, v)`).
+    Signed,
+}
+
+/// How a `str` place was reached by dereferencing its pointer.
+///
+/// Eliminates the invalid `(fat: false, from_mut: true)` combination: an immutable `&str` is a
+/// JavaScript string (`None`), while `&mut str` / `*mut str` (`FatMut`) and `*const str` /
+/// `NonNull<str>` / `Unique<str>` / `Box<str>` (`FatConst`) are live `{ buf, off, len }` UTF-8
+/// byte slices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrPlaceKind {
+    /// Not a `FatSlice` `str` deref (either a non-`str` place or an immutable `&str` JS string).
+    None,
+    /// Dereferenced from an immutable `FatSlice` `str` pointer (`*const str`, `NonNull<str>`,
+    /// `Unique<str>`, `Box<str>`), which may alias a memoized `__rt.str_bytes`/`__rt.bstr_bytes`
+    /// view and must detach before mutating.
+    FatConst,
+    /// Dereferenced from a mutable `FatSlice` `str` pointer (`&mut str`, `*mut str`).
+    FatMut,
+}
+
+/// Metadata carried from a `Proj::Deref` across transparent `Proj::Field` and `Proj::Downcast`
+/// steps to the projection that consumes it. Keeping all carried variants in one enum ensures
+/// transparent and downcast steps restore every piece of metadata atomically.
+enum DerefCarry {
+    None,
+    UnsizedTail { meta: Expr, raw: Option<Expr> },
+    Str(StrPlaceKind),
+    RawByteSlice { signed: bool },
+}
+
 /// A place, lowered to the JavaScript that reads and writes it (`place.rs::JsPlace`).
 #[derive(Clone, Debug)]
 pub enum JsPlace {
@@ -33,7 +72,7 @@ pub enum JsPlace {
     Slot {
         pointer: Expr,
         indirect: bool,
-        byte_signed: Option<bool>,
+        byte_access: SlotByteAccess,
     },
     /// One byte element indexed out of a raw `*const [u8]` / `*mut [u8]` / `*const [i8]` /
     /// `*mut [i8]` slice when whole-program analysis sees potential wide-to-byte aliasing.
@@ -71,15 +110,23 @@ pub struct Walk {
     /// object's `__rt.box` ([`JsCx::raw_view`]), never the slot of that expression, which would
     /// be the address of the storage *holding* the reference.
     pub object: bool,
-    /// Whether a `str` place was reached by dereferencing a `FatSlice` `str` pointer (`&mut str`,
-    /// `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`).
-    pub str_mutable: bool,
-    /// Whether that `str` pointer was specifically mutable (`&mut str` / `*mut str`), so it
-    /// cannot alias a memoized `__rt.str_bytes` / `__rt.bstr_bytes` view.
-    pub str_from_mut: bool,
+    /// Whether a `str` place was reached by dereferencing a `FatSlice` `str` pointer, and whether
+    /// that pointer was mutable.
+    pub str_kind: StrPlaceKind,
     /// Whether the final projection landed on a `heap.smi_u32_fields` struct field stored as
     /// signed `Int32`.
     pub smi_u32: bool,
+}
+
+/// Mutable walk cursor threaded across projection steps in [`JsCx::walk_place`].
+struct WalkState {
+    current: JsPlace,
+    ty: TypeId,
+    variant: Option<u32>,
+    identity: Option<Expr>,
+    carry: DerefCarry,
+    object: bool,
+    smi_u32: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -93,560 +140,543 @@ impl<'a> JsCx<'a> {
 
     /// The place walk (`place.rs::walk_place`).
     pub fn walk_place(&self, root: &Root, path: &[Proj]) -> Res<Walk> {
-        let table = self.table;
         // `js-str=bytes`: one byte of a byte view held as its string (or `{ buf, off, len }`
         // byte-string subslice) is that string's code unit.
-        if let (
-            Root::Value(view),
-            [Proj::Deref, step @ (Proj::Index(_) | Proj::ConstantIndex { .. })],
-        ) = (root, path)
-        {
-            if let Some(bv) = self.byte_view(*view) {
-                match bv.mode {
-                    super::ByteViewMode::FullSlice => {
-                        let string = self.expr_of(*view)?;
-                        let index = match step {
-                            Proj::Index(index) => self.expr_of(*index)?,
-                            Proj::ConstantIndex {
-                                offset,
-                                from_end: false,
-                                ..
-                            } => jsast::num(*offset as f64),
-                            Proj::ConstantIndex { offset, .. } => jsast::binary(
-                                BinOp::Sub,
-                                jsast::member(string.clone(), "length"),
-                                jsast::num(*offset as f64),
-                            ),
-                            _ => unreachable!("matched above"),
-                        };
-                        let pointee =
-                            value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
-                                decline(OpClass::Place, "a byte view that is not a pointer")
-                            })?;
-                        let element = self.element_ty(pointee)?;
-                        return Ok(Walk {
-                            place: JsPlace::Var(jsast::method_call(
-                                string,
-                                "charCodeAt",
-                                vec![index],
-                            )),
-                            ty: element,
-                            identity: None,
-                            object: false,
-                            str_mutable: false,
-                            str_from_mut: false,
-                            smi_u32: false,
-                        });
-                    }
-                    super::ByteViewMode::VarSlice => {
-                        let base = self.byte_view_base_expr(bv, *view)?;
-                        let off = self.byte_view_off_expr(*view)?;
-                        let index = match step {
-                            Proj::Index(index) => self.expr_of(*index)?,
-                            Proj::ConstantIndex {
-                                offset,
-                                from_end: false,
-                                ..
-                            } => jsast::num(*offset as f64),
-                            Proj::ConstantIndex { offset, .. } => {
-                                let len = self.byte_view_len_expr(*view)?;
-                                jsast::binary(
-                                    BinOp::UShr,
-                                    jsast::binary(BinOp::Sub, len, jsast::num(*offset as f64)),
-                                    jsast::num(0),
-                                )
-                            }
-                            _ => unreachable!("matched above"),
-                        };
-                        let total = if matches!(off, Expr::Num(n) if n == 0.0) {
-                            index
-                        } else if matches!(index, Expr::Num(n) if n == 0.0) {
-                            off
-                        } else {
-                            jsast::binary(
-                                BinOp::UShr,
-                                jsast::binary(BinOp::Add, off, index),
-                                jsast::num(0),
-                            )
-                        };
-                        let pointee =
-                            value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
-                                decline(OpClass::Place, "a byte view that is not a pointer")
-                            })?;
-                        let element = self.element_ty(pointee)?;
-                        return Ok(Walk {
-                            place: JsPlace::Var(jsast::method_call(
-                                base,
-                                "charCodeAt",
-                                vec![total],
-                            )),
-                            ty: element,
-                            identity: None,
-                            object: false,
-                            str_mutable: false,
-                            str_from_mut: false,
-                            smi_u32: false,
-                        });
-                    }
-                    super::ByteViewMode::ThinPtr => {
-                        if let Some(arr_len) =
-                            super::byte_view_analysis::is_immutable_byte_array_ptr(
-                                table,
-                                self.ty_of(*view)?,
-                            )
-                        {
-                            let base = self.byte_view_base_expr(bv, *view)?;
-                            let off = self.byte_view_off_expr(*view)?;
-                            let index = match step {
-                                Proj::Index(index) => self.expr_of(*index)?,
-                                Proj::ConstantIndex {
-                                    offset,
-                                    from_end: false,
-                                    ..
-                                } => jsast::num(*offset as f64),
-                                Proj::ConstantIndex { offset, .. } => {
-                                    jsast::num(arr_len.saturating_sub(*offset) as f64)
-                                }
-                                _ => unreachable!("matched above"),
-                            };
-                            let total = if matches!(off, Expr::Num(n) if n == 0.0) {
-                                index
-                            } else if matches!(index, Expr::Num(n) if n == 0.0) {
-                                off
-                            } else {
-                                jsast::binary(
-                                    BinOp::UShr,
-                                    jsast::binary(BinOp::Add, off, index),
-                                    jsast::num(0),
-                                )
-                            };
-                            let pointee =
-                                value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
-                                    decline(OpClass::Place, "a byte view that is not a pointer")
-                                })?;
-                            let element = self.element_ty(pointee)?;
-                            return Ok(Walk {
-                                place: JsPlace::Var(jsast::method_call(
-                                    base,
-                                    "charCodeAt",
-                                    vec![total],
-                                )),
-                                ty: element,
-                                identity: None,
-                                object: false,
-                                str_mutable: false,
-                                str_from_mut: false,
-                                smi_u32: false,
-                            });
-                        }
-                    }
-                }
-            }
+        if let Some(walk) = self.try_walk_byte_view_place(root, path)? {
+            return Ok(walk);
         }
-        let (mut current, mut ty) = self.root_place(root)?;
-        let mut variant: Option<u32> = None;
-        let mut identity = None;
-        let mut tail: Option<Expr> = None;
-        let mut raw_tail: Option<Expr> = None;
-        let mut str_mutable = false;
-        let mut str_from_mut = false;
-        let mut raw_byte_slice: Option<bool> = None;
-        let mut smi_u32 = false;
+        let (current, ty) = self.root_place(root)?;
         // An SSA value has no storage of its own: an aggregate one is held as the object.
-        let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
+        let object = matches!(root, Root::Value(_)) && is_object(self.table, ty);
+        let mut state = WalkState {
+            current,
+            ty,
+            variant: None,
+            identity: None,
+            carry: DerefCarry::None,
+            object,
+            smi_u32: false,
+        };
 
         for (step, proj) in path.iter().enumerate() {
-            identity = None;
-            smi_u32 = false;
-            let carried_tail = tail.take();
-            let carried_raw_tail = raw_tail.take();
-            let carried_str_mutable = std::mem::take(&mut str_mutable);
-            let carried_str_from_mut = std::mem::take(&mut str_from_mut);
-            let carried_raw_byte_slice = raw_byte_slice.take();
+            state.identity = None;
+            state.smi_u32 = false;
+            let carried = std::mem::replace(&mut state.carry, DerefCarry::None);
             // A downcast and a transparent field are the same place; every other step leaves it.
-            object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
+            state.object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
             match proj {
-                Proj::Deref => {
-                    let Some(pointee) = value::pointee_of(table, ty) else {
-                        return Err(decline(
-                            OpClass::Place,
-                            format!(
-                                "deref of non-pointer {ty:?} at projection {step} from {root:?}"
-                            ),
-                        ));
-                    };
-                    // Nothing inside a place with no storage has storage either, and a pointer
-                    // read out of no storage is `undefined`.
-                    if matches!(current, JsPlace::Unit(_)) {
-                        current = JsPlace::Unit(jsast::undefined());
-                        ty = pointee;
-                        variant = None;
-                        continue;
-                    }
-                    if self.soa_layout(pointee).is_some() {
-                        let (buf, off) = if step == 0 {
-                            if let Root::Value(v) = root {
-                                if let Some(pair) = self.soa_refs.borrow().get(v).cloned() {
-                                    pair
-                                } else {
-                                    let value = self.read_place(&current);
-                                    self.soa_unpack_slot_expr_for_place(value)
-                                }
-                            } else {
-                                let value = self.read_place(&current);
-                                self.soa_unpack_slot_expr_for_place(value)
-                            }
-                        } else {
-                            let value = self.read_place(&current);
-                            self.soa_unpack_slot_expr_for_place(value)
-                        };
-                        current = JsPlace::SoaElem {
-                            buf,
-                            off,
-                            elem_ty: pointee,
-                        };
-                        object = false;
-                        ty = pointee;
-                        variant = None;
-                        continue;
-                    }
-                    let value = self.read_place(&current);
-                    let shape = table.peeled(pointee);
-                    current = match value::kind(table, shape) {
-                        Some(TypeKind::Dynamic { .. }) => {
-                            identity = Some(value.clone());
-                            JsPlace::Deref(jsast::member(value, PTR))
-                        }
-                        Some(TypeKind::Slice(element)) => {
-                            if self.byte_views.raw_byte_derefs && value::is_raw(table, ty) {
-                                raw_byte_slice = match value::kind(table, *element) {
-                                    Some(TypeKind::Integer { bits: 8, signed }) => Some(*signed),
-                                    _ => None,
-                                };
-                            }
-                            identity = Some(value.clone());
-                            JsPlace::Deref(value)
-                        }
-                        Some(TypeKind::Str) => {
-                            str_mutable = value::is_mut_str_ptr(table, ty);
-                            str_from_mut = value::is_mutable_ptr(table, ty);
-                            identity = Some(value.clone());
-                            JsPlace::Deref(value)
-                        }
-                        _ if table.unsized_tail(shape).is_some() => {
-                            let is_raw_tail = value::is_raw(table, ty);
-                            let value = if is_raw_tail {
-                                raw_tail = Some(value.clone());
-                                self.raw_to_ref(pointee, value)
-                            } else {
-                                value
-                            };
-                            identity = Some(value.clone());
-                            tail = Some(jsast::member(value.clone(), META));
-                            JsPlace::Deref(jsast::member(value, PTR))
-                        }
-                        Some(TypeKind::Array { length, .. }) if is_slot(table, ty) => {
-                            JsPlace::Array(value, *length)
-                        }
-                        _ if is_slot(table, ty) => JsPlace::Slot {
-                            pointer: value,
-                            indirect: table.is_indirect(pointee),
-                            byte_signed: if self.byte_views.raw_byte_derefs {
-                                match value::kind(table, shape) {
-                                    Some(TypeKind::Integer { bits: 8, signed }) => Some(*signed),
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            },
-                        },
-                        // A reference to an aggregate: the pointee is the reference value.
-                        _ => {
-                            object = is_object(table, pointee);
-                            JsPlace::Deref(value)
-                        }
-                    };
-                    ty = pointee;
-                    variant = None;
-                }
+                Proj::Deref => self.step_deref(root, step, &mut state)?,
                 Proj::Field {
                     field,
                     ty: field_ty,
-                } => {
-                    let key = match table.field(ty, variant, *field) {
-                        Some(descriptor) => descriptor.key,
-                        None => {
-                            return Err(decline(
-                                OpClass::Place,
-                                format!("field {field} of a type with no such field"),
-                            ))
-                        }
-                    };
-                    object &= matches!(key, FieldKey::Transparent);
-                    smi_u32 = variant.is_none() && self.is_smi_u32_field(ty, *field);
-                    let field_ty = *field_ty;
-                    if let JsPlace::SoaElem { buf, off, elem_ty } = current {
-                        if table.is_zst(field_ty) {
-                            current = JsPlace::Unit(jsast::undefined());
-                        } else if let Some(col) =
-                            self.soa_layout(elem_ty).and_then(|l| l.field(*field))
-                        {
-                            if col.scalar.is_bool() {
-                                current = JsPlace::SoaBool {
-                                    buf,
-                                    col: col.col_name.clone(),
-                                    off,
-                                };
-                            } else {
-                                current = JsPlace::Var(jsast::index(
-                                    jsast::member(buf, col.col_name.clone()),
-                                    off,
-                                ));
-                            }
-                        } else {
-                            return Err(decline(
-                                OpClass::Place,
-                                format!("SoA field {field} missing from layout"),
-                            ));
-                        }
-                        ty = field_ty;
-                        variant = None;
-                        continue;
-                    }
-                    if matches!(current, JsPlace::Unit(_)) {
-                        // Still no storage, and still the same address.
-                    } else if table.is_zst(field_ty)
-                        && matches!(
-                            table.enum_repr(table.peeled(ty)),
-                            Some(
-                                rcgjs_object::jir::types::EnumRepr::IntTag { fieldless: true }
-                                    | rcgjs_object::jir::types::EnumRepr::NullNiche { .. }
-                                    | rcgjs_object::jir::types::EnumRepr::SentinelNiche { .. }
-                            )
-                        )
-                    {
-                        current = JsPlace::Unit(jsast::undefined());
-                    } else if matches!(key, FieldKey::Transparent) {
-                        tail = carried_tail;
-                        raw_tail = carried_raw_tail;
-                        str_mutable = carried_str_mutable;
-                        str_from_mut = carried_str_from_mut;
-                        raw_byte_slice = carried_raw_byte_slice;
-                    } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
-                        let base = self.read_place(&current);
-                        current =
-                            self.tail_place(base, key, field_ty, carried_tail, carried_raw_tail)?;
-                    } else {
-                        let base = self.read_place(&current);
-                        current = JsPlace::Var(field_expr(self.interns, base, key));
-                    }
-                    ty = field_ty;
-                    variant = None;
-                }
-                Proj::Index(index) => {
-                    let element = self.element_ty(ty)?;
-                    if let Some(address) = self.unit_element(&current, ty, element) {
-                        // The index is not spelled, so `fuse` never makes it an inline value
-                        // ([`reaches_unit`]): it was evaluated where it was defined.
-                        current = JsPlace::Unit(address);
-                    } else {
-                        let index = self.expr_of(*index)?;
-                        current = match current {
-                            JsPlace::Array(pointer, _) => {
-                                JsPlace::Var(self.unwindow_element(pointer, index))
-                            }
-                            _ => {
-                                let base = self.read_place(&current);
-                                if let Some(signed) = carried_raw_byte_slice {
-                                    let (setup, slot) = self.reread(base, &[BUF, OFF]);
-                                    JsPlace::ByteAt {
-                                        buf: super::ptr::sequenced(
-                                            setup,
-                                            ptr::slot_buf(slot.clone()),
-                                        ),
-                                        off: offset(ptr::slot_off(slot), index),
-                                        signed,
-                                    }
-                                } else if self.soa_slice_layout(ty).is_some() {
-                                    let (buf, base_off) = self.soa_unpack_slot_expr_for_place(base);
-                                    let total_off = if self.is_zero_slice_off(root, step, &base_off)
-                                    {
-                                        index
-                                    } else {
-                                        offset(base_off, index)
-                                    };
-                                    JsPlace::SoaElem {
-                                        buf,
-                                        off: total_off,
-                                        elem_ty: element,
-                                    }
-                                } else {
-                                    JsPlace::Var(self.element_expr(ty, base, index))
-                                }
-                            }
-                        };
-                    }
-                    ty = element;
-                    variant = None;
-                }
+                } => self.step_field(*field, *field_ty, carried, &mut state)?,
+                Proj::Index(index) => self.step_index(root, step, *index, carried, &mut state)?,
                 Proj::ConstantIndex {
                     offset: idx_offset,
                     from_end,
                     ..
-                } => {
-                    let element = self.element_ty(ty)?;
-                    if let Some(address) = self.unit_element(&current, ty, element) {
-                        current = JsPlace::Unit(address);
-                    } else {
-                        current = match current {
-                            JsPlace::Array(pointer, length) => {
-                                let index = if *from_end {
-                                    length.saturating_sub(*idx_offset)
-                                } else {
-                                    *idx_offset
-                                };
-                                JsPlace::Var(
-                                    self.unwindow_element(pointer, jsast::num(index as f64)),
-                                )
-                            }
-                            _ => {
-                                let base = self.read_place(&current);
-                                if self.soa_slice_layout(ty).is_some() {
-                                    if *from_end {
-                                        let (setup, slot) =
-                                            self.reread(base, &[BUF, OFF, ptr::LEN]);
-                                        let buf = super::ptr::sequenced(
-                                            setup,
-                                            ptr::slot_buf(slot.clone()),
-                                        );
-                                        let base_off = ptr::slot_off(slot.clone());
-                                        let index = jsast::binary(
-                                            BinOp::Sub,
-                                            ptr::slot_len(slot),
-                                            jsast::num(*idx_offset as f64),
-                                        );
-                                        let total_off =
-                                            if self.is_zero_slice_off(root, step, &base_off) {
-                                                index
-                                            } else {
-                                                offset(base_off, index)
-                                            };
-                                        JsPlace::SoaElem {
-                                            buf,
-                                            off: total_off,
-                                            elem_ty: element,
-                                        }
-                                    } else {
-                                        let (buf, base_off) =
-                                            self.soa_unpack_slot_expr_for_place(base);
-                                        let index = jsast::num(*idx_offset as f64);
-                                        let total_off =
-                                            if self.is_zero_slice_off(root, step, &base_off) {
-                                                index
-                                            } else {
-                                                offset(base_off, index)
-                                            };
-                                        JsPlace::SoaElem {
-                                            buf,
-                                            off: total_off,
-                                            elem_ty: element,
-                                        }
-                                    }
-                                } else {
-                                    let index = self.constant_index(
-                                        ty,
-                                        base.clone(),
-                                        *idx_offset,
-                                        *from_end,
-                                    );
-                                    if let Some(signed) = carried_raw_byte_slice {
-                                        let (setup, slot) = self.reread(base, &[BUF, OFF]);
-                                        JsPlace::ByteAt {
-                                            buf: super::ptr::sequenced(
-                                                setup,
-                                                ptr::slot_buf(slot.clone()),
-                                            ),
-                                            off: offset(ptr::slot_off(slot), index),
-                                            signed,
-                                        }
-                                    } else {
-                                        JsPlace::Var(self.element_expr(ty, base, index))
-                                    }
-                                }
-                            }
-                        };
-                    }
-                    ty = element;
-                    variant = None;
-                }
-                // A run of a zero-sized array is a zero-sized array at the same address. A run of
-                // a slice stays a fat slice whatever its element is, because its `len` is the
-                // element count.
-                Proj::Subslice { .. }
-                    if matches!(current, JsPlace::Unit(_)) || table.is_zst(ty) =>
-                {
-                    if !matches!(current, JsPlace::Unit(_)) {
-                        current = JsPlace::Unit(self.read_place(&current));
-                    }
-                    variant = None;
-                }
+                } => self.step_constant_index(
+                    root,
+                    step,
+                    *idx_offset,
+                    *from_end,
+                    carried,
+                    &mut state,
+                )?,
                 Proj::Subslice { from, to, from_end } => {
-                    let array_source = match current {
-                        JsPlace::Array(pointer, length) => Ok((pointer, length)),
-                        other => match value::kind(table, ty) {
-                            Some(TypeKind::Array { length, .. }) => {
-                                Ok((self.read_place(&other), *length))
-                            }
-                            _ => Err(other),
-                        },
-                    };
-                    match array_source {
-                        Ok((source, length)) => {
-                            let end = if *from_end {
-                                length.saturating_sub(*to)
-                            } else {
-                                *to
-                            };
-                            let sub_len = end.saturating_sub(*from);
-                            let (setup, slot) =
-                                self.reread(jsast::rt_call("unwindow", vec![source]), &[BUF, OFF]);
-                            let window = ptr::window_slot(
-                                ptr::slot_buf(slot.clone()),
-                                offset(ptr::slot_off(slot), jsast::num(*from as f64)),
-                                sub_len,
-                            );
-                            current = JsPlace::Array(super::ptr::sequenced(setup, window), sub_len);
-                            variant = None;
-                        }
-                        Err(other) => {
-                            let base = self.read_place(&other);
-                            let (value, subslice_ty) =
-                                self.subslice(ty, base, *from, *to, *from_end)?;
-                            current = JsPlace::Deref(value);
-                            ty = subslice_ty;
-                            variant = None;
-                        }
-                    }
+                    self.step_subslice(*from, *to, *from_end, &mut state)?;
                 }
                 Proj::Downcast { variant: index } => {
-                    variant = Some(*index);
-                    tail = carried_tail;
-                    str_mutable = carried_str_mutable;
-                    str_from_mut = carried_str_from_mut;
-                    raw_byte_slice = carried_raw_byte_slice;
+                    Self::step_downcast(*index, carried, &mut state);
                 }
             }
         }
+        let str_kind = match state.carry {
+            DerefCarry::Str(kind) => kind,
+            _ => StrPlaceKind::None,
+        };
         Ok(Walk {
-            place: current,
-            ty,
-            identity,
-            object,
-            str_mutable,
-            str_from_mut,
-            smi_u32,
+            place: state.current,
+            ty: state.ty,
+            identity: state.identity,
+            object: state.object,
+            str_kind,
+            smi_u32: state.smi_u32,
         })
+    }
+
+    /// Fast path for indexing a `js-str=bytes` byte view (`FullSlice`, `VarSlice`, or array
+    /// `ThinPtr`) directly via `base.charCodeAt(total)`.
+    fn try_walk_byte_view_place(&self, root: &Root, path: &[Proj]) -> Res<Option<Walk>> {
+        let (
+            Root::Value(view),
+            [Proj::Deref, step @ (Proj::Index(_) | Proj::ConstantIndex { .. })],
+        ) = (root, path)
+        else {
+            return Ok(None);
+        };
+        let Some(bv) = self.byte_view(*view) else {
+            return Ok(None);
+        };
+        let table = self.table;
+        let (base, off, index) = match bv.mode {
+            super::ByteViewMode::FullSlice => {
+                let string = self.expr_of(*view)?;
+                let index = match step {
+                    Proj::Index(index) => self.expr_of(*index)?,
+                    Proj::ConstantIndex {
+                        offset,
+                        from_end: false,
+                        ..
+                    } => jsast::num(*offset as f64),
+                    Proj::ConstantIndex { offset, .. } => jsast::binary(
+                        BinOp::Sub,
+                        jsast::member(string.clone(), "length"),
+                        jsast::num(*offset as f64),
+                    ),
+                    _ => unreachable!("matched above"),
+                };
+                (string, None, index)
+            }
+            super::ByteViewMode::VarSlice => {
+                let base = self.byte_view_base_expr(bv, *view)?;
+                let off = self.byte_view_off_expr(*view)?;
+                let index = match step {
+                    Proj::Index(index) => self.expr_of(*index)?,
+                    Proj::ConstantIndex {
+                        offset,
+                        from_end: false,
+                        ..
+                    } => jsast::num(*offset as f64),
+                    Proj::ConstantIndex { offset, .. } => {
+                        let len = self.byte_view_len_expr(*view)?;
+                        jsast::binary(
+                            BinOp::UShr,
+                            jsast::binary(BinOp::Sub, len, jsast::num(*offset as f64)),
+                            jsast::num(0),
+                        )
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                (base, Some(off), index)
+            }
+            super::ByteViewMode::ThinPtr => {
+                let Some(arr_len) = super::byte_view_analysis::is_immutable_byte_array_ptr(
+                    table,
+                    self.ty_of(*view)?,
+                ) else {
+                    return Ok(None);
+                };
+                let base = self.byte_view_base_expr(bv, *view)?;
+                let off = self.byte_view_off_expr(*view)?;
+                let index = match step {
+                    Proj::Index(index) => self.expr_of(*index)?,
+                    Proj::ConstantIndex {
+                        offset,
+                        from_end: false,
+                        ..
+                    } => jsast::num(*offset as f64),
+                    Proj::ConstantIndex { offset, .. } => {
+                        jsast::num(arr_len.saturating_sub(*offset) as f64)
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                (base, Some(off), index)
+            }
+        };
+        let total = match off {
+            None => index,
+            Some(Expr::Num(0.0)) => index,
+            Some(off) if matches!(index, Expr::Num(n) if n == 0.0) => off,
+            Some(off) => jsast::binary(
+                BinOp::UShr,
+                jsast::binary(BinOp::Add, off, index),
+                jsast::num(0),
+            ),
+        };
+        let pointee = value::pointee_of(table, self.ty_of(*view)?)
+            .ok_or_else(|| decline(OpClass::Place, "a byte view that is not a pointer"))?;
+        let element = self.element_ty(pointee)?;
+        Ok(Some(Walk {
+            place: JsPlace::Var(jsast::method_call(base, "charCodeAt", vec![total])),
+            ty: element,
+            identity: None,
+            object: false,
+            str_kind: StrPlaceKind::None,
+            smi_u32: false,
+        }))
+    }
+
+    fn step_deref(&self, root: &Root, step: usize, state: &mut WalkState) -> Res<()> {
+        let table = self.table;
+        let Some(pointee) = value::pointee_of(table, state.ty) else {
+            return Err(decline(
+                OpClass::Place,
+                format!(
+                    "deref of non-pointer {:?} at projection {step} from {root:?}",
+                    state.ty
+                ),
+            ));
+        };
+        // Nothing inside a place with no storage has storage either, and a pointer read out of no
+        // storage is `undefined`.
+        if matches!(state.current, JsPlace::Unit(_)) {
+            state.current = JsPlace::Unit(jsast::undefined());
+            state.ty = pointee;
+            state.variant = None;
+            return Ok(());
+        }
+        if self.soa_layout(pointee).is_some() {
+            let cached = (step == 0)
+                .then(|| match root {
+                    Root::Value(v) => self.soa_refs.borrow().get(v).cloned(),
+                    Root::Cell(_) => None,
+                })
+                .flatten();
+            let (buf, off) = match cached {
+                Some(pair) => pair,
+                None => {
+                    let value = self.read_place(&state.current);
+                    self.soa_unpack_slot_expr_for_place(value)
+                }
+            };
+            state.current = JsPlace::SoaElem {
+                buf,
+                off,
+                elem_ty: pointee,
+            };
+            state.object = false;
+            state.ty = pointee;
+            state.variant = None;
+            return Ok(());
+        }
+        let value = self.read_place(&state.current);
+        let shape = table.peeled(pointee);
+        state.current = match value::kind(table, shape) {
+            Some(TypeKind::Dynamic { .. }) => {
+                state.identity = Some(value.clone());
+                JsPlace::Deref(jsast::member(value, PTR))
+            }
+            Some(TypeKind::Slice(element)) => {
+                if self.byte_views.raw_byte_derefs && value::is_raw(table, state.ty) {
+                    if let Some(TypeKind::Integer { bits: 8, signed }) =
+                        value::kind(table, *element)
+                    {
+                        state.carry = DerefCarry::RawByteSlice { signed: *signed };
+                    }
+                }
+                state.identity = Some(value.clone());
+                JsPlace::Deref(value)
+            }
+            Some(TypeKind::Str) => {
+                let str_kind = if value::is_mutable_ptr(table, state.ty) {
+                    StrPlaceKind::FatMut
+                } else if value::is_mut_str_ptr(table, state.ty) {
+                    StrPlaceKind::FatConst
+                } else {
+                    StrPlaceKind::None
+                };
+                if str_kind != StrPlaceKind::None {
+                    state.carry = DerefCarry::Str(str_kind);
+                }
+                state.identity = Some(value.clone());
+                JsPlace::Deref(value)
+            }
+            _ if table.unsized_tail(shape).is_some() => {
+                let is_raw_tail = value::is_raw(table, state.ty);
+                let (raw, value) = if is_raw_tail {
+                    (Some(value.clone()), self.raw_to_ref(pointee, value))
+                } else {
+                    (None, value)
+                };
+                state.identity = Some(value.clone());
+                state.carry = DerefCarry::UnsizedTail {
+                    meta: jsast::member(value.clone(), META),
+                    raw,
+                };
+                JsPlace::Deref(jsast::member(value, PTR))
+            }
+            Some(TypeKind::Array { length, .. }) if is_slot(table, state.ty) => {
+                JsPlace::Array(value, *length)
+            }
+            _ if is_slot(table, state.ty) => JsPlace::Slot {
+                pointer: value,
+                indirect: table.is_indirect(pointee),
+                byte_access: if self.byte_views.raw_byte_derefs {
+                    match value::kind(table, shape) {
+                        Some(TypeKind::Integer {
+                            bits: 8,
+                            signed: true,
+                        }) => SlotByteAccess::Signed,
+                        Some(TypeKind::Integer {
+                            bits: 8,
+                            signed: false,
+                        }) => SlotByteAccess::Unsigned,
+                        _ => SlotByteAccess::None,
+                    }
+                } else {
+                    SlotByteAccess::None
+                },
+            },
+            // A reference to an aggregate: the pointee is the reference value.
+            _ => {
+                state.object = is_object(table, pointee);
+                JsPlace::Deref(value)
+            }
+        };
+        state.ty = pointee;
+        state.variant = None;
+        Ok(())
+    }
+
+    fn step_field(
+        &self,
+        field: u32,
+        field_ty: TypeId,
+        carried: DerefCarry,
+        state: &mut WalkState,
+    ) -> Res<()> {
+        let table = self.table;
+        let key = match table.field(state.ty, state.variant, field) {
+            Some(descriptor) => descriptor.key,
+            None => {
+                return Err(decline(
+                    OpClass::Place,
+                    format!("field {field} of a type with no such field"),
+                ))
+            }
+        };
+        state.object &= matches!(key, FieldKey::Transparent);
+        state.smi_u32 = state.variant.is_none() && self.is_smi_u32_field(state.ty, field);
+        if let JsPlace::SoaElem { buf, off, elem_ty } = &state.current {
+            let (buf, off, elem_ty) = (buf.clone(), off.clone(), *elem_ty);
+            if table.is_zst(field_ty) {
+                state.current = JsPlace::Unit(jsast::undefined());
+            } else if let Some(col) = self.soa_layout(elem_ty).and_then(|l| l.field(field)) {
+                if col.scalar.is_bool() {
+                    state.current = JsPlace::SoaBool {
+                        buf,
+                        col: col.col_name.clone(),
+                        off,
+                    };
+                } else {
+                    state.current =
+                        JsPlace::Var(jsast::index(jsast::member(buf, col.col_name.clone()), off));
+                }
+            } else {
+                return Err(decline(
+                    OpClass::Place,
+                    format!("SoA field {field} missing from layout"),
+                ));
+            }
+            state.ty = field_ty;
+            state.variant = None;
+            return Ok(());
+        }
+        if matches!(state.current, JsPlace::Unit(_)) {
+            // Still no storage, and still the same address.
+        } else if table.is_zst(field_ty)
+            && matches!(
+                table.enum_repr(table.peeled(state.ty)),
+                Some(
+                    rcgjs_object::jir::types::EnumRepr::IntTag { fieldless: true }
+                        | rcgjs_object::jir::types::EnumRepr::NullNiche { .. }
+                        | rcgjs_object::jir::types::EnumRepr::SentinelNiche { .. }
+                )
+            )
+        {
+            state.current = JsPlace::Unit(jsast::undefined());
+        } else if matches!(key, FieldKey::Transparent) {
+            state.carry = carried;
+        } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
+            let (tail, raw_tail) = match carried {
+                DerefCarry::UnsizedTail { meta, raw } => (Some(meta), raw),
+                _ => (None, None),
+            };
+            let base = self.read_place(&state.current);
+            state.current = self.tail_place(base, key, field_ty, tail, raw_tail)?;
+        } else {
+            let base = self.read_place(&state.current);
+            state.current = JsPlace::Var(field_expr(self.interns, base, key));
+        }
+        state.ty = field_ty;
+        state.variant = None;
+        Ok(())
+    }
+
+    fn step_index(
+        &self,
+        root: &Root,
+        step: usize,
+        index: rcgjs_object::jir::repr::ValueId,
+        carried: DerefCarry,
+        state: &mut WalkState,
+    ) -> Res<()> {
+        let element = self.element_ty(state.ty)?;
+        if let Some(address) = self.unit_element(&state.current, state.ty, element) {
+            // The index is not spelled, so `fuse` never makes it an inline value
+            // ([`reaches_unit`]): it was evaluated where it was defined.
+            state.current = JsPlace::Unit(address);
+        } else {
+            let index = self.expr_of(index)?;
+            let current = std::mem::replace(&mut state.current, JsPlace::Unit(jsast::undefined()));
+            state.current = match current {
+                JsPlace::Array(pointer, _) => JsPlace::Var(self.unwindow_element(pointer, index)),
+                other => {
+                    let base = self.read_place(&other);
+                    if let DerefCarry::RawByteSlice { signed } = carried {
+                        let (setup, slot) = self.reread(base, &[BUF, OFF]);
+                        JsPlace::ByteAt {
+                            buf: super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                            off: offset(ptr::slot_off(slot), index),
+                            signed,
+                        }
+                    } else if self.soa_slice_layout(state.ty).is_some() {
+                        let (buf, base_off) = self.soa_unpack_slot_expr_for_place(base);
+                        let total_off = if self.is_zero_slice_off(root, step, &base_off) {
+                            index
+                        } else {
+                            offset(base_off, index)
+                        };
+                        JsPlace::SoaElem {
+                            buf,
+                            off: total_off,
+                            elem_ty: element,
+                        }
+                    } else {
+                        JsPlace::Var(self.element_expr(state.ty, base, index))
+                    }
+                }
+            };
+        }
+        state.ty = element;
+        state.variant = None;
+        Ok(())
+    }
+
+    fn step_constant_index(
+        &self,
+        root: &Root,
+        step: usize,
+        idx_offset: u64,
+        from_end: bool,
+        carried: DerefCarry,
+        state: &mut WalkState,
+    ) -> Res<()> {
+        let element = self.element_ty(state.ty)?;
+        if let Some(address) = self.unit_element(&state.current, state.ty, element) {
+            state.current = JsPlace::Unit(address);
+        } else {
+            let current = std::mem::replace(&mut state.current, JsPlace::Unit(jsast::undefined()));
+            state.current = match current {
+                JsPlace::Array(pointer, length) => {
+                    let index = if from_end {
+                        length.saturating_sub(idx_offset)
+                    } else {
+                        idx_offset
+                    };
+                    JsPlace::Var(self.unwindow_element(pointer, jsast::num(index as f64)))
+                }
+                other => {
+                    let base = self.read_place(&other);
+                    if self.soa_slice_layout(state.ty).is_some() {
+                        let (buf, base_off, index) = if from_end {
+                            let (setup, slot) = self.reread(base, &[BUF, OFF, ptr::LEN]);
+                            let buf = super::ptr::sequenced(setup, ptr::slot_buf(slot.clone()));
+                            let base_off = ptr::slot_off(slot.clone());
+                            let index = jsast::binary(
+                                BinOp::Sub,
+                                ptr::slot_len(slot),
+                                jsast::num(idx_offset as f64),
+                            );
+                            (buf, base_off, index)
+                        } else {
+                            let (buf, base_off) = self.soa_unpack_slot_expr_for_place(base);
+                            (buf, base_off, jsast::num(idx_offset as f64))
+                        };
+                        let total_off = if self.is_zero_slice_off(root, step, &base_off) {
+                            index
+                        } else {
+                            offset(base_off, index)
+                        };
+                        JsPlace::SoaElem {
+                            buf,
+                            off: total_off,
+                            elem_ty: element,
+                        }
+                    } else {
+                        let index =
+                            self.constant_index(state.ty, base.clone(), idx_offset, from_end);
+                        if let DerefCarry::RawByteSlice { signed } = carried {
+                            let (setup, slot) = self.reread(base, &[BUF, OFF]);
+                            JsPlace::ByteAt {
+                                buf: super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                off: offset(ptr::slot_off(slot), index),
+                                signed,
+                            }
+                        } else {
+                            JsPlace::Var(self.element_expr(state.ty, base, index))
+                        }
+                    }
+                }
+            };
+        }
+        state.ty = element;
+        state.variant = None;
+        Ok(())
+    }
+
+    fn step_subslice(&self, from: u64, to: u64, from_end: bool, state: &mut WalkState) -> Res<()> {
+        // A run of a zero-sized array is a zero-sized array at the same address. A run of a slice
+        // stays a fat slice whatever its element is, because its `len` is the element count.
+        if matches!(state.current, JsPlace::Unit(_)) || self.table.is_zst(state.ty) {
+            if !matches!(state.current, JsPlace::Unit(_)) {
+                state.current = JsPlace::Unit(self.read_place(&state.current));
+            }
+            state.variant = None;
+            return Ok(());
+        }
+        let current = std::mem::replace(&mut state.current, JsPlace::Unit(jsast::undefined()));
+        let array_source = match current {
+            JsPlace::Array(pointer, length) => Ok((pointer, length)),
+            other => match value::kind(self.table, state.ty) {
+                Some(TypeKind::Array { length, .. }) => Ok((self.read_place(&other), *length)),
+                _ => Err(other),
+            },
+        };
+        match array_source {
+            Ok((source, length)) => {
+                let end = if from_end {
+                    length.saturating_sub(to)
+                } else {
+                    to
+                };
+                let sub_len = end.saturating_sub(from);
+                let (setup, slot) =
+                    self.reread(jsast::rt_call("unwindow", vec![source]), &[BUF, OFF]);
+                let window = ptr::window_slot(
+                    ptr::slot_buf(slot.clone()),
+                    offset(ptr::slot_off(slot), jsast::num(from as f64)),
+                    sub_len,
+                );
+                state.current = JsPlace::Array(super::ptr::sequenced(setup, window), sub_len);
+                state.variant = None;
+            }
+            Err(other) => {
+                let base = self.read_place(&other);
+                let (value, subslice_ty) = self.subslice(state.ty, base, from, to, from_end)?;
+                state.current = JsPlace::Deref(value);
+                state.ty = subslice_ty;
+                state.variant = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn step_downcast(variant: u32, carried: DerefCarry, state: &mut WalkState) {
+        state.variant = Some(variant);
+        state.carry = carried;
     }
 
     /// The place a struct's unsized tail is (`place.rs::tail_place`).
@@ -826,16 +856,19 @@ impl<'a> JsCx<'a> {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
             JsPlace::Slot {
                 pointer,
-                byte_signed: Some(signed),
+                byte_access: SlotByteAccess::Unsigned,
                 ..
-            } => {
-                let mut args = vec![pointer.clone()];
-                if *signed {
-                    args.push(Expr::Bool(true));
-                }
-                jsast::rt_call("read_byte", args)
-            }
-            JsPlace::Slot { pointer, .. } => self.slot_element(pointer.clone()),
+            } => jsast::rt_call("read_byte", vec![pointer.clone()]),
+            JsPlace::Slot {
+                pointer,
+                byte_access: SlotByteAccess::Signed,
+                ..
+            } => jsast::rt_call("read_byte", vec![pointer.clone(), Expr::Bool(true)]),
+            JsPlace::Slot {
+                pointer,
+                byte_access: SlotByteAccess::None,
+                ..
+            } => self.slot_element(pointer.clone()),
             JsPlace::ByteAt { buf, off, signed } => {
                 let mut args = vec![buf.clone(), off.clone()];
                 if *signed {
@@ -877,14 +910,16 @@ impl<'a> JsCx<'a> {
             JsPlace::Deref(target) => self.write_indirect(ty, target, value),
             JsPlace::Slot {
                 pointer,
-                byte_signed: Some(_),
+                byte_access: SlotByteAccess::Unsigned | SlotByteAccess::Signed,
                 ..
             } => Ok(vec![jsast::expr_stmt(jsast::rt_call(
                 "write_byte",
                 vec![pointer, value],
             ))]),
             JsPlace::Slot {
-                pointer, indirect, ..
+                pointer,
+                indirect,
+                byte_access: SlotByteAccess::None,
             } => {
                 let mut target = self.slot_element(pointer);
                 let mut stmts = Vec::new();
@@ -977,22 +1012,25 @@ impl<'a> JsCx<'a> {
             let value = walk
                 .identity
                 .unwrap_or_else(|| self.read_place(&walk.place));
-            return Ok(match (walk.str_mutable, mutable) {
-                (true, true) => {
-                    let live = if walk.str_from_mut {
-                        value
+            return Ok(match (walk.str_kind, mutable) {
+                (StrPlaceKind::FatMut, true) => {
+                    if self.needs_byte_slice_ref() {
+                        jsast::rt_call("byte_slice_ref", vec![value])
                     } else {
-                        jsast::rt_call("detach_str_memo", vec![value])
-                    };
+                        value
+                    }
+                }
+                (StrPlaceKind::FatConst, true) => {
+                    let live = jsast::rt_call("detach_str_memo", vec![value]);
                     if self.needs_byte_slice_ref() {
                         jsast::rt_call("byte_slice_ref", vec![live])
                     } else {
                         live
                     }
                 }
-                (true, false) => self.bytes_to_str(value),
-                (false, false) => value,
-                (false, true) => self.str_to_bytes_mut(value),
+                (StrPlaceKind::FatConst | StrPlaceKind::FatMut, false) => self.bytes_to_str(value),
+                (StrPlaceKind::None, false) => value,
+                (StrPlaceKind::None, true) => self.str_to_bytes_mut(value),
             });
         }
         if let Some(identity) = walk.identity {
@@ -1066,13 +1104,11 @@ impl<'a> JsCx<'a> {
             let value = walk
                 .identity
                 .unwrap_or_else(|| self.read_place(&walk.place));
-            return Ok(match (walk.str_mutable, mutable) {
-                (true, true) if !walk.str_from_mut => {
-                    jsast::rt_call("detach_str_memo", vec![value])
-                }
-                (true, _) => value,
-                (false, true) => self.str_to_bytes_mut(value),
-                (false, false) => self.str_to_bytes(value),
+            return Ok(match (walk.str_kind, mutable) {
+                (StrPlaceKind::FatConst, true) => jsast::rt_call("detach_str_memo", vec![value]),
+                (StrPlaceKind::FatConst | StrPlaceKind::FatMut, _) => value,
+                (StrPlaceKind::None, true) => self.str_to_bytes_mut(value),
+                (StrPlaceKind::None, false) => self.str_to_bytes(value),
             });
         }
         if let Some(identity) = walk.identity {
@@ -1149,9 +1185,7 @@ impl<'a> JsCx<'a> {
     /// Whether `base_off` for an SoA slice indexing step is provably always `0`, allowing
     /// `0 + index` to fold directly to `index`.
     fn is_zero_slice_off(&self, root: &Root, step: usize, base_off: &Expr) -> bool {
-        if matches!(base_off, Expr::Num(n) if *n == 0.0)
-            || matches!(base_off, Expr::RawNum(s) if s == "0")
-        {
+        if super::ast_util::is_zero_num(base_off) {
             return true;
         }
         if step != 1 {

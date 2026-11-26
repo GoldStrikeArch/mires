@@ -21,10 +21,6 @@
 //! deterministic: nodes and edge sets are `BTreeMap`/`BTreeSet`, members of one component are
 //! sorted by `ItemId`.
 
-// The effects summaries and their wave 2 consumers (inline, devirt) are the readers; until the
-// O group lands only the summary computation and the tests call this.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::refs::{self, RefScan};

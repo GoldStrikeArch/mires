@@ -34,7 +34,7 @@ pub struct SourceFact {
 }
 
 /// The origin of one statement, terminator, or local.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Origin {
     pub kind: OriginKind,
     /// The span's position, when it has one that maps to a real file.
@@ -47,7 +47,7 @@ pub struct Origin {
     pub inline_stack: Vec<OriginId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum OriginKind {
     /// Append-only: postcard serializes this enum by index.
     Statement,

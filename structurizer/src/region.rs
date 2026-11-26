@@ -38,7 +38,7 @@ pub enum Test {
     /// The given value is less than or equal to the scrutinee.
     Le(u128),
     /// The scrutinee is one of `len` consecutive values starting at `lo`.
-    /// `len` is at least one.
+    /// `len` is at least one, and `lo + len` does not overflow `u128`.
     InRange { lo: u128, len: u128 },
 }
 

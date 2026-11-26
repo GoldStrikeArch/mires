@@ -13,7 +13,9 @@ use crate::jir::summary::ItemSummary;
 use crate::jir::types::{FieldDescriptor, FieldKey, SigAbi, TypeId, TypeKind, VariantDescriptor};
 use rcgjs_object::object::Header;
 
-type Res<T> = Result<T, &'static str>;
+use super::InlineDecline;
+
+type Res<T> = Result<T, InlineDecline>;
 
 #[derive(Clone)]
 pub(crate) struct Metadata<'a> {
@@ -41,7 +43,7 @@ impl Metadata<'_> {
     /// A failed import discards both the translated body and every appended table entry.
     pub fn import(&self, provider: &Self, body: &Func, call: OriginId) -> Res<(Func, Self)> {
         if !self.compatible(provider) {
-            return Err("inline.object-incompatible");
+            return Err(InlineDecline::ObjectIncompatible);
         }
         let mut imported = self.clone();
         let mut target = self.interns.as_ref().clone();
@@ -60,7 +62,7 @@ impl Metadata<'_> {
                 let mut caller = caller.as_ref().clone();
                 let offset = caller.origins.len() as u32;
                 if caller.origins.len().saturating_add(callee.origins.len()) > 65536 {
-                    return Err("inline.origin-budget");
+                    return Err(InlineDecline::OriginBudget);
                 }
                 let caller_orig_len = caller.origins.len();
                 let map = |id: OriginId| -> Res<OriginId> {
@@ -73,7 +75,7 @@ impl Metadata<'_> {
                     } else if id.0 == u32::MAX {
                         Ok(id)
                     } else {
-                        Err("inline.origin-invalid")
+                        Err(InlineDecline::OriginInvalid)
                     }
                 };
                 for origin in &callee.origins {
@@ -118,7 +120,7 @@ impl Metadata<'_> {
                 }
                 None
             }
-            _ => return Err("inline.origin-unavailable"),
+            _ => return Err(InlineDecline::OriginUnavailable),
         };
         imported.interns = Cow::Owned(remap.target);
         imported.origins = origins;
@@ -135,7 +137,7 @@ struct Remap<'a> {
 
 impl Remap<'_> {
     fn string(&mut self, id: StrId) -> Res<StrId> {
-        let value = self.source.str(id).ok_or("inline.string-invalid")?;
+        let value = self.source.str(id).ok_or(InlineDecline::StringInvalid)?;
         Ok(self.target.intern_str(value))
     }
 
@@ -143,7 +145,7 @@ impl Remap<'_> {
         let mut fact = self
             .source
             .source_fact(id)
-            .ok_or("inline.source-invalid")?
+            .ok_or(InlineDecline::SourceInvalid)?
             .clone();
         fact.file = self.string(fact.file)?;
         Ok(self.target.intern_source_fact(fact))
@@ -305,10 +307,10 @@ impl Remap<'_> {
                     OpKind::Assert { track_caller, .. } => {
                         *track_caller = track_caller.map(|id| self.fact(id)).transpose()?;
                     }
-                    OpKind::Zombie(_) => return Err("inline.zombie"),
+                    OpKind::Zombie(_) => return Err(InlineDecline::Zombie),
                     OpKind::Host { payload, .. } => self.host(payload)?,
                     OpKind::Convert { .. } | OpKind::SpillRead(_) | OpKind::SpillWrite { .. } => {
-                        return Err("inline.carrier-boundary")
+                        return Err(InlineDecline::CarrierBoundary)
                     }
                     OpKind::Copy(_)
                     | OpKind::Move(_)
@@ -331,7 +333,7 @@ impl Remap<'_> {
     }
 
     fn bytes(&mut self, id: BytesId) -> Res<BytesId> {
-        let value = self.source.bytes(id).ok_or("inline.host-boundary")?;
+        let value = self.source.bytes(id).ok_or(InlineDecline::HostBoundary)?;
         Ok(self.target.intern_bytes(value))
     }
 
@@ -360,7 +362,7 @@ impl Remap<'_> {
         let mut sig = self
             .source
             .sig(id)
-            .ok_or("inline.signature-invalid")?
+            .ok_or(InlineDecline::SignatureInvalid)?
             .clone();
         for ty in &sig.inputs {
             self.need(*ty);
@@ -396,9 +398,13 @@ impl Remap<'_> {
     fn types(&mut self) -> Res<()> {
         while let Some(id) = self.pending.pop() {
             if self.seen.len() > 4096 {
-                return Err("inline.type-budget");
+                return Err(InlineDecline::TypeBudget);
             }
-            let mut ty = self.source.ty(id).ok_or("inline.type-unavailable")?.clone();
+            let mut ty = self
+                .source
+                .ty(id)
+                .ok_or(InlineDecline::TypeUnavailable)?
+                .clone();
             ty.name = ty.name.map(|id| self.string(id)).transpose()?;
             match &mut ty.kind {
                 TypeKind::Tuple(fields) | TypeKind::CoroutineClosure { upvars: fields, .. } => {
@@ -454,7 +460,7 @@ impl Remap<'_> {
                     }
                     self.variants(variants)?;
                 }
-                TypeKind::Opaque => return Err("inline.type-opaque"),
+                TypeKind::Opaque => return Err(InlineDecline::TypeOpaque),
                 TypeKind::Bool
                 | TypeKind::Char
                 | TypeKind::Integer { .. }
@@ -477,7 +483,7 @@ impl Remap<'_> {
                 // representation field must agree under the same stable TypeId.
                 ty.name = existing.name;
                 if &ty != existing {
-                    return Err("inline.type-conflict");
+                    return Err(InlineDecline::TypeConflict);
                 }
             } else {
                 self.target.intern_type(ty);

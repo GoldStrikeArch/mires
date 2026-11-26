@@ -61,20 +61,51 @@ use super::semantic::{
     BinaryOp, CallSemantic, Callee, CastKind, ConstTree, CoroutineKind, DirectItemRef, DropGlue,
     HostPayload, ItemId, Signature, TypeId, UnaryOp,
 };
-use super::types::{TypeKind, TypeTable};
-use super::verify::VerifyError;
+use super::types::TypeTable;
+use super::verify::{VerifyError, VerifyErrorKind};
+use crate::index_vec::Idx;
 
 /// An SSA value: an index into [`Func::values`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 
+impl Idx for ValueId {
+    fn new(idx: usize) -> Self {
+        Self(u32::try_from(idx).expect("ValueId overflows u32"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// A storage cell: an index into [`Func::cells`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CellId(pub u32);
 
+impl Idx for CellId {
+    fn new(idx: usize) -> Self {
+        Self(u32::try_from(idx).expect("CellId overflows u32"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// A JIR-R block: an index into [`Func::blocks`]. Block 0 is the entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RBlockId(pub u32);
+
+impl Idx for RBlockId {
+    fn new(idx: usize) -> Self {
+        Self(u32::try_from(idx).expect("RBlockId overflows u32"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// One lowered function.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,11 +178,67 @@ pub enum Carrier {
 }
 
 impl Carrier {
+    /// Every carrier variant in discriminant order.
+    const ALL: [Self; 10] = [
+        Self::Baseline,
+        Self::Virtual,
+        Self::Flat,
+        Self::HostString,
+        Self::StringBuilder,
+        Self::NativeVec,
+        Self::SliceView,
+        Self::Opaque,
+        Self::NativeBox,
+        Self::NativeMap,
+    ];
+
     /// This carrier's bit in a [`CarrierPolicy`].
+    ///
+    /// Exhaustively matches every variant so appending a variant beyond [`CarrierPolicy`]'s
+    /// 16-bit capacity fails at compile time.
     const fn bit(self) -> u16 {
-        1 << (self as u16)
+        const fn checked_bit(variant: Carrier) -> u16 {
+            let shift = variant as u32;
+            assert!(
+                shift < u16::BITS,
+                "Carrier variant exceeds CarrierPolicy(u16) bit capacity",
+            );
+            1u16 << shift
+        }
+
+        match self {
+            Self::Baseline => const { checked_bit(Self::Baseline) },
+            Self::Virtual => const { checked_bit(Self::Virtual) },
+            Self::Flat => const { checked_bit(Self::Flat) },
+            Self::HostString => const { checked_bit(Self::HostString) },
+            Self::StringBuilder => const { checked_bit(Self::StringBuilder) },
+            Self::NativeVec => const { checked_bit(Self::NativeVec) },
+            Self::SliceView => const { checked_bit(Self::SliceView) },
+            Self::Opaque => const { checked_bit(Self::Opaque) },
+            Self::NativeBox => const { checked_bit(Self::NativeBox) },
+            Self::NativeMap => const { checked_bit(Self::NativeMap) },
+        }
     }
 }
+
+const _: () = {
+    assert!(
+        Carrier::ALL.len() <= u16::BITS as usize,
+        "Carrier variants exceed CarrierPolicy(u16) bit capacity",
+    );
+    let mut i = 0;
+    while i < Carrier::ALL.len() {
+        assert!(
+            Carrier::ALL[i] as usize == i,
+            "Carrier::ALL must list variants in discriminant order",
+        );
+        assert!(
+            (Carrier::ALL[i] as u32) < u16::BITS,
+            "Carrier discriminant overflows CarrierPolicy(u16)",
+        );
+        i += 1;
+    }
+};
 
 /// The carriers a verified [`Func`] may give its values.
 ///
@@ -186,6 +273,53 @@ pub struct RBlock {
     pub params: Vec<ValueId>,
     pub ops: Vec<Op>,
     pub term: RTerm,
+}
+
+impl RBlock {
+    /// Index of the trailing operation protected by [`RTerm::Invoke`], if this block terminates
+    /// with `Invoke` and contains at least one op.
+    pub fn protected_op_index(&self) -> Option<usize> {
+        matches!(self.term, RTerm::Invoke { .. })
+            .then(|| self.ops.len().checked_sub(1))
+            .flatten()
+    }
+
+    /// The trailing operation protected by [`RTerm::Invoke`], if any.
+    pub fn protected_op(&self) -> Option<&Op> {
+        self.protected_op_index().and_then(|idx| self.ops.get(idx))
+    }
+
+    /// Whether `idx` is the trailing operation protected by [`RTerm::Invoke`].
+    pub fn is_protected_op(&self, idx: usize) -> bool {
+        self.protected_op_index() == Some(idx)
+    }
+
+    /// Appends `op` to this block without displacing a trailing [`RTerm::Invoke`]-protected op.
+    ///
+    /// When `self.term` is [`RTerm::Invoke`] and `self.ops` is non-empty, inserts `op`
+    /// immediately before the final protected op; otherwise pushes to the end.
+    pub fn push_before_protected(&mut self, op: Op) {
+        if let Some(protected) = self.protected_op_index() {
+            self.ops.insert(protected, op);
+        } else {
+            self.ops.push(op);
+        }
+    }
+
+    /// Retains ops satisfying `keep(index, op)`, always keeping the trailing
+    /// [`RTerm::Invoke`]-protected op if present.
+    pub fn retain_ops_preserving_protected<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(usize, &Op) -> bool,
+    {
+        let protected = self.protected_op_index();
+        let mut idx = 0usize;
+        self.ops.retain(|op| {
+            let current = idx;
+            idx += 1;
+            protected == Some(current) || keep(current, op)
+        });
+    }
 }
 
 /// One operation.
@@ -404,7 +538,8 @@ impl OpKind {
         }
     }
 
-    fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
+    /// Invokes `f` with every [`ValueId`] operand read by this op, in operand order.
+    pub fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
         let path_uses = |path: &[Proj], f: &mut dyn FnMut(ValueId)| {
             for proj in path {
                 if let Proj::Index(v) = proj {
@@ -472,6 +607,102 @@ impl OpKind {
                 f(*cond);
                 msg.for_each_use(f);
             }
+        }
+    }
+
+    /// Mutably visits every [`ValueId`] operand read by this op, in operand order.
+    pub fn visit_values_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+        match self {
+            Self::Const(_)
+            | Self::CellAlloc(_)
+            | Self::CellLoad(_)
+            | Self::Zombie(_)
+            | Self::SpillRead(_) => {}
+            Self::Copy(v)
+            | Self::Move(v)
+            | Self::Repeat { v, .. }
+            | Self::Field { base: v, .. }
+            | Self::Discriminant(v)
+            | Self::SetDiscriminant { base: v, .. }
+            | Self::CellStore { v, .. }
+            | Self::Deref(v)
+            | Self::Unary { v, .. }
+            | Self::Cast { v, .. }
+            | Self::Materialize(v)
+            | Self::Convert { v, .. }
+            | Self::SpillWrite { v, .. } => f(v),
+            Self::Aggregate { fields, .. } => {
+                for field in fields {
+                    f(field);
+                }
+            }
+            Self::SetField { base, v, .. } => {
+                f(base);
+                f(v);
+            }
+            Self::BorrowView { root, path, .. }
+            | Self::RawView { root, path, .. }
+            | Self::Drop { root, path, .. } => {
+                if let Root::Value(v) = root {
+                    f(v);
+                }
+                for proj in path {
+                    if let Proj::Index(v) = proj {
+                        f(v);
+                    }
+                }
+            }
+            Self::SliceView { ptr, len } => {
+                f(ptr);
+                f(len);
+            }
+            Self::StoreThrough { ptr, v } => {
+                f(ptr);
+                f(v);
+            }
+            Self::Binary { l, r, .. } => {
+                f(l);
+                f(r);
+            }
+            Self::Call { function, args, .. } => {
+                if let Some(function) = function {
+                    f(function);
+                }
+                for arg in args {
+                    f(arg);
+                }
+            }
+            Self::Intrinsic { args, .. } | Self::Host { args, .. } => {
+                for arg in args {
+                    f(arg);
+                }
+            }
+            Self::Assert { cond, msg, .. } => {
+                f(cond);
+                msg.visit_values_mut(f);
+            }
+        }
+    }
+
+    /// Mutably visits every [`CellId`] referenced by this op.
+    pub fn visit_cells_mut(&mut self, mut f: impl FnMut(&mut CellId)) {
+        match self {
+            Self::CellAlloc(cell)
+            | Self::CellLoad(cell)
+            | Self::CellStore { cell, .. }
+            | Self::BorrowView {
+                root: Root::Cell(cell),
+                ..
+            }
+            | Self::RawView {
+                root: Root::Cell(cell),
+                ..
+            }
+            | Self::Drop {
+                root: Root::Cell(cell),
+                ..
+            } => f(cell),
+            _ => {}
         }
     }
 }
@@ -544,7 +775,8 @@ pub enum RAssertMessage {
 }
 
 impl RAssertMessage {
-    fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
+    /// Invokes `f` with every [`ValueId`] operand read by this assertion message.
+    pub fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
         match self {
             Self::BoundsCheck {
                 length: a,
@@ -564,6 +796,35 @@ impl RAssertMessage {
             | Self::DivisionByZero(v)
             | Self::RemainderByZero(v)
             | Self::InvalidEnum(v) => f(*v),
+            Self::ResumedAfterReturn(_)
+            | Self::ResumedAfterPanic(_)
+            | Self::ResumedAfterDrop(_)
+            | Self::NullPointer
+            | Self::NullReference => {}
+        }
+    }
+
+    /// Mutably visits every [`ValueId`] operand read by this assertion message.
+    pub fn visit_values_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+        match self {
+            Self::BoundsCheck {
+                length: a,
+                index: b,
+            }
+            | Self::Overflow {
+                left: a, right: b, ..
+            }
+            | Self::MisalignedPointer {
+                required: a,
+                found: b,
+            } => {
+                f(a);
+                f(b);
+            }
+            Self::OverflowNeg(v)
+            | Self::DivisionByZero(v)
+            | Self::RemainderByZero(v)
+            | Self::InvalidEnum(v) => f(v),
             Self::ResumedAfterReturn(_)
             | Self::ResumedAfterPanic(_)
             | Self::ResumedAfterDrop(_)
@@ -623,31 +884,105 @@ impl RTerm {
         self.edges().into_iter().map(|(block, _)| block).collect()
     }
 
-    /// Every value the terminator itself reads (the scrutinee, the returned or thrown value, and
-    /// every edge argument).
-    pub fn uses(&self) -> Vec<ValueId> {
-        let mut uses = Vec::new();
+    /// Mutably visits every outgoing `(target, edge_args)` pair in order.
+    pub fn edges_mut(&mut self, mut f: impl FnMut(&mut RBlockId, &mut Vec<ValueId>)) {
         match self {
-            Self::Goto(_, args) => uses.extend(args),
+            Self::Goto(block, args) => f(block, args),
+            Self::Switch { cases, default, .. } => {
+                for (_, block, args) in cases {
+                    f(block, args);
+                }
+                f(&mut default.0, &mut default.1);
+            }
+            Self::Invoke { normal, unwind } => {
+                f(&mut normal.0, &mut normal.1);
+                f(&mut unwind.0, &mut unwind.1);
+            }
+            Self::Return(_) | Self::Unreachable | Self::Throw(_) => {}
+        }
+    }
+
+    /// Mutably visits every successor block target in order.
+    pub fn targets_mut(&mut self, mut f: impl FnMut(&mut RBlockId)) {
+        self.edges_mut(|block, _| f(block));
+    }
+
+    /// Invokes `f` with every [`ValueId`] read by this terminator (scrutinee, returned/thrown
+    /// value, and edge arguments), in order.
+    pub fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
+        match self {
+            Self::Goto(_, args) => args.iter().copied().for_each(f),
             Self::Switch {
                 scrut,
                 cases,
                 default,
                 ..
             } => {
-                uses.push(*scrut);
+                f(*scrut);
                 for (_, _, args) in cases {
-                    uses.extend(args);
+                    args.iter().copied().for_each(&mut f);
                 }
-                uses.extend(&default.1);
+                default.1.iter().copied().for_each(f);
             }
             Self::Invoke { normal, unwind } => {
-                uses.extend(&normal.1);
-                uses.extend(&unwind.1);
+                normal.1.iter().copied().for_each(&mut f);
+                unwind.1.iter().copied().for_each(f);
             }
-            Self::Return(v) | Self::Throw(v) => uses.extend(v),
+            Self::Return(v) | Self::Throw(v) => {
+                if let Some(v) = v {
+                    f(*v);
+                }
+            }
             Self::Unreachable => {}
         }
+    }
+
+    /// Mutably visits every [`ValueId`] read by this terminator, in order.
+    pub fn visit_values_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+        match self {
+            Self::Goto(_, args) => {
+                for v in args {
+                    f(v);
+                }
+            }
+            Self::Switch {
+                scrut,
+                cases,
+                default,
+                ..
+            } => {
+                f(scrut);
+                for (_, _, args) in cases {
+                    for v in args {
+                        f(v);
+                    }
+                }
+                for v in &mut default.1 {
+                    f(v);
+                }
+            }
+            Self::Invoke { normal, unwind } => {
+                for v in &mut normal.1 {
+                    f(v);
+                }
+                for v in &mut unwind.1 {
+                    f(v);
+                }
+            }
+            Self::Return(v) | Self::Throw(v) => {
+                if let Some(v) = v {
+                    f(v);
+                }
+            }
+            Self::Unreachable => {}
+        }
+    }
+
+    /// Every value the terminator itself reads (the scrutinee, the returned or thrown value, and
+    /// every edge argument).
+    pub fn uses(&self) -> Vec<ValueId> {
+        let mut uses = Vec::new();
+        self.for_each_use(|v| uses.push(v));
         uses
     }
 }
@@ -693,13 +1028,7 @@ impl FuncBuilder {
 
     /// Defines a value; the caller is responsible for an op or block parameter binding it.
     pub fn value(&mut self, ty: TypeId, origin: OriginId) -> ValueId {
-        let id = ValueId(self.func.values.len() as u32);
-        self.func.values.push(ValueDef {
-            ty,
-            carrier: Carrier::Baseline,
-            origin,
-        });
-        id
+        self.func.push_value(ty, Carrier::Baseline, origin)
     }
 
     /// Adds an entry parameter (a block 0 parameter listed in `Func::params`).
@@ -917,6 +1246,10 @@ struct Verifier<'a> {
 impl<'a> Verifier<'a> {
     fn err(message: impl fmt::Display) -> VerifyError {
         VerifyError::new(format!("JIR-R {message}"))
+    }
+
+    fn err_kind(kind: VerifyErrorKind, message: impl fmt::Display) -> VerifyError {
+        VerifyError::with_kind(kind, format!("JIR-R {message}"))
     }
 
     fn value_def(&self, v: ValueId) -> Result<&'a ValueDef, VerifyError> {
@@ -1241,13 +1574,13 @@ impl<'a> Verifier<'a> {
             | OpKind::Drop { root, path, .. } => self.check_place(root, path)?,
             OpKind::Deref(ptr) => {
                 let ptr_ty = self.value_def(*ptr)?.ty;
-                if let (Some(pointee), Some(result)) = (self.pointee(ptr_ty), result) {
+                if let (Some(pointee), Some(result)) = (self.table.pointee(ptr_ty), result) {
                     self.expect_type(result, pointee, "deref")?;
                 }
             }
             OpKind::StoreThrough { ptr, v } => {
                 let ptr_ty = self.value_def(*ptr)?.ty;
-                if let Some(pointee) = self.pointee(ptr_ty) {
+                if let Some(pointee) = self.table.pointee(ptr_ty) {
                     self.expect_type(*v, pointee, "store through")?;
                 }
             }
@@ -1330,17 +1663,6 @@ impl<'a> Verifier<'a> {
             | OpKind::SpillWrite { .. } => {}
         }
         Ok(())
-    }
-
-    /// The pointee type of a reference or raw pointer type, after peeling wrappers.
-    fn pointee(&self, ty: TypeId) -> Option<TypeId> {
-        let peeled = self.table.peeled(ty);
-        match &self.table.get(peeled)?.kind {
-            TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                Some(*pointee)
-            }
-            _ => None,
-        }
     }
 
     fn check_term(&self, block: &RBlock) -> Result<(), VerifyError> {
@@ -1499,10 +1821,13 @@ impl<'a> Verifier<'a> {
             for (position, op) in block.ops.iter().enumerate() {
                 for v in op.kind.uses() {
                     if moved.contains(&v) {
-                        return Err(Self::err(format!(
-                            "v{} is used at op {position} of b{} after being moved",
-                            v.0, block_id.0
-                        )));
+                        return Err(Self::err_kind(
+                            VerifyErrorKind::UseAfterMove,
+                            format!(
+                                "v{} is used at op {position} of b{} after being moved",
+                                v.0, block_id.0
+                            ),
+                        ));
                     }
                 }
                 let cell = match &op.kind {
@@ -1542,10 +1867,13 @@ impl<'a> Verifier<'a> {
             }
             for v in block.term.uses() {
                 if moved.contains(&v) {
-                    return Err(Self::err(format!(
-                        "v{} is used by the terminator of b{} after being moved",
-                        v.0, block_id.0
-                    )));
+                    return Err(Self::err_kind(
+                        VerifyErrorKind::UseAfterMove,
+                        format!(
+                            "v{} is used by the terminator of b{} after being moved",
+                            v.0, block_id.0
+                        ),
+                    ));
                 }
             }
         }
@@ -1661,8 +1989,198 @@ impl Func {
         verifier.check_moves_and_cells()
     }
 
+    /// Allocates and appends a new SSA value definition, returning its [`ValueId`].
+    pub fn push_value(&mut self, ty: TypeId, carrier: Carrier, origin: OriginId) -> ValueId {
+        let id = ValueId(u32::try_from(self.values.len()).expect("ValueId overflows u32"));
+        self.values.push(ValueDef {
+            ty,
+            carrier,
+            origin,
+        });
+        id
+    }
+
     /// The type of `v`.
     pub fn ty(&self, v: ValueId) -> Option<TypeId> {
         self.values.get(v.0 as usize).map(|def| def.ty)
+    }
+
+    /// The type of a place [`Root`] (either an SSA value or a storage cell).
+    pub fn root_ty(&self, root: Root) -> Option<TypeId> {
+        match root {
+            Root::Value(v) => self.values.get(v.0 as usize).map(|def| def.ty),
+            Root::Cell(c) => self.cells.get(c.0 as usize).map(|def| def.ty),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jir::semantic::{AbiSignature, DefinitionId};
+
+    #[test]
+    fn repr_mut_visitors_and_func_helpers() {
+        let sig = Signature {
+            arguments: Vec::new(),
+            result: TypeId(1),
+            abi: AbiSignature::default(),
+        };
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 1,
+        };
+        let mut builder = FuncBuilder::new(item, sig);
+        let c0 = builder.cell(TypeId(2), false, OriginId(0));
+        let mut func = builder.finish();
+        let v0 = func.push_value(TypeId(1), Carrier::Baseline, OriginId(0));
+        let v1 = func.push_value(TypeId(1), Carrier::Baseline, OriginId(0));
+        assert_eq!(func.root_ty(Root::Value(v0)), Some(TypeId(1)));
+        assert_eq!(func.root_ty(Root::Cell(c0)), Some(TypeId(2)));
+
+        let mut op = OpKind::BorrowView {
+            root: Root::Cell(c0),
+            path: vec![Proj::Index(v0)],
+            mutable: false,
+        };
+        let mut seen = Vec::new();
+        op.for_each_use(|v| seen.push(v));
+        assert_eq!(seen, vec![v0]);
+        op.visit_values_mut(|v| *v = v1);
+        op.visit_cells_mut(|c| *c = CellId(3));
+        assert_eq!(
+            op,
+            OpKind::BorrowView {
+                root: Root::Cell(CellId(3)),
+                path: vec![Proj::Index(v1)],
+                mutable: false,
+            }
+        );
+
+        let mut term = RTerm::Switch {
+            scrut: v0,
+            scrut_ty: TypeId(1),
+            cases: vec![(0, RBlockId(1), vec![v0])],
+            default: (RBlockId(2), vec![v1]),
+        };
+        term.visit_values_mut(|v| {
+            if *v == v0 {
+                *v = v1;
+            }
+        });
+        term.targets_mut(|b| b.0 += 10);
+        assert_eq!(term.uses(), vec![v1, v1, v1]);
+        assert_eq!(term.successors(), vec![RBlockId(11), RBlockId(12)]);
+    }
+
+    fn dummy_op(result: Option<ValueId>, kind: OpKind) -> Op {
+        Op {
+            result,
+            origin: OriginId(0),
+            kind,
+        }
+    }
+
+    fn invoke_term() -> RTerm {
+        RTerm::Invoke {
+            normal: (RBlockId(1), Vec::new()),
+            unwind: (RBlockId(2), Vec::new()),
+        }
+    }
+
+    #[test]
+    fn rblock_protected_op_helpers_respect_invoke_blocks() {
+        let op0 = dummy_op(Some(ValueId(0)), OpKind::Const(ConstTree::Unit));
+        let op1 = dummy_op(Some(ValueId(1)), OpKind::Copy(ValueId(0)));
+        let protected_call = dummy_op(
+            Some(ValueId(2)),
+            OpKind::Call {
+                callee: Callee::Nop,
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+        );
+
+        // Non-invoke block has no protected op.
+        let mut plain = RBlock {
+            id: RBlockId(0),
+            params: Vec::new(),
+            ops: vec![op0.clone()],
+            term: RTerm::Return(None),
+        };
+        assert_eq!(plain.protected_op_index(), None);
+        assert_eq!(plain.protected_op(), None);
+        assert!(!plain.is_protected_op(0));
+        plain.push_before_protected(op1.clone());
+        assert_eq!(plain.ops, vec![op0.clone(), op1.clone()]);
+        let mut seen_indices = Vec::new();
+        plain.retain_ops_preserving_protected(|idx, _| {
+            seen_indices.push(idx);
+            idx == 1
+        });
+        assert_eq!(seen_indices, vec![0, 1]);
+        assert_eq!(plain.ops, vec![op1.clone()]);
+
+        // Empty invoke block has no protected op until an op is inserted.
+        let mut empty_invoke = RBlock {
+            id: RBlockId(0),
+            params: Vec::new(),
+            ops: Vec::new(),
+            term: invoke_term(),
+        };
+        assert_eq!(empty_invoke.protected_op_index(), None);
+        assert_eq!(empty_invoke.protected_op(), None);
+        assert!(!empty_invoke.is_protected_op(0));
+        empty_invoke.push_before_protected(protected_call.clone());
+        assert_eq!(empty_invoke.protected_op_index(), Some(0));
+        assert_eq!(empty_invoke.protected_op(), Some(&protected_call));
+        assert!(empty_invoke.is_protected_op(0));
+
+        // Non-empty invoke block inserts before the trailing protected op.
+        let mut invoke = RBlock {
+            id: RBlockId(0),
+            params: Vec::new(),
+            ops: vec![op0.clone(), protected_call.clone()],
+            term: invoke_term(),
+        };
+        assert_eq!(invoke.protected_op_index(), Some(1));
+        assert_eq!(invoke.protected_op(), Some(&protected_call));
+        assert!(!invoke.is_protected_op(0));
+        assert!(invoke.is_protected_op(1));
+
+        invoke.push_before_protected(op1.clone());
+        assert_eq!(
+            invoke.ops,
+            vec![op0.clone(), op1.clone(), protected_call.clone()]
+        );
+        assert_eq!(invoke.protected_op_index(), Some(2));
+        assert_eq!(invoke.protected_op(), Some(&protected_call));
+
+        // Retaining with a predicate keeps only matching pre-ops plus the protected op.
+        invoke.retain_ops_preserving_protected(|idx, _| idx == 0);
+        assert_eq!(invoke.ops, vec![op0.clone(), protected_call.clone()]);
+        assert_eq!(invoke.protected_op_index(), Some(1));
+
+        // Even rejecting every op preserves the protected op.
+        invoke.retain_ops_preserving_protected(|_, _| false);
+        assert_eq!(invoke.ops, vec![protected_call.clone()]);
+        assert_eq!(invoke.protected_op_index(), Some(0));
+    }
+
+    #[test]
+    fn carrier_policy_covers_every_carrier_variant() {
+        let mut policy = CarrierPolicy::BASELINE;
+        assert!(policy.allows(Carrier::Baseline));
+        for &carrier in &Carrier::ALL[1..] {
+            assert!(!policy.allows(carrier), "unexpectedly allowed {carrier:?}");
+            policy = policy.with(carrier);
+            assert!(policy.allows(carrier), "should allow {carrier:?}");
+        }
     }
 }

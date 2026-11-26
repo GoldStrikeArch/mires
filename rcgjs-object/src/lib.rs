@@ -49,6 +49,7 @@ pub mod artifact;
 pub mod dts;
 pub mod evaluation;
 pub mod host;
+pub mod index_vec;
 pub mod item;
 pub mod jir;
 pub mod jsast;

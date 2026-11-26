@@ -6,6 +6,8 @@
 //! the single CGU's object onto the `-o` path, which is how `-o out.js --emit=obj` ends up
 //! containing our JS.
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fs;
 use std::path::PathBuf;
@@ -31,8 +33,8 @@ use rustc_span::Symbol;
 
 use crate::cgu::CguCx;
 use crate::item::{
-    object_identity, Decline, Interns, ItemKind, JsItem, JsName, Linkage, ObjectIdentity,
-    ZombieKind, ZombieLog,
+    object_identity, prologue, Decline, Interns, ItemKind, JsItem, JsItemJir, JsName, Linkage,
+    ObjectIdentity, Zombie, ZombieKind, ZombieLog,
 };
 use crate::jsast;
 
@@ -56,11 +58,6 @@ impl JsModule {
             identity,
             interns: Interns::new(),
         }
-    }
-
-    /// The banner every object file and every finished program starts with.
-    pub(crate) fn prologue(label: &str) -> String {
-        format!("// rustc_codegen_js — {label}\n")
     }
 }
 
@@ -94,7 +91,7 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
             MonoItem::Fn(instance) => {
                 let item = codegen_jir_fn(&cx, instance);
                 if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind {
-                    reject_unwind_crossing_calls(tcx, instance);
+                    crate::unwind_check::reject_unwind_crossing_calls(tcx, instance);
                 }
                 if cx.claim(&item.name) {
                     module.items.push(item);
@@ -155,446 +152,55 @@ fn requires_cleanup_lowering<'tcx>(
             .any(|block| block.is_cleanup)
 }
 
-/// Under `-Cpanic=unwind` (the unwind build mode), an error for each place in this function where
-/// a host exception could cross a frame whose cleanup rustc removed.
-///
-/// rustc gives a call no cleanup edge when the callee's ABI cannot unwind (`fn_can_unwind`, so
-/// every such ABI, not a list of names): the destructors this function holds across the call are
-/// then gone from its MIR, and a JavaScript exception that comes out of the call would leave
-/// without running them. Two shapes reach that point:
-///
-/// * a call whose callee has such an ABI and may let a host exception out: a foreign import, a
-///   call through a function pointer or a `dyn` method, or a Rust function whose transitive call
-///   and drop graph cannot be proven free of `UnwindTerminate(Abi)`, non-sysroot foreign imports,
-///   indirect or `dyn` dispatch (including dropping a `dyn` value), inline assembly, tail calls,
-///   or unresolved / bodyless non-sysroot callees;
-/// * such a callee inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges
-///   inside this body, where the cleanup of this frame is gone the same way.
-///
-/// Either is refused only where this frame holds a value with drop glue across it
-/// ([`HeldDrops`]): with nothing to drop the exception passes this frame as it would with the
-/// edge, and the next frame up decides for itself. Declared `extern "C-unwind"` the call keeps its
-/// edge, which is the fix every message names. A Rust callee whose transitive call and drop graph
-/// is available and free of those hazards (cycles included) cannot let anything out and is
-/// accepted.
-///
-/// The sysroot's own crates are not checked where the sysroot build compiles them
-/// ([`is_sysroot_build`]): they call no host function (the imports they declare are the runtime's,
-/// which this compiler supplies), and `compiler_builtins`' intrinsics call one another through the
-/// C ABI. Their generics are checked where a program instantiates them, and a program's call to an
-/// import a sysroot crate declares is accepted ([`is_sysroot_crate`]). It is an error where the
-/// call is compiled rather than a zombie: the JIR lane replaces an item's zombies with its
-/// lowering's, and this is a property of the program, not of the lowering.
-fn reject_unwind_crossing_calls<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: rustc_middle::ty::Instance<'tcx>,
-) {
-    use rustc_middle::mir::TerminatorKind;
-    use rustc_middle::ty::{self, layout::fn_can_unwind, InstanceKind};
-    if is_sysroot_build(tcx) {
-        return;
-    }
-    let body = tcx.instance_mir(instance.def);
-    let mut held = HeldDrops::new(tcx, instance, body);
-    let fix = "Declare it `extern \"C-unwind\"`.";
-    let consequence =
-        "under -Cpanic=unwind (JSC_PANIC=unwind) rustc gives the call no cleanup, so \
-                       a host exception thrown behind it would skip this function's destructors";
-    // rustc deduplicates an identical diagnostic, so each instance of a generic reports once.
-    for (block, data) in body.basic_blocks.iter_enumerated() {
-        let terminator = data.terminator();
-        let span = terminator.source_info.span;
-        if ends_in_abi_terminate(&terminator.kind) {
-            if let Some((callee, call)) =
-                inlined_nounwind_frame(tcx, body, terminator.source_info.scope)
-                    .filter(|_| held.across(block))
+/// Collects link-level dependencies from a JIR encoding result, or records the decline as an
+/// `Unsupported` zombie when encoding failed.
+fn collect_jir_outcome<'tcx>(
+    cx: &CguCx<'tcx>,
+    name: &JsName,
+    def_id: rustc_hir::def_id::DefId,
+    encoded: Result<crate::jir::encode::EncodedJir, rcgjs_object::jir::decline::EncodeDecline>,
+    on_decline: impl FnOnce(
+        &rcgjs_object::jir::decline::EncodeDecline,
+    ) -> (Option<rcgjs_object::jir::semantic::ItemId>, String),
+) -> (JsItemJir, BTreeSet<JsName>, Vec<Zombie>) {
+    match encoded {
+        Ok(encoded) => {
+            let mut refs = encoded.extra_refs;
             {
-                let abi = callee.ty(tcx, crate::value::typing_env()).fn_sig(tcx).abi();
-                tcx.dcx()
-                    .struct_span_err(
-                        call,
-                        format!(
-                            "rustc_codegen_js: `{}` has the \"{}\" ABI, which cannot unwind, and \
-                             rustc inlined it here: {consequence}. {fix}",
-                            tcx.def_path_str(callee.def_id()),
-                            abi.as_str()
-                        ),
-                    )
-                    .with_span_note(
-                        tcx.def_span(callee.def_id()),
-                        "the function is defined here",
-                    )
-                    .emit();
-            }
-        }
-        let TerminatorKind::Call { func, .. } = &terminator.kind else {
-            continue;
-        };
-        let callee_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            crate::value::typing_env(),
-            ty::EarlyBinder::bind(tcx, func.ty(body, tcx)),
-        );
-        let abi = callee_ty.fn_sig(tcx).abi();
-        if fn_can_unwind(tcx, None, abi) || !held.across(block) {
-            continue;
-        }
-        let abi = abi.as_str();
-        let ty::FnDef(callee, args) = *callee_ty.kind() else {
-            tcx.dcx().span_err(
-                span,
-                format!(
-                    "rustc_codegen_js: this call goes through a `{callee_ty}`, whose \"{abi}\" ABI \
-                     cannot unwind: {consequence}. Use an `extern \"C-unwind\"` function pointer \
-                     type."
-                ),
-            );
-            continue;
-        };
-        let path = tcx.def_path_str(callee);
-        if tcx.is_foreign_item(callee) {
-            if is_sysroot_crate(tcx, callee.krate) {
-                continue;
-            }
-            tcx.dcx()
-                .struct_span_err(
-                    span,
-                    format!(
-                        "rustc_codegen_js: `{path}` is a foreign import with the \"{abi}\" ABI, \
-                         which cannot unwind: under -Cpanic=unwind (JSC_PANIC=unwind) a host \
-                         exception thrown through it would skip its callers' cleanup. {fix}"
-                    ),
-                )
-                .with_span_note(tcx.def_span(callee), "the import is declared here")
-                .emit();
-            continue;
-        }
-        let resolved = args
-            .no_bound_vars()
-            .map(|args| ty::Instance::try_resolve(tcx, crate::value::typing_env(), callee, args));
-        let why = match resolved {
-            Some(Ok(Some(target))) => {
-                if matches!(target.def, InstanceKind::Virtual(..)) {
-                    tcx.dcx().span_err(
-                        span,
-                        format!(
-                            "rustc_codegen_js: this call of the `dyn` method `{path}` has the \
-                             \"{abi}\" ABI, which cannot unwind: {consequence}. Declare the method \
-                             `extern \"C-unwind\"`."
-                        ),
-                    );
-                    continue;
-                }
-                match callee_may_pass_host_exception(tcx, target) {
-                    None => continue,
-                    Some(why) => why,
+                let interns = cx.interns();
+                for dep in encoded.item.body.link_dependencies() {
+                    if let Some(dep_name) = interns.str(dep) {
+                        refs.insert(JsName::new(dep_name.to_owned()));
+                    }
                 }
             }
-            _ => "and it does not resolve to a body that shows no host exception leaves it",
-        };
-        tcx.dcx()
-            .struct_span_err(
-                span,
-                format!(
-                    "rustc_codegen_js: `{path}` has the \"{abi}\" ABI, which cannot unwind, {why}: \
-                     {consequence}. {fix}"
-                ),
+            // Keep any self-reference out of `refs` so dependency ordering matches `JsItem::new`.
+            refs.remove(name);
+            (JsItemJir::from(encoded.item), refs, Vec::new())
+        }
+        Err(decline) => {
+            let loc = cx
+                .tcx
+                .sess
+                .source_map()
+                .span_to_diagnostic_string(cx.tcx.def_span(def_id));
+            let (item, message) = on_decline(&decline);
+            let zombies = vec![Zombie {
+                loc,
+                message,
+                span: None,
+                kind: ZombieKind::Unsupported,
+            }];
+            (
+                JsItemJir::Declined {
+                    item,
+                    decline: Decline::Encode(decline),
+                },
+                BTreeSet::new(),
+                zombies,
             )
-            .with_span_note(tcx.def_span(callee), "the function is defined here")
-            .emit();
-    }
-}
-
-/// Returns `None` iff `root`'s transitive call and drop graph is available and proven free of any
-/// way for a host exception to leave `root`; otherwise returns `Some(why)` describing the hazard.
-fn callee_may_pass_host_exception<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    root: rustc_middle::ty::Instance<'tcx>,
-) -> Option<&'static str> {
-    use rustc_data_structures::fx::FxHashSet;
-    use rustc_middle::mir::TerminatorKind;
-    use rustc_middle::ty::{self, InstanceKind, ShimKind};
-
-    let mut visited = FxHashSet::default();
-    let mut work = vec![root];
-
-    while let Some(inst) = work.pop() {
-        if !visited.insert(inst) {
-            continue;
-        }
-        match inst.def {
-            InstanceKind::Intrinsic(_)
-            | InstanceKind::LlvmIntrinsic(_)
-            | InstanceKind::Shim(ShimKind::DropGlue(_, None) | ShimKind::ThreadLocal(..)) => {
-                continue;
-            }
-            InstanceKind::Virtual(..) => {
-                return Some(
-                    "and it dispatches through a `dyn` method that may pass a host exception",
-                );
-            }
-            InstanceKind::Shim(ShimKind::DropGlue(_, Some(drop_ty)))
-                if matches!(drop_ty.kind(), ty::Dynamic(..)) =>
-            {
-                return Some("and dropping a `dyn` value inside it may pass a host exception");
-            }
-            InstanceKind::Item(def_id) => {
-                if tcx.is_foreign_item(def_id) {
-                    if is_sysroot_crate(tcx, def_id.krate) {
-                        continue;
-                    }
-                    return Some("and a host exception can leave it");
-                }
-                if !tcx.is_mir_available(def_id) {
-                    if is_sysroot_crate(tcx, def_id.krate) {
-                        continue;
-                    }
-                    return Some(
-                        "and a callee's body is not available to show that no host exception \
-                         leaves it",
-                    );
-                }
-            }
-            // Other shims (`DropGlue(_, Some(_))`, `CloneShim`, `ClosureOnceShim`, `FnPtrShim`,
-            // `ReifyShim`, `VTableShim`, etc.) provide compiler-synthesized MIR via `instance_mir`.
-            InstanceKind::Shim(_) => {}
-        }
-
-        let body = tcx.instance_mir(inst.def);
-        for data in body.basic_blocks.iter() {
-            let term = data.terminator();
-            if ends_in_abi_terminate(&term.kind) {
-                return Some("and a host exception can leave it");
-            }
-            match &term.kind {
-                TerminatorKind::InlineAsm { .. } => {
-                    return Some("and inline assembly inside it may pass a host exception");
-                }
-                TerminatorKind::TailCall { .. } => {
-                    return Some("and a tail call inside it may pass a host exception");
-                }
-                TerminatorKind::Drop { place, .. } => {
-                    let drop_ty = inst.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        crate::value::typing_env(),
-                        ty::EarlyBinder::bind(tcx, place.ty(&body.local_decls, tcx).ty),
-                    );
-                    if matches!(drop_ty.kind(), ty::Dynamic(..)) {
-                        return Some(
-                            "and dropping a `dyn` value inside it may pass a host exception",
-                        );
-                    }
-                    let drop_inst = ty::Instance::resolve_drop_glue(tcx, drop_ty);
-                    if !matches!(
-                        drop_inst.def,
-                        InstanceKind::Shim(ShimKind::DropGlue(_, None))
-                    ) {
-                        work.push(drop_inst);
-                    }
-                }
-                TerminatorKind::Call { func, .. } => {
-                    let callee_ty = inst.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        crate::value::typing_env(),
-                        ty::EarlyBinder::bind(tcx, func.ty(body, tcx)),
-                    );
-                    let ty::FnDef(callee_def, callee_args) = *callee_ty.kind() else {
-                        return Some(
-                            "and it calls through a function pointer that may pass a host \
-                             exception",
-                        );
-                    };
-                    if tcx.is_foreign_item(callee_def) {
-                        if is_sysroot_crate(tcx, callee_def.krate) {
-                            continue;
-                        }
-                        return Some("and a host exception can leave it");
-                    }
-                    match callee_args.no_bound_vars().map(|args| {
-                        ty::Instance::try_resolve(tcx, crate::value::typing_env(), callee_def, args)
-                    }) {
-                        Some(Ok(Some(next))) => work.push(next),
-                        _ => {
-                            return Some(
-                                "and a call inside it does not resolve to a body that shows no \
-                                 host exception leaves it",
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
         }
     }
-
-    None
-}
-
-/// Which values a frame holds across a call, asked only where a refusal is in question.
-///
-/// A value is held across the call ending `block` when its type has drop glue and it is used after
-/// the call returns (dropped, moved or read: maybe-live at the call's return block), other than the
-/// call's own destination, which is not yet written while the call runs. A terminator with no
-/// block to return to (a call that does not return, or `UnwindTerminate` ending a cleanup path)
-/// gives no such answer, so there every local of such a type whose storage is live counts.
-struct HeldDrops<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    instance: rustc_middle::ty::Instance<'tcx>,
-    body: &'a rustc_middle::mir::Body<'tcx>,
-    /// Per local, whether its type has drop glue.
-    droppable: Option<Vec<bool>>,
-    live: Option<
-        rustc_mir_dataflow::ResultsCursor<'a, 'tcx, rustc_mir_dataflow::impls::MaybeLiveLocals>,
-    >,
-    storage: Option<
-        rustc_mir_dataflow::ResultsCursor<
-            'a,
-            'tcx,
-            rustc_mir_dataflow::impls::MaybeStorageLive<'a>,
-        >,
-    >,
-}
-
-impl<'a, 'tcx> HeldDrops<'a, 'tcx> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        instance: rustc_middle::ty::Instance<'tcx>,
-        body: &'a rustc_middle::mir::Body<'tcx>,
-    ) -> Self {
-        Self {
-            tcx,
-            instance,
-            body,
-            droppable: None,
-            live: None,
-            storage: None,
-        }
-    }
-
-    fn across(&mut self, block: rustc_middle::mir::BasicBlock) -> bool {
-        use rustc_middle::mir::TerminatorKind;
-        use rustc_mir_dataflow::impls::{
-            always_storage_live_locals, MaybeLiveLocals, MaybeStorageLive,
-        };
-        use rustc_mir_dataflow::Analysis;
-        let (tcx, instance, body) = (self.tcx, self.instance, self.body);
-        let droppable = self.droppable.get_or_insert_with(|| {
-            body.local_decls
-                .iter()
-                .map(|decl| {
-                    instance
-                        .instantiate_mir_and_normalize_erasing_regions(
-                            tcx,
-                            crate::value::typing_env(),
-                            rustc_middle::ty::EarlyBinder::bind(tcx, decl.ty),
-                        )
-                        .needs_drop(tcx, crate::value::typing_env())
-                })
-                .collect()
-        });
-        if !droppable.contains(&true) {
-            return false;
-        }
-        let terminator = body.basic_blocks[block].terminator();
-        let returns_to = match &terminator.kind {
-            TerminatorKind::Call {
-                target: Some(target),
-                destination,
-                ..
-            } => Some((*target, Some(destination.local))),
-            TerminatorKind::Drop { target, .. } => Some((*target, None)),
-            _ => None,
-        };
-        match returns_to {
-            Some((target, destination)) => {
-                let live = self.live.get_or_insert_with(|| {
-                    MaybeLiveLocals
-                        .iterate_to_fixpoint(tcx, body, None)
-                        .into_results_cursor(body)
-                });
-                live.seek_to_block_start(target);
-                live.get()
-                    .iter()
-                    .any(|local| droppable[local.as_usize()] && Some(local) != destination)
-            }
-            None => {
-                let storage = self.storage.get_or_insert_with(|| {
-                    MaybeStorageLive::new(std::borrow::Cow::Owned(always_storage_live_locals(body)))
-                        .iterate_to_fixpoint(tcx, body, None)
-                        .into_results_cursor(body)
-                });
-                storage.seek_to_block_end(block);
-                storage
-                    .get()
-                    .iter()
-                    .any(|local| droppable[local.as_usize()])
-            }
-        }
-    }
-}
-
-/// Whether a terminator can end a cleanup path in `UnwindTerminate(Abi)`: rustc's mark of a frame
-/// that cannot unwind. An `Assert` is left out: its unwind is a Rust panic, which aborts in this
-/// backend and never carries a host exception.
-fn ends_in_abi_terminate(kind: &rustc_middle::mir::TerminatorKind<'_>) -> bool {
-    use rustc_middle::mir::{TerminatorKind, UnwindAction, UnwindTerminateReason};
-    match kind {
-        TerminatorKind::UnwindTerminate(UnwindTerminateReason::Abi) => true,
-        TerminatorKind::Assert { .. } => false,
-        kind => matches!(
-            kind.unwind(),
-            Some(UnwindAction::Terminate(UnwindTerminateReason::Abi))
-        ),
-    }
-}
-
-/// The outermost function inlined at `scope` whose ABI cannot unwind, with the span of the call
-/// rustc inlined it at: the frame an `UnwindTerminate(Abi)` at `scope` belongs to, when it is not
-/// this body's own. `None` when every inlined frame there can unwind (the edge then ends this
-/// body's own cleanup, or a `#[rustc_nounwind]` function's, whose promise is not about ABIs).
-fn inlined_nounwind_frame<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &rustc_middle::mir::Body<'tcx>,
-    mut scope: rustc_middle::mir::SourceScope,
-) -> Option<(rustc_middle::ty::Instance<'tcx>, rustc_span::Span)> {
-    let mut found = None;
-    loop {
-        let data = &body.source_scopes[scope];
-        if let Some((callee, call)) = data.inlined {
-            let abi = callee.ty(tcx, crate::value::typing_env()).fn_sig(tcx).abi();
-            if !rustc_middle::ty::layout::fn_can_unwind(tcx, None, abi) {
-                found = Some((callee, call));
-            }
-        }
-        match data.parent_scope {
-            Some(parent) => scope = parent,
-            None => return found,
-        }
-    }
-}
-
-/// Whether this compilation is the sysroot build's: `scripts/build_sysroot.sh` compiles `core`,
-/// `compiler_builtins` and `alloc` with `-Zforce-unstable-if-unmarked` (rustc's own rule for the
-/// standard library's crates), which a program's compilation is never given.
-fn is_sysroot_build(tcx: TyCtxt<'_>) -> bool {
-    tcx.sess.opts.unstable_opts.force_unstable_if_unmarked
-}
-
-/// Whether `krate`, in a program's compilation, is one of the sysroot's own crates, whose foreign
-/// imports are the runtime's: decided by where rustc loaded the crate from (the target's sysroot
-/// library directory), never by its name. A crate passed with `--extern` from anywhere else is the
-/// program's, whatever it is called, and so is the crate being compiled.
-fn is_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
-    if krate == rustc_span::def_id::LOCAL_CRATE {
-        return false;
-    }
-    let sysroot = &tcx.sess.target_tlib_path.dir;
-    let source = tcx.used_crate_source(krate);
-    [&source.rlib, &source.rmeta, &source.dylib]
-        .into_iter()
-        .flatten()
-        .next()
-        .is_some_and(|path| path.starts_with(sysroot))
 }
 
 /// Builds a JIR-only function item: encodes MIR to JIR-S and populates `refs` from the JIR
@@ -613,66 +219,30 @@ fn codegen_jir_fn<'tcx>(cx: &CguCx<'tcx>, instance: rustc_middle::ty::Instance<'
     };
     let names = vec![(name.as_str().to_owned(), debug_path.clone())];
     let loc = crate::jir::encode::location_of(tcx, mir.span);
-    let item_id = crate::jir::encode::item_id(cx, instance);
 
-    let (jir, decline, mut refs, mut zombies) =
-        match crate::jir::encode::function(cx, instance, mir) {
-            Ok(encoded) => {
-                let mut refs = encoded.extra_refs;
-                {
-                    let interns = cx.interns();
-                    for dep in encoded.item.body.link_dependencies() {
-                        if let Some(dep_name) = interns.str(dep) {
-                            refs.insert(JsName::new(dep_name.to_owned()));
-                        }
-                    }
-                }
-                refs.remove(&name);
-                (Some(encoded.item), None, refs, Vec::new())
-            }
-            Err(decline) => {
-                let loc_str = tcx
-                    .sess
-                    .source_map()
-                    .span_to_diagnostic_string(tcx.def_span(instance.def_id()));
-                let message = if requires_cleanup_lowering(cx, instance) {
-                    format!(
-                        "{} (encoding: {decline})",
-                        rcgjs_object::item::CLEANUP_LOWERING_REQUIRED
-                    )
-                } else {
-                    format!("JIR encoding declined: {decline}")
-                };
-                let zombies = vec![rcgjs_object::item::Zombie {
-                    loc: loc_str,
-                    message,
-                    span: None,
-                    kind: ZombieKind::Unsupported,
-                }];
-                (
-                    None,
-                    Some(Decline::Encode(decline)),
-                    Default::default(),
-                    zombies,
+    let (jir, refs, zombies) = collect_jir_outcome(
+        cx,
+        &name,
+        instance.def_id(),
+        crate::jir::encode::function(cx, instance, mir),
+        |decline| {
+            let message = if requires_cleanup_lowering(cx, instance) {
+                format!(
+                    "{} (encoding: {decline})",
+                    rcgjs_object::item::CLEANUP_LOWERING_REQUIRED
                 )
-            }
-        };
-    // Keep any self-reference out of `refs` so dependency ordering matches `JsItem::new`.
-    refs.remove(&name);
+            } else {
+                format!("JIR encoding declined: {decline}")
+            };
+            (Some(crate::jir::encode::item_id(cx, instance)), message)
+        },
+    );
     let decl = jsast::function(name.as_str(), Vec::new(), Vec::new());
-    JsItem::new(
-        name,
-        ItemKind::Fn,
-        decl,
-        std::mem::take(&mut zombies),
-        linkage,
-        debug_path,
-    )
-    .with_extra_refs(refs)
-    .with_source(loc, names)
-    .with_dts(dts)
-    .with_jir_item(Some(item_id))
-    .with_jir(jir, decline)
+    JsItem::new(name, ItemKind::Fn, decl, zombies, linkage, debug_path)
+        .with_extra_refs(refs)
+        .with_source(loc, names)
+        .with_dts(dts)
+        .with_jir(jir)
 }
 
 /// Builds a JIR-only static item. See [`codegen_jir_fn`].
@@ -686,44 +256,18 @@ fn codegen_jir_static<'tcx>(cx: &CguCx<'tcx>, def_id: rustc_hir::def_id::DefId) 
     let names = vec![(name.as_str().to_owned(), debug_path.clone())];
     let loc = crate::jir::encode::location_of(tcx, tcx.def_span(def_id));
 
-    let (jir, decline, mut refs, zombies) = match crate::jir::encode::static_item(cx, def_id) {
-        Ok(encoded) => {
-            let mut refs = encoded.extra_refs;
-            {
-                let interns = cx.interns();
-                for dep in encoded.item.body.link_dependencies() {
-                    if let Some(dep_name) = interns.str(dep) {
-                        refs.insert(JsName::new(dep_name.to_owned()));
-                    }
-                }
-            }
-            (Some(encoded.item), None, refs, Vec::new())
-        }
-        Err(decline) => {
-            let loc_str = tcx
-                .sess
-                .source_map()
-                .span_to_diagnostic_string(tcx.def_span(def_id));
-            let zombies = vec![rcgjs_object::item::Zombie {
-                loc: loc_str,
-                message: format!("JIR encoding declined: {decline}"),
-                span: None,
-                kind: ZombieKind::Unsupported,
-            }];
-            (
-                None,
-                Some(Decline::Encode(decline)),
-                Default::default(),
-                zombies,
-            )
-        }
-    };
-    refs.remove(&name);
+    let (jir, refs, zombies) = collect_jir_outcome(
+        cx,
+        &name,
+        def_id,
+        crate::jir::encode::static_item(cx, def_id),
+        |decline| (None, format!("JIR encoding declined: {decline}")),
+    );
     let decl = jsast::let_(name.as_str(), jsast::undefined());
     JsItem::new(name, ItemKind::Static, decl, zombies, linkage, debug_path)
         .with_extra_refs(refs)
         .with_source(loc, names)
-        .with_jir(jir, decline)
+        .with_jir(jir)
 }
 
 /// Write a codegen unit's JavaScript out as its "object file" and describe it to rustc.
@@ -740,14 +284,16 @@ fn emit_module(
 ) -> Result<CompiledModule, String> {
     let tmp_file = output_filenames.temp_path_for_cgu(OutputType::Object, &name);
 
-    // The last thing that happens to an item before it becomes text. Local renaming is per item and
-    // needs the AST, so this is as late as it can run; item renaming needs the whole program and so
-    // waits for `link.rs`. A no-op unless `js-minify` is on.
-    crate::minify::shorten_locals(&mut module.items);
+    // Only synthesized allocator shims carry non-empty JavaScript ASTs with local variables at
+    // codegen time; regular CGU items carry empty JIR placeholder stubs (lowered and minified at
+    // link time) or bindings without locals. A no-op unless `js-minify` is on.
+    if kind == ModuleKind::Allocator {
+        crate::minify::shorten_locals(&mut module.items);
+    }
 
     let interns = std::mem::take(&mut module.interns);
     let text = crate::item::write_object(
-        &JsModule::prologue(&format!("codegen unit `{}`", module.cgu_name)),
+        &prologue(&format!("codegen unit `{}`", module.cgu_name)),
         &module.items,
         crate::opts::get().comments,
         &module.crate_name,
@@ -764,11 +310,11 @@ fn emit_module(
     }
 
     if prof.enabled() {
-        prof.artifact_size(
-            "object_file",
-            tmp_file.file_name().unwrap().to_string_lossy(),
-            text.len() as u64,
+        let artifact_name = tmp_file.file_name().map_or_else(
+            || Cow::Borrowed(name.as_str()),
+            |file| file.to_string_lossy(),
         );
+        prof.artifact_size("object_file", artifact_name, text.len() as u64);
     }
 
     Ok(CompiledModule {

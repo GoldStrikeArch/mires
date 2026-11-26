@@ -12,12 +12,8 @@
 
 pub mod diag;
 
-/// The `js!{}` block section format, shared verbatim with the `js-macro` crate that writes it.
-#[path = "../../js-macro/src/block.rs"]
-mod block;
-/// The `#[js_extern]` descriptor format, shared verbatim with the macro crate that writes it.
-#[path = "../../js-extern-macro/src/descriptor.rs"]
-mod descriptor;
+/// The `js!{}` block and `#[js_extern]` descriptor formats, shared via `mires-marker-abi`.
+pub(crate) use mires_marker_abi::{block, descriptor};
 
 mod analysis;
 mod link;

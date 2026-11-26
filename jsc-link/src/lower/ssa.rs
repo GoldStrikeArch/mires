@@ -45,8 +45,6 @@
 //! parameter takes the signature's result type) and a synthetic view of a pointer-typed place
 //! with no reference type in the table (`plan.rs`, "Synthetic views").
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::jir::decline::{Decline, LowerDecline, OpClass};
@@ -61,6 +59,7 @@ use crate::jir::semantic::{
     StatementKind, TerminateReason, Terminator, TypeId, Unwind,
 };
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
+use crate::jir::VerifyErrorKind;
 
 use super::plan::{placeholder_view_ok, NO_ORIGIN};
 
@@ -68,6 +67,7 @@ use super::plan::{placeholder_view_ok, NO_ORIGIN};
 ///
 /// `origins` is the body's origin table when the object carried one; without it every op and
 /// value carries [`NO_ORIGIN`]. The result passes `Func::verify` or this returns a decline.
+#[cfg(test)]
 pub fn build(
     body: &Body,
     origins: Option<&OriginTable>,
@@ -131,7 +131,7 @@ pub fn build_with(
         let func = builder.finish()?;
         match func.verify(table) {
             Ok(()) => return Ok(func),
-            Err(err) if moves && err.message.contains("after being moved") => {
+            Err(err) if moves && err.kind == VerifyErrorKind::UseAfterMove => {
                 moves = false;
                 continue;
             }
@@ -1024,17 +1024,6 @@ impl<'a> Builder<'a> {
 
     // -- places -------------------------------------------------------------------------------
 
-    /// The type a `Deref` of a value of type `ty` yields, if `ty` is a pointer.
-    fn pointee(&self, ty: TypeId) -> Option<TypeId> {
-        let peeled = self.table.peeled(ty);
-        match &self.table.get(peeled)?.kind {
-            TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                Some(*pointee)
-            }
-            _ => None,
-        }
-    }
-
     /// Whether a value of `ty` can be read whole (its layout has a size).
     fn is_sized(&self, ty: TypeId) -> bool {
         self.table
@@ -1166,7 +1155,7 @@ impl<'a> Builder<'a> {
                     cur_ty = *ty;
                 }
                 Projection::Deref if simple && !cell_root => {
-                    let Some(pointee) = self.pointee(cur_ty) else {
+                    let Some(pointee) = self.table.pointee(cur_ty) else {
                         return Err(decline(OpClass::Place, "deref of a non-pointer type"));
                     };
                     let next_is_element = matches!(
@@ -1614,7 +1603,7 @@ impl<'a> Builder<'a> {
                         "copy_nonoverlapping statement without an interned intrinsic name",
                     ));
                 };
-                let Some(pointee) = self.pointee(source.ty) else {
+                let Some(pointee) = self.table.pointee(source.ty) else {
                     return Err(decline(
                         OpClass::Statement,
                         "copy_nonoverlapping of a non-pointer",
@@ -2051,7 +2040,7 @@ impl<'a> Builder<'a> {
         for block in &mut func.blocks {
             block.params.retain(|param| !removed.contains(param));
             for op in &mut block.ops {
-                rewrite_op(&mut op.kind, &resolve);
+                op.kind.visit_values_mut(|v| *v = resolve(*v));
             }
         }
         for (index, shape) in terms.into_iter().enumerate() {
@@ -2123,145 +2112,9 @@ pub(crate) fn compact_values(func: &mut Func, dead: &BTreeSet<ValueId>) {
             if let Some(result) = op.result.as_mut() {
                 *result = renumber(*result);
             }
-            rewrite_op(&mut op.kind, &renumber);
+            op.kind.visit_values_mut(|v| *v = renumber(*v));
         }
-        rewrite_term(&mut block.term, &renumber);
-    }
-}
-
-/// Applies `f` to every value an op reads.
-///
-/// `pub(crate)` because the JIR passes (`opt/`) rewrite operands too and there is no reason for a
-/// second copy of this match to exist.
-pub(crate) fn rewrite_op(kind: &mut OpKind, f: &dyn Fn(ValueId) -> ValueId) {
-    let path = |path: &mut Vec<Proj>| {
-        for proj in path.iter_mut() {
-            if let Proj::Index(v) = proj {
-                *v = f(*v);
-            }
-        }
-    };
-    let root = |root: &mut Root| {
-        if let Root::Value(v) = root {
-            *v = f(*v);
-        }
-    };
-    match kind {
-        OpKind::Const(_)
-        | OpKind::CellAlloc(_)
-        | OpKind::CellLoad(_)
-        | OpKind::Zombie(_)
-        | OpKind::SpillRead(_) => {}
-        OpKind::Copy(v)
-        | OpKind::Move(v)
-        | OpKind::Repeat { v, .. }
-        | OpKind::Field { base: v, .. }
-        | OpKind::Discriminant(v)
-        | OpKind::SetDiscriminant { base: v, .. }
-        | OpKind::CellStore { v, .. }
-        | OpKind::Deref(v)
-        | OpKind::Unary { v, .. }
-        | OpKind::Cast { v, .. }
-        | OpKind::Materialize(v)
-        | OpKind::Convert { v, .. }
-        | OpKind::SpillWrite { v, .. } => *v = f(*v),
-        OpKind::Aggregate { fields, .. } => fields.iter_mut().for_each(|v| *v = f(*v)),
-        OpKind::SetField { base, v, .. } => {
-            *base = f(*base);
-            *v = f(*v);
-        }
-        OpKind::BorrowView {
-            root: r, path: p, ..
-        }
-        | OpKind::RawView {
-            root: r, path: p, ..
-        }
-        | OpKind::Drop {
-            root: r, path: p, ..
-        } => {
-            root(r);
-            path(p);
-        }
-        OpKind::SliceView { ptr, len } => {
-            *ptr = f(*ptr);
-            *len = f(*len);
-        }
-        OpKind::StoreThrough { ptr, v } => {
-            *ptr = f(*ptr);
-            *v = f(*v);
-        }
-        OpKind::Binary { l, r, .. } => {
-            *l = f(*l);
-            *r = f(*r);
-        }
-        OpKind::Call { function, args, .. } => {
-            if let Some(function) = function {
-                *function = f(*function);
-            }
-            args.iter_mut().for_each(|v| *v = f(*v));
-        }
-        OpKind::Intrinsic { args, .. } | OpKind::Host { args, .. } => {
-            args.iter_mut().for_each(|v| *v = f(*v))
-        }
-        OpKind::Assert { cond, msg, .. } => {
-            *cond = f(*cond);
-            match msg {
-                RAssertMessage::BoundsCheck {
-                    length: a,
-                    index: b,
-                }
-                | RAssertMessage::Overflow {
-                    left: a, right: b, ..
-                }
-                | RAssertMessage::MisalignedPointer {
-                    required: a,
-                    found: b,
-                } => {
-                    *a = f(*a);
-                    *b = f(*b);
-                }
-                RAssertMessage::OverflowNeg(v)
-                | RAssertMessage::DivisionByZero(v)
-                | RAssertMessage::RemainderByZero(v)
-                | RAssertMessage::InvalidEnum(v) => *v = f(*v),
-                RAssertMessage::ResumedAfterReturn(_)
-                | RAssertMessage::ResumedAfterPanic(_)
-                | RAssertMessage::ResumedAfterDrop(_)
-                | RAssertMessage::NullPointer
-                | RAssertMessage::NullReference => {}
-            }
-        }
-    }
-}
-
-pub(crate) fn rewrite_term(term: &mut RTerm, f: &dyn Fn(ValueId) -> ValueId) {
-    match term {
-        RTerm::Goto(_, args) => args.iter_mut().for_each(|v| *v = f(*v)),
-        RTerm::Switch {
-            scrut,
-            cases,
-            default,
-            ..
-        } => {
-            *scrut = f(*scrut);
-            for (_, _, args) in cases {
-                args.iter_mut().for_each(|v| *v = f(*v));
-            }
-            default.1.iter_mut().for_each(|v| *v = f(*v));
-        }
-        RTerm::Invoke { normal, unwind } => {
-            normal
-                .1
-                .iter_mut()
-                .chain(&mut unwind.1)
-                .for_each(|v| *v = f(*v));
-        }
-        RTerm::Return(v) | RTerm::Throw(v) => {
-            if let Some(v) = v {
-                *v = f(*v);
-            }
-        }
-        RTerm::Unreachable => {}
+        block.term.visit_values_mut(|v| *v = renumber(*v));
     }
 }
 
@@ -3235,16 +3088,6 @@ mod tests {
             ty: I32,
             kind: OperandKind::Constant(Constant::Scalar {
                 bits: value as u32 as u128,
-                bytes: 4,
-            }),
-        }
-    }
-
-    fn usize_const(value: u32) -> Operand {
-        Operand {
-            ty: USIZE,
-            kind: OperandKind::Constant(Constant::Scalar {
-                bits: value as u128,
                 bytes: 4,
             }),
         }

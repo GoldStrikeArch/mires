@@ -1,9 +1,63 @@
 //! The dynamic host operations identified by `rcgjs.host.*` markers.
 //! Both compiler lanes use this contract after decoding the marker identity.
 
+use std::fmt;
+
 use crate::evaluation::{captured, OperandEvaluation};
 use crate::jsast::{self, BinOp, Expr, UnOp};
 use crate::ptr;
+
+/// Primitive `typeof` tag tested by [`HostOperation::TypeIs`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsTypeof {
+    Boolean,
+    Number,
+    BigInt,
+    String,
+    Function,
+}
+
+impl JsTypeof {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::BigInt => "bigint",
+            Self::String => "string",
+            Self::Function => "function",
+        }
+    }
+}
+
+/// Failure when lowering a [`HostOperation`] into a JavaScript expression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostLowerError {
+    /// [`HostOperation::lower_array`] was called on an operation that does not accept an argument array.
+    ArrayUnsupported(HostOperation),
+    /// The caller provided a different number of arguments than [`HostOperation::arity`].
+    ArityMismatch {
+        operation: HostOperation,
+        expected: usize,
+        found: usize,
+    },
+}
+
+impl fmt::Display for HostLowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArrayUnsupported(_) => {
+                f.write_str("only invocation and construction accept an argument array")
+            }
+            Self::ArityMismatch {
+                operation,
+                expected,
+                ..
+            } => write!(f, "host operation {operation:?} takes {expected} arguments"),
+        }
+    }
+}
+
+impl std::error::Error for HostLowerError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostOperation {
@@ -14,7 +68,7 @@ pub enum HostOperation {
     Truthy,
     StrictEq,
     Add,
-    TypeIs(&'static str),
+    TypeIs(JsTypeof),
     IsObject,
     IsInteger,
     BigIntRange,
@@ -44,11 +98,11 @@ impl HostOperation {
             "truthy" => Self::Truthy,
             "stricteq" => Self::StrictEq,
             "add" => Self::Add,
-            "isboolean" => Self::TypeIs("boolean"),
-            "isnumber" => Self::TypeIs("number"),
-            "isbigint" => Self::TypeIs("bigint"),
-            "isstring" => Self::TypeIs("string"),
-            "isfunction" => Self::TypeIs("function"),
+            "isboolean" => Self::TypeIs(JsTypeof::Boolean),
+            "isnumber" => Self::TypeIs(JsTypeof::Number),
+            "isbigint" => Self::TypeIs(JsTypeof::BigInt),
+            "isstring" => Self::TypeIs(JsTypeof::String),
+            "isfunction" => Self::TypeIs(JsTypeof::Function),
             "isobject" => Self::IsObject,
             "isinteger" => Self::IsInteger,
             "bigintrange" => Self::BigIntRange,
@@ -119,25 +173,26 @@ impl HostOperation {
         )
     }
 
-    pub fn lower(self, arguments: Vec<Expr>) -> Result<Expr, String> {
+    pub fn lower(self, arguments: Vec<Expr>) -> Result<Expr, HostLowerError> {
         self.lower_with(arguments, false)
     }
 
     /// Calls with a proven private argument array need no Rust slice conversion.
     /// The JavaScript array remains an allocation charged to the caller.
-    pub fn lower_array(self, arguments: Vec<Expr>) -> Result<Expr, String> {
+    pub fn lower_array(self, arguments: Vec<Expr>) -> Result<Expr, HostLowerError> {
         if !matches!(self, Self::Invoke | Self::Construct) {
-            return Err("only invocation and construction accept an argument array".to_owned());
+            return Err(HostLowerError::ArrayUnsupported(self));
         }
         self.lower_with(arguments, true)
     }
 
-    fn lower_with(self, arguments: Vec<Expr>, array: bool) -> Result<Expr, String> {
+    fn lower_with(self, arguments: Vec<Expr>, array: bool) -> Result<Expr, HostLowerError> {
         if arguments.len() != self.arity() {
-            return Err(format!(
-                "host operation {self:?} takes {} arguments",
-                self.arity()
-            ));
+            return Err(HostLowerError::ArityMismatch {
+                operation: self,
+                expected: self.arity(),
+                found: arguments.len(),
+            });
         }
         if self.evaluation() == OperandEvaluation::Materialize
             && arguments.iter().any(|value| !captured(value))
@@ -164,10 +219,10 @@ impl HostOperation {
             Self::Truthy => jsast::not(jsast::not(one())),
             Self::StrictEq => jsast::binary(BinOp::StrictEq, one(), values[1].clone()),
             Self::Add => jsast::rt_call("host_add", values.to_vec()),
-            Self::TypeIs(name) => jsast::binary(
+            Self::TypeIs(kind) => jsast::binary(
                 BinOp::StrictEq,
                 jsast::unary(UnOp::TypeOf, one()),
-                jsast::string(name),
+                jsast::string(kind.as_str()),
             ),
             Self::IsObject => jsast::binary(
                 BinOp::And,
@@ -425,6 +480,22 @@ assert.deepEqual(trace, [0, 1, 'construct']);
         assert_eq!(
             spelled(HostOperation::Abort),
             "__rt.js_abort(typeof a0 === \"string\" ? a0 : \"\")"
+        );
+        assert_eq!(
+            HostOperation::from_marker("isstring"),
+            Some(HostOperation::TypeIs(JsTypeof::String))
+        );
+        assert_eq!(
+            HostOperation::Add.lower(vec![]),
+            Err(HostLowerError::ArityMismatch {
+                operation: HostOperation::Add,
+                expected: 2,
+                found: 0,
+            })
+        );
+        assert_eq!(
+            HostOperation::Add.lower_array(vec![jsast::null(), jsast::null()]),
+            Err(HostLowerError::ArrayUnsupported(HostOperation::Add))
         );
     }
 }

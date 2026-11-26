@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     path::{Path, PathBuf},
 };
@@ -190,17 +191,49 @@ impl fmt::Display for Fix {
     /// written relative to it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(dir) = &self.dir {
-            write!(f, "cd {} && ", dir.display())?;
+            let dir = dir.display().to_string();
+            write!(f, "cd {} && ", shell_word(&dir))?;
         }
         for (key, value) in &self.env {
-            write!(f, "{key}='{value}' ")?;
+            write!(f, "{key}={} ", shell_single_quote(value))?;
         }
-        f.write_str(&self.shorten(&self.program))?;
+        let program = self.shorten(&self.program);
+        f.write_str(&shell_word(&program))?;
         for arg in &self.args {
-            write!(f, " {}", self.shorten(arg))?;
+            let arg = self.shorten(arg);
+            write!(f, " {}", shell_word(&arg))?;
         }
         Ok(())
     }
+}
+
+/// Quote `word` for a POSIX shell only when it is empty or contains characters
+/// outside the unquoted safe set.
+fn shell_word(word: &str) -> Cow<'_, str> {
+    let safe = !word.is_empty()
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+')
+        });
+    if safe {
+        Cow::Borrowed(word)
+    } else {
+        Cow::Owned(shell_single_quote(word))
+    }
+}
+
+/// Single-quote `value` for a POSIX shell, escaping embedded single quotes.
+fn shell_single_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 #[cfg(test)]
@@ -279,5 +312,22 @@ mod tests {
         assert_eq!(Step::Toolchain.label(), "toolchain");
         assert_eq!(Step::Backend.label(), "backend");
         assert_eq!(Step::Sysroot.label(), "sysroot");
+    }
+
+    #[test]
+    fn unsafe_paths_values_and_arguments_are_shell_quoted() {
+        let fix = Fix::new(Step::Sysroot, "bash")
+            .args(["/my spike/scripts/build_sysroot.sh", "", "arg with $(cmd)"])
+            .env("JS_EXTRA_ARGS", "it's $(unsafe)")
+            .dir("/my spike");
+
+        assert_eq!(
+            fix.to_string(),
+            concat!(
+                "cd '/my spike' && ",
+                "JS_EXTRA_ARGS='it'\\''s $(unsafe)' ",
+                "bash scripts/build_sysroot.sh '' 'arg with $(cmd)'",
+            )
+        );
     }
 }

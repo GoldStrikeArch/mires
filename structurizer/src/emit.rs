@@ -21,6 +21,133 @@ pub(crate) type Skeleton = Region<BlockId, BlockId>;
 /// the stack, so the caller falls back to a dispatch loop.
 const MAX_DEPTH: u32 = 300;
 
+/// Whether control can fall off the end of an emitted region.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Flow {
+    /// Control may reach the statement after this region.
+    FallsThrough,
+    /// Control never falls off the end (every path jumps, returns, or throws).
+    Diverges,
+}
+
+impl Flow {
+    fn falls_through(self) -> bool {
+        self == Flow::FallsThrough
+    }
+
+    /// Combines alternative paths (branch arms, switch arms, or a construct
+    /// body with its `break` exits): falls through if either path can.
+    fn join(self, other: Flow) -> Flow {
+        match (self, other) {
+            (Flow::Diverges, Flow::Diverges) => Flow::Diverges,
+            _ => Flow::FallsThrough,
+        }
+    }
+
+    /// Sequences `self` followed by `next`: falls through only if both can.
+    fn then(self, next: Flow) -> Flow {
+        match (self, next) {
+            (Flow::FallsThrough, Flow::FallsThrough) => Flow::FallsThrough,
+            _ => Flow::Diverges,
+        }
+    }
+}
+
+/// Output of compiling a block, scope, or decision tree.
+struct Emitted {
+    flow: Flow,
+    code: Vec<Skeleton>,
+}
+
+impl Emitted {
+    fn new(flow: Flow, code: Vec<Skeleton>) -> Emitted {
+        Emitted { flow, code }
+    }
+
+    fn fallthrough(code: Vec<Skeleton>) -> Emitted {
+        Emitted {
+            flow: Flow::FallsThrough,
+            code,
+        }
+    }
+
+    fn diverges(code: Vec<Skeleton>) -> Emitted {
+        Emitted {
+            flow: Flow::Diverges,
+            code,
+        }
+    }
+
+    fn append(&mut self, mut other: Emitted) {
+        self.code.append(&mut other.code);
+        self.flow = self.flow.then(other.flow);
+    }
+}
+
+/// Identifies an enclosing loop or switch whose `break` exits are tracked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ExitId(u32);
+
+impl ExitId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Identifies a case of a [`Region::Dispatch`] switch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CaseId(u32);
+
+impl CaseId {
+    const ENTRY: CaseId = CaseId(0);
+
+    fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Truncates the scope stack back to its saved length on drop, keeping early
+/// `?` returns fail-safe.
+struct ScopeGuard<'a> {
+    stack: &'a mut Vec<Scope>,
+    saved_len: usize,
+}
+
+impl<'a> ScopeGuard<'a> {
+    fn new(stack: &'a mut Vec<Scope>) -> ScopeGuard<'a> {
+        let saved_len = stack.len();
+        ScopeGuard { stack, saved_len }
+    }
+}
+
+impl std::ops::Deref for ScopeGuard<'_> {
+    type Target = Vec<Scope>;
+
+    fn deref(&self) -> &Self::Target {
+        self.stack
+    }
+}
+
+impl std::ops::DerefMut for ScopeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.stack
+    }
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.stack.truncate(self.saved_len);
+    }
+}
+
+fn next_depth(depth: u32) -> Result<u32, StructureError> {
+    let next = depth + 1;
+    if next > MAX_DEPTH {
+        return Err(StructureError::TooDeep);
+    }
+    Ok(next)
+}
+
 /// Where control goes when it falls off the end of the code being emitted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ft {
@@ -36,13 +163,13 @@ enum SKind {
     /// Back to the head of a loop: `continue`.
     Loop,
     /// Past the end of a loop: `break`.
-    ExitLoop(u32),
+    ExitLoop(ExitId),
     /// Past the end of a switch: `break`.
-    ExitSwitch(u32),
+    ExitSwitch(ExitId),
     /// Past the end of a labeled block: `break label`.
     Forward,
     /// Around the dispatch loop: `sel = case; continue`.
-    Dispatch { sel: TmpId, case: u32 },
+    Dispatch { sel: TmpId, case: CaseId },
 }
 
 /// One entry of the scope stack: the block reached by leaving `label` the way
@@ -75,7 +202,6 @@ pub(crate) struct Emitter<'a, S, C> {
     /// known to be reachable.
     exit_used: Vec<bool>,
     next_tmp: u32,
-    depth: u32,
 }
 
 impl<'a, S, C> Emitter<'a, S, C> {
@@ -96,7 +222,6 @@ impl<'a, S, C> Emitter<'a, S, C> {
             label_used: Vec::new(),
             exit_used: Vec::new(),
             next_tmp: 0,
-            depth: 0,
         }
     }
 
@@ -108,8 +233,8 @@ impl<'a, S, C> Emitter<'a, S, C> {
     pub(crate) fn run(&mut self) -> Result<Skeleton, StructureError> {
         let entry = *self.order.rpo.first().ok_or(StructureError::EmptyCfg)?;
         let mut stack = Vec::new();
-        let (_, code) = self.compile_block(entry, &mut stack, Ft::Return)?;
-        let skel = Region::seq(code);
+        let emitted = self.compile_block(entry, &mut stack, Ft::Return, 0)?;
+        let skel = Region::seq(emitted.code);
         for &b in &self.order.rpo {
             if !self.visited[b.index()] {
                 return Err(StructureError::Internal(
@@ -166,12 +291,12 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 label,
                 kind: SKind::Dispatch {
                     sel,
-                    case: i as u32,
+                    case: CaseId(i as u32),
                 },
             });
         }
-        let mut cases = Vec::with_capacity(heads.len());
-        let mut last_never = true;
+        let mut cases: Vec<(CaseId, Skeleton)> = Vec::with_capacity(heads.len());
+        let mut last_flow = Flow::Diverges;
         for (i, &head) in heads.iter().enumerate() {
             // Falling off a case runs the one emitted after it, which is what
             // a jump to that case's block means.
@@ -179,26 +304,26 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 Some(&next) => Ft::Block(next),
                 None => Ft::Return,
             };
-            let mut body = Vec::new();
+            let mut body = Emitted::fallthrough(Vec::new());
             let mut pc = head;
-            let never = loop {
+            loop {
                 let (stmts, branch) = self.take_block(pc)?;
-                body.push(Region::Block(stmts));
+                body.code.push(Region::Block(stmts));
                 if let Branching::Goto(next) = branch {
                     if absorbed[next.index()] {
                         pc = next;
                         continue;
                     }
                 }
-                let (never, mut code) = self.compile_branch_or_test(branch, &mut stack, ft)?;
-                body.append(&mut code);
-                break never;
-            };
-            if i + 1 == heads.len() {
-                last_never = never;
-                close_last_case(&mut body, never);
+                let tail = self.compile_branch_or_test(branch, &mut stack, ft, 0)?;
+                body.append(tail);
+                break;
             }
-            cases.push((i as u32, Region::seq(body)));
+            if i + 1 == heads.len() {
+                last_flow = body.flow;
+                close_last_case(&mut body.code, body.flow);
+            }
+            cases.push((CaseId(i as u32), Region::seq(body.code)));
         }
         for &b in &self.order.rpo {
             if !self.visited[b.index()] {
@@ -208,12 +333,12 @@ impl<'a, S, C> Emitter<'a, S, C> {
             }
         }
         let skel = Region::Seq(vec![
-            Region::SetSel(sel, 0),
+            Region::SetSel(sel, CaseId::ENTRY.raw()),
             Region::Dispatch {
                 sel,
                 label: Some(label),
-                cases,
-                trailing_break: !last_never,
+                cases: cases.into_iter().map(|(c, r)| (c.raw(), r)).collect(),
+                trailing_break: last_flow.falls_through(),
             },
         ]);
         Ok(self.drop_unused_labels(skel))
@@ -224,9 +349,21 @@ impl<'a, S, C> Emitter<'a, S, C> {
         Label(self.label_used.len() as u32 - 1)
     }
 
-    fn fresh_exit(&mut self) -> u32 {
+    fn fresh_exit(&mut self) -> ExitId {
         self.exit_used.push(false);
-        self.exit_used.len() as u32 - 1
+        ExitId(self.exit_used.len() as u32 - 1)
+    }
+
+    fn mark_exit_used(&mut self, exit: ExitId) {
+        self.exit_used[exit.index()] = true;
+    }
+
+    fn exit_flow(&self, exit: ExitId) -> Flow {
+        if self.exit_used[exit.index()] {
+            Flow::FallsThrough
+        } else {
+            Flow::Diverges
+        }
     }
 
     fn fresh_tmp(&mut self) -> TmpId {
@@ -288,14 +425,15 @@ impl<'a, S, C> Emitter<'a, S, C> {
         pc: BlockId,
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         if !self.heads_a_loop(pc) {
-            return self.compile_block_no_loop(pc, stack, ft);
+            return self.compile_block_no_loop(pc, stack, ft, depth);
         }
-        self.enter()?;
+        let next = next_depth(depth)?;
         let label = self.fresh_label();
         let exit = self.fresh_exit();
-        let depth = stack.len();
+        let mut stack = ScopeGuard::new(stack);
         stack.push(Scope {
             target: pc,
             label,
@@ -308,15 +446,13 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 kind: SKind::ExitLoop(exit),
             });
         }
-        let (never_body, body) = self.compile_block_no_loop(pc, stack, Ft::Block(pc))?;
-        stack.truncate(depth);
-        self.leave();
-        let never = !self.exit_used[exit as usize] && never_body;
-        Ok((
-            never,
+        let body = self.compile_block_no_loop(pc, &mut stack, Ft::Block(pc), next)?;
+        let flow = self.exit_flow(exit).join(body.flow);
+        Ok(Emitted::new(
+            flow,
             vec![Region::Loop {
                 label: Some(label),
-                body: Box::new(Region::seq(body)),
+                body: Box::new(Region::seq(body.code)),
             }],
         ))
     }
@@ -327,7 +463,8 @@ impl<'a, S, C> Emitter<'a, S, C> {
         pc: BlockId,
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         let (stmts, branch) = self.take_block(pc)?;
 
         // A block dominated by this one needs a scope of its own when control
@@ -354,15 +491,14 @@ impl<'a, S, C> Emitter<'a, S, C> {
         }
         self.order.sort_in_post_order(&mut new_scopes);
 
-        let (never, mut after) =
-            if !cyclic.is_empty() || new_scopes.len() > self.opts.merge_node_max {
-                self.compile_dispatch(branch, &new_scopes, stack, ft)?
-            } else {
-                self.compile_scopes(branch, &new_scopes, stack, ft)?
-            };
-        let mut code = vec![Region::Block(stmts)];
-        code.append(&mut after);
-        Ok((never, code))
+        let after = if !cyclic.is_empty() || new_scopes.len() > self.opts.merge_node_max {
+            self.compile_dispatch(branch, &new_scopes, stack, ft, depth)?
+        } else {
+            self.compile_scopes(branch, &new_scopes, stack, ft, depth)?
+        };
+        let mut emitted = Emitted::fallthrough(vec![Region::Block(stmts)]);
+        emitted.append(after);
+        Ok(emitted)
     }
 
     /// Nests one labeled block per scope, outermost first, each falling
@@ -373,28 +509,27 @@ impl<'a, S, C> Emitter<'a, S, C> {
         scopes: &[BlockId],
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         let Some((&x, rest)) = scopes.split_first() else {
-            return self.compile_branch_or_test(branch, stack, ft);
+            return self.compile_branch_or_test(branch, stack, ft, depth);
         };
-        self.enter()?;
+        let next = next_depth(depth)?;
         let label = self.fresh_label();
-        let depth = stack.len();
+        let mut stack = ScopeGuard::new(stack);
         stack.push(Scope {
             target: x,
             label,
             kind: SKind::Forward,
         });
-        let (_, inner) = self.compile_scopes(branch, rest, stack, Ft::Block(x))?;
-        let (never, mut code) = self.compile_block(x, stack, ft)?;
-        stack.truncate(depth);
-        self.leave();
+        let inner = self.compile_scopes(branch, rest, &mut stack, Ft::Block(x), next)?;
+        let mut after = self.compile_block(x, &mut stack, ft, next)?;
         let mut out = vec![Region::Labeled {
             label,
-            body: Box::new(Region::seq(inner)),
+            body: Box::new(Region::seq(inner.code)),
         }];
-        out.append(&mut code);
-        Ok((never, out))
+        out.append(&mut after.code);
+        Ok(Emitted::new(after.flow, out))
     }
 
     /// Emits the scopes as the cases of one selector driven loop.
@@ -409,13 +544,14 @@ impl<'a, S, C> Emitter<'a, S, C> {
         scopes: &[BlockId],
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
-        self.enter()?;
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
+        let next = next_depth(depth)?;
         self.stats.dispatch_fallbacks += 1;
         let sel = self.fresh_tmp();
         let label = self.fresh_label();
         let exit = self.fresh_exit();
-        let depth = stack.len();
+        let mut stack = ScopeGuard::new(stack);
         // Case 0 is the dispatch itself, the scopes are cases 1..n.
         for (i, &x) in scopes.iter().enumerate() {
             stack.push(Scope {
@@ -423,7 +559,7 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 label,
                 kind: SKind::Dispatch {
                     sel,
-                    case: i as u32 + 1,
+                    case: CaseId(i as u32 + 1),
                 },
             });
         }
@@ -437,50 +573,47 @@ impl<'a, S, C> Emitter<'a, S, C> {
 
         // Emitted in reverse so each case falls through to the one before it,
         // and the first scope falls through to the join.
-        let ordered: Vec<(u32, BlockId)> = scopes
+        let ordered: Vec<(CaseId, BlockId)> = scopes
             .iter()
             .enumerate()
-            .map(|(i, &x)| (i as u32 + 1, x))
+            .map(|(i, &x)| (CaseId(i as u32 + 1), x))
             .rev()
             .collect();
         let dispatch_ft = match ordered.first() {
             Some(&(_, x)) => Ft::Block(x),
             None => ft,
         };
-        let (dispatch_never, dispatch_code) =
-            self.compile_branch_or_test(branch, stack, dispatch_ft)?;
-        let mut cases = vec![(0, dispatch_code)];
-        let mut last_never = dispatch_never;
+        let dispatch = self.compile_branch_or_test(branch, &mut stack, dispatch_ft, next)?;
+        let mut cases = vec![(CaseId::ENTRY, dispatch.code)];
+        let mut last_flow = dispatch.flow;
         for (i, &(case, x)) in ordered.iter().enumerate() {
             let case_ft = match ordered.get(i + 1) {
-                Some(&(_, next)) => Ft::Block(next),
+                Some(&(_, next_block)) => Ft::Block(next_block),
                 None => ft,
             };
-            let (never, code) = self.compile_block(x, stack, case_ft)?;
-            last_never = never;
-            cases.push((case, code));
+            let emitted = self.compile_block(x, &mut stack, case_ft, next)?;
+            last_flow = emitted.flow;
+            cases.push((case, emitted.code));
         }
         // The last case falls off towards the join, which the trailing `break` reaches.
         if let Some((_, code)) = cases.last_mut() {
-            close_last_case(code, last_never);
+            close_last_case(code, last_flow);
         }
         let cases = cases
             .into_iter()
-            .map(|(case, code)| (case, Region::seq(code)))
+            .map(|(case, code)| (case.raw(), Region::seq(code)))
             .collect();
-        stack.truncate(depth);
-        self.leave();
 
-        let never = !self.exit_used[exit as usize] && last_never;
-        Ok((
-            never,
+        let flow = self.exit_flow(exit).join(last_flow);
+        Ok(Emitted::new(
+            flow,
             vec![
-                Region::SetSel(sel, 0),
+                Region::SetSel(sel, CaseId::ENTRY.raw()),
                 Region::Dispatch {
                     sel,
                     label: Some(label),
                     cases,
-                    trailing_break: !never,
+                    trailing_break: flow.falls_through(),
                 },
             ],
         ))
@@ -493,13 +626,14 @@ impl<'a, S, C> Emitter<'a, S, C> {
         target: BlockId,
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         if ft == Ft::Block(target) {
-            return Ok((false, Vec::new()));
+            return Ok(Emitted::fallthrough(Vec::new()));
         }
         let scope = stack.iter().rev().find(|s| s.target == target).copied();
         let Some(scope) = scope else {
-            return self.compile_block(target, stack, ft);
+            return self.compile_block(target, stack, ft, depth);
         };
         let code = match scope.kind {
             SKind::Loop => {
@@ -507,7 +641,7 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 vec![Region::Continue(l)]
             }
             SKind::ExitLoop(exit) | SKind::ExitSwitch(exit) => {
-                self.exit_used[exit as usize] = true;
+                self.mark_exit_used(exit);
                 let l = self.label_for(Br::Break, target, scope.label, stack);
                 vec![Region::Break(l)]
             }
@@ -517,10 +651,10 @@ impl<'a, S, C> Emitter<'a, S, C> {
             }
             SKind::Dispatch { sel, case } => {
                 let l = self.label_for(Br::Continue, target, scope.label, stack);
-                vec![Region::SetSel(sel, case), Region::Continue(l)]
+                vec![Region::SetSel(sel, case.raw()), Region::Continue(l)]
             }
         };
-        Ok((true, code))
+        Ok(Emitted::diverges(code))
     }
 
     /// The label a jump has to name, or `None` when leaving the innermost
@@ -566,12 +700,13 @@ impl<'a, S, C> Emitter<'a, S, C> {
         branch: Branching,
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         match branch {
-            Branching::Goto(b) => self.compile_branch(b, stack, ft),
-            Branching::Return => Ok((true, vec![Region::Return])),
-            Branching::Unreachable => Ok((true, vec![Region::Unreachable])),
-            Branching::Throw => Ok((true, vec![Region::Throw])),
+            Branching::Goto(b) => self.compile_branch(b, stack, ft, depth),
+            Branching::Return => Ok(Emitted::diverges(vec![Region::Return])),
+            Branching::Unreachable => Ok(Emitted::diverges(vec![Region::Unreachable])),
+            Branching::Throw => Ok(Emitted::diverges(vec![Region::Throw])),
             Branching::Test(pc, dtree) => {
                 // The scrutinee is evaluated once: inline when a single test
                 // reads it, bound to a temporary otherwise. A tree that tests
@@ -590,9 +725,10 @@ impl<'a, S, C> Emitter<'a, S, C> {
                         Some(Scrut::Tmp(tmp))
                     }
                 };
-                let (never, mut code) = self.compile_dtree(&dtree, &mut scrut, stack, ft)?;
-                prefix.append(&mut code);
-                Ok((never, prefix))
+                let tail = self.compile_dtree(&dtree, &mut scrut, stack, ft, depth)?;
+                let mut out = Emitted::fallthrough(prefix);
+                out.append(tail);
+                Ok(out)
             }
         }
     }
@@ -603,30 +739,30 @@ impl<'a, S, C> Emitter<'a, S, C> {
         scrut: &mut Option<Scrut<BlockId>>,
         stack: &mut Vec<Scope>,
         ft: Ft,
-    ) -> Result<(bool, Vec<Skeleton>), StructureError> {
+        depth: u32,
+    ) -> Result<Emitted, StructureError> {
         match dtree {
-            DTree::Branch(b) => self.compile_branch(*b, stack, ft),
+            DTree::Branch(b) => self.compile_branch(*b, stack, ft, depth),
             DTree::If(test, a, b) => {
-                self.enter()?;
-                let (never1, then_) = self.compile_dtree(a, scrut, stack, ft)?;
-                let (never2, else_) = self.compile_dtree(b, scrut, stack, ft)?;
-                self.leave();
+                let next = next_depth(depth)?;
+                let then_ = self.compile_dtree(a, scrut, stack, ft, next)?;
+                let else_ = self.compile_dtree(b, scrut, stack, ft, next)?;
                 let scrut = self.take_scrut(scrut)?;
-                Ok((
-                    never1 && never2,
+                Ok(Emitted::new(
+                    then_.flow.join(else_.flow),
                     vec![Region::If {
                         scrut,
                         test: *test,
-                        then_: Box::new(Region::seq(then_)),
-                        else_: Box::new(Region::seq(else_)),
+                        then_: Box::new(Region::seq(then_.code)),
+                        else_: Box::new(Region::seq(else_.code)),
                     }],
                 ))
             }
             DTree::Switch { arms, default } => {
-                self.enter()?;
+                let next = next_depth(depth)?;
                 let label = self.fresh_label();
                 let exit = self.fresh_exit();
-                let depth = stack.len();
+                let mut stack = ScopeGuard::new(stack);
                 if let Ft::Block(join) = ft {
                     stack.push(Scope {
                         target: join,
@@ -635,30 +771,28 @@ impl<'a, S, C> Emitter<'a, S, C> {
                     });
                 }
                 // The default is emitted last, so it is compiled first.
-                let (mut all_never, default) = self
-                    .compile_branch(*default, stack, ft)
-                    .map(|(n, c)| (n, Region::seq(c)))?;
+                let default = self.compile_branch(*default, &mut stack, ft, next)?;
+                let mut all_flow = default.flow;
+                let default_region = Region::seq(default.code);
                 let mut cases: Vec<(Vec<u128>, Skeleton)> = Vec::with_capacity(arms.len());
                 for (values, target) in arms.iter().rev() {
-                    let (never, mut code) = self.compile_branch(*target, stack, ft)?;
-                    if !never {
+                    let mut arm = self.compile_branch(*target, &mut stack, ft, next)?;
+                    if arm.flow.falls_through() {
                         // Falling off an arm would run the next one.
-                        code.push(Region::Break(None));
-                        all_never = false;
+                        arm.code.push(Region::Break(None));
                     }
-                    cases.push((values.clone(), Region::seq(code)));
+                    all_flow = all_flow.join(arm.flow);
+                    cases.push((values.clone(), Region::seq(arm.code)));
                 }
                 cases.reverse();
-                stack.truncate(depth);
-                self.leave();
-                let never = !self.exit_used[exit as usize] && all_never;
+                let flow = self.exit_flow(exit).join(all_flow);
                 let scrut = self.take_scrut(scrut)?;
-                Ok((
-                    never,
+                Ok(Emitted::new(
+                    flow,
                     vec![Region::Switch {
                         scrut,
                         arms: cases,
-                        default: Box::new(default),
+                        default: Box::new(default_region),
                         label: Some(label),
                     }],
                 ))
@@ -676,18 +810,6 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 .take()
                 .ok_or(StructureError::Internal("scrutinee read more than once")),
         }
-    }
-
-    fn enter(&mut self) -> Result<(), StructureError> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            return Err(StructureError::TooDeep);
-        }
-        Ok(())
-    }
-
-    fn leave(&mut self) {
-        self.depth -= 1;
     }
 
     /// Drops the labels no jump names, which is where the guarantee that every
@@ -768,8 +890,8 @@ impl<'a, S, C> Emitter<'a, S, C> {
 /// Falling off the last case would run that guard instead of the code after the dispatch, so the
 /// case leaves the `switch` explicitly, onto the trailing `break`, exactly as a [`Region::Switch`]
 /// arm that can reach its end does.
-fn close_last_case(code: &mut Vec<Skeleton>, never: bool) {
-    if !never {
+fn close_last_case(code: &mut Vec<Skeleton>, flow: Flow) {
+    if flow.falls_through() {
         code.push(Region::Break(None));
     }
 }
@@ -790,5 +912,29 @@ impl Branching {
             Branching::Test(_, d) => d.nbbranch(target),
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_join_and_then_truth_tables() {
+        assert_eq!(Flow::Diverges.join(Flow::Diverges), Flow::Diverges);
+        assert_eq!(Flow::Diverges.join(Flow::FallsThrough), Flow::FallsThrough);
+        assert_eq!(Flow::FallsThrough.join(Flow::Diverges), Flow::FallsThrough);
+        assert_eq!(
+            Flow::FallsThrough.join(Flow::FallsThrough),
+            Flow::FallsThrough
+        );
+
+        assert_eq!(
+            Flow::FallsThrough.then(Flow::FallsThrough),
+            Flow::FallsThrough
+        );
+        assert_eq!(Flow::FallsThrough.then(Flow::Diverges), Flow::Diverges);
+        assert_eq!(Flow::Diverges.then(Flow::FallsThrough), Flow::Diverges);
+        assert_eq!(Flow::Diverges.then(Flow::Diverges), Flow::Diverges);
     }
 }

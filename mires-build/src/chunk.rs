@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::{BuildError, EntryRole, Result};
 
@@ -48,6 +51,13 @@ impl Chunk {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ChunkEntry {
+    name: String,
+    entry: String,
+    role: EntryRole,
+}
+
 /// How a program is split into files, and how the pieces are named, published,
 /// and served.
 ///
@@ -85,8 +95,7 @@ impl Chunk {
 /// lazily loaded island.
 #[derive(Debug, Clone)]
 pub struct Chunking {
-    entries: Vec<(String, String)>,
-    roles: Vec<(String, EntryRole)>,
+    entries: Vec<ChunkEntry>,
     shared: String,
     dir: String,
     specifier: String,
@@ -101,7 +110,6 @@ impl Chunking {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            roles: Vec::new(),
             shared: DEFAULT_SHARED_NAME.to_owned(),
             dir: DEFAULT_CHUNK_DIR.to_owned(),
             specifier: DEFAULT_SPECIFIER_PREFIX.to_owned(),
@@ -140,9 +148,11 @@ impl Chunking {
         entry: impl Into<String>,
         role: EntryRole,
     ) -> Self {
-        let name = name.into();
-        self.roles.push((name.clone(), role));
-        self.entries.push((name, entry.into()));
+        self.entries.push(ChunkEntry {
+            name: name.into(),
+            entry: entry.into(),
+            role,
+        });
         self
     }
 
@@ -180,12 +190,16 @@ impl Chunking {
     /// The URL the chunk directory is served from, which turns on the import
     /// map.
     ///
-    /// A chunk's URL is this and its published file name, so the base ends in
-    /// a slash. Without it there is no import map to write, since nothing says
-    /// where the chunks will be.
+    /// A chunk's URL is this and its published file name, so a trailing slash
+    /// is added when non-empty. Without it there is no import map to write,
+    /// since nothing says where the chunks will be.
     #[must_use]
     pub fn url_base(mut self, base: impl Into<String>) -> Self {
-        self.url_base = Some(base.into());
+        let mut base = base.into();
+        if !base.is_empty() && !base.ends_with('/') {
+            base.push('/');
+        }
+        self.url_base = Some(base);
         self
     }
 
@@ -220,7 +234,7 @@ impl Chunking {
 
     /// The requested chunk names, in order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(|(name, _)| name.as_str())
+        self.entries.iter().map(|entry| entry.name.as_str())
     }
 
     /// The name of the shared chunk.
@@ -248,13 +262,13 @@ impl Chunking {
         let mut args: Vec<String> = self
             .entries
             .iter()
-            .map(|(name, entry)| format!("{CHUNK_ARG}={name}:{entry}"))
+            .map(|entry| format!("{CHUNK_ARG}={}:{}", entry.name, entry.entry))
             .collect();
         args.push(format!("{SHARED_CHUNK_ARG}={}", self.shared));
         args.extend(
-            self.roles
+            self.entries
                 .iter()
-                .map(|(name, role)| format!("js-chunk-role={name}:{}", role.as_str())),
+                .map(|entry| format!("js-chunk-role={}:{}", entry.name, entry.role.as_str())),
         );
         if self.register_entries {
             args.push(CHUNK_REGISTRY_ARG.to_owned());
@@ -308,18 +322,32 @@ impl Chunking {
         Some(json)
     }
 
-    /// Check every name and entry point can be spelled in a backend option and
-    /// in a file name.
+    /// Check every name, entry point, and output directory invariant before
+    /// passing the split request to the backend.
     ///
     /// # Errors
     ///
-    /// Returns `Err` naming the first name that cannot.
+    /// Returns `Err` if a name cannot be spelled, if chunk names repeat or
+    /// collide with [`shared`](Self::shared), or if [`dir`](Self::dir) is
+    /// empty or escapes `OUT_DIR`.
     pub(crate) fn check(&self) -> Result {
-        for (name, entry) in &self.entries {
-            check_name(name)?;
-            check_name(entry)?;
+        let mut seen = HashSet::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            check_name(&entry.name)?;
+            check_name(&entry.entry)?;
+            if !seen.insert(entry.name.as_str()) {
+                return Err(BuildError::DuplicateChunkName {
+                    name: entry.name.clone(),
+                });
+            }
         }
-        check_name(&self.shared)
+        check_name(&self.shared)?;
+        if seen.contains(self.shared.as_str()) {
+            return Err(BuildError::SharedChunkNameCollision {
+                name: self.shared.clone(),
+            });
+        }
+        check_dir(&self.dir)
     }
 }
 
@@ -344,6 +372,30 @@ fn check_name(name: &str) -> Result {
     }
     Err(BuildError::ChunkName {
         name: name.to_owned(),
+    })
+}
+
+/// Whether `dir` names a safe relative directory inside `OUT_DIR`.
+fn check_dir(dir: &str) -> Result {
+    let mut has_normal = false;
+    let valid = !dir.is_empty()
+        && !dir.contains('\\')
+        && Path::new(dir)
+            .components()
+            .all(|component| match component {
+                Component::Normal(_) => {
+                    has_normal = true;
+                    true
+                }
+                Component::CurDir => true,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => false,
+            })
+        && has_normal;
+    if valid {
+        return Ok(());
+    }
+    Err(BuildError::InvalidChunkDir {
+        dir: dir.to_owned(),
     })
 }
 
@@ -592,5 +644,68 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, BuildError::ChunkName { name } if name == "a b"));
+    }
+
+    #[test]
+    fn duplicate_chunk_names_are_refused() {
+        let error = Chunking::new()
+            .island("counter")
+            .entry("counter", "other")
+            .check()
+            .unwrap_err();
+
+        assert!(matches!(error, BuildError::DuplicateChunkName { name } if name == "counter"));
+    }
+
+    #[test]
+    fn chunk_name_colliding_with_shared_is_refused() {
+        let error = Chunking::new().island("shared").check().unwrap_err();
+        assert!(matches!(
+            error,
+            BuildError::SharedChunkNameCollision { name } if name == "shared"
+        ));
+
+        let custom = Chunking::new()
+            .island("common")
+            .shared("common")
+            .check()
+            .unwrap_err();
+        assert!(matches!(
+            custom,
+            BuildError::SharedChunkNameCollision { name } if name == "common"
+        ));
+    }
+
+    #[test]
+    fn empty_or_traversing_chunk_dir_is_refused() {
+        for bad in ["", ".", "..", "../out", "a/../b", "/abs/chunks", "a\\b"] {
+            let error = Chunking::new().dir(bad).check().unwrap_err();
+            assert!(
+                matches!(&error, BuildError::InvalidChunkDir { dir } if dir == bad),
+                "{bad:?} should be refused, got {error}"
+            );
+        }
+        assert!(Chunking::new().dir("assets/chunks").check().is_ok());
+    }
+
+    #[test]
+    fn url_base_normalizes_missing_trailing_slash() {
+        let chunking = Chunking::new().island("counter").url_base("/demo/chunks");
+        let map = chunking
+            .import_map(&[chunk("counter", "counter.js")])
+            .unwrap();
+        assert_eq!(
+            map,
+            r#"{"imports":{"topcoat-island/counter":"/demo/chunks/counter.js"}}"#
+        );
+
+        let empty_base = Chunking::new().island("counter").url_base("");
+        let map = empty_base
+            .import_map(&[chunk("counter", "counter.js")])
+            .unwrap();
+        assert_eq!(
+            map,
+            r#"{"imports":{"topcoat-island/counter":"counter.js"}}"#
+        );
     }
 }

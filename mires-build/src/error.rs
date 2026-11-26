@@ -27,7 +27,11 @@ pub enum BuildError {
     Unmet(Box<Unmet>),
     #[error("the {} step failed with {status}", step.label())]
     Fix { step: Step, status: ExitStatus },
-    #[error("rustc exited with {status} compiling the client crate")]
+    #[error(
+        "rustc exited with {status} compiling the client crate{}{}",
+        if stderr.trim().is_empty() { "" } else { ":\n" },
+        stderr.trim()
+    )]
     Compile { status: ExitStatus, stderr: String },
     #[error("minimal runtime extraction exited with {status}:\n{stderr}")]
     MinimalShim { status: ExitStatus, stderr: String },
@@ -37,11 +41,33 @@ pub enum BuildError {
         "{name:?} cannot name a chunk; a name is made of ASCII letters, digits, `_`, `-`, and `$`"
     )]
     ChunkName { name: String },
+    #[error("duplicate chunk name {name:?}")]
+    DuplicateChunkName { name: String },
+    #[error("chunk {name:?} collides with the shared chunk name")]
+    SharedChunkNameCollision { name: String },
+    #[error("{dir:?} is not a valid relative chunk directory")]
+    InvalidChunkDir { dir: String },
     #[error(
         "optimization reports do not yet describe split chunk artifacts; disable chunking or \
          the report"
     )]
     ChunkedOptimizationReport,
+    #[error("invalid artifact manifest at {}: {reason}", path.display())]
+    ManifestInvalid { path: PathBuf, reason: String },
+    #[error(
+        "one runtime publication at {} cannot supply different entry providers",
+        path.display()
+    )]
+    RuntimeProviderMismatch { path: PathBuf },
+    #[error("runtime provider {name:?} collides with a compiler artifact")]
+    RuntimeProviderCollision { name: String },
+    #[error(
+        "generated runtime for {specifier:?} needs a local `./` module specifier; use `shim(false)` \
+         for an external provider"
+    )]
+    ExternalRuntimeRequiresNoShim { specifier: String },
+    #[error("failed to derive sysroot cache key via {}: {detail}", script.display())]
+    SysrootKey { script: PathBuf, detail: String },
     #[error(
         "the module supplying `__rt` ({}, imported as {specifier:?}) does not export {}:\n  {}\n\
          Add them to that module, or stop the compiled code reaching for them.",

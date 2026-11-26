@@ -483,12 +483,13 @@ fn a_region_visits_the_same_blocks_as_the_graph_it_came_from() {
 
     assert_eq!(graphs, 2 * per_phase);
     assert_eq!(checks, graphs * 3 * 8);
-    // The generator has to keep producing graphs worth checking. The whole
-    // body fallbacks under these options are all one pre-existing class: a
-    // switch listing one value twice with two targets makes its second target
-    // reachable by edge but dead in the decision tree, which only the flat
-    // dispatch emits. MIR switches list each value once, so a backend never
-    // takes that path.
+    // The generator has to keep producing graphs worth checking. With shadowed
+    // switch targets excluded from live CFG edges, none of these small graphs
+    // should need a whole-body dispatch fallback.
+    assert_eq!(
+        whole_body, 0,
+        "unexpected whole-body fallback on small property graphs: {whole_body}"
+    );
     assert!(irreducible > 0, "no irreducible graph was generated");
     assert!(
         dispatches >= graphs,

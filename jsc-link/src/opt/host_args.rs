@@ -5,8 +5,10 @@
 //! shared arrays, storage observations, and other coercions keep the ordinary call.
 //! A promoted empty array is replaced with a fresh empty argument array at each call.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 
 use crate::jir::interns::Interns;
 use crate::jir::repr::{Carrier, Func, OpKind, Root, ValueId};
@@ -15,11 +17,58 @@ use crate::jir::types::{PinnedBoundary, TypeKind};
 use crate::jir::TypeTable;
 use rcgjs_object::host::HostOperation;
 
+use super::cfg::DefUse;
+
+/// Why a dynamic host call site kept its ordinary argument slice.
+///
+/// Variants are ordered alphabetically by [`Self::as_code`] so `BTreeMap` iteration
+/// matches `str` ordering and [`Borrow<str>`] satisfies its `Ord` contract.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum HostArgsDecline {
+    Arity,
+    PackBorrow,
+    PackCarrier,
+    PackCoercion,
+    PackDynamic,
+    PackElement,
+    PackEscapes,
+    PackNotFresh,
+    PackNotLocal,
+}
+
+impl HostArgsDecline {
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::Arity => "host.argument-arity",
+            Self::PackBorrow => "host.argument-pack-borrow",
+            Self::PackCarrier => "host.argument-pack-carrier",
+            Self::PackCoercion => "host.argument-pack-coercion",
+            Self::PackDynamic => "host.argument-pack-dynamic",
+            Self::PackElement => "host.argument-pack-element",
+            Self::PackEscapes => "host.argument-pack-escapes",
+            Self::PackNotFresh => "host.argument-pack-not-fresh",
+            Self::PackNotLocal => "host.argument-pack-not-local",
+        }
+    }
+}
+
+impl Borrow<str> for HostArgsDecline {
+    fn borrow(&self) -> &str {
+        self.as_code()
+    }
+}
+
+impl Hash for HostArgsDecline {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_code().hash(state);
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostArgsStats {
     pub would_lower: u32,
     pub final_emitted: u32,
-    pub declines: BTreeMap<&'static str, u32>,
+    pub declines: BTreeMap<HostArgsDecline, u32>,
 }
 
 impl HostArgsStats {
@@ -29,7 +78,7 @@ impl HostArgsStats {
             if index > 0 {
                 out.push(',');
             }
-            crate::lane_report::push_string(&mut out, reason);
+            crate::lane_report::push_string(&mut out, reason.as_code());
             let _ = write!(out, ":{count}");
         }
         let _ = write!(
@@ -43,17 +92,7 @@ impl HostArgsStats {
 
 pub fn run(func: &mut Func, table: &TypeTable, interns: &Interns) -> HostArgsStats {
     let mut stats = HostArgsStats::default();
-    let mut uses = vec![0u32; func.values.len()];
-    for block in &func.blocks {
-        for value in block
-            .ops
-            .iter()
-            .flat_map(|op| op.kind.uses())
-            .chain(block.term.uses())
-        {
-            uses[value.0 as usize] += 1;
-        }
-    }
+    let def_use = DefUse::of(func);
     for block in &mut func.blocks {
         let defs: BTreeMap<_, _> = block
             .ops
@@ -82,19 +121,19 @@ pub fn run(func: &mut Func, table: &TypeTable, interns: &Interns) -> HostArgsSta
             };
             let candidate = (|| {
                 if args.len() != operation.arity() {
-                    return Err("host.argument-arity");
+                    return Err(HostArgsDecline::Arity);
                 }
                 let definition = |value: ValueId| {
-                    if uses[value.0 as usize] != 1 {
-                        return Err("host.argument-pack-escapes");
+                    if def_use.use_count(value) != 1 {
+                        return Err(HostArgsDecline::PackEscapes);
                     }
                     if func.values[value.0 as usize].carrier != Carrier::Baseline {
-                        return Err("host.argument-pack-carrier");
+                        return Err(HostArgsDecline::PackCarrier);
                     }
                     defs.get(&value)
                         .copied()
                         .filter(|position| *position < index)
-                        .ok_or("host.argument-pack-not-local")
+                        .ok_or(HostArgsDecline::PackNotLocal)
                 };
                 let cast = definition(*args.last().unwrap())?;
                 let OpKind::Cast {
@@ -104,26 +143,26 @@ pub fn run(func: &mut Func, table: &TypeTable, interns: &Interns) -> HostArgsSta
                     to,
                 } = block.ops[cast].kind
                 else {
-                    return Err("host.argument-pack-dynamic");
+                    return Err(HostArgsDecline::PackDynamic);
                 };
                 let Some(TypeKind::Reference {
                     pointee: array_ty,
                     mutable: false,
                 }) = table.get(from).map(|ty| &ty.kind)
                 else {
-                    return Err("host.argument-pack-coercion");
+                    return Err(HostArgsDecline::PackCoercion);
                 };
                 let Some(TypeKind::Array { element, length }) =
                     table.get(*array_ty).map(|ty| &ty.kind)
                 else {
-                    return Err("host.argument-pack-coercion");
+                    return Err(HostArgsDecline::PackCoercion);
                 };
                 let Some(TypeKind::Reference {
                     pointee: slice_ty,
                     mutable: false,
                 }) = table.get(to).map(|ty| &ty.kind)
                 else {
-                    return Err("host.argument-pack-coercion");
+                    return Err(HostArgsDecline::PackCoercion);
                 };
                 if !matches!(table.get(*slice_ty).map(|ty| &ty.kind), Some(TypeKind::Slice(ty)) if ty == element)
                     || !table.get(*element).is_some_and(|ty| {
@@ -132,7 +171,7 @@ pub fn run(func: &mut Func, table: &TypeTable, interns: &Interns) -> HostArgsSta
                             && !ty.layout.needs_drop
                     })
                 {
-                    return Err("host.argument-pack-element");
+                    return Err(HostArgsDecline::PackElement);
                 }
                 let borrow = definition(v)?;
                 if *length == 0 && borrow < cast {
@@ -149,20 +188,20 @@ pub fn run(func: &mut Func, table: &TypeTable, interns: &Interns) -> HostArgsSta
                     mutable: false,
                 } = &block.ops[borrow].kind
                 else {
-                    return Err("host.argument-pack-borrow");
+                    return Err(HostArgsDecline::PackBorrow);
                 };
                 if !path.is_empty()
                     || func.values[array.0 as usize].ty != *array_ty
                     || borrow >= cast
                 {
-                    return Err("host.argument-pack-borrow");
+                    return Err(HostArgsDecline::PackBorrow);
                 }
                 let fresh = definition(*array)?;
                 let OpKind::Aggregate { ty, fields, .. } = &block.ops[fresh].kind else {
-                    return Err("host.argument-pack-not-fresh");
+                    return Err(HostArgsDecline::PackNotFresh);
                 };
                 if ty != array_ty || fields.len() as u64 != *length || fresh >= borrow {
-                    return Err("host.argument-pack-not-fresh");
+                    return Err(HostArgsDecline::PackNotFresh);
                 }
                 Ok((*array, None))
             })();

@@ -100,6 +100,18 @@ impl JsName {
     }
 }
 
+impl std::borrow::Borrow<str> for JsName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for JsName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Display for JsName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -262,6 +274,55 @@ impl OptimizationInfo {
     }
 }
 
+/// The JIR-S payload attached to a [`JsItem`] during codegen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum JsItemJir {
+    /// The item's encoded JIR-S body and origins, written to S3/S5.
+    Encoded(Box<JirItem>),
+    /// The encoder declined this item; `item` keeps its stable identity when known so direct
+    /// calls and function pointers still resolve to it.
+    Declined {
+        item: Option<crate::jir::semantic::ItemId>,
+        decline: Decline,
+    },
+    /// A synthesized item (allocator shim, import, hoisted constant) with no Rust identity.
+    #[default]
+    Synthesized,
+}
+
+impl From<JirItem> for JsItemJir {
+    fn from(jir: JirItem) -> Self {
+        Self::Encoded(Box::new(jir))
+    }
+}
+
+impl JsItemJir {
+    pub fn encoded(&self) -> Option<&JirItem> {
+        match self {
+            Self::Encoded(jir) => Some(jir),
+            Self::Declined { .. } | Self::Synthesized => None,
+        }
+    }
+
+    pub fn item_id(&self) -> Option<crate::jir::semantic::ItemId> {
+        match self {
+            Self::Encoded(jir) => Some(jir.body.item),
+            Self::Declined { item, .. } => *item,
+            Self::Synthesized => None,
+        }
+    }
+
+    pub fn availability(&self) -> Availability {
+        match self {
+            Self::Encoded(_) => Availability::Available,
+            Self::Declined { decline, .. } => Availability::Unavailable(decline.clone()),
+            Self::Synthesized => Availability::Unavailable(Decline::Encode(
+                crate::jir::decline::EncodeDecline::Synthesized,
+            )),
+        }
+    }
+}
+
 /// One named top level declaration, plus everything the link step needs to know about it.
 pub struct JsItem {
     pub name: JsName,
@@ -288,18 +349,8 @@ pub struct JsItem {
     pub optimization: OptimizationInfo,
     /// Allocator provider metadata carried on the allocator shim marker item.
     pub allocator_provider: AllocatorProvider,
-    /// The item's JIR-S body and origins, written to the object's S3/S5 in every `js-opt` mode.
-    /// `None` for a synthesized item or one the encoder declined; the decline says which.
-    pub jir: Option<JirItem>,
-    /// Why `jir` is `None`, when it is.
-    pub jir_decline: Option<Decline>,
-    /// The item's stable identity, independent of whether its body encoded.
-    ///
-    /// [`JirItem`] carries the same id, but only for an item that *has* a body; an item the
-    /// encoder declined still has to be findable by identity, because it is what some other
-    /// item's `Callee::Direct` or `fn` pointer names (`lower/js/call.rs`, `lower/js/rvalue.rs`).
-    /// `None` for a synthesized item, which has no Rust identity at all.
-    pub jir_item: Option<crate::jir::semantic::ItemId>,
+    /// The item's JIR-S state (encoded body, encoder decline with optional identity, or synthesized).
+    pub jir: JsItemJir,
 }
 
 /// A JIR-S body with its origin table, as the encoder produces it and the object stores it.
@@ -335,9 +386,7 @@ impl JsItem {
             dts: None,
             optimization: OptimizationInfo::default(),
             allocator_provider: AllocatorProvider::Unknown,
-            jir: None,
-            jir_decline: None,
-            jir_item: None,
+            jir: JsItemJir::Synthesized,
         }
     }
 
@@ -351,16 +400,9 @@ impl JsItem {
         self
     }
 
-    /// Attaches the JIR-S body, or the reason there is none.
-    pub fn with_jir(mut self, jir: Option<JirItem>, decline: Option<Decline>) -> Self {
+    /// Attaches the item's JIR-S payload (encoded body, decline, or synthesized marker).
+    pub fn with_jir(mut self, jir: JsItemJir) -> Self {
         self.jir = jir;
-        self.jir_decline = decline;
-        self
-    }
-
-    /// Attaches the item's stable identity, which it has whether or not its body encoded.
-    pub fn with_jir_item(mut self, item: Option<crate::jir::semantic::ItemId>) -> Self {
-        self.jir_item = item;
         self
     }
 
@@ -394,23 +436,6 @@ impl JsItem {
         self
     }
 
-    /// Records a proven representation or lowering choice for the optimization report.
-    #[allow(dead_code)]
-    pub fn optimization_selection(
-        &mut self,
-        pass: impl Into<String>,
-        selected: impl Into<String>,
-        reason: impl Into<String>,
-    ) {
-        self.optimization.select(pass, selected, reason);
-    }
-
-    /// Records a rejected candidate. Reachable workspace misses may also become warnings.
-    #[allow(dead_code)]
-    pub fn optimization_miss(&mut self, miss: OptimizationMiss) {
-        self.optimization.misses.push(miss);
-    }
-
     /// Attaches allocator provider identity (set on `__rust_no_alloc_shim_is_unstable`).
     pub fn with_allocator_provider(mut self, provider: AllocatorProvider) -> Self {
         self.allocator_provider = provider;
@@ -431,24 +456,23 @@ impl JsItem {
         let comments = comments && self.kind != ItemKind::Const;
         let names: std::collections::BTreeMap<String, String> =
             self.names.iter().cloned().collect();
-        let style = match crate::opts::get().minify {
+        let style = match crate::opts::get().minify.is_enabled() {
             true => jsast::Style::Compact,
             false => jsast::Style::Readable,
         };
         let target = crate::opts::get().ecma_target;
         if comments {
-            let program = [jsast::comment(self.debug_path.clone()), self.decl.clone()];
-            jsast::program_to_string_mapped_styled_for_target(
-                &program,
+            let header = jsast::comment(self.debug_path.clone());
+            jsast::program_refs_to_string_mapped_styled_for_target(
+                &[&header, &self.decl],
                 names,
                 self.loc.clone(),
                 style,
                 target,
             )
         } else {
-            let program = std::slice::from_ref(&self.decl);
             jsast::program_to_string_mapped_styled_for_target(
-                program,
+                std::slice::from_ref(&self.decl),
                 names,
                 self.loc.clone(),
                 style,
@@ -647,7 +671,6 @@ impl LinkJir {
     }
 
     /// The interns the body refers into.
-    #[allow(dead_code)]
     pub fn interns(&self) -> Option<&Interns> {
         self.linked_interns
             .as_deref()
@@ -828,19 +851,13 @@ pub fn write_object(
         let (js, mappings) = item.to_js_mapped(comments);
         let deps: Vec<String> = item.refs.iter().map(|r| r.as_str().to_owned()).collect();
         debug_assert!(deps.windows(2).all(|pair| pair[0] < pair[1]));
-        let availability = match (&item.jir, &item.jir_decline) {
-            (Some(_), _) => Availability::Available,
-            (None, Some(decline)) => Availability::Unavailable(decline.clone()),
-            (None, None) => Availability::Unavailable(Decline::Encode(
-                crate::jir::decline::EncodeDecline::Synthesized,
-            )),
-        };
+        let availability = item.jir.availability();
         writer.push_item(
             &js,
             ItemInput {
                 key: SemanticKey {
                     link_name: item.name.as_str().to_owned(),
-                    item: item.jir.as_ref().map(|jir| jir.body.item).or(item.jir_item),
+                    item: item.jir.item_id(),
                 },
                 availability,
                 deps,
@@ -848,7 +865,7 @@ pub fn write_object(
                 linkage: item.linkage.clone(),
                 order: item.order.clone(),
                 dts: item.dts.is_some(),
-                body: item.jir.as_ref().map(|jir| (&jir.body, &jir.origins)),
+                body: item.jir.encoded().map(|jir| (&jir.body, &jir.origins)),
             },
         );
         baseline.push(SerBaseline {
@@ -892,27 +909,21 @@ pub fn write_program(prologue: &str, items: &[&LinkItem]) -> (String, Vec<u32>) 
 #[derive(Debug)]
 pub struct ReadObject {
     pub items: Vec<LinkItem>,
-    /// The format the object was written in: [`FORMAT_VERSION`], or the legacy text-footer format.
-    pub format: u16,
     /// What every object in one program has to agree on, for
-    /// [`crate::jir::summary::merge_headers`]. `None` for a format 19 object, which carries no
-    /// header at all and is therefore held to nothing.
-    pub header: Option<Header>,
-    object: Option<Arc<Object>>,
+    /// [`crate::jir::summary::merge_headers`].
+    pub header: Header,
+    object: Arc<Object>,
 }
 
 impl ReadObject {
     /// Source contents retained independently of reachable JIR bodies.
     pub fn sources(&self) -> Result<BTreeMap<String, String>, String> {
-        self.object.as_ref().map_or_else(
-            || Ok(BTreeMap::new()),
-            |object| object.sources().map_err(|error| error.to_string()),
-        )
+        self.object.sources().map_err(|error| error.to_string())
     }
 
     /// Object metadata survives even when a generic-only crate has no emitted items.
-    pub fn interns(&self) -> Option<&Interns> {
-        self.object.as_ref().map(|object| &object.interns)
+    pub fn interns(&self) -> &Interns {
+        &self.object.interns
     }
 }
 
@@ -990,9 +1001,8 @@ fn read_object_20(mut object: Object) -> Result<ReadObject, String> {
     }
     Ok(ReadObject {
         items,
-        format: FORMAT_VERSION,
-        header: Some(header),
-        object: Some(object),
+        header,
+        object,
     })
 }
 
@@ -1129,13 +1139,10 @@ mod tests {
             Linkage::internal(),
             "crate::f".to_owned(),
         )
-        .with_jir(
-            Some(JirItem {
-                body: body.clone(),
-                origins: origins.clone(),
-            }),
-            None,
-        );
+        .with_jir(JsItemJir::from(JirItem {
+            body: body.clone(),
+            origins: origins.clone(),
+        }));
         let bytes = write_object(
             "",
             &[item],
@@ -1274,6 +1281,32 @@ mod tests {
         assert_eq!(forward.optimization.misses.len(), 2);
         assert_eq!(forward.optimization.misses[0].pass, "a-pass");
         assert_eq!(forward.optimization.misses[1].pass, "z-pass");
+    }
+
+    #[test]
+    fn js_name_borrows_str_and_to_js_mapped_prints_comment_without_cloning_decl() {
+        let mut map = BTreeMap::new();
+        map.insert(JsName::new("alpha".to_owned()), 1u32);
+        assert_eq!(map.get("alpha"), Some(&1));
+        let name = JsName::new("beta".to_owned());
+        let s: &str = name.as_ref();
+        assert_eq!(s, "beta");
+
+        let item = JsItem::new(
+            JsName::new("f".to_owned()),
+            ItemKind::Fn,
+            jsast::function("f", Vec::new(), vec![jsast::ret(jsast::num(1))]),
+            Vec::new(),
+            Linkage::internal(),
+            "crate::f".to_owned(),
+        );
+        let (with_comment, _) = item.to_js_mapped(true);
+        assert_eq!(
+            with_comment,
+            "// crate::f\nfunction f() {\n  return 1;\n}\n"
+        );
+        let (without_comment, _) = item.to_js_mapped(false);
+        assert_eq!(without_comment, "function f() {\n  return 1;\n}\n");
     }
 
     /// A hand-built JIR body for the object tests: `fn f(x: i32) -> i32 { x + 1 }`.

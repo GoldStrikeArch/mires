@@ -20,17 +20,22 @@
 //! no-op and the sidecar reports what the analyses would have found.
 
 pub mod candidates;
+pub(crate) mod cfg;
 pub mod dce;
 pub mod devirtualize;
 pub mod host_args;
 pub mod inline;
 pub mod partial_escape;
-mod pipeline;
+pub mod pipeline;
 pub mod projection;
+pub mod prune_drops;
 pub mod prune_invoke;
 pub mod range;
 pub mod slice_forward;
 pub mod slice_iter;
+pub(crate) mod tx;
 pub mod witness;
 
-pub use pipeline::{o_pass_enabled, observed_carriers, optimize, optimize_for_probe, OptStats};
+#[allow(unused_imports)]
+pub use pipeline::optimize;
+pub use pipeline::{observed_carriers, optimize_for_probe, optimize_with_facts, OptStats};

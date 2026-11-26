@@ -238,25 +238,26 @@ pub fn structure<S: Payload, C>(
         (skeleton, emitter.stats())
     } else {
         // Hoisting a loop continuation out changes which blocks dominate it,
-        // so the tree has to be built again afterwards. A graph with a multi
-        // entry loop skips the hoist: it is calibrated for loops with one
-        // entry, and the cycles it would move resolve through dispatches.
-        let dom = if stats.irreducible {
-            dom
-        } else {
-            loops::shrink_loops(&cfg, &mut order, opts)?;
+        // so the tree has to be built again afterwards when any edge was added.
+        // A graph with a multi entry loop skips the hoist: it is calibrated for
+        // loops with one entry, and the cycles it would move resolve through
+        // dispatches.
+        let dom = if !stats.irreducible && loops::shrink_loops(&cfg, &mut order, &dom, opts)? {
             dom::Dom::build(&order)?
+        } else {
+            dom
         };
         let mut emitter = emit::Emitter::new(&cfg, &order, &dom, opts, stats);
         match emitter.run() {
             Ok(skeleton) => (skeleton, emitter.stats()),
-            Err(_) => {
-                // Nothing has been consumed yet, so a shape the nested form
-                // cannot take still has the flat one to fall back on.
+            Err(StructureError::TooDeep) => {
+                // Nothing has been consumed yet, so a body that nests past the
+                // depth limit still has the flat dispatch to fall back on.
                 let mut emitter = emit::Emitter::new(&cfg, &order, &dom, opts, stats);
                 let skeleton = emitter.run_dispatch()?;
                 (skeleton, emitter.stats())
             }
+            Err(err) => return Err(err),
         }
     };
 

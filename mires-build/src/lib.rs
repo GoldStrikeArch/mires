@@ -31,8 +31,7 @@
 //!
 //! [`Toolchain::preconditions`] is that list of steps, and
 //! [`Toolchain::apply`] performs one, so a tool outside a build script can set
-//! the checkout up without a second opinion about when it is ready. That is
-//! what `topcoat client setup` does.
+//! the checkout up without a second opinion about when it is ready.
 //!
 //! The `JS_EXTRA_ARGS` the sysroot was built with are recorded next to it. Any
 //! backend option that changes how items are spelled has to be the same on
@@ -132,6 +131,9 @@ pub use error::*;
 pub use pinned::*;
 pub use preconditions::*;
 pub use rcgjs_object::artifact::EntryRole;
+#[doc(hidden)]
+pub use rcgjs_object::opts::OptimizerPass;
+pub use rcgjs_object::opts::{Lane, OptimizerMode, Profile};
 pub use rerun::*;
 pub use shimcheck::*;
 pub use toolchain::*;

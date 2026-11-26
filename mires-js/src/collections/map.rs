@@ -56,9 +56,11 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// Inserts a value, returning the one the key held before.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let class = key.as_class();
-        if let Some(held) =
-            unsafe { raw::map_try_get_mut::<K::Class, MapEntry<V>>(self.raw, class) }
-        {
+        // SAFETY: Every entry in `self.raw` is a `MapEntry<V>`, and `&mut self` grants exclusive
+        // access for the duration of this borrow.
+        #[allow(unsafe_code)]
+        let existing = unsafe { raw::map_try_get_mut::<K::Class, MapEntry<V>>(self.raw, class) };
+        if let Some(held) = existing {
             return held.value.replace(value);
         }
         raw::map_set(self.raw, class, MapEntry { value: Some(value) });
@@ -68,6 +70,9 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// The value a key holds.
     #[must_use]
     pub fn get(&self, key: &K::Class) -> Option<&V> {
+        // SAFETY: Every entry in `self.raw` is a `MapEntry<V>`, and `&self` prevents concurrent
+        // mutation for the returned lifetime.
+        #[allow(unsafe_code)]
         let held: &MapEntry<V> = unsafe { raw::map_try_get(self.raw, key) }?;
         held.value.as_ref()
     }
@@ -78,12 +83,18 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// [`get`](HashMap::get) reads.
     #[must_use]
     pub fn get_mut(&mut self, key: &K::Class) -> Option<&mut V> {
+        // SAFETY: Every entry in `self.raw` is a `MapEntry<V>`, and `&mut self` guarantees unique
+        // access for the returned lifetime.
+        #[allow(unsafe_code)]
         let held: &mut MapEntry<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
         held.value.as_mut()
     }
 
     /// Removes a key, returning the value it held.
     pub fn remove(&mut self, key: &K::Class) -> Option<V> {
+        // SAFETY: Every entry in `self.raw` is a `MapEntry<V>`, `&mut self` guarantees exclusive
+        // access, and `held` is not used after `raw::map_del`.
+        #[allow(unsafe_code)]
         let held: &mut MapEntry<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
         let taken = held.value.take();
         let _ = raw::map_del(self.raw, key);
@@ -102,9 +113,17 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// performs zero per-entry `Map` lookups. The map cannot change while the iterator is alive.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, K, V> {
+        // SAFETY: Every key in `self.raw` snapshots as `K::Snapshot`, and the returned slice
+        // borrows from `&self`.
+        #[allow(unsafe_code)]
+        let keys = unsafe { raw::map_keys::<K::Snapshot>(self.raw) };
+        // SAFETY: Every value in `self.raw` is a `MapEntry<V>`, and `&self` prevents mutation
+        // while `Iter` is alive.
+        #[allow(unsafe_code)]
+        let vals = unsafe { raw::map_values::<MapEntry<V>>(self.raw) };
         Iter {
-            keys: raw::map_keys::<K::Snapshot>(self.raw),
-            vals: unsafe { raw::map_values::<MapEntry<V>>(self.raw) },
+            keys,
+            vals,
             index: 0,
             marker: PhantomData,
         }

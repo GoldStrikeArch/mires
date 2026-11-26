@@ -14,8 +14,9 @@
 //! Bounded-set dispatch groups are not built (D6: YAGNI — the idiomatic sidecar shows four
 //! `unknown-call` candidates). A rewrite happens only when the target's body is one the lane
 //! also built, with a positionally aligned signature and no trailing caller `Location`, so the
-//! direct lowering spells exactly the call the dispatch would have made. Every rewrite records
-//! a [`Witness::Devirt`] and the func is re-verified; any failure reverts the whole function.
+//! direct lowering spells exactly the call the dispatch would have made. Every rewrite is applied
+//! transactionally and re-verified under its observed carriers; any failure reverts the whole
+//! function.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,7 +29,8 @@ use crate::jir::types::TypeKind;
 use crate::jir::BodyKind;
 use crate::lower::js::unsize::VtableIndex;
 
-use super::observed_carriers;
+use super::cfg::{Cfg, DefUse};
+use super::tx::{try_rewrite_func, TxOutcome};
 
 /// What the pass did, for the sidecar's `devirt` block.
 #[derive(Clone, Debug, Default)]
@@ -72,41 +74,223 @@ pub fn run(
             continue;
         }
         let table = &caller_interns.types;
-        let mut rewritten = func.clone();
-        let mut applied_count = 0u32;
-        for rewrite in &rewrites {
-            let op = &mut rewritten.blocks[rewrite.block].ops[rewrite.op];
-            let OpKind::Call {
-                callee,
-                function,
-                args,
-                ..
-            } = &mut op.kind
-            else {
-                continue;
-            };
-            *callee = Callee::Direct {
-                item: rewrite.item,
-                link_name: rewrite.link_name,
-            };
-            *function = None;
-            if let Some(receiver) = rewrite.receiver {
-                args[0] = receiver;
+        match try_rewrite_func(
+            func,
+            table,
+            |rewritten| {
+                let mut applied_count = 0u32;
+                for rewrite in &rewrites {
+                    let op = &mut rewritten.blocks[rewrite.block].ops[rewrite.op];
+                    let OpKind::Call {
+                        callee,
+                        function,
+                        args,
+                        ..
+                    } = &mut op.kind
+                    else {
+                        continue;
+                    };
+                    *callee = Callee::Direct {
+                        item: rewrite.item,
+                        link_name: rewrite.link_name,
+                    };
+                    *function = None;
+                    if let Some(receiver) = rewrite.receiver {
+                        args[0] = receiver;
+                    }
+                    applied_count += 1;
+                }
+                (applied_count > 0).then_some(applied_count)
+            },
+            |_, _| true,
+        ) {
+            TxOutcome::Unchanged => {}
+            TxOutcome::RolledBack => {
+                stats.witnesses_failed += 1;
             }
-            applied_count += 1;
+            TxOutcome::Committed {
+                func: rewritten,
+                payload: applied_count,
+            } => {
+                stats.applied += applied_count;
+                stats.witnesses_recorded += applied_count;
+                stats.items.insert(name.clone());
+                funcs.insert(name, Ok(rewritten));
+            }
         }
-        stats.witnesses_recorded += applied_count;
-        let verified = rewritten
-            .verify_carriers(table, observed_carriers(&rewritten))
-            .is_ok();
-        if !verified {
-            continue; // The func in the map is still the backup's content: nothing changed.
-        }
-        stats.applied += applied_count;
-        stats.items.insert(name.clone());
-        funcs.insert(name, Ok(rewritten));
     }
     stats
+}
+
+/// Per-function context shared while planning devirtualization rewrites.
+struct PlanCx<'a> {
+    func: &'a Func,
+    caller_interns: &'a Interns,
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    items: &'a BTreeMap<JsName, LinkItem>,
+    vtables: &'a VtableIndex,
+    def_use: DefUse,
+    forwarded: BTreeMap<u32, crate::jir::repr::ValueId>,
+}
+
+impl<'a> PlanCx<'a> {
+    fn new(
+        func: &'a Func,
+        caller_interns: &'a Interns,
+        funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+        items: &'a BTreeMap<JsName, LinkItem>,
+        vtables: &'a VtableIndex,
+    ) -> Self {
+        // Every value's defining op, for the constant traces, plus the one incoming argument of
+        // each single-predecessor block's parameters (an inlined body's entry takes that shape,
+        // and the constant a caller passed flows through it).
+        let def_use = DefUse::of(func);
+        let incoming = Cfg::incoming_args(func);
+        let mut forwarded: BTreeMap<u32, crate::jir::repr::ValueId> = BTreeMap::new();
+        for block in &func.blocks {
+            let [args] = incoming[block.id.0 as usize].as_slice() else {
+                continue;
+            };
+            for (position, param) in block.params.iter().enumerate() {
+                if let Some(arg) = args.get(position) {
+                    forwarded.insert(param.0, *arg);
+                }
+            }
+        }
+        Self {
+            func,
+            caller_interns,
+            funcs,
+            items,
+            vtables,
+            def_use,
+            forwarded,
+        }
+    }
+
+    fn resolve(&self, mut v: crate::jir::repr::ValueId) -> Option<&'a OpKind> {
+        for _ in 0..64 {
+            if let Some(def) = self.def_use.def_kind(self.func, v) {
+                match def {
+                    OpKind::Copy(inner) | OpKind::Move(inner) => v = *inner,
+                    other => return Some(other),
+                }
+            } else {
+                v = *self.forwarded.get(&v.0)?;
+            }
+        }
+        None
+    }
+
+    /// A reified fn pointer's identity: a `ReifyFnPointer` coercion carries it in the `FnDef`
+    /// type's resolved instance (the operand is zero-sized), a decoded constant in a `Global`
+    /// function reference; the coercion casts between pointer shapes are peeled. The virtual trace
+    /// below must NOT peel the unsizing cast — it IS its evidence — so only this helper walks
+    /// casts.
+    fn fn_target(&self, mut v: crate::jir::repr::ValueId) -> Option<(ItemId, StrId)> {
+        use crate::jir::semantic::CastKind;
+        for _ in 0..64 {
+            match self.resolve(v)? {
+                OpKind::Const(ConstTree::Global {
+                    target: GlobalReference::Function { item, link_name },
+                    offset: 0,
+                }) => return Some((*item, *link_name)),
+                OpKind::Cast {
+                    kind: CastKind::PointerCoercion,
+                    v: inner,
+                    from,
+                    ..
+                } => {
+                    if let Some(TypeKind::FnDef {
+                        instance: Some(instance),
+                        ..
+                    }) = self.caller_interns.types.get(*from).map(|d| &d.kind)
+                    {
+                        return Some((instance.item, instance.link_name));
+                    }
+                    v = *inner;
+                }
+                OpKind::Cast {
+                    kind: CastKind::FnPtrToPtr | CastKind::Subtype,
+                    v: inner,
+                    ..
+                } => v = *inner,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether the target named `link_name` (a caller-scoped id) is a body the lane built whose
+    /// parameters align positionally with `args` arguments and that takes no trailing `Location`.
+    fn aligned(&self, link_name: StrId, args: usize) -> Option<()> {
+        let name = self.caller_interns.str(link_name)?;
+        let target = self.funcs.get(name)?.as_ref().ok()?;
+        (!target.sig.abi.caller_location
+            && target.sig.abi.spread.is_none()
+            && target.params.len() == args)
+            .then_some(())
+    }
+
+    /// The unique target of a virtual call whose receiver is the unsizing cast of a plain
+    /// reference, plus the thin receiver value that replaces the fat pointer.
+    fn virtual_target(
+        &self,
+        args: &[crate::jir::repr::ValueId],
+        slot: u32,
+        receiver_ty: TypeId,
+    ) -> Option<(ItemId, StrId, crate::jir::repr::ValueId)> {
+        let table = &self.caller_interns.types;
+        let fat = *args.first()?;
+        let OpKind::Cast {
+            kind: crate::jir::semantic::CastKind::PointerCoercion,
+            v,
+            from,
+            ..
+        } = self.resolve(fat)?
+        else {
+            return None;
+        };
+        // A *reference* to a concrete pointee: the virtual lowering hands the vtable's method the
+        // data half of the fat pointer, which for a reference is the operand unchanged. A raw
+        // pointer is re-wrapped at the cast (`raw_to_ref`) and is not matched.
+        let TypeKind::Reference {
+            pointee,
+            mutable: _,
+        } = table.get(*from)?.kind
+        else {
+            return None;
+        };
+        if matches!(table.get(pointee)?.kind, TypeKind::Dynamic { .. }) {
+            return None; // dyn-to-dyn: not a constant vtable.
+        }
+        let TypeKind::Dynamic { principal, .. } = table.get(receiver_ty)?.kind else {
+            return None;
+        };
+        let vtable_name = [pointee, table.peeled(pointee)]
+            .iter()
+            .find_map(|key| self.vtables.get(&(*key, principal)))?;
+        let vtable = self.items.get(vtable_name.as_str())?;
+        let BodyKind::Vtable { entries, .. } = &vtable.jir.body.as_ref()?.kind else {
+            return None;
+        };
+        let VtableEntry::Method(method) = entries.get(slot as usize)? else {
+            return None;
+        };
+        // The method's name is interned in the vtable's object; the rewrite has to spell it with a
+        // caller-scoped id, which exists only if the caller's object interned the same string.
+        let target = vtable.jir.interns()?.str(method.link_name)?;
+        let position = self
+            .caller_interns
+            .strings
+            .iter()
+            .position(|s| s == target)?;
+        let link_name = StrId(position as u32);
+        self.aligned(link_name, args.len())?;
+        // The thin operand must be a value of this function (it is: the cast is one of its ops).
+        debug_assert!((v.0 as usize) < self.func.values.len());
+        Some((method.item, link_name, *v))
+    }
 }
 
 /// The rewrites one function admits, in block-and-op order.
@@ -117,48 +301,7 @@ fn plan(
     items: &BTreeMap<JsName, LinkItem>,
     vtables: &VtableIndex,
 ) -> Vec<Rewrite> {
-    // Every value's defining op, for the constant traces, plus the one incoming argument of
-    // each single-predecessor block's parameters (an inlined body's entry takes that shape, and
-    // the constant a caller passed flows through it).
-    let mut defs: BTreeMap<u32, &OpKind> = BTreeMap::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            if let Some(result) = op.result {
-                defs.insert(result.0, &op.kind);
-            }
-        }
-    }
-    let mut incoming: BTreeMap<u32, Vec<&[crate::jir::repr::ValueId]>> = BTreeMap::new();
-    for block in &func.blocks {
-        for (target, args) in block.term.edges() {
-            incoming.entry(target.0).or_default().push(args);
-        }
-    }
-    let mut forwarded: BTreeMap<u32, crate::jir::repr::ValueId> = BTreeMap::new();
-    for block in &func.blocks {
-        let Some([args]) = incoming.get(&block.id.0).map(Vec::as_slice) else {
-            continue;
-        };
-        for (position, param) in block.params.iter().enumerate() {
-            if let Some(arg) = args.get(position) {
-                forwarded.insert(param.0, *arg);
-            }
-        }
-    }
-    let resolve = |mut v: crate::jir::repr::ValueId| -> Option<&OpKind> {
-        for _ in 0..64 {
-            if let Some(def) = defs.get(&v.0) {
-                match def {
-                    OpKind::Copy(inner) | OpKind::Move(inner) => v = *inner,
-                    other => return Some(*other),
-                }
-            } else {
-                v = *forwarded.get(&v.0)?;
-            }
-        }
-        None
-    };
-
+    let cx = PlanCx::new(func, caller_interns, funcs, items, vtables);
     let mut rewrites = Vec::new();
     for (block_index, block) in func.blocks.iter().enumerate() {
         for (op_index, op) in block.ops.iter().enumerate() {
@@ -173,48 +316,10 @@ fn plan(
             else {
                 continue;
             };
-            // A reified fn pointer's identity: a `ReifyFnPointer` coercion carries it in the
-            // `FnDef` type's resolved instance (the operand is zero-sized), a decoded constant
-            // in a `Global` function reference; the coercion casts between pointer shapes are
-            // peeled. The virtual trace below must NOT peel the unsizing cast — it IS its
-            // evidence — so only this arm walks casts.
-            let fn_target = |mut v: crate::jir::repr::ValueId| -> Option<(ItemId, StrId)> {
-                use crate::jir::semantic::CastKind;
-                for _ in 0..64 {
-                    match resolve(v)? {
-                        OpKind::Const(ConstTree::Global {
-                            target: GlobalReference::Function { item, link_name },
-                            offset: 0,
-                        }) => return Some((*item, *link_name)),
-                        OpKind::Cast {
-                            kind: CastKind::PointerCoercion,
-                            v: inner,
-                            from,
-                            ..
-                        } => {
-                            if let Some(TypeKind::FnDef {
-                                instance: Some(instance),
-                                ..
-                            }) = caller_interns.types.get(*from).map(|d| &d.kind)
-                            {
-                                return Some((instance.item, instance.link_name));
-                            }
-                            v = *inner;
-                        }
-                        OpKind::Cast {
-                            kind: CastKind::FnPtrToPtr | CastKind::Subtype,
-                            v: inner,
-                            ..
-                        } => v = *inner,
-                        _ => return None,
-                    }
-                }
-                None
-            };
             let planned = match callee {
                 Callee::Indirect { .. } => function.and_then(|f| {
-                    fn_target(f).and_then(|(item, link_name)| {
-                        aligned(caller_interns, link_name, args.len(), funcs)?;
+                    cx.fn_target(f).and_then(|(item, link_name)| {
+                        cx.aligned(link_name, args.len())?;
                         Some(Rewrite {
                             block: block_index,
                             op: op_index,
@@ -224,108 +329,21 @@ fn plan(
                         })
                     })
                 }),
-                Callee::Virtual { slot, receiver } => virtual_target(
-                    func,
-                    caller_interns,
-                    resolve,
-                    args,
-                    *slot,
-                    *receiver,
-                    funcs,
-                    items,
-                    vtables,
-                )
-                .map(|(item, link_name, thin)| Rewrite {
-                    block: block_index,
-                    op: op_index,
-                    item,
-                    link_name,
-                    receiver: Some(thin),
-                }),
+                Callee::Virtual { slot, receiver } => cx
+                    .virtual_target(args, *slot, *receiver)
+                    .map(|(item, link_name, thin)| Rewrite {
+                        block: block_index,
+                        op: op_index,
+                        item,
+                        link_name,
+                        receiver: Some(thin),
+                    }),
                 _ => None,
             };
             rewrites.extend(planned);
         }
     }
     rewrites
-}
-
-/// Whether the target named `link_name` (a caller-scoped id) is a body the lane built whose
-/// parameters align positionally with `args` arguments and that takes no trailing `Location`.
-fn aligned(
-    caller_interns: &Interns,
-    link_name: StrId,
-    args: usize,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-) -> Option<()> {
-    let name = JsName::new(caller_interns.str(link_name)?.to_owned());
-    let target = funcs.get(&name)?.as_ref().ok()?;
-    (!target.sig.abi.caller_location
-        && target.sig.abi.spread.is_none()
-        && target.params.len() == args)
-        .then_some(())
-}
-
-/// The unique target of a virtual call whose receiver is the unsizing cast of a plain
-/// reference, plus the thin receiver value that replaces the fat pointer.
-#[allow(clippy::too_many_arguments)] // One call site; the arguments are the trace's inputs.
-fn virtual_target<'a>(
-    func: &Func,
-    caller_interns: &Interns,
-    resolve: impl Fn(crate::jir::repr::ValueId) -> Option<&'a OpKind>,
-    args: &[crate::jir::repr::ValueId],
-    slot: u32,
-    receiver_ty: TypeId,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    items: &BTreeMap<JsName, LinkItem>,
-    vtables: &VtableIndex,
-) -> Option<(ItemId, StrId, crate::jir::repr::ValueId)> {
-    let table = &caller_interns.types;
-    let fat = *args.first()?;
-    let OpKind::Cast {
-        kind: crate::jir::semantic::CastKind::PointerCoercion,
-        v,
-        from,
-        ..
-    } = resolve(fat)?
-    else {
-        return None;
-    };
-    // A *reference* to a concrete pointee: the virtual lowering hands the vtable's method the
-    // data half of the fat pointer, which for a reference is the operand unchanged. A raw
-    // pointer is re-wrapped at the cast (`raw_to_ref`) and is not matched.
-    let TypeKind::Reference {
-        pointee,
-        mutable: _,
-    } = table.get(*from)?.kind
-    else {
-        return None;
-    };
-    if matches!(table.get(pointee)?.kind, TypeKind::Dynamic { .. }) {
-        return None; // dyn-to-dyn: not a constant vtable.
-    }
-    let TypeKind::Dynamic { principal, .. } = table.get(receiver_ty)?.kind else {
-        return None;
-    };
-    let vtable_name = [pointee, table.peeled(pointee)]
-        .iter()
-        .find_map(|key| vtables.get(&(*key, principal)))?;
-    let vtable = items.get(&JsName::new(vtable_name.clone()))?;
-    let BodyKind::Vtable { entries, .. } = &vtable.jir.body.as_ref()?.kind else {
-        return None;
-    };
-    let VtableEntry::Method(method) = entries.get(slot as usize)? else {
-        return None;
-    };
-    // The method's name is interned in the vtable's object; the rewrite has to spell it with a
-    // caller-scoped id, which exists only if the caller's object interned the same string.
-    let target = vtable.jir.interns()?.str(method.link_name)?;
-    let position = caller_interns.strings.iter().position(|s| s == target)?;
-    let link_name = StrId(position as u32);
-    aligned(caller_interns, link_name, args.len(), funcs)?;
-    // The thin operand must be a value of this function (it is: the cast is one of its ops).
-    debug_assert!((v.0 as usize) < func.values.len());
-    Some((method.item, link_name, *v))
 }
 
 #[cfg(test)]

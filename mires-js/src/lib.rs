@@ -26,8 +26,26 @@
 
 extern crate alloc;
 
-// Host `Map`-backed collections: the one FFI seam allowed unsafe.
-#[allow(unsafe_code)]
+/// One transparent word representing an opaque host-managed JavaScript value.
+///
+/// Every handle wrapper in this crate is `#[repr(transparent)]` over `HostHandle`. The backend
+/// peels transparent layers down to the inner `u32` (never read by Rust code) while keeping each
+/// outer type's `PinnedBoundary::Host` identity.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct HostHandle(#[allow(dead_code)] u32);
+
+#[cfg(test)]
+impl HostHandle {
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 pub mod collections;
 
 pub use js_extern_macro::{js_bindings, js_export};

@@ -47,13 +47,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::jir::origin::OriginId;
 use crate::jir::repr::{
-    Carrier, CellId, Dominators, Func, FuncBuilder, Op, OpKind, Proj, RAssertMessage, RBlockId,
-    RTerm, Root, ValueDef, ValueId,
+    Carrier, CellId, Func, FuncBuilder, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, DropGlue, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
 
 use super::candidates;
+use super::cfg::{mask, Cfg};
 
 /// What the pass saw in one function.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -73,8 +73,8 @@ pub fn run(func: &mut Func, table: &TypeTable) -> PeaStats {
     if func.has_invoke() {
         return PeaStats::default();
     }
-    let doms = Dominators::of(func);
-    let analysis = Analysis::of(func, table, &doms);
+    let cfg = Cfg::of(func);
+    let analysis = Analysis::of(func, table, &cfg);
     let objects = analysis.nodes.len() as u32;
     let escaped = analysis.escaped.len() as u32;
     let mut stats = PeaStats {
@@ -86,7 +86,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> PeaStats {
     if stats.scalarized == 0 {
         return stats;
     }
-    match rewrite(func, table, &analysis, &doms) {
+    match rewrite(func, table, &analysis, &cfg) {
         Some((built, params_added)) => {
             *func = built;
             stats.params_added = params_added;
@@ -100,16 +100,6 @@ pub fn run(func: &mut Func, table: &TypeTable) -> PeaStats {
         }
     }
     stats
-}
-
-fn pointer_pointee(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
-    let peeled = table.peeled(ty);
-    match &table.get(peeled)?.kind {
-        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-            Some(*pointee)
-        }
-        _ => None,
-    }
 }
 
 type CellProjStep = (Option<u32>, u32, TypeId);
@@ -237,8 +227,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                 continue;
             };
             let root_def = func.values[root_val.0 as usize];
-            if root_def.carrier != Carrier::Baseline
-                || pointer_pointee(table, root_def.ty) != Some(root_ty)
+            if root_def.carrier != Carrier::Baseline || table.pointee(root_def.ty) != Some(root_ty)
             {
                 continue;
             }
@@ -269,7 +258,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                             if let Some(res) = use_op.result {
                                 let res_def = func.values[res.0 as usize];
                                 if res_def.carrier != Carrier::Baseline
-                                    || pointer_pointee(table, res_def.ty) != Some(ptr_ty)
+                                    || table.pointee(res_def.ty) != Some(ptr_ty)
                                 {
                                     ok = false;
                                     break;
@@ -300,7 +289,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                             if let Some(res) = use_op.result {
                                 let res_def = func.values[res.0 as usize];
                                 if res_def.carrier != Carrier::Baseline
-                                    || pointer_pointee(table, res_def.ty) != Some(next_ty)
+                                    || table.pointee(res_def.ty) != Some(next_ty)
                                 {
                                     ok = false;
                                     break;
@@ -393,12 +382,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                     steps,
                 }) => {
                     let origin = op.origin;
-                    let load_id = ValueId(func.values.len() as u32);
-                    func.values.push(ValueDef {
-                        ty: *cell_ty,
-                        carrier: Carrier::Baseline,
-                        origin,
-                    });
+                    let load_id = func.push_value(*cell_ty, Carrier::Baseline, origin);
                     new_ops.push(Op {
                         result: Some(load_id),
                         origin,
@@ -406,12 +390,7 @@ pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
                     });
                     let mut cur = load_id;
                     for &(variant, field, step_ty) in &steps[..steps.len() - 1] {
-                        let mid = ValueId(func.values.len() as u32);
-                        func.values.push(ValueDef {
-                            ty: step_ty,
-                            carrier: Carrier::Baseline,
-                            origin,
-                        });
+                        let mid = func.push_value(step_ty, Carrier::Baseline, origin);
                         new_ops.push(Op {
                             result: Some(mid),
                             origin,
@@ -485,27 +464,23 @@ pub(crate) fn unbox_cells(func: &mut Func, table: &TypeTable) -> bool {
     changed
 }
 
-/// Promotes cell borrows and unboxes cells with no remaining `Root::Cell` references.
-#[allow(dead_code)]
-pub(crate) fn demote_boxed_cells(func: &mut Func, table: &TypeTable) -> bool {
-    let promoted = promote_cell_borrows(func, table);
-    let unboxed = unbox_cells(func, table);
-    promoted || unboxed
-}
-
 fn count_value_uses(func: &Func, target: ValueId) -> usize {
-    func.blocks
-        .iter()
-        .map(|block| {
-            block
-                .ops
-                .iter()
-                .flat_map(|op| op.kind.uses())
-                .chain(block.term.uses())
-                .filter(|v| *v == target)
-                .count()
-        })
-        .sum()
+    let mut count = 0usize;
+    for block in &func.blocks {
+        for op in &block.ops {
+            op.kind.for_each_use(|v| {
+                if v == target {
+                    count += 1;
+                }
+            });
+        }
+        block.term.for_each_use(|v| {
+            if v == target {
+                count += 1;
+            }
+        });
+    }
+    count
 }
 
 /// Prevents `fuse.rs` / `emit.rs` from treating a mutated cell as a read-only `param_cells`
@@ -568,8 +543,7 @@ fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
     // Apply back-to-front so earlier indices stay valid.
     for (op_idx, _cell, param, needs_move) in insertions.into_iter().rev() {
         let param_def = func.values[param.0 as usize];
-        let copy_id = ValueId(func.values.len() as u32);
-        func.values.push(param_def);
+        let copy_id = func.push_value(param_def.ty, param_def.carrier, param_def.origin);
         let origin = func.blocks[0].ops[op_idx].origin;
         if let OpKind::CellStore { v, .. } = &mut func.blocks[0].ops[op_idx].kind {
             *v = copy_id;
@@ -887,8 +861,51 @@ struct Analysis {
     escaped: BTreeSet<NodeId>,
 }
 
+/// Escape seeds, implications, and unpinned-slot constraints accumulated by [`Analysis::decide`].
+#[derive(Default)]
+struct EscapeConstraints {
+    escaped: BTreeSet<NodeId>,
+    worklist: Vec<NodeId>,
+    implications: Vec<(NodeId, NodeId)>,
+    /// Slots whose contents the analysis cannot pin to one node: a `Field` read of one is a
+    /// value, so a node that lives there has to be a real object.
+    unpinned: BTreeSet<(NodeId, u32)>,
+    deferred_unpinned: Vec<(NodeId, NodeId)>,
+}
+
+impl EscapeConstraints {
+    fn seed_node(&mut self, node: NodeId) {
+        if self.escaped.insert(node) {
+            self.worklist.push(node);
+        }
+    }
+
+    fn unpin_all(&mut self, node: NodeId, arity: usize) {
+        self.unpinned
+            .extend((0..arity as u32).map(|field| (node, field)));
+    }
+
+    fn build_edges(&self) -> BTreeMap<NodeId, Vec<NodeId>> {
+        let mut edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        for &(from, to) in &self.implications {
+            edges.entry(from).or_default().push(to);
+        }
+        edges
+    }
+
+    fn close_worklist(&mut self, edges: &BTreeMap<NodeId, Vec<NodeId>>) {
+        while let Some(node) = self.worklist.pop() {
+            for next in edges.get(&node).into_iter().flatten() {
+                if self.escaped.insert(*next) {
+                    self.worklist.push(*next);
+                }
+            }
+        }
+    }
+}
+
 impl Analysis {
-    fn of(func: &Func, table: &TypeTable, doms: &Dominators) -> Self {
+    fn of(func: &Func, table: &TypeTable, cfg: &Cfg) -> Self {
         let mut analysis = Self {
             nodes: Vec::new(),
             node_of: BTreeMap::new(),
@@ -897,9 +914,9 @@ impl Analysis {
             mutated_nodes: BTreeSet::new(),
             escaped: BTreeSet::new(),
         };
-        let incoming = predecessors(func, doms);
+        let incoming = cfg.reachable_incoming_args(func);
         analysis.discover(func, table, &incoming);
-        analysis.decide(func, table, &incoming, doms);
+        analysis.decide(func, table, &incoming, cfg);
         analysis
     }
 
@@ -949,7 +966,7 @@ impl Analysis {
 
     /// Assigns nodes and views to values, to a fixpoint. Monotone and independent of escapes: a
     /// `Copy`, a `Move`, a `Deref` or a nested `BorrowView` is classified once its operand is.
-    fn discover(&mut self, func: &Func, table: &TypeTable, incoming: &[Vec<Vec<ValueId>>]) {
+    fn discover(&mut self, func: &Func, table: &TypeTable, incoming: &[Vec<&[ValueId]>]) {
         // A block parameter is a node by its type alone — but only where it really is bound from
         // an incoming edge. The entry parameters come from the caller, and an unreachable block's
         // come from nowhere.
@@ -1336,23 +1353,19 @@ impl Analysis {
 
     /// Walks every use, seeds the nodes that need a real object, and closes the implications over
     /// block parameters and copies.
-    fn decide(
-        &mut self,
-        func: &Func,
-        table: &TypeTable,
-        incoming: &[Vec<Vec<ValueId>>],
-        doms: &Dominators,
-    ) {
-        let mut seeds: BTreeSet<NodeId> = BTreeSet::new();
-        let mut implications: Vec<(NodeId, NodeId)> = Vec::new();
-        // Slots whose contents the analysis cannot pin to one node: a `Field` read of one is a
-        // value, so a node that lives there has to be a real object.
-        let mut unpinned: BTreeSet<(NodeId, u32)> = BTreeSet::new();
-        for &(node, field) in self.view_of.values() {
-            if let Some(field) = field {
-                unpinned.insert((node, field));
-            }
-        }
+    fn decide(&mut self, func: &Func, table: &TypeTable, incoming: &[Vec<&[ValueId]>], cfg: &Cfg) {
+        self.collect_mutated_nodes(func);
+        let mut constraints = EscapeConstraints::default();
+        self.seed_op_and_term_escapes(func, table, &mut constraints);
+        self.unpin_merges_and_loops(func, table, cfg, &mut constraints);
+        self.add_param_and_copy_implications(func, table, incoming, &mut constraints);
+        let edges = constraints.build_edges();
+        constraints.close_worklist(&edges);
+        self.refine_late_materializable_parents(func, &edges, &mut constraints);
+        self.escaped = constraints.escaped;
+    }
+
+    fn collect_mutated_nodes(&mut self, func: &Func) {
         for block in &func.blocks {
             for op in &block.ops {
                 match &op.kind {
@@ -1370,7 +1383,19 @@ impl Analysis {
                 }
             }
         }
+    }
 
+    fn seed_op_and_term_escapes(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        constraints: &mut EscapeConstraints,
+    ) {
+        for &(node, field) in self.view_of.values() {
+            if let Some(field) = field {
+                constraints.unpinned.insert((node, field));
+            }
+        }
         for block in &func.blocks {
             for op in &block.ops {
                 if let OpKind::SetField {
@@ -1382,7 +1407,7 @@ impl Analysis {
                 {
                     if let Some(&node) = self.node_of.get(base) {
                         if let Some(slot) = self.nodes[node].slot_of(*variant, *field) {
-                            unpinned.insert((node, slot as u32));
+                            constraints.unpinned.insert((node, slot as u32));
                         }
                     }
                 }
@@ -1397,11 +1422,11 @@ impl Analysis {
                                     .iter()
                                     .any(|field| table.needs_clone(field.ty))
                                 {
-                                    seeds.insert(target_node);
-                                    seeds.insert(src_node);
+                                    constraints.seed_node(target_node);
+                                    constraints.seed_node(src_node);
                                 } else {
-                                    implications.push((target_node, src_node));
-                                    implications.push((src_node, target_node));
+                                    constraints.implications.push((target_node, src_node));
+                                    constraints.implications.push((src_node, target_node));
                                 }
                             }
                         }
@@ -1413,8 +1438,7 @@ impl Analysis {
                         for v in fields {
                             if let Some(&child) = self.node_of.get(v) {
                                 if self.can_late_materialize(child, table) {
-                                    unpinned
-                                        .extend((0..self.arity(child) as u32).map(|f| (child, f)));
+                                    constraints.unpin_all(child, self.arity(child));
                                 }
                             }
                         }
@@ -1426,7 +1450,7 @@ impl Analysis {
                             allowed.remove(position);
                         }
                         None => {
-                            self.seed(&mut seeds, used);
+                            self.seed(constraints, used);
                         }
                     }
                 }
@@ -1436,40 +1460,49 @@ impl Analysis {
             for (_, args) in block.term.edges() {
                 for arg in args {
                     if let Some(&(node, _)) = self.view_of.get(arg) {
-                        seeds.insert(node);
+                        constraints.seed_node(node);
                     }
                 }
             }
             match &block.term {
-                RTerm::Switch { scrut, .. } => self.seed(&mut seeds, *scrut),
+                RTerm::Switch { scrut, .. } => self.seed(constraints, *scrut),
                 RTerm::Return(Some(v)) => {
                     if let Some(&node) = self.node_of.get(v) {
                         if self.can_late_materialize(node, table) {
-                            unpinned.extend((0..self.arity(node) as u32).map(|f| (node, f)));
+                            constraints.unpin_all(node, self.arity(node));
                         } else {
-                            self.seed(&mut seeds, *v);
+                            self.seed(constraints, *v);
                         }
                     } else {
-                        self.seed(&mut seeds, *v);
+                        self.seed(constraints, *v);
                     }
                 }
-                RTerm::Throw(Some(v)) => self.seed(&mut seeds, *v),
+                RTerm::Throw(Some(v)) => self.seed(constraints, *v),
                 _ => {}
             }
         }
+    }
 
+    fn unpin_merges_and_loops(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        cfg: &Cfg,
+        constraints: &mut EscapeConstraints,
+    ) {
+        let doms = &cfg.doms;
         // Nesting is not followed through a merge (D4 rule 4): a block parameter's fields are
         // values, so a node that would sit in one becomes a real object instead.
         for block in &func.blocks {
             for param in &block.params {
                 if let Some(&node) = self.node_of.get(param) {
-                    unpinned.extend((0..self.arity(node) as u32).map(|field| (node, field)));
+                    constraints.unpin_all(node, self.arity(node));
                 }
             }
             for (_, args) in block.term.edges() {
                 for arg in args {
                     if let Some(&node) = self.node_of.get(arg) {
-                        unpinned.extend((0..self.arity(node) as u32).map(|field| (node, field)));
+                        constraints.unpin_all(node, self.arity(node));
                     }
                 }
             }
@@ -1494,7 +1527,7 @@ impl Analysis {
                     .iter()
                     .any(|header| node.block != *header && doms.dominates(node.block, *header))
             {
-                unpinned.extend((0..node.fields.len() as u32).map(|field| (index, field)));
+                constraints.unpin_all(index, node.fields.len());
             }
         }
 
@@ -1506,20 +1539,27 @@ impl Analysis {
         // loop), `unpinned` on `parent` is irrelevant because `ops()` materializes `child`
         // directly into `parent`'s `Aggregate`. We only seed `child` for `unpinned` after the
         // initial fixpoint if `parent` stayed virtual.
-        let mut deferred_unpinned: Vec<(NodeId, NodeId)> = Vec::new();
         for (&(parent, field), &child) in &self.nested {
             if self.can_late_materialize(child, table) {
-                if unpinned.contains(&(parent, field)) {
-                    deferred_unpinned.push((parent, child));
+                if constraints.unpinned.contains(&(parent, field)) {
+                    constraints.deferred_unpinned.push((parent, child));
                 }
             } else {
-                implications.push((parent, child));
-                if unpinned.contains(&(parent, field)) {
-                    seeds.insert(child);
+                constraints.implications.push((parent, child));
+                if constraints.unpinned.contains(&(parent, field)) {
+                    constraints.seed_node(child);
                 }
             }
         }
+    }
 
+    fn add_param_and_copy_implications(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        incoming: &[Vec<&[ValueId]>],
+        constraints: &mut EscapeConstraints,
+    ) {
         // A parameter follows its incoming arguments into escape, never the reverse: an escaped
         // argument has no field state for an edge to pass on, but a virtual argument reaching a
         // parameter that is real — escaped for reasons of its own, of another shape, or not a
@@ -1535,16 +1575,16 @@ impl Analysis {
                         .and_then(|arg| self.node_of.get(arg).copied());
                     match (param_node, arg_node) {
                         (Some(p), Some(a)) if self.same_shape(p, a) => {
-                            implications.push((a, p));
+                            constraints.implications.push((a, p));
                             if self.nodes[a].enum_info.is_some() {
-                                implications.push((p, a));
+                                constraints.implications.push((p, a));
                             }
                         }
                         (Some(p), _) => {
-                            seeds.insert(p);
+                            constraints.seed_node(p);
                         }
                         (None, Some(a)) if self.nodes[a].enum_info.is_some() => {
-                            seeds.insert(a);
+                            constraints.seed_node(a);
                         }
                         (None, _) => {}
                     }
@@ -1557,11 +1597,11 @@ impl Analysis {
         for (id, node) in self.nodes.iter().enumerate() {
             if let Some(src) = node.deref_from {
                 if node.fields.iter().any(|field| table.needs_clone(field.ty)) {
-                    seeds.insert(id);
-                    seeds.insert(src);
+                    constraints.seed_node(id);
+                    constraints.seed_node(src);
                 } else {
-                    implications.push((id, src));
-                    implications.push((src, id));
+                    constraints.implications.push((id, src));
+                    constraints.implications.push((src, id));
                 }
             }
             let Some(source) = node.copied_from else {
@@ -1571,16 +1611,16 @@ impl Analysis {
             if node.fields.iter().any(|field| table.needs_clone(field.ty))
                 && self.node_of.contains_key(&source)
             {
-                seeds.insert(id);
+                constraints.seed_node(id);
                 if let Some(&from) = self.node_of.get(&source) {
-                    seeds.insert(from);
+                    constraints.seed_node(from);
                 }
                 continue;
             }
             let Some(&from) = self.node_of.get(&source) else {
                 continue;
             };
-            implications.push((id, from));
+            constraints.implications.push((id, from));
             // A copy fixes its variant at the copy site. An object the copy reads its fields back
             // out of can be *given another variant* behind its back — `*r = None`, a `&mut` call,
             // `mem::replace` — and the copy would then read the old variant's fields off the new
@@ -1592,34 +1632,29 @@ impl Analysis {
                 node.fields.len(),
             ) || table.variants(node.shape.ty).len() > 1
             {
-                implications.push((from, id));
+                constraints.implications.push((from, id));
             }
         }
+    }
 
-        let mut edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-        for &(from, to) in &implications {
-            edges.entry(from).or_default().push(to);
-        }
-        let mut worklist: Vec<NodeId> = seeds.iter().copied().collect();
-        self.escaped = seeds;
-        while let Some(node) = worklist.pop() {
-            for next in edges.get(&node).into_iter().flatten() {
-                if self.escaped.insert(*next) {
-                    worklist.push(*next);
-                }
-            }
-        }
+    fn refine_late_materializable_parents(
+        &self,
+        func: &Func,
+        edges: &BTreeMap<NodeId, Vec<NodeId>>,
+        constraints: &mut EscapeConstraints,
+    ) {
         // If a virtual `parent` holding late-materializable children is itself a pure packaging
         // `Aggregate` passed into an escaped/real block parameter (e.g. `[a, b, c, d, e, f, g, h]`
         // handed to `IntoIter` right after SHA-512's 80-round loop), it is going to be
         // materialized on that edge anyway. Escaping `parent` directly keeps all its
         // `can_late_materialize` children virtual (materialized once at `parent`'s `Aggregate` in
         // `ops()`) instead of escaping them back into their defining loop.
-        if !deferred_unpinned.is_empty() {
-            let mut candidate_parents: BTreeSet<NodeId> = deferred_unpinned
+        if !constraints.deferred_unpinned.is_empty() {
+            let mut candidate_parents: BTreeSet<NodeId> = constraints
+                .deferred_unpinned
                 .iter()
                 .map(|&(parent, _)| parent)
-                .filter(|parent| !self.escaped.contains(parent))
+                .filter(|parent| !constraints.escaped.contains(parent))
                 .collect();
             if !candidate_parents.is_empty() {
                 let mut aggregate_defined: BTreeSet<NodeId> = BTreeSet::new();
@@ -1670,7 +1705,8 @@ impl Analysis {
                                 .get(pos)
                                 .and_then(|p| self.node_of.get(p).copied())
                                 .is_some_and(|p| {
-                                    !self.escaped.contains(&p) && self.same_shape(arg_node, p)
+                                    !constraints.escaped.contains(&p)
+                                        && self.same_shape(arg_node, p)
                                 });
                             if !param_virtual_same {
                                 edge_materialized.insert(arg_node);
@@ -1684,43 +1720,30 @@ impl Analysis {
                         && !has_virtual_access.contains(node)
                 });
                 for parent in candidate_parents {
-                    if self.escaped.insert(parent) {
-                        worklist.push(parent);
-                    }
+                    constraints.seed_node(parent);
                 }
-                while let Some(node) = worklist.pop() {
-                    for next in edges.get(&node).into_iter().flatten() {
-                        if self.escaped.insert(*next) {
-                            worklist.push(*next);
-                        }
-                    }
-                }
+                constraints.close_worklist(edges);
             }
         }
         // Any late-materializable child nested inside an unpinned field of a *virtual* parent must
         // still escape so the parent's merge/loop-header state carries a plain value rather than
         // `FieldVal::Node`. Escaped parents materialize the child directly in `ops()`.
-        for (parent, child) in deferred_unpinned {
-            if !self.escaped.contains(&parent) && self.escaped.insert(child) {
-                worklist.push(child);
+        let deferred = std::mem::take(&mut constraints.deferred_unpinned);
+        for (parent, child) in deferred {
+            if !constraints.escaped.contains(&parent) {
+                constraints.seed_node(child);
             }
         }
-        while let Some(node) = worklist.pop() {
-            for next in edges.get(&node).into_iter().flatten() {
-                if self.escaped.insert(*next) {
-                    worklist.push(*next);
-                }
-            }
-        }
+        constraints.close_worklist(edges);
     }
 
     /// Marks whatever `v` names — a node or a view's node — as needing a real object.
-    fn seed(&self, seeds: &mut BTreeSet<NodeId>, v: ValueId) {
+    fn seed(&self, constraints: &mut EscapeConstraints, v: ValueId) {
         if let Some(&node) = self.node_of.get(&v) {
-            seeds.insert(node);
+            constraints.seed_node(node);
         }
         if let Some(&(node, _)) = self.view_of.get(&v) {
-            seeds.insert(node);
+            constraints.seed_node(node);
         }
     }
 
@@ -1934,40 +1957,24 @@ fn tracked_field(path: &[Proj], node: &Node) -> Option<Option<u32>> {
     }
 }
 
-/// The argument lists reaching each block from its reachable predecessors, in block order.
-fn predecessors(func: &Func, doms: &Dominators) -> Vec<Vec<Vec<ValueId>>> {
-    let mut incoming: Vec<Vec<Vec<ValueId>>> = vec![Vec::new(); func.blocks.len()];
-    for &id in &doms.rpo {
-        for (target, args) in func.blocks[id.0 as usize].term.edges() {
-            incoming[target.0 as usize].push(args.to_vec());
-        }
-    }
-    incoming
-}
-
 // ---------------------------------------------------------------------------------------------
 // The rewrite
 // ---------------------------------------------------------------------------------------------
 
 /// The whole rewrite. `None` means the function was in a shape the rewrite does not model, and the
 /// caller keeps the original.
-fn rewrite(
-    func: &Func,
-    table: &TypeTable,
-    analysis: &Analysis,
-    doms: &Dominators,
-) -> Option<(Func, u32)> {
+fn rewrite(func: &Func, table: &TypeTable, analysis: &Analysis, cfg: &Cfg) -> Option<(Func, u32)> {
     let mut rewriter = Rewriter {
         old: func,
         table,
         analysis,
-        doms,
+        cfg,
         builder: FuncBuilder::new(func.item, func.sig.clone()),
         map: BTreeMap::new(),
         carriers: BTreeMap::new(),
         exit: vec![BTreeMap::new(); func.blocks.len()],
         merged: vec![Vec::new(); func.blocks.len()],
-        live_in: live_nodes(func, analysis, doms),
+        live_in: live_nodes(func, analysis, cfg),
         constants: BTreeMap::new(),
         materialized: BTreeMap::new(),
         params_added: 0,
@@ -1995,7 +2002,7 @@ fn rewrite(
 /// A forward *must* analysis (intersection over predecessors), which is exactly "created in a
 /// block that dominates this one". It is computed up front so the rewrite knows a loop header's
 /// parameter layout before the latch that feeds it is walked.
-fn live_nodes(func: &Func, analysis: &Analysis, doms: &Dominators) -> Vec<BTreeSet<NodeId>> {
+fn live_nodes(func: &Func, analysis: &Analysis, cfg: &Cfg) -> Vec<BTreeSet<NodeId>> {
     let blocks = func.blocks.len();
     let all: BTreeSet<NodeId> = (0..analysis.nodes.len())
         .filter(|node| !analysis.escaped.contains(node))
@@ -2004,25 +2011,22 @@ fn live_nodes(func: &Func, analysis: &Analysis, doms: &Dominators) -> Vec<BTreeS
     for node in &all {
         created[analysis.nodes[*node].block.0 as usize].insert(*node);
     }
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); blocks];
-    for &id in &doms.rpo {
-        for target in func.blocks[id.0 as usize].term.successors() {
-            preds[target.0 as usize].push(id.0 as usize);
-        }
-    }
     let mut live_in: Vec<BTreeSet<NodeId>> = vec![all; blocks];
     live_in[0] = BTreeSet::new();
     loop {
         let mut changed = false;
-        for &id in &doms.rpo {
+        for &id in &cfg.doms.rpo {
             let index = id.0 as usize;
             if index == 0 {
                 continue;
             }
             let mut next: Option<BTreeSet<NodeId>> = None;
-            for pred in &preds[index] {
-                let out: BTreeSet<NodeId> =
-                    live_in[*pred].union(&created[*pred]).copied().collect();
+            for pred in cfg.reachable_preds(id) {
+                let pred_idx = pred.0 as usize;
+                let out: BTreeSet<NodeId> = live_in[pred_idx]
+                    .union(&created[pred_idx])
+                    .copied()
+                    .collect();
                 next = Some(match next {
                     None => out,
                     Some(current) => current.intersection(&out).copied().collect(),
@@ -2044,7 +2048,7 @@ struct Rewriter<'a> {
     old: &'a Func,
     table: &'a TypeTable,
     analysis: &'a Analysis,
-    doms: &'a Dominators,
+    cfg: &'a Cfg,
     builder: FuncBuilder,
     /// Old value to new value, for every value that survives.
     map: BTreeMap<ValueId, ValueId>,
@@ -2100,7 +2104,7 @@ impl Rewriter<'_> {
             let new = self.builder.param(def.ty, def.origin);
             self.retain(param, new);
         }
-        let rpo = self.doms.rpo.clone();
+        let rpo = self.cfg.doms.rpo.clone();
         for id in &rpo {
             let mut state = self.enter(*id)?;
             self.ops(*id, &mut state)?;
@@ -2176,17 +2180,10 @@ impl Rewriter<'_> {
     /// The reachable predecessors of `id` already walked, and whether any is a back edge — which
     /// makes `id` a loop header, whose every live field takes a parameter.
     fn incoming_blocks(&self, id: RBlockId) -> (Vec<RBlockId>, bool) {
-        let order = |block: RBlockId| self.doms.order[block.0 as usize];
+        let order = |block: RBlockId| self.cfg.doms.order[block.0 as usize];
         let mut processed = Vec::new();
         let mut header = false;
-        for &pred in &self.doms.rpo {
-            if !self.old.blocks[pred.0 as usize]
-                .term
-                .successors()
-                .contains(&id)
-            {
-                continue;
-            }
+        for pred in self.cfg.reachable_preds(id) {
             if order(pred) < order(id) {
                 processed.push(pred);
             } else {
@@ -2869,130 +2866,23 @@ impl Rewriter<'_> {
         Some(self.builder.op(block, kind, def.ty, def.origin))
     }
 
-    /// Rewrites every value an op reads to its new id. Mirrors `OpKind::for_each_use`.
+    /// Rewrites every value an op reads to its new id.
     fn remap(&self, kind: &mut OpKind) -> Option<()> {
-        if !kind.uses().iter().all(|v| self.map.contains_key(v)) {
+        let mut all_mapped = true;
+        kind.for_each_use(|v| {
+            if !self.map.contains_key(&v) {
+                all_mapped = false;
+            }
+        });
+        if !all_mapped {
             return None;
         }
-        let map = &self.map;
-        let mut one = |v: &mut ValueId| {
-            if let Some(new) = map.get(v) {
-                *v = *new;
+        kind.visit_values_mut(|v| {
+            if let Some(&new) = self.map.get(v) {
+                *v = new;
             }
-        };
-        let f: &mut dyn FnMut(&mut ValueId) = &mut one;
-        let path = |path: &mut Vec<Proj>, f: &mut dyn FnMut(&mut ValueId)| {
-            for proj in path {
-                if let Proj::Index(v) = proj {
-                    f(v);
-                }
-            }
-        };
-        let root = |root: &mut Root, f: &mut dyn FnMut(&mut ValueId)| {
-            if let Root::Value(v) = root {
-                f(v);
-            }
-        };
-        match kind {
-            OpKind::Const(_)
-            | OpKind::CellAlloc(_)
-            | OpKind::CellLoad(_)
-            | OpKind::Zombie(_)
-            | OpKind::SpillRead(_) => {}
-            OpKind::Copy(v)
-            | OpKind::Move(v)
-            | OpKind::Repeat { v, .. }
-            | OpKind::Field { base: v, .. }
-            | OpKind::Discriminant(v)
-            | OpKind::SetDiscriminant { base: v, .. }
-            | OpKind::CellStore { v, .. }
-            | OpKind::SpillWrite { v, .. }
-            | OpKind::Deref(v)
-            | OpKind::Unary { v, .. }
-            | OpKind::Cast { v, .. }
-            | OpKind::Materialize(v)
-            | OpKind::Convert { v, .. } => f(v),
-            OpKind::Aggregate { fields, .. } => fields.iter_mut().for_each(&mut *f),
-            OpKind::SetField { base, v, .. } => {
-                f(base);
-                f(v);
-            }
-            OpKind::BorrowView {
-                root: r, path: p, ..
-            }
-            | OpKind::RawView {
-                root: r, path: p, ..
-            }
-            | OpKind::Drop {
-                root: r, path: p, ..
-            } => {
-                root(r, &mut *f);
-                path(p, &mut *f);
-            }
-            OpKind::SliceView { ptr, len } => {
-                f(ptr);
-                f(len);
-            }
-            OpKind::StoreThrough { ptr, v } => {
-                f(ptr);
-                f(v);
-            }
-            OpKind::Binary { l, r, .. } => {
-                f(l);
-                f(r);
-            }
-            OpKind::Call { function, args, .. } => {
-                if let Some(function) = function {
-                    f(function);
-                }
-                args.iter_mut().for_each(&mut *f);
-            }
-            OpKind::Intrinsic { args, .. } | OpKind::Host { args, .. } => {
-                args.iter_mut().for_each(&mut *f)
-            }
-            OpKind::Assert { cond, msg, .. } => {
-                f(cond);
-                remap_message(msg, f);
-            }
-        }
+        });
         Some(())
-    }
-}
-
-fn remap_message(msg: &mut RAssertMessage, f: &mut dyn FnMut(&mut ValueId)) {
-    match msg {
-        RAssertMessage::BoundsCheck {
-            length: a,
-            index: b,
-        }
-        | RAssertMessage::Overflow {
-            left: a, right: b, ..
-        }
-        | RAssertMessage::MisalignedPointer {
-            required: a,
-            found: b,
-        } => {
-            f(a);
-            f(b);
-        }
-        RAssertMessage::OverflowNeg(v)
-        | RAssertMessage::DivisionByZero(v)
-        | RAssertMessage::RemainderByZero(v)
-        | RAssertMessage::InvalidEnum(v) => f(v),
-        RAssertMessage::ResumedAfterReturn(_)
-        | RAssertMessage::ResumedAfterPanic(_)
-        | RAssertMessage::ResumedAfterDrop(_)
-        | RAssertMessage::NullPointer
-        | RAssertMessage::NullReference => {}
-    }
-}
-
-/// `bits` truncated to `bytes` bytes.
-fn mask(bits: u128, bytes: u8) -> u128 {
-    match bytes {
-        0 => 0,
-        1..=15 => bits & ((1u128 << (u32::from(bytes) * 8)) - 1),
-        _ => bits,
     }
 }
 

@@ -34,7 +34,8 @@ use crate::jir::types::{EnumRepr, NominalForm, TypeKind};
 use crate::jir::TypeTable;
 use crate::lower::fuse::{op_purity, Purity};
 
-use super::witness::Witness;
+use super::cfg::{mask, mask_bits, Cfg};
+use super::witness::{ScalarBits, Witness};
 
 /// The fixpoint bound. A round that changes nothing stops earlier.
 const ROUNDS: usize = 4;
@@ -222,12 +223,7 @@ fn split_unsigned_checked_adds(func: &mut Func, table: &TypeTable) -> bool {
     for (pair, candidate) in &candidates {
         func.values[pair.0 as usize].ty = candidate.ty;
         if let Some(bool_ty) = candidate.bool_ty {
-            let overflow = ValueId(func.values.len() as u32);
-            func.values.push(crate::jir::repr::ValueDef {
-                ty: bool_ty,
-                carrier: crate::jir::repr::Carrier::Baseline,
-                origin: candidate.origin,
-            });
+            let overflow = func.push_value(bool_ty, Carrier::Baseline, candidate.origin);
             overflow_values.insert(*pair, overflow);
         }
     }
@@ -295,130 +291,133 @@ fn split_unsigned_checked_adds(func: &mut Func, table: &TypeTable) -> bool {
     true
 }
 
-/// Rewrites `AddWithOverflow(x, 1)` at signed `iN` (`N >= 2`) to `Add(x, 1)` + `overflow = false`
-/// when dominated by a `Switch` edge proving `x < y` at the same signed type `iN`.
-///
-/// For any two's-complement signed integer `x < y` (`x, y: iN`), `x <= iN::MAX - 1` and
-/// `x >= iN::MIN`, so `x + 1` is strictly within `[iN::MIN + 1, iN::MAX]` and cannot overflow.
-/// This removes the `unreachable_unchecked` branch and panic payload inside `Range<iN>::next`.
-fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
-    let n_values = func.values.len();
-    let n_blocks = func.blocks.len();
-    if n_blocks == 0 {
-        return false;
-    }
+#[derive(Clone, Copy)]
+struct SignedStepCandidate {
+    ty: TypeId,
+    has_ovf_proj: bool,
+    valid: bool,
+}
 
-    let mut has_signed_add_ovf = false;
-    let mut defs: Vec<Option<(usize, usize)>> = vec![None; n_values];
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            if let Some(result) = op.result {
-                defs[result.0 as usize] = Some((b_idx, op_idx));
-            }
-            if let OpKind::Binary {
-                op: BinaryOp::AddWithOverflow,
-                ty,
-                ..
-            } = op.kind
-            {
-                if matches!(table.int_info(ty), Some((true, bits)) if bits >= 2) {
-                    has_signed_add_ovf = true;
+struct SignedStepCx<'a> {
+    func: &'a Func,
+    table: &'a TypeTable,
+    defs: Vec<Option<(usize, usize)>>,
+    reachable: Vec<bool>,
+    preds: Vec<Vec<(usize, Vec<ValueId>)>>,
+    single_edge: Vec<Option<ValueId>>,
+}
+
+impl<'a> SignedStepCx<'a> {
+    fn build(func: &'a Func, table: &'a TypeTable) -> Option<Self> {
+        let n_values = func.values.len();
+        let n_blocks = func.blocks.len();
+        if n_blocks == 0 {
+            return None;
+        }
+
+        let mut has_signed_add_ovf = false;
+        let mut defs: Vec<Option<(usize, usize)>> = vec![None; n_values];
+        for (b_idx, block) in func.blocks.iter().enumerate() {
+            for (op_idx, op) in block.ops.iter().enumerate() {
+                if let Some(result) = op.result {
+                    defs[result.0 as usize] = Some((b_idx, op_idx));
+                }
+                if let OpKind::Binary {
+                    op: BinaryOp::AddWithOverflow,
+                    ty,
+                    ..
+                } = op.kind
+                {
+                    if matches!(table.int_info(ty), Some((true, bits)) if bits >= 2) {
+                        has_signed_add_ovf = true;
+                    }
                 }
             }
         }
-    }
-    if !has_signed_add_ovf {
-        return false;
-    }
+        if !has_signed_add_ovf {
+            return None;
+        }
 
-    let doms = Dominators::of(func);
-    let mut reachable = vec![false; n_blocks];
-    reachable[0] = true;
-    let mut stack = vec![0usize];
-    while let Some(b) = stack.pop() {
-        for succ in func.blocks[b].term.successors() {
-            let s = succ.0 as usize;
-            if s < n_blocks && !reachable[s] {
-                reachable[s] = true;
-                stack.push(s);
-            }
-        }
-    }
-
-    let mut preds: Vec<Vec<(usize, Vec<ValueId>)>> = vec![Vec::new(); n_blocks];
-    for (pred_idx, block) in func.blocks.iter().enumerate() {
-        if !reachable[pred_idx] {
-            continue;
-        }
-        for (target, args) in block.term.edges() {
-            let t = target.0 as usize;
-            if t < n_blocks {
-                preds[t].push((pred_idx, args.to_vec()));
-            }
-        }
-    }
-
-    let mut single_edge: Vec<Option<ValueId>> = vec![None; n_values];
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        if b_idx == 0 || !reachable[b_idx] {
-            continue;
-        }
-        let mut unique_pred: Option<(usize, &[ValueId])> = None;
-        let mut ok = true;
-        for (pred_idx, args) in &preds[b_idx] {
-            match unique_pred {
-                None => unique_pred = Some((*pred_idx, args.as_slice())),
-                Some((prev, _)) if prev == *pred_idx => ok = false,
-                Some(_) => ok = false,
-            }
-        }
-        if let (true, Some((pred_idx, args))) = (ok, unique_pred) {
-            if pred_idx != b_idx && args.len() == block.params.len() {
-                for (&param, &arg) in block.params.iter().zip(args.iter()) {
-                    single_edge[param.0 as usize] = Some(arg);
+        let mut reachable = vec![false; n_blocks];
+        reachable[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            for succ in func.blocks[b].term.successors() {
+                let s = succ.0 as usize;
+                if s < n_blocks && !reachable[s] {
+                    reachable[s] = true;
+                    stack.push(s);
                 }
             }
         }
+
+        let mut preds: Vec<Vec<(usize, Vec<ValueId>)>> = vec![Vec::new(); n_blocks];
+        for (pred_idx, block) in func.blocks.iter().enumerate() {
+            if !reachable[pred_idx] {
+                continue;
+            }
+            for (target, args) in block.term.edges() {
+                let t = target.0 as usize;
+                if t < n_blocks {
+                    preds[t].push((pred_idx, args.to_vec()));
+                }
+            }
+        }
+
+        let mut single_edge: Vec<Option<ValueId>> = vec![None; n_values];
+        for (b_idx, block) in func.blocks.iter().enumerate() {
+            if b_idx == 0 || !reachable[b_idx] {
+                continue;
+            }
+            if let [(pred_idx, args)] = preds[b_idx].as_slice() {
+                if *pred_idx != b_idx && args.len() == block.params.len() {
+                    for (&param, &arg) in block.params.iter().zip(args.iter()) {
+                        single_edge[param.0 as usize] = Some(arg);
+                    }
+                }
+            }
+        }
+
+        Some(Self {
+            func,
+            table,
+            defs,
+            reachable,
+            preds,
+            single_edge,
+        })
     }
 
-    let def_op = |v: ValueId| -> Option<&Op> {
-        let (b, i) = defs.get(v.0 as usize).copied().flatten()?;
-        func.blocks.get(b)?.ops.get(i)
-    };
+    fn def_op(&self, v: ValueId) -> Option<&'a Op> {
+        let (b, i) = self.defs.get(v.0 as usize).copied().flatten()?;
+        self.func.blocks.get(b)?.ops.get(i)
+    }
 
-    let strip_aliases = |mut v: ValueId| -> ValueId {
+    fn strip_aliases(&self, mut v: ValueId) -> ValueId {
         for _ in 0..16 {
-            if let Some(op) = def_op(v) {
+            if let Some(op) = self.def_op(v) {
                 match op.kind {
                     OpKind::Copy(s) | OpKind::Move(s) => v = s,
                     _ => break,
                 }
-            } else if let Some(src) = single_edge.get(v.0 as usize).copied().flatten() {
+            } else if let Some(src) = self.single_edge.get(v.0 as usize).copied().flatten() {
                 v = src;
             } else {
                 break;
             }
         }
         v
-    };
+    }
 
-    let mask_bits = |x: u128, bits: u32| -> u128 {
-        match bits {
-            0 => 0,
-            1..=127 => x & ((1u128 << bits) - 1),
-            _ => x,
-        }
-    };
-
-    let eval_const_int = |start: ValueId| -> Option<(u128, TypeId)> {
+    fn eval_const_int(&self, start: ValueId) -> Option<(u128, TypeId)> {
         let mut chain: Vec<(bool, u32, u32, TypeId)> = Vec::new();
         let mut cur = start;
         let mut base: Option<(u128, TypeId)> = None;
         for _ in 0..16 {
-            if let Some(op) = def_op(cur) {
+            if let Some(op) = self.def_op(cur) {
                 match op.kind {
                     OpKind::Const(ConstTree::Scalar { bits, bytes }) => {
-                        base = Some((mask(bits, bytes), func.values[cur.0 as usize].ty));
+                        base = Some((mask(bits, bytes), self.func.values[cur.0 as usize].ty));
                         break;
                     }
                     OpKind::Copy(s) | OpKind::Move(s) => cur = s,
@@ -428,15 +427,15 @@ fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
                         from,
                         to,
                     } => {
-                        let (from_signed, from_bits) = table.int_info(from)?;
-                        let (_, to_bits) = table.int_info(to)?;
+                        let (from_signed, from_bits) = self.table.int_info(from)?;
+                        let (_, to_bits) = self.table.int_info(to)?;
                         chain.push((from_signed, from_bits, to_bits, to));
                         cur = v;
                     }
                     _ => return None,
                 }
             } else {
-                let src = single_edge.get(cur.0 as usize).copied().flatten()?;
+                let src = self.single_edge.get(cur.0 as usize).copied().flatten()?;
                 cur = src;
             }
         }
@@ -451,191 +450,194 @@ fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
             val_ty = to;
         }
         Some((val, val_ty))
-    };
+    }
 
-    let is_signed_one = |v: ValueId, target_ty: TypeId| -> bool {
-        let Some((true, bits)) = table.int_info(target_ty) else {
+    fn is_signed_one(&self, v: ValueId, target_ty: TypeId) -> bool {
+        let Some((true, bits)) = self.table.int_info(target_ty) else {
             return false;
         };
         if bits < 2 {
             return false;
         }
-        let Some((val, val_ty)) = eval_const_int(v) else {
+        let Some((val, val_ty)) = self.eval_const_int(v) else {
             return false;
         };
         val_ty == target_ty && signed_value(val, bits) == 1
-    };
+    }
 
-    // Collect edge facts `(target_block, x_root, signed_ty)` where entering `target_block`
-    // proves `x_root < some_y` at `signed_ty`.
-    let mut edge_facts: Vec<(RBlockId, ValueId, TypeId)> = Vec::new();
-    for t_idx in 1..n_blocks {
-        if !reachable[t_idx] || preds[t_idx].len() != 1 {
-            continue;
-        }
-        let pred_idx = preds[t_idx][0].0;
-        if pred_idx == t_idx {
-            continue;
-        }
-        let RTerm::Switch {
-            scrut,
-            scrut_ty,
-            cases,
-            default,
-        } = &func.blocks[pred_idx].term
-        else {
-            continue;
-        };
-        let t_id = RBlockId(t_idx as u32);
-        let width_bytes = table
-            .int_info(*scrut_ty)
-            .map_or(1, |(_, bits)| (bits / 8).max(1) as u8);
-        let mut reaches_t = false;
-        let mut all_nonzero = true;
-        for (val, target, _) in cases {
-            if *target == t_id {
-                reaches_t = true;
-                if mask(*val, width_bytes) == 0 {
-                    all_nonzero = false;
-                    break;
-                }
+    /// Collects edge facts `(target_block, x_root, signed_ty)` where entering `target_block`
+    /// proves `x_root < some_y` at `signed_ty`.
+    fn collect_lt_edge_facts(&self) -> Vec<(RBlockId, ValueId, TypeId)> {
+        let mut edge_facts: Vec<(RBlockId, ValueId, TypeId)> = Vec::new();
+        for t_idx in 1..self.func.blocks.len() {
+            if !self.reachable[t_idx] || self.preds[t_idx].len() != 1 {
+                continue;
             }
-        }
-        if default.0 == t_id {
-            reaches_t = true;
-            if !cases.iter().any(|(val, _, _)| mask(*val, width_bytes) == 0) {
-                all_nonzero = false;
+            let pred_idx = self.preds[t_idx][0].0;
+            if pred_idx == t_idx {
+                continue;
             }
-        }
-        if !reaches_t || !all_nonzero {
-            continue;
-        }
-        let scrut_root = strip_aliases(*scrut);
-        let Some(scrut_op) = def_op(scrut_root) else {
-            continue;
-        };
-        let OpKind::Binary {
-            op: cmp_op @ (BinaryOp::Lt | BinaryOp::Gt),
-            l,
-            r,
-            ty: cmp_ty,
-        } = scrut_op.kind
-        else {
-            continue;
-        };
-        if !matches!(table.int_info(cmp_ty), Some((true, bits)) if bits >= 2) {
-            continue;
-        }
-        let x = if cmp_op == BinaryOp::Lt { l } else { r };
-        edge_facts.push((t_id, strip_aliases(x), cmp_ty));
-    }
-    if edge_facts.is_empty() {
-        return false;
-    }
-
-    #[derive(Clone, Copy)]
-    struct Candidate {
-        ty: TypeId,
-        has_ovf_proj: bool,
-        valid: bool,
-    }
-
-    let mut candidates: BTreeMap<ValueId, Candidate> = BTreeMap::new();
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        if !reachable[b_idx] {
-            continue;
-        }
-        let b_id = RBlockId(b_idx as u32);
-        for op in &block.ops {
-            let (
-                Some(result),
-                OpKind::Binary {
-                    op: BinaryOp::AddWithOverflow,
-                    l,
-                    r,
-                    ty,
-                },
-            ) = (op.result, &op.kind)
+            let RTerm::Switch {
+                scrut,
+                scrut_ty,
+                cases,
+                default,
+            } = &self.func.blocks[pred_idx].term
             else {
                 continue;
             };
-            if !matches!(table.int_info(*ty), Some((true, bits)) if bits >= 2) {
+            let t_id = RBlockId(t_idx as u32);
+            let width_bytes = self
+                .table
+                .int_info(*scrut_ty)
+                .map_or(1, |(_, bits)| (bits / 8).max(1) as u8);
+            let mut reaches_t = false;
+            let mut all_nonzero = true;
+            for (val, target, _) in cases {
+                if *target == t_id {
+                    reaches_t = true;
+                    if mask(*val, width_bytes) == 0 {
+                        all_nonzero = false;
+                        break;
+                    }
+                }
+            }
+            if default.0 == t_id {
+                reaches_t = true;
+                if !cases.iter().any(|(val, _, _)| mask(*val, width_bytes) == 0) {
+                    all_nonzero = false;
+                }
+            }
+            if !reaches_t || !all_nonzero {
                 continue;
             }
-            let l_root = strip_aliases(*l);
-            let r_root = strip_aliases(*r);
-            let proven = (is_signed_one(*r, *ty)
-                && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
-                    fact_ty == *ty && fact_x == l_root && doms.dominates(fact_b, b_id)
-                }))
-                || (is_signed_one(*l, *ty)
-                    && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
-                        fact_ty == *ty && fact_x == r_root && doms.dominates(fact_b, b_id)
-                    }));
-            if proven {
-                candidates.insert(
-                    result,
-                    Candidate {
-                        ty: *ty,
-                        has_ovf_proj: false,
-                        valid: true,
-                    },
-                );
+            let scrut_root = self.strip_aliases(*scrut);
+            let Some(scrut_op) = self.def_op(scrut_root) else {
+                continue;
+            };
+            let OpKind::Binary {
+                op: cmp_op @ (BinaryOp::Lt | BinaryOp::Gt),
+                l,
+                r,
+                ty: cmp_ty,
+            } = scrut_op.kind
+            else {
+                continue;
+            };
+            if !matches!(self.table.int_info(cmp_ty), Some((true, bits)) if bits >= 2) {
+                continue;
             }
+            let x = if cmp_op == BinaryOp::Lt { l } else { r };
+            edge_facts.push((t_id, self.strip_aliases(x), cmp_ty));
         }
-    }
-    if candidates.is_empty() {
-        return false;
+        edge_facts
     }
 
-    for block in &func.blocks {
-        for op in &block.ops {
-            for used in op.kind.uses() {
-                let Some(cand) = candidates.get_mut(&used) else {
+    fn collect_proven_candidates(
+        &self,
+        doms: &Dominators,
+        edge_facts: &[(RBlockId, ValueId, TypeId)],
+    ) -> BTreeMap<ValueId, SignedStepCandidate> {
+        let mut candidates: BTreeMap<ValueId, SignedStepCandidate> = BTreeMap::new();
+        for (b_idx, block) in self.func.blocks.iter().enumerate() {
+            if !self.reachable[b_idx] {
+                continue;
+            }
+            let b_id = RBlockId(b_idx as u32);
+            for op in &block.ops {
+                let (
+                    Some(result),
+                    OpKind::Binary {
+                        op: BinaryOp::AddWithOverflow,
+                        l,
+                        r,
+                        ty,
+                    },
+                ) = (op.result, &op.kind)
+                else {
                     continue;
                 };
-                match (&op.kind, op.result) {
-                    (
-                        OpKind::Field {
-                            base,
-                            variant: None,
-                            field: 0,
+                if !matches!(self.table.int_info(*ty), Some((true, bits)) if bits >= 2) {
+                    continue;
+                }
+                let l_root = self.strip_aliases(*l);
+                let r_root = self.strip_aliases(*r);
+                let proven = (self.is_signed_one(*r, *ty)
+                    && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
+                        fact_ty == *ty && fact_x == l_root && doms.dominates(fact_b, b_id)
+                    }))
+                    || (self.is_signed_one(*l, *ty)
+                        && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
+                            fact_ty == *ty && fact_x == r_root && doms.dominates(fact_b, b_id)
+                        }));
+                if proven {
+                    candidates.insert(
+                        result,
+                        SignedStepCandidate {
+                            ty: *ty,
+                            has_ovf_proj: false,
+                            valid: true,
                         },
-                        Some(result),
-                    ) if *base == used && func.values[result.0 as usize].ty == cand.ty => {}
-                    (
-                        OpKind::Field {
-                            base,
-                            variant: None,
-                            field: 1,
-                        },
-                        Some(result),
-                    ) if *base == used
-                        && matches!(
-                            table
-                                .get(func.values[result.0 as usize].ty)
-                                .map(|d| &d.kind),
-                            Some(TypeKind::Bool)
-                        ) =>
-                    {
-                        cand.has_ovf_proj = true;
-                    }
-                    _ => cand.valid = false,
+                    );
                 }
             }
         }
-        for used in block.term.uses() {
-            if let Some(cand) = candidates.get_mut(&used) {
-                cand.valid = false;
-            }
-        }
-    }
-    candidates.retain(|_, cand| cand.valid && cand.has_ovf_proj);
-    if candidates.is_empty() {
-        return false;
+        candidates
     }
 
-    for (&pair, cand) in &candidates {
+    fn validate_candidate_uses(&self, candidates: &mut BTreeMap<ValueId, SignedStepCandidate>) {
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                for used in op.kind.uses() {
+                    let Some(cand) = candidates.get_mut(&used) else {
+                        continue;
+                    };
+                    match (&op.kind, op.result) {
+                        (
+                            OpKind::Field {
+                                base,
+                                variant: None,
+                                field: 0,
+                            },
+                            Some(result),
+                        ) if *base == used && self.func.values[result.0 as usize].ty == cand.ty => {
+                        }
+                        (
+                            OpKind::Field {
+                                base,
+                                variant: None,
+                                field: 1,
+                            },
+                            Some(result),
+                        ) if *base == used
+                            && matches!(
+                                self.table
+                                    .get(self.func.values[result.0 as usize].ty)
+                                    .map(|d| &d.kind),
+                                Some(TypeKind::Bool)
+                            ) =>
+                        {
+                            cand.has_ovf_proj = true;
+                        }
+                        _ => cand.valid = false,
+                    }
+                }
+            }
+            for used in block.term.uses() {
+                if let Some(cand) = candidates.get_mut(&used) {
+                    cand.valid = false;
+                }
+            }
+        }
+        candidates.retain(|_, cand| cand.valid && cand.has_ovf_proj);
+    }
+}
+
+fn rewrite_signed_step_candidates(
+    func: &mut Func,
+    candidates: &BTreeMap<ValueId, SignedStepCandidate>,
+) {
+    for (&pair, cand) in candidates {
         func.values[pair.0 as usize].ty = cand.ty;
     }
     for block in &mut func.blocks {
@@ -673,6 +675,35 @@ fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
             }
         }
     }
+}
+
+/// Rewrites `AddWithOverflow(x, 1)` at signed `iN` (`N >= 2`) to `Add(x, 1)` + `overflow = false`
+/// when dominated by a `Switch` edge proving `x < y` at the same signed type `iN`.
+///
+/// For any two's-complement signed integer `x < y` (`x, y: iN`), `x <= iN::MAX - 1` and
+/// `x >= iN::MIN`, so `x + 1` is strictly within `[iN::MIN + 1, iN::MAX]` and cannot overflow.
+/// This removes the `unreachable_unchecked` branch and panic payload inside `Range<iN>::next`.
+fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
+    let candidates = {
+        let Some(cx) = SignedStepCx::build(func, table) else {
+            return false;
+        };
+        let edge_facts = cx.collect_lt_edge_facts();
+        if edge_facts.is_empty() {
+            return false;
+        }
+        let doms = Dominators::of(func);
+        let mut candidates = cx.collect_proven_candidates(&doms, &edge_facts);
+        if candidates.is_empty() {
+            return false;
+        }
+        cx.validate_candidate_uses(&mut candidates);
+        candidates
+    };
+    if candidates.is_empty() {
+        return false;
+    }
+    rewrite_signed_step_candidates(func, &candidates);
     true
 }
 
@@ -1030,15 +1061,6 @@ fn compact_values(func: &mut Func) {
     crate::lower::ssa::compact_values(func, &dead);
 }
 
-/// Pointer metadata helper shared by constant-reference folding and ref<->raw round-trip elision.
-fn ptr_info(table: &TypeTable, ty: TypeId) -> Option<(bool, TypeId)> {
-    match &table.get(table.peeled(ty))?.kind {
-        TypeKind::Reference { pointee, .. } => Some((false, *pointee)),
-        TypeKind::RawPointer { pointee, .. } => Some((true, *pointee)),
-        _ => None,
-    }
-}
-
 /// Whether `tree` is a self-contained value tree that can materialize directly as `OpKind::Const`
 /// for a direct, non-cloned type.
 fn is_direct_const_tree(tree: &ConstTree) -> bool {
@@ -1124,13 +1146,16 @@ fn fold_const_ref_derefs(func: &mut Func, table: &TypeTable) -> bool {
                 }
                 match &op.kind {
                     OpKind::Const(ConstTree::Reference(inner)) => {
-                        if let Some((false, pointee)) = ptr_info(table, res_def.ty) {
+                        if let Some((pointee, _, false)) = table.ptr_info(res_def.ty) {
                             const_refs.insert(result, ((**inner).clone(), pointee));
                         }
                     }
                     OpKind::Copy(src) | OpKind::Move(src) => {
                         if let Some((tree, pointee)) = const_refs.get(src).cloned() {
-                            if ptr_info(table, res_def.ty) == Some((false, pointee)) {
+                            if table
+                                .ptr_info(res_def.ty)
+                                .is_some_and(|(pt, _, is_raw)| !is_raw && pt == pointee)
+                            {
                                 const_refs.insert(result, (tree, pointee));
                             }
                         }
@@ -1149,7 +1174,10 @@ fn fold_const_ref_derefs(func: &mut Func, table: &TypeTable) -> bool {
                         if let Some((sub_tree, sub_ty)) =
                             project_const_tree(table, &base_tree, base_ty, rest)
                         {
-                            if ptr_info(table, res_def.ty) == Some((false, sub_ty)) {
+                            if table
+                                .ptr_info(res_def.ty)
+                                .is_some_and(|(pt, _, is_raw)| !is_raw && pt == sub_ty)
+                            {
                                 const_refs.insert(result, (sub_tree.clone(), sub_ty));
                             }
                         }
@@ -1383,66 +1411,82 @@ fn forward_single_store_cells(func: &mut Func, table: &TypeTable) -> bool {
 /// `remove_dead_ops` and `remove_trivial_params` sweep the wrapper aggregate, its block parameters,
 /// and the `ref -> raw` cast (`__rt.box(b)`), while leaving any escaping or address-observed raw
 /// pointer untouched.
-fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum PtrProv {
-        RawOf {
-            root_raw: ValueId,
-            src_ref: ValueId,
-            src_ty: TypeId,
-            pointee: TypeId,
-        },
-        Wrapped {
-            root_raw: ValueId,
-            src_ref: ValueId,
-            src_ty: TypeId,
-            pointee: TypeId,
-        },
-    }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PtrProv {
+    RawOf {
+        root_raw: ValueId,
+        src_ref: ValueId,
+        src_ty: TypeId,
+        pointee: TypeId,
+    },
+    Wrapped {
+        root_raw: ValueId,
+        src_ref: ValueId,
+        src_ty: TypeId,
+        pointee: TypeId,
+    },
+}
 
-    impl PtrProv {
-        fn root_raw(self) -> ValueId {
-            match self {
-                Self::RawOf { root_raw, .. } | Self::Wrapped { root_raw, .. } => root_raw,
-            }
+impl PtrProv {
+    fn root_raw(self) -> ValueId {
+        match self {
+            Self::RawOf { root_raw, .. } | Self::Wrapped { root_raw, .. } => root_raw,
         }
     }
+}
 
-    let is_thin_indirect_pointee = |pt: TypeId| -> bool {
-        let peeled = table.peeled(pt);
-        table.is_indirect(pt)
-            && table.unsized_tail(pt).is_none()
-            && !matches!(
-                table.get(peeled).map(|d| &d.kind),
-                Some(
-                    TypeKind::Array { .. }
-                        | TypeKind::Slice(_)
-                        | TypeKind::Str
-                        | TypeKind::Dynamic { .. }
-                )
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RoundtripLat {
+    Top,
+    Known(PtrProv),
+    Bottom,
+}
+
+impl RoundtripLat {
+    fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Top, x) | (x, Self::Top) => x,
+            (Self::Known(x), Self::Known(y)) if x == y => Self::Known(x),
+            _ => Self::Bottom,
+        }
+    }
+}
+
+struct RoundtripSeed {
+    state: Vec<RoundtripLat>,
+    def_pos: Vec<Option<(RBlockId, Option<usize>)>>,
+    seeded: bool,
+}
+
+fn is_thin_indirect_pointee(table: &TypeTable, pt: TypeId) -> bool {
+    let peeled = table.peeled(pt);
+    table.is_indirect(pt)
+        && table.unsized_tail(pt).is_none()
+        && !matches!(
+            table.get(peeled).map(|d| &d.kind),
+            Some(
+                TypeKind::Array { .. }
+                    | TypeKind::Slice(_)
+                    | TypeKind::Str
+                    | TypeKind::Dynamic { .. }
             )
-    };
+        )
+}
 
-    let is_single_field_wrapper = |ty: TypeId| -> bool {
-        match table.get(table.peeled(ty)).map(|d| &d.kind) {
-            Some(TypeKind::Adt {
-                form: NominalForm::Struct,
-                variants,
-                ..
-            }) => variants.len() == 1 && variants[0].fields.len() == 1,
-            Some(TypeKind::Tuple(elems)) => elems.len() == 1,
-            _ => false,
-        }
-    };
-
-    if func.blocks.is_empty() {
-        return false;
+fn is_single_field_wrapper(table: &TypeTable, ty: TypeId) -> bool {
+    match table.get(table.peeled(ty)).map(|d| &d.kind) {
+        Some(TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        }) => variants.len() == 1 && variants[0].fields.len() == 1,
+        Some(TypeKind::Tuple(elems)) => elems.len() == 1,
+        _ => false,
     }
+}
 
+fn seed_roundtrip_lattice(func: &Func, table: &TypeTable, doms: &Dominators) -> RoundtripSeed {
     let n_values = func.values.len();
-    let n_blocks = func.blocks.len();
-    let doms = Dominators::of(func);
-
     let mut moved: BTreeSet<ValueId> = BTreeSet::new();
     let mut def_pos: Vec<Option<(RBlockId, Option<usize>)>> = vec![None; n_values];
     for block in &func.blocks {
@@ -1459,33 +1503,7 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    let dominates_op = |v: ValueId, use_block: RBlockId, use_op_idx: usize| -> bool {
-        let Some((db, dop)) = def_pos.get(v.0 as usize).copied().flatten() else {
-            return false;
-        };
-        if db == use_block {
-            dop.is_none_or(|di| di < use_op_idx)
-        } else {
-            doms.dominates(db, use_block)
-        }
-    };
-
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum Lat {
-        Top,
-        Known(PtrProv),
-        Bottom,
-    }
-
-    let meet = |a: Lat, b: Lat| -> Lat {
-        match (a, b) {
-            (Lat::Top, x) | (x, Lat::Top) => x,
-            (Lat::Known(x), Lat::Known(y)) if x == y => Lat::Known(x),
-            _ => Lat::Bottom,
-        }
-    };
-
-    let mut state: Vec<Lat> = vec![Lat::Bottom; n_values];
+    let mut state: Vec<RoundtripLat> = vec![RoundtripLat::Bottom; n_values];
     let mut seeded = false;
     for block in &func.blocks {
         if !doms.is_reachable(block.id) {
@@ -1494,7 +1512,7 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
         if block.id.0 > 0 {
             for &p in &block.params {
                 if func.values[p.0 as usize].carrier == Carrier::Baseline {
-                    state[p.0 as usize] = Lat::Top;
+                    state[p.0 as usize] = RoundtripLat::Top;
                 }
             }
         }
@@ -1521,16 +1539,17 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                     {
                         continue;
                     }
-                    let (Some((false, from_pt)), Some((true, to_pt))) =
-                        (ptr_info(table, *from), ptr_info(table, *to))
+                    let (Some((from_pt, _, false)), Some((to_pt, _, true))) =
+                        (table.ptr_info(*from), table.ptr_info(*to))
                     else {
                         continue;
                     };
                     let peeled_pt = table.peeled(from_pt);
-                    if peeled_pt != table.peeled(to_pt) || !is_thin_indirect_pointee(from_pt) {
+                    if peeled_pt != table.peeled(to_pt) || !is_thin_indirect_pointee(table, from_pt)
+                    {
                         continue;
                     }
-                    state[res.0 as usize] = Lat::Known(PtrProv::RawOf {
+                    state[res.0 as usize] = RoundtripLat::Known(PtrProv::RawOf {
                         root_raw: res,
                         src_ref: *src,
                         src_ty: *from,
@@ -1539,45 +1558,48 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                     seeded = true;
                 }
                 OpKind::Copy(_) | OpKind::Move(_) => {
-                    state[res.0 as usize] = Lat::Top;
+                    state[res.0 as usize] = RoundtripLat::Top;
                 }
                 OpKind::Aggregate {
                     ty,
                     variant: 0,
                     active_field: None,
                     fields,
-                } if fields.len() == 1 && is_single_field_wrapper(*ty) => {
-                    state[res.0 as usize] = Lat::Top;
+                } if fields.len() == 1 && is_single_field_wrapper(table, *ty) => {
+                    state[res.0 as usize] = RoundtripLat::Top;
                 }
                 OpKind::Field {
                     variant: None,
                     field: 0,
                     ..
-                } if ptr_info(table, res_def.ty).is_some_and(|(is_raw, _)| is_raw) => {
-                    state[res.0 as usize] = Lat::Top;
+                } if table
+                    .ptr_info(res_def.ty)
+                    .is_some_and(|(_, _, is_raw)| is_raw) =>
+                {
+                    state[res.0 as usize] = RoundtripLat::Top;
                 }
                 _ => {}
             }
         }
     }
-    if !seeded {
-        return false;
-    }
 
-    let mut incoming: Vec<Vec<Vec<ValueId>>> = vec![Vec::new(); n_blocks];
-    for block in &func.blocks {
-        if !doms.is_reachable(block.id) {
-            continue;
-        }
-        for (target, args) in block.term.edges() {
-            if let Some(slot) = incoming.get_mut(target.0 as usize) {
-                slot.push(args.to_vec());
-            }
-        }
+    RoundtripSeed {
+        state,
+        def_pos,
+        seeded,
     }
+}
 
-    // Optimistic greatest-fixpoint propagation across Copy/Move, single-field Aggregate/Field,
-    // and mutually-recursive BlockParam cycles (e.g. `while ... { fut.await }`).
+/// Optimistic greatest-fixpoint propagation across `Copy`/`Move`, single-field `Aggregate`/`Field`,
+/// and mutually-recursive block-parameter cycles (e.g. `while ... { fut.await }`).
+fn solve_roundtrip_fixpoint(
+    func: &Func,
+    table: &TypeTable,
+    cfg: &Cfg,
+    mut state: Vec<RoundtripLat>,
+) -> Vec<Option<PtrProv>> {
+    let doms = &cfg.doms;
+    let incoming = cfg.reachable_incoming_args(func);
     loop {
         let mut progress = false;
         for block in &func.blocks {
@@ -1591,14 +1613,14 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                         continue;
                     }
                     let next = if edges.is_empty() {
-                        Lat::Bottom
+                        RoundtripLat::Bottom
                     } else {
-                        let mut acc = Lat::Top;
+                        let mut acc = RoundtripLat::Top;
                         for args in edges {
                             acc = match args.get(pos) {
                                 Some(&arg) if arg == param => acc,
-                                Some(&arg) => meet(acc, state[arg.0 as usize]),
-                                None => Lat::Bottom,
+                                Some(&arg) => acc.meet(state[arg.0 as usize]),
+                                None => RoundtripLat::Bottom,
                             };
                         }
                         acc
@@ -1624,49 +1646,50 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                         variant: 0,
                         active_field: None,
                         fields,
-                    } if fields.len() == 1 && is_single_field_wrapper(*ty) => {
+                    } if fields.len() == 1 && is_single_field_wrapper(table, *ty) => {
                         match state[fields[0].0 as usize] {
-                            Lat::Top => Lat::Top,
-                            Lat::Known(PtrProv::RawOf {
+                            RoundtripLat::Top => RoundtripLat::Top,
+                            RoundtripLat::Known(PtrProv::RawOf {
                                 root_raw,
                                 src_ref,
                                 src_ty,
                                 pointee,
-                            }) => Lat::Known(PtrProv::Wrapped {
+                            }) => RoundtripLat::Known(PtrProv::Wrapped {
                                 root_raw,
                                 src_ref,
                                 src_ty,
                                 pointee,
                             }),
-                            _ => Lat::Bottom,
+                            _ => RoundtripLat::Bottom,
                         }
                     }
                     OpKind::Field {
                         base,
                         variant: None,
                         field: 0,
-                    } if ptr_info(table, func.values[res.0 as usize].ty)
-                        .is_some_and(|(is_raw, _)| is_raw) =>
+                    } if table
+                        .ptr_info(func.values[res.0 as usize].ty)
+                        .is_some_and(|(_, _, is_raw)| is_raw) =>
                     {
                         match state[base.0 as usize] {
-                            Lat::Top => Lat::Top,
-                            Lat::Known(PtrProv::Wrapped {
+                            RoundtripLat::Top => RoundtripLat::Top,
+                            RoundtripLat::Known(PtrProv::Wrapped {
                                 root_raw,
                                 src_ref,
                                 src_ty,
                                 pointee,
-                            }) if ptr_info(table, func.values[res.0 as usize].ty).is_some_and(
-                                |(is_raw, pt)| is_raw && table.peeled(pt) == pointee,
+                            }) if table.ptr_info(func.values[res.0 as usize].ty).is_some_and(
+                                |(pt, _, is_raw)| is_raw && table.peeled(pt) == pointee,
                             ) =>
                             {
-                                Lat::Known(PtrProv::RawOf {
+                                RoundtripLat::Known(PtrProv::RawOf {
                                     root_raw,
                                     src_ref,
                                     src_ty,
                                     pointee,
                                 })
                             }
-                            _ => Lat::Bottom,
+                            _ => RoundtripLat::Bottom,
                         }
                     }
                     _ => cur,
@@ -1682,16 +1705,35 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    let prov: Vec<Option<PtrProv>> = state
+    state
         .into_iter()
         .map(|s| match s {
-            Lat::Known(p) => Some(p),
-            Lat::Top | Lat::Bottom => None,
+            RoundtripLat::Known(p) => Some(p),
+            RoundtripLat::Top | RoundtripLat::Bottom => None,
         })
-        .collect();
+        .collect()
+}
 
-    // Verify each `root_raw` family is completely non-escaping and never written/observed as a raw
-    // pointer; any other use taints its root family so we preserve `__rt.box` faithfully.
+/// Verifies each `root_raw` family is completely non-escaping and never written/observed as a raw
+/// pointer, returning the safe `(block_idx, op_idx, replacement_kind)` rewrites for untainted roots.
+fn collect_untainted_consumers(
+    func: &Func,
+    table: &TypeTable,
+    doms: &Dominators,
+    def_pos: &[Option<(RBlockId, Option<usize>)>],
+    prov: &[Option<PtrProv>],
+) -> Vec<(usize, usize, OpKind)> {
+    let dominates_op = |v: ValueId, use_block: RBlockId, use_op_idx: usize| -> bool {
+        let Some((db, dop)) = def_pos.get(v.0 as usize).copied().flatten() else {
+            return false;
+        };
+        if db == use_block {
+            dop.is_none_or(|di| di < use_op_idx)
+        } else {
+            doms.dominates(db, use_block)
+        }
+    };
+
     let mut tainted: BTreeSet<ValueId> = BTreeSet::new();
     let mut consumers: Vec<(usize, usize, ValueId, OpKind)> = Vec::new();
     for (b_idx, block) in func.blocks.iter().enumerate() {
@@ -1736,7 +1778,7 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                             },
                             Some(res),
                         ) if func.values[res.0 as usize].carrier == Carrier::Baseline
-                            && ptr_info(table, *to).is_some_and(|(is_raw, to_pt)| {
+                            && table.ptr_info(*to).is_some_and(|(to_pt, _, is_raw)| {
                                 !is_raw && table.peeled(to_pt) == pointee
                             })
                             && dominates_op(src_ref, block.id, op_idx) =>
@@ -1763,8 +1805,7 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
                             },
                             Some(res),
                         ) if func.values[res.0 as usize].carrier == Carrier::Baseline
-                            && ptr_info(table, src_ty).map(|(_, pt)| pt)
-                                == Some(func.values[res.0 as usize].ty)
+                            && table.pointee(src_ty) == Some(func.values[res.0 as usize].ty)
                             && dominates_op(src_ref, block.id, op_idx) =>
                         {
                             consumers.push((b_idx, op_idx, root, OpKind::Deref(src_ref)));
@@ -1810,13 +1851,27 @@ fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    let mut changed = false;
-    for (b_idx, op_idx, root, new_kind) in consumers {
-        if tainted.contains(&root) {
-            continue;
-        }
+    consumers
+        .into_iter()
+        .filter(|(_, _, root, _)| !tainted.contains(root))
+        .map(|(b_idx, op_idx, _, new_kind)| (b_idx, op_idx, new_kind))
+        .collect()
+}
+
+fn elide_ref_raw_roundtrips(func: &mut Func, table: &TypeTable) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let cfg = Cfg::of(func);
+    let seed = seed_roundtrip_lattice(func, table, &cfg.doms);
+    if !seed.seeded {
+        return false;
+    }
+    let prov = solve_roundtrip_fixpoint(func, table, &cfg, seed.state);
+    let consumers = collect_untainted_consumers(func, table, &cfg.doms, &seed.def_pos, &prov);
+    let changed = !consumers.is_empty();
+    for (b_idx, op_idx, new_kind) in consumers {
         func.blocks[b_idx].ops[op_idx].kind = new_kind;
-        changed = true;
     }
     changed
 }
@@ -1941,8 +1996,14 @@ fn fold_constant_comparisons(
             witnesses.push(Witness::ConstFold {
                 op: witness_op,
                 ty: *ty,
-                l: l_witness,
-                r: r_witness,
+                l: ScalarBits {
+                    bits: l_witness.0,
+                    bytes: l_witness.1,
+                },
+                r: ScalarBits {
+                    bits: r_witness.0,
+                    bytes: r_witness.1,
+                },
                 result: value,
             });
             op.kind = OpKind::Const(ConstTree::Scalar {
@@ -1976,7 +2037,7 @@ fn remove_settled_asserts(func: &mut Func) -> bool {
     let mut changed = false;
     for block in &mut func.blocks {
         let before = block.ops.len();
-        block.ops.retain(|op| match &op.kind {
+        block.retain_ops_preserving_protected(|_, op| match &op.kind {
             OpKind::Assert { cond, expected, .. } => match constants.get(cond) {
                 Some((bits, bytes)) => (mask(*bits, *bytes) != 0) != *expected,
                 None => true,
@@ -2167,10 +2228,10 @@ fn fold_constant_switches(
             bytes,
             cases: cases
                 .iter()
-                .map(|(case, target, _)| (*case, target.0))
+                .map(|(case, target, _)| (*case, *target))
                 .collect(),
-            default: default.0 .0,
-            taken: taken.0 .0,
+            default: default.0,
+            taken: taken.0,
         });
         block.term = RTerm::Goto(taken.0, taken.1);
         changed = true;
@@ -2235,15 +2296,6 @@ fn uninhabited(table: &TypeTable, ty: TypeId) -> bool {
             ..
         }) => variants.is_empty(),
         _ => false,
-    }
-}
-
-/// `bits` truncated to `bytes` bytes; `bytes >= 16` is the identity.
-fn mask(bits: u128, bytes: u8) -> u128 {
-    match bytes {
-        0 => 0,
-        1..=15 => bits & ((1u128 << (bytes as u32 * 8)) - 1),
-        _ => bits,
     }
 }
 
@@ -2367,9 +2419,9 @@ fn thread_one_merge(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witn
             witnesses.push(Witness::BranchFold {
                 scrut: discr as u128,
                 bytes: width,
-                cases: cases.iter().map(|(case, t, _)| (*case, t.0)).collect(),
-                default: default.0 .0,
-                taken: taken.0,
+                cases: cases.iter().map(|(case, t, _)| (*case, *t)).collect(),
+                default: default.0,
+                taken,
             });
             retargets.push((pred, edge, taken, mapped));
         }
@@ -2377,8 +2429,17 @@ fn thread_one_merge(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witn
             continue;
         }
         for (pred, edge, target, args) in retargets {
-            *edge_args_mut(&mut func.blocks[pred].term)[edge].1 = args;
-            retarget_edge(&mut func.blocks[pred].term, edge, target);
+            let mut args = Some(args);
+            let mut idx = 0usize;
+            func.blocks[pred].term.edges_mut(|t, a| {
+                if idx == edge {
+                    *t = target;
+                    if let Some(new_args) = args.take() {
+                        *a = new_args;
+                    }
+                }
+                idx += 1;
+            });
         }
         return true;
     }
@@ -2509,20 +2570,18 @@ fn localize_merge_values(func: &mut Func, merge_id: RBlockId) -> bool {
         let arm = covering[use_block];
         for &v in used {
             needed.entry((arm, v)).or_insert_with(|| {
-                let id = ValueId(func.values.len() as u32);
                 let def = func.values[v.0 as usize];
-                func.values.push(def);
-                id
+                func.push_value(def.ty, def.carrier, def.origin)
             });
         }
     }
     for (&(arm, v), &fresh) in &needed {
         func.blocks[arm as usize].params.push(fresh);
-        for (target, args) in edge_args_mut(&mut func.blocks[merge_index].term) {
+        func.blocks[merge_index].term.edges_mut(|target, args| {
             if target.0 == arm {
                 args.push(v);
             }
-        }
+        });
     }
     for (use_block, used) in &use_blocks {
         let arm = covering[use_block];
@@ -2531,14 +2590,13 @@ fn localize_merge_values(func: &mut Func, merge_id: RBlockId) -> bool {
         let rewrite = |v: ValueId| map.get(&v).copied().unwrap_or(v);
         let block = &mut func.blocks[*use_block as usize];
         for op in &mut block.ops {
-            crate::lower::ssa::rewrite_op(&mut op.kind, &rewrite);
+            op.kind.visit_values_mut(|v| *v = rewrite(*v));
         }
-        crate::lower::ssa::rewrite_term(&mut block.term, &rewrite);
+        block.term.visit_values_mut(|v| *v = rewrite(*v));
     }
     true
 }
 
-/// Sets the target of edge `edge` (in [`edge_args_mut`] order) of `term`.
 /// Payload merge splitting: an enum merge parameter used only as one variant's fields is
 /// replaced by a parameter per field, each incoming edge passing the field values instead of
 /// the whole object.
@@ -2573,11 +2631,33 @@ fn split_payload_merges(func: &mut Func, table: &TypeTable) -> bool {
     changed
 }
 
-/// One splitting step: finds the first splittable merge parameter and rewrites it. Reports
-/// whether it did anything.
-fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
-    use crate::jir::repr::{Carrier, RBlock, ValueDef};
+type PayloadProj = (usize, usize, u32, ValueId, crate::jir::origin::OriginId);
 
+struct PayloadMergeIndex {
+    pinned: Vec<bool>,
+    agg_fields: BTreeMap<ValueId, (u32, Vec<ValueId>)>,
+    discr_base: BTreeMap<ValueId, ValueId>,
+    is_merge_param: Vec<bool>,
+    invalid: Vec<bool>,
+    param_variant: Vec<Option<u32>>,
+    param_projs: BTreeMap<ValueId, Vec<PayloadProj>>,
+    incoming: Vec<Vec<(usize, usize)>>,
+}
+
+enum PayloadEdgePlan {
+    Direct(Vec<ValueId>),
+    Split { arg: ValueId },
+}
+
+struct PayloadSplitPlan {
+    merge_index: usize,
+    position: usize,
+    variant: u32,
+    projections: Vec<PayloadProj>,
+    edges: Vec<(usize, usize, PayloadEdgePlan)>,
+}
+
+fn index_payload_merges(func: &Func, table: &TypeTable) -> Option<PayloadMergeIndex> {
     // The unpinned enum aggregates, with their field values: the direct-pass edges.
     let pinned = pinned_values(func);
     let built = built_unpinned(func, table);
@@ -2607,7 +2687,7 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
     }
 
     if agg_fields.is_empty() {
-        return false;
+        return None;
     }
 
     // Pre-index all merge-block parameters, their uses, and incoming block edges in one linear
@@ -2623,8 +2703,7 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
     }
     let mut invalid = vec![false; n_values];
     let mut param_variant: Vec<Option<u32>> = vec![None; n_values];
-    type ProjList = Vec<(usize, usize, u32, ValueId, crate::jir::origin::OriginId)>;
-    let mut param_projs: BTreeMap<ValueId, ProjList> = BTreeMap::new();
+    let mut param_projs: BTreeMap<ValueId, Vec<PayloadProj>> = BTreeMap::new();
     let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); func.blocks.len()];
     for (block_index, block) in func.blocks.iter().enumerate() {
         for (op_index, op) in block.ops.iter().enumerate() {
@@ -2685,186 +2764,233 @@ fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
         }
     }
 
-    for (merge_index, merge_incoming) in incoming.iter().enumerate().skip(1) {
-        let merge_id = RBlockId(merge_index as u32);
-        'params: for position in 0..func.blocks[merge_index].params.len() {
+    Some(PayloadMergeIndex {
+        pinned,
+        agg_fields,
+        discr_base,
+        is_merge_param,
+        invalid,
+        param_variant,
+        param_projs,
+        incoming,
+    })
+}
+
+/// Validates and builds the per-edge rewrite plan for one candidate merge parameter.
+fn plan_payload_merge_edges(
+    func: &Func,
+    table: &TypeTable,
+    index: &PayloadMergeIndex,
+    merge_incoming: &[(usize, usize)],
+    position: usize,
+    variant: u32,
+    projections: &[PayloadProj],
+) -> Option<Vec<(usize, usize, PayloadEdgePlan)>> {
+    if projections.is_empty() {
+        return None;
+    }
+    let mut plans: Vec<(usize, usize, PayloadEdgePlan)> = Vec::new();
+    let mut direct = false;
+    for &(pred_index, edge) in merge_incoming {
+        let pred = &func.blocks[pred_index];
+        let (_, args) = pred.term.edges()[edge];
+        let &arg = args.get(position)?;
+        if let Some((built_variant, fields)) = index.agg_fields.get(&arg) {
+            if *built_variant != variant {
+                return None;
+            }
+            let values = projections
+                .iter()
+                .map(|&(_, _, field, _, _)| fields.get(field as usize).copied())
+                .collect::<Option<Vec<ValueId>>>()?;
+            plans.push((pred_index, edge, PayloadEdgePlan::Direct(values)));
+            direct = true;
+            continue;
+        }
+        // A switch proves only the discriminant. It does not prove that storage
+        // reachable through the opaque value stayed unchanged before this edge.
+        if index.pinned[arg.0 as usize] {
+            return None;
+        }
+        // A `Switch` case over the argument's own discriminant proves the variant on
+        // that edge; the default edge names no variant and refuses.
+        let RTerm::Switch {
+            scrut,
+            scrut_ty,
+            cases,
+            ..
+        } = &pred.term
+        else {
+            return None;
+        };
+        if index.discr_base.get(scrut) != Some(&arg) || edge >= cases.len() {
+            return None;
+        }
+        let arg_ty = func.values[arg.0 as usize].ty;
+        let variants = table.variants(table.peeled(arg_ty));
+        let discr = variants.get(variant as usize)?.logical_discr;
+        let width = table
+            .int_info(*scrut_ty)
+            .map_or(16, |(_, bits)| (bits / 8) as u8);
+        if mask(cases[edge].0, width) != mask(discr as u128, width) {
+            return None;
+        }
+        plans.push((pred_index, edge, PayloadEdgePlan::Split { arg }));
+    }
+    direct.then_some(plans)
+}
+
+fn find_splittable_payload_merge(
+    func: &Func,
+    table: &TypeTable,
+    index: &PayloadMergeIndex,
+) -> Option<PayloadSplitPlan> {
+    for (merge_index, merge_incoming) in index.incoming.iter().enumerate().skip(1) {
+        for position in 0..func.blocks[merge_index].params.len() {
             let param = func.blocks[merge_index].params[position];
             let p_idx = param.0 as usize;
-            if !is_merge_param[p_idx] || invalid[p_idx] {
+            if !index.is_merge_param[p_idx] || index.invalid[p_idx] {
                 continue;
             }
             // Every use must be a `Field` of one same downcast variant; anything else — another
             // op, an edge argument, a scrutinee, a return — keeps the object whole.
-            let Some(k) = param_variant[p_idx] else {
+            let Some(variant) = index.param_variant[p_idx] else {
                 continue;
             };
-            let Some(projections) = param_projs.get(&param) else {
+            let Some(projections) = index.param_projs.get(&param) else {
                 continue;
             };
-
             // Every projection's result becomes a parameter of its own — two reads of one field
             // simply bind the same passed value twice, which spares the rewrite any use
             // tracking (and a `Move` it must not duplicate).
-
-            // A plan per incoming edge, or the parameter is refused whole.
-            enum Plan {
-                Direct(Vec<ValueId>),
-                Split { arg: ValueId },
-            }
-            let mut plans: Vec<(usize, usize, Plan)> = Vec::new();
-            let mut direct = false;
-            for &(pred_index, edge) in merge_incoming {
-                let pred = &func.blocks[pred_index];
-                let (_, args) = pred.term.edges()[edge];
-                let Some(&arg) = args.get(position) else {
-                    continue 'params;
-                };
-                if let Some((built_variant, fields)) = agg_fields.get(&arg) {
-                    if *built_variant != k {
-                        continue 'params;
-                    }
-                    let Some(values) = projections
-                        .iter()
-                        .map(|&(_, _, field, _, _)| fields.get(field as usize).copied())
-                        .collect::<Option<Vec<ValueId>>>()
-                    else {
-                        continue 'params;
-                    };
-                    plans.push((pred_index, edge, Plan::Direct(values)));
-                    direct = true;
-                    continue;
-                }
-                // A switch proves only the discriminant. It does not prove that storage
-                // reachable through the opaque value stayed unchanged before this edge.
-                if pinned[arg.0 as usize] {
-                    continue 'params;
-                }
-                // A `Switch` case over the argument's own discriminant proves the variant on
-                // that edge; the default edge names no variant and refuses.
-                let RTerm::Switch {
-                    scrut,
-                    scrut_ty,
-                    cases,
-                    ..
-                } = &pred.term
-                else {
-                    continue 'params;
-                };
-                if discr_base.get(scrut) != Some(&arg) || edge >= cases.len() {
-                    continue 'params;
-                }
-                let arg_ty = func.values[arg.0 as usize].ty;
-                let variants = table.variants(table.peeled(arg_ty));
-                let Some(discr) = variants.get(k as usize).map(|v| v.logical_discr) else {
-                    continue 'params;
-                };
-                let width = table
-                    .int_info(*scrut_ty)
-                    .map_or(16, |(_, bits)| (bits / 8) as u8);
-                if mask(cases[edge].0, width) != mask(discr as u128, width) {
-                    continue 'params;
-                }
-                plans.push((pred_index, edge, Plan::Split { arg }));
-            }
-            if !direct || projections.is_empty() {
+            let Some(edges) = plan_payload_merge_edges(
+                func,
+                table,
+                index,
+                merge_incoming,
+                position,
+                variant,
+                projections,
+            ) else {
                 continue;
-            }
-
-            // The rewrite. Params first: every projection result becomes a parameter, in
-            // projection order, and the projection ops are deleted (descending op order keeps
-            // the indices valid within a block).
-            let new_params: Vec<ValueId> = projections
-                .iter()
-                .map(|&(_, _, _, result, _)| result)
-                .collect();
-            func.blocks[merge_index]
-                .params
-                .splice(position..=position, new_params);
-            let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            for &(block_index, op_index, _, _, _) in projections {
-                by_block.entry(block_index).or_default().push(op_index);
-            }
-            for (block_index, mut ops) in by_block {
-                ops.sort_unstable_by(|a, b| b.cmp(a));
-                for op_index in ops {
-                    func.blocks[block_index].ops.remove(op_index);
-                }
-            }
-            // The edges.
-            let origin = projections[0].4;
-            for (pred_index, edge, plan) in plans {
-                match plan {
-                    Plan::Direct(values) => {
-                        edge_args_mut(&mut func.blocks[pred_index].term)[edge]
-                            .1
-                            .splice(position..=position, values);
-                    }
-                    Plan::Split { arg } => {
-                        // A new block on the edge alone: the field reads the switch proved,
-                        // then the jump the edge was making, with the fields in the object's
-                        // place. One read per distinct field; a repeated projection binds the
-                        // same read twice.
-                        let mut args: Vec<ValueId> =
-                            func.blocks[pred_index].term.edges()[edge].1.to_vec();
-                        let mut values = Vec::with_capacity(projections.len());
-                        let mut ops = Vec::with_capacity(projections.len());
-                        for &(_, _, field, result, _) in projections {
-                            let value = ValueId(func.values.len() as u32);
-                            func.values.push(ValueDef {
-                                ty: func.values[result.0 as usize].ty,
-                                carrier: Carrier::Baseline,
-                                origin,
-                            });
-                            ops.push(Op {
-                                result: Some(value),
-                                origin,
-                                kind: OpKind::Field {
-                                    base: arg,
-                                    variant: Some(k),
-                                    field,
-                                },
-                            });
-                            values.push(value);
-                        }
-                        args.splice(position..=position, values);
-                        let split_id = RBlockId(func.blocks.len() as u32);
-                        func.blocks.push(RBlock {
-                            id: split_id,
-                            params: Vec::new(),
-                            ops,
-                            term: RTerm::Goto(merge_id, args),
-                        });
-                        let term = &mut func.blocks[pred_index].term;
-                        edge_args_mut(term)[edge].1.clear();
-                        retarget_edge(term, edge, split_id);
-                    }
-                }
-            }
-            return true;
+            };
+            return Some(PayloadSplitPlan {
+                merge_index,
+                position,
+                variant,
+                projections: projections.clone(),
+                edges,
+            });
         }
     }
-    false
+    None
 }
 
-fn retarget_edge(term: &mut RTerm, edge: usize, to: RBlockId) {
-    match term {
-        RTerm::Goto(target, _) => *target = to,
-        RTerm::Invoke { normal, unwind } => {
-            if edge == 0 {
-                normal.0 = to;
-            } else {
-                unwind.0 = to;
-            }
-        }
-        RTerm::Switch { cases, default, .. } => {
-            if edge < cases.len() {
-                cases[edge].1 = to;
-            } else {
-                default.0 = to;
-            }
-        }
-        RTerm::Return(_) | RTerm::Unreachable | RTerm::Throw(_) => {}
+fn apply_payload_merge_split(func: &mut Func, plan: PayloadSplitPlan) {
+    use crate::jir::repr::RBlock;
+
+    let PayloadSplitPlan {
+        merge_index,
+        position,
+        variant,
+        projections,
+        edges,
+    } = plan;
+    let merge_id = RBlockId(merge_index as u32);
+
+    // Params first: every projection result becomes a parameter, in projection order, and the
+    // projection ops are deleted (descending op order keeps the indices valid within a block).
+    let new_params: Vec<ValueId> = projections
+        .iter()
+        .map(|&(_, _, _, result, _)| result)
+        .collect();
+    func.blocks[merge_index]
+        .params
+        .splice(position..=position, new_params);
+    let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &(block_index, op_index, _, _, _) in &projections {
+        by_block.entry(block_index).or_default().push(op_index);
     }
+    for (block_index, mut ops) in by_block {
+        ops.sort_unstable_by(|a, b| b.cmp(a));
+        for op_index in ops {
+            func.blocks[block_index].ops.remove(op_index);
+        }
+    }
+
+    // Rewrite each incoming edge according to its plan.
+    let origin = projections[0].4;
+    for (pred_index, edge, edge_plan) in edges {
+        match edge_plan {
+            PayloadEdgePlan::Direct(values) => {
+                let mut values = Some(values);
+                let mut idx = 0usize;
+                func.blocks[pred_index].term.edges_mut(|_, args| {
+                    if idx == edge {
+                        if let Some(vals) = values.take() {
+                            args.splice(position..=position, vals);
+                        }
+                    }
+                    idx += 1;
+                });
+            }
+            PayloadEdgePlan::Split { arg } => {
+                // A new block on the edge alone: the field reads the switch proved,
+                // then the jump the edge was making, with the fields in the object's
+                // place. One read per distinct field; a repeated projection binds the
+                // same read twice.
+                let mut args: Vec<ValueId> = func.blocks[pred_index].term.edges()[edge].1.to_vec();
+                let mut values = Vec::with_capacity(projections.len());
+                let mut ops = Vec::with_capacity(projections.len());
+                for &(_, _, field, result, _) in &projections {
+                    let value = func.push_value(
+                        func.values[result.0 as usize].ty,
+                        Carrier::Baseline,
+                        origin,
+                    );
+                    ops.push(Op {
+                        result: Some(value),
+                        origin,
+                        kind: OpKind::Field {
+                            base: arg,
+                            variant: Some(variant),
+                            field,
+                        },
+                    });
+                    values.push(value);
+                }
+                args.splice(position..=position, values);
+                let split_id = RBlockId(func.blocks.len() as u32);
+                func.blocks.push(RBlock {
+                    id: split_id,
+                    params: Vec::new(),
+                    ops,
+                    term: RTerm::Goto(merge_id, args),
+                });
+                let mut idx = 0usize;
+                func.blocks[pred_index].term.edges_mut(|target, edge_args| {
+                    if idx == edge {
+                        edge_args.clear();
+                        *target = split_id;
+                    }
+                    idx += 1;
+                });
+            }
+        }
+    }
+}
+
+/// One splitting step: finds the first splittable merge parameter and rewrites it. Reports
+/// whether it did anything.
+fn split_one_payload_merge(func: &mut Func, table: &TypeTable) -> bool {
+    let Some(index) = index_payload_merges(func, table) else {
+        return false;
+    };
+    let Some(plan) = find_splittable_payload_merge(func, table, &index) else {
+        return false;
+    };
+    apply_payload_merge_split(func, plan);
+    true
 }
 
 /// Deletes the blocks the entry does not reach and renumbers the rest densely.
@@ -2902,29 +3028,14 @@ fn remove_unreachable_blocks(func: &mut Func) -> bool {
             continue;
         }
         block.id = remap[index].expect("a kept block has a new id");
-        for target in term_targets_mut(&mut block.term) {
+        block.term.targets_mut(|target| {
             // A successor of a reachable block is reachable, so the remap always has it.
             *target = remap[target.0 as usize].expect("a successor of a reachable block is kept");
-        }
+        });
         kept.push(block);
     }
     func.blocks = kept;
     true
-}
-
-/// Every successor id of a terminator, mutably.
-fn term_targets_mut(term: &mut RTerm) -> Vec<&mut RBlockId> {
-    match term {
-        RTerm::Goto(target, _) => vec![target],
-        RTerm::Invoke { normal, unwind } => vec![&mut normal.0, &mut unwind.0],
-        RTerm::Switch { cases, default, .. } => {
-            let mut targets: Vec<&mut RBlockId> =
-                cases.iter_mut().map(|(_, target, _)| target).collect();
-            targets.push(&mut default.0);
-            targets
-        }
-        RTerm::Return(_) | RTerm::Unreachable | RTerm::Throw(_) => Vec::new(),
-    }
 }
 
 /// Deletes ops whose result nothing reads and whose own work is `Const` or `Read`.
@@ -2953,10 +3064,8 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
         for block in &func.blocks {
             // The final operation and Invoke form one exception boundary, even when a purity
             // oracle says the call has no ordinary effects and its result is otherwise dead.
-            if matches!(block.term, RTerm::Invoke { .. }) {
-                if let Some(result) = block.ops.last().and_then(|op| op.result) {
-                    mark(result, &mut used);
-                }
+            if let Some(result) = block.protected_op().and_then(|op| op.result) {
+                mark(result, &mut used);
             }
             for op in &block.ops {
                 match &op.kind {
@@ -2990,66 +3099,52 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
                     }
                     _ => {}
                 }
-                for v in op.kind.uses() {
-                    mark(v, &mut used);
-                }
+                op.kind.for_each_use(|v| mark(v, &mut used));
             }
-            for v in block.term.uses() {
-                mark(v, &mut used);
-            }
+            block.term.for_each_use(|v| mark(v, &mut used));
         }
         let mut round = false;
         for block in &mut func.blocks {
             let before = block.ops.len();
-            let is_invoke = matches!(block.term, RTerm::Invoke { .. });
-            let last_idx = before.saturating_sub(1);
-            let mut idx = 0usize;
-            block.ops.retain(|op| {
-                let cur_idx = idx;
-                idx += 1;
-                if is_invoke && cur_idx == last_idx {
-                    return true;
-                }
-                match op.result {
-                    Some(result) if !used[result.0 as usize] => match &op.kind {
-                        // Only a plain call is the oracle's to vouch for. A call the lowering
-                        // intercepts — a host payload, a `rcgjs.tc.*`/`rcgjs.host.*` marker, raw
-                        // JavaScript — is summarized by its Rust body, which is NOT what runs: the
-                        // DOM lowering replaces it with template/effect emission whose deletion is
-                        // observable (the trace regression this guard pins). The inliner's
-                        // `collect_sites` spells the same refusal.
-                        OpKind::Call {
-                            callee,
-                            host: None,
-                            semantic:
-                                CallSemantic::Ordinary
-                                | CallSemantic::Standard(_)
-                                | CallSemantic::GlobalAllocator,
-                            ..
-                        } => !pure_call.is_some_and(|oracle| oracle(callee)),
-                        OpKind::Call { .. } => true,
-                        kind => op_purity(kind) == Purity::Effect,
-                    },
-                    None => match &op.kind {
-                        OpKind::CellAlloc(cell) => {
-                            used_cells.get(cell.0 as usize).copied().unwrap_or(true)
-                        }
-                        OpKind::CellStore { cell, .. } => {
-                            observed_cells.get(cell.0 as usize).copied().unwrap_or(true)
-                        }
-                        OpKind::Call {
-                            callee: Callee::Nop,
-                            host: None,
-                            semantic:
-                                CallSemantic::Ordinary
-                                | CallSemantic::Standard(_)
-                                | CallSemantic::GlobalAllocator,
-                            ..
-                        } => false,
-                        _ => true,
-                    },
+            block.retain_ops_preserving_protected(|_, op| match op.result {
+                Some(result) if !used[result.0 as usize] => match &op.kind {
+                    // Only a plain call is the oracle's to vouch for. A call the lowering
+                    // intercepts — a host payload, a `rcgjs.tc.*`/`rcgjs.host.*` marker, raw
+                    // JavaScript — is summarized by its Rust body, which is NOT what runs: the
+                    // DOM lowering replaces it with template/effect emission whose deletion is
+                    // observable (the trace regression this guard pins). The inliner's
+                    // `collect_sites` spells the same refusal.
+                    OpKind::Call {
+                        callee,
+                        host: None,
+                        semantic:
+                            CallSemantic::Ordinary
+                            | CallSemantic::Standard(_)
+                            | CallSemantic::GlobalAllocator,
+                        ..
+                    } => !pure_call.is_some_and(|oracle| oracle(callee)),
+                    OpKind::Call { .. } => true,
+                    kind => op_purity(kind) == Purity::Effect,
+                },
+                None => match &op.kind {
+                    OpKind::CellAlloc(cell) => {
+                        used_cells.get(cell.0 as usize).copied().unwrap_or(true)
+                    }
+                    OpKind::CellStore { cell, .. } => {
+                        observed_cells.get(cell.0 as usize).copied().unwrap_or(true)
+                    }
+                    OpKind::Call {
+                        callee: Callee::Nop,
+                        host: None,
+                        semantic:
+                            CallSemantic::Ordinary
+                            | CallSemantic::Standard(_)
+                            | CallSemantic::GlobalAllocator,
+                        ..
+                    } => false,
                     _ => true,
-                }
+                },
+                _ => true,
             });
             round |= block.ops.len() != before;
         }
@@ -3078,160 +3173,156 @@ enum Replacement {
 /// that pass equal constant *values* through different `Const` ops (same tree, same type) are
 /// one value too: the merge folds to a fresh constant at the block's head.
 fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
-    // Incoming edge arguments per block, in (predecessor, edge) order. Only the values matter.
-    let mut incoming: Vec<Vec<Vec<ValueId>>> = vec![Vec::new(); func.blocks.len()];
-    for block in &func.blocks {
-        for (target, args) in block.term.edges() {
-            incoming[target.0 as usize].push(args.to_vec());
-        }
-    }
+    let (dead_params, candidates) = {
+        // Incoming edge arguments per block, in (predecessor, edge) order. Only the values matter.
+        let incoming = Cfg::incoming_args(func);
 
-    // How many places name each value, and whether a value is a parameter or a constant. Both
-    // decide whether the replacement below is worth making; see `stays_named`. `constants` is
-    // what lets two different `Const` ops count as one incoming value.
-    let mut uses = vec![0usize; func.values.len()];
-    let mut leaf = vec![false; func.values.len()];
-    let mut is_view = vec![false; func.values.len()];
-    let mut constants: BTreeMap<ValueId, &ConstTree> = BTreeMap::new();
-    for block in &func.blocks {
-        for param in &block.params {
-            leaf[param.0 as usize] = true;
-        }
-        for op in &block.ops {
-            if let Some(result) = op.result {
-                match &op.kind {
-                    OpKind::Const(tree) => {
-                        leaf[result.0 as usize] = true;
-                        constants.insert(result, tree);
+        // How many places name each value, and whether a value is a parameter or a constant. Both
+        // decide whether the replacement below is worth making; see `stays_named`. `constants` is
+        // what lets two different `Const` ops count as one incoming value.
+        let mut uses = vec![0usize; func.values.len()];
+        let mut leaf = vec![false; func.values.len()];
+        let mut is_view = vec![false; func.values.len()];
+        let mut constants: BTreeMap<ValueId, &ConstTree> = BTreeMap::new();
+        for block in &func.blocks {
+            for param in &block.params {
+                leaf[param.0 as usize] = true;
+            }
+            for op in &block.ops {
+                if let Some(result) = op.result {
+                    match &op.kind {
+                        OpKind::Const(tree) => {
+                            leaf[result.0 as usize] = true;
+                            constants.insert(result, tree);
+                        }
+                        OpKind::BorrowView { .. } | OpKind::RawView { .. } => {
+                            is_view[result.0 as usize] = true;
+                        }
+                        _ => {}
                     }
-                    OpKind::BorrowView { .. } | OpKind::RawView { .. } => {
-                        is_view[result.0 as usize] = true;
-                    }
-                    _ => {}
                 }
+                op.kind.for_each_use(|v| uses[v.0 as usize] += 1);
             }
-            for v in op.kind.uses() {
-                uses[v.0 as usize] += 1;
-            }
+            block.term.for_each_use(|v| uses[v.0 as usize] += 1);
         }
-        for v in block.term.uses() {
-            uses[v.0 as usize] += 1;
-        }
-    }
 
-    // Backward liveness over non-entry block parameters: any parameter with no use in an op or
-    // non-edge terminator (Return/Throw/Switch.scrut) — including a mutually recursive cycle of
-    // dead loop parameters — needs no replacement at all. Dropping all dead parameters together
-    // frees the value chains that fed them for `remove_dead_ops`.
-    let mut param_of: Vec<Option<(usize, usize)>> = vec![None; func.values.len()];
-    for block in func.blocks.iter().skip(1) {
-        let b_idx = block.id.0 as usize;
-        for (pos, &param) in block.params.iter().enumerate() {
-            param_of[param.0 as usize] = Some((b_idx, pos));
-        }
-    }
-    let mut live_param = vec![false; func.values.len()];
-    let mut work: Vec<ValueId> = Vec::new();
-    let mark_live = |v: ValueId, live_param: &mut [bool], work: &mut Vec<ValueId>| {
-        if param_of.get(v.0 as usize).copied().flatten().is_some() && !live_param[v.0 as usize] {
-            live_param[v.0 as usize] = true;
-            work.push(v);
-        }
-    };
-    for block in &func.blocks {
-        for op in &block.ops {
-            for v in op.kind.uses() {
-                mark_live(v, &mut live_param, &mut work);
+        // Backward liveness over non-entry block parameters: any parameter with no use in an op or
+        // non-edge terminator (Return/Throw/Switch.scrut) — including a mutually recursive cycle of
+        // dead loop parameters — needs no replacement at all. Dropping all dead parameters together
+        // frees the value chains that fed them for `remove_dead_ops`.
+        let mut param_of: Vec<Option<(usize, usize)>> = vec![None; func.values.len()];
+        for block in func.blocks.iter().skip(1) {
+            let b_idx = block.id.0 as usize;
+            for (pos, &param) in block.params.iter().enumerate() {
+                param_of[param.0 as usize] = Some((b_idx, pos));
             }
         }
-        match &block.term {
-            RTerm::Switch { scrut, .. } => mark_live(*scrut, &mut live_param, &mut work),
-            RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => {
-                mark_live(*v, &mut live_param, &mut work);
+        let mut live_param = vec![false; func.values.len()];
+        let mut work: Vec<ValueId> = Vec::new();
+        let mark_live = |v: ValueId, live_param: &mut [bool], work: &mut Vec<ValueId>| {
+            if param_of.get(v.0 as usize).copied().flatten().is_some() && !live_param[v.0 as usize]
+            {
+                live_param[v.0 as usize] = true;
+                work.push(v);
             }
-            _ => {}
-        }
-    }
-    while let Some(v) = work.pop() {
-        let Some((b_idx, pos)) = param_of[v.0 as usize] else {
-            continue;
         };
-        for args in &incoming[b_idx] {
-            if let Some(&arg) = args.get(pos) {
-                mark_live(arg, &mut live_param, &mut work);
+        for block in &func.blocks {
+            for op in &block.ops {
+                op.kind
+                    .for_each_use(|v| mark_live(v, &mut live_param, &mut work));
             }
-        }
-    }
-    let dead_params: BTreeSet<(usize, usize)> = func
-        .blocks
-        .iter()
-        .skip(1)
-        .flat_map(|block| {
-            block
-                .params
-                .iter()
-                .enumerate()
-                .filter(|(_, param)| !live_param[param.0 as usize])
-                .map(|(position, _)| (block.id.0 as usize, position))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Every parameter that could go, and what would replace it.
-    let mut candidates: Vec<(usize, usize, ValueId, Replacement)> = Vec::new();
-    for block in func.blocks.iter().skip(1) {
-        let index = block.id.0 as usize;
-        if incoming[index].is_empty() {
-            continue;
-        }
-        for (position, param) in block.params.iter().enumerate() {
-            if dead_params.contains(&(index, position)) {
-                continue;
-            }
-            // The incoming values other than the parameter itself, one per edge.
-            let mut passed = Vec::with_capacity(incoming[index].len());
-            let mut complete = true;
-            for args in &incoming[index] {
-                match args.get(position) {
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                    Some(arg) if arg == param => {}
-                    Some(arg) => passed.push(*arg),
+            match &block.term {
+                RTerm::Switch { scrut, .. } => mark_live(*scrut, &mut live_param, &mut work),
+                RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => {
+                    mark_live(*v, &mut live_param, &mut work);
                 }
+                _ => {}
             }
-            let (true, Some(&first)) = (complete, passed.first()) else {
+        }
+        while let Some(v) = work.pop() {
+            let Some((b_idx, pos)) = param_of[v.0 as usize] else {
                 continue;
             };
-            if passed.iter().all(|arg| *arg == first) {
-                if stays_named(&uses, &leaf, first, passed.len())
-                    || (passed.len() == 1
-                        && uses[first.0 as usize] == 1
-                        && is_view[first.0 as usize])
-                {
-                    candidates.push((index, position, *param, Replacement::Value(first)));
-                }
-            } else if let (true, Some(&tree)) = (constant_merge, constants.get(&first)) {
-                let ty = func.values[first.0 as usize].ty;
-                let equal_constants = passed.iter().all(|arg| {
-                    func.values[arg.0 as usize].ty == ty
-                        && constants.get(arg).is_some_and(|other| *other == tree)
-                });
-                if equal_constants
-                    && func.values[param.0 as usize].ty == ty
-                    && func.values[param.0 as usize].carrier == crate::jir::repr::Carrier::Baseline
-                {
-                    candidates.push((
-                        index,
-                        position,
-                        *param,
-                        Replacement::Constant(tree.clone(), ty),
-                    ));
+            for args in &incoming[b_idx] {
+                if let Some(&arg) = args.get(pos) {
+                    mark_live(arg, &mut live_param, &mut work);
                 }
             }
         }
-    }
+        let dead_params: BTreeSet<(usize, usize)> = func
+            .blocks
+            .iter()
+            .skip(1)
+            .flat_map(|block| {
+                let block_id = block.id.0 as usize;
+                let live_ref = &live_param;
+                block
+                    .params
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, param)| !live_ref[param.0 as usize])
+                    .map(move |(position, _)| (block_id, position))
+            })
+            .collect();
+
+        // Every parameter that could go, and what would replace it.
+        let mut candidates: Vec<(usize, usize, ValueId, Replacement)> = Vec::new();
+        for block in func.blocks.iter().skip(1) {
+            let index = block.id.0 as usize;
+            if incoming[index].is_empty() {
+                continue;
+            }
+            for (position, param) in block.params.iter().enumerate() {
+                if dead_params.contains(&(index, position)) {
+                    continue;
+                }
+                // The incoming values other than the parameter itself, one per edge.
+                let mut passed = Vec::with_capacity(incoming[index].len());
+                let mut complete = true;
+                for args in &incoming[index] {
+                    match args.get(position) {
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                        Some(arg) if arg == param => {}
+                        Some(arg) => passed.push(*arg),
+                    }
+                }
+                let (true, Some(&first)) = (complete, passed.first()) else {
+                    continue;
+                };
+                if passed.iter().all(|arg| *arg == first) {
+                    if stays_named(&uses, &leaf, first, passed.len())
+                        || (passed.len() == 1
+                            && uses[first.0 as usize] == 1
+                            && is_view[first.0 as usize])
+                    {
+                        candidates.push((index, position, *param, Replacement::Value(first)));
+                    }
+                } else if let (true, Some(&tree)) = (constant_merge, constants.get(&first)) {
+                    let ty = func.values[first.0 as usize].ty;
+                    let equal_constants = passed.iter().all(|arg| {
+                        func.values[arg.0 as usize].ty == ty
+                            && constants.get(arg).is_some_and(|other| *other == tree)
+                    });
+                    if equal_constants
+                        && func.values[param.0 as usize].ty == ty
+                        && func.values[param.0 as usize].carrier
+                            == crate::jir::repr::Carrier::Baseline
+                    {
+                        candidates.push((
+                            index,
+                            position,
+                            *param,
+                            Replacement::Constant(tree.clone(), ty),
+                        ));
+                    }
+                }
+            }
+        }
+        (dead_params, candidates)
+    };
 
     // A parameter replaced by another parameter that is itself going would end up standing for
     // whatever THAT one stands for, which is how the guard above gets bypassed — and a cycle of
@@ -3253,9 +3344,8 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
                 value
             }
             Replacement::Constant(tree, ty) => {
-                let fresh = ValueId(func.values.len() as u32);
                 let def = func.values[param.0 as usize];
-                func.values.push(crate::jir::repr::ValueDef { ty, ..def });
+                let fresh = func.push_value(ty, def.carrier, def.origin);
                 inserted[index].push(Op {
                     result: Some(fresh),
                     origin: def.origin,
@@ -3283,13 +3373,13 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
         for (offset, op) in std::mem::take(&mut inserted[index]).into_iter().enumerate() {
             block.ops.insert(offset, op);
         }
-        for (target, args) in edge_args_mut(&mut block.term) {
+        block.term.edges_mut(|target, args| {
             for position in dropped[target.0 as usize].iter().rev() {
                 if *position < args.len() {
                     args.remove(*position);
                 }
             }
-        }
+        });
     }
     substitute(func, &substitution);
     true
@@ -3311,36 +3401,21 @@ fn stays_named(uses: &[usize], leaf: &[bool], value: ValueId, edges: usize) -> b
     leaf.get(index).copied().unwrap_or(false) || uses.get(index).copied().unwrap_or(0) > edges
 }
 
-/// Every edge of a terminator as its target and its argument list, mutably.
-fn edge_args_mut(term: &mut RTerm) -> Vec<(RBlockId, &mut Vec<ValueId>)> {
-    match term {
-        RTerm::Goto(target, args) => vec![(*target, args)],
-        RTerm::Invoke { normal, unwind } => {
-            vec![(normal.0, &mut normal.1), (unwind.0, &mut unwind.1)]
-        }
-        RTerm::Switch { cases, default, .. } => {
-            let mut edges: Vec<(RBlockId, &mut Vec<ValueId>)> = cases
-                .iter_mut()
-                .map(|(_, target, args)| (*target, args))
-                .collect();
-            edges.push((default.0, &mut default.1));
-            edges
-        }
-        RTerm::Return(_) | RTerm::Unreachable | RTerm::Throw(_) => Vec::new(),
-    }
-}
-
 /// Rewrites every use of a value in `map` to what it maps to.
-///
-/// The operand walk is `ssa::rewrite_op`/`rewrite_term`, which the SSA builder already keeps in
-/// step with `OpKind`: a second copy of that match here is a second thing to forget to update.
 fn substitute(func: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
-    let rewrite = |v: ValueId| map.get(&v).copied().unwrap_or(v);
     for block in &mut func.blocks {
         for op in &mut block.ops {
-            crate::lower::ssa::rewrite_op(&mut op.kind, &rewrite);
+            op.kind.visit_values_mut(|v| {
+                if let Some(&new) = map.get(v) {
+                    *v = new;
+                }
+            });
         }
-        crate::lower::ssa::rewrite_term(&mut block.term, &rewrite);
+        block.term.visit_values_mut(|v| {
+            if let Some(&new) = map.get(v) {
+                *v = new;
+            }
+        });
     }
 }
 

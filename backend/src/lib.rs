@@ -15,6 +15,7 @@ extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_hashes;
 extern crate rustc_hir;
+extern crate rustc_index;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
@@ -45,18 +46,7 @@ use rustc_target::spec::{Arch, Os};
 mod alloc_support;
 mod cgu;
 mod const_raw;
-/// The `#[js_extern]` descriptor format.
-///
-/// The file itself lives in `js-extern-macro`, which is where it is written, and is included here
-/// rather than copied: the macro encodes and this backend decodes, and two copies of a format is
-/// how a format drifts. A proc-macro crate can export nothing but proc macros, so a dependency
-/// would have meant a third crate carrying one file.
-///
-/// The encoding half is the macro's and is unused here, which is what the `dead_code` allowance is
-/// for. Its unit tests come along and run under `cargo test -p rustc_codegen_mires` as well, so the
-/// two sides are checked against one format rather than against each other.
-#[path = "../../js-extern-macro/src/descriptor.rs"]
-mod descriptor;
+pub(crate) use mires_marker_abi::descriptor;
 mod driver;
 mod dts;
 mod identity;
@@ -67,6 +57,7 @@ mod link;
 pub(crate) use rcgjs_object::minify;
 mod naming;
 mod opts;
+mod unwind_check;
 mod value;
 mod vtable;
 

@@ -228,6 +228,16 @@ pub fn lower_func_with_ascii(
     func: &Func,
     ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'_>>,
 ) -> Result<LoweredItem, Decline> {
+    lower_func_with_plans(input, func, ascii, None)
+}
+
+/// [`lower_func`] carrying whole-program ASCII facts and an optional SoA `Vec` plan.
+pub fn lower_func_with_plans(
+    input: &LowerInput<'_>,
+    func: &Func,
+    ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'_>>,
+    soa: Option<&crate::plan::soa_vec::SoaPlan>,
+) -> Result<LoweredItem, Decline> {
     if let crate::jir::semantic::BodySemantic::Standard(
         op @ (crate::jir::semantic::StandardOperation::F64FromStr
         | crate::jir::semantic::StandardOperation::F32FromStr),
@@ -243,7 +253,7 @@ pub fn lower_func_with_ascii(
     let plan = fuse::plan(func, input.origins, input.table, input.interns, input.opts);
     let force_dispatch = matches!(input.opts.structure, crate::opts::Structure::Trampoline);
     let structured = structure::structure(func, &plan, input.table, force_dispatch)?;
-    js::function::lower_with_ascii(input, func, &plan, structured.region, ascii)
+    js::function::lower_with_plans(input, func, &plan, structured.region, ascii, soa)
 }
 
 #[cfg(test)]

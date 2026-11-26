@@ -1592,6 +1592,7 @@ fn repr_slice_view_and_moves() {
         },
     });
     let error = broken.verify(&interns.types).unwrap_err();
+    assert_eq!(error.kind, crate::jir::VerifyErrorKind::UseAfterMove);
     assert!(error.message.contains("after being moved"), "{error}");
 }
 
@@ -2286,5 +2287,6 @@ fn repr_rejects_move_of_loop_invariant_outer_value_across_backedge() {
     b.terminate(exit, RTerm::Return(Some(exit_val)));
     let func = b.finish();
     let error = func.verify(&interns.types).unwrap_err();
+    assert_eq!(error.kind, crate::jir::VerifyErrorKind::UseAfterMove);
     assert!(error.message.contains("after being moved"), "{error}");
 }

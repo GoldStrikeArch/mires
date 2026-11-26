@@ -15,6 +15,7 @@
 //!    `__rt.scale_scalar(p, size, kind)`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::OnceLock;
 
 use rcgjs_object::jir::decline::Decline;
 use rcgjs_object::jir::interns::Interns;
@@ -24,8 +25,8 @@ use rcgjs_object::jir::semantic::{
     UnaryOp,
 };
 use rcgjs_object::jir::types::{RepresentationCandidate, TypeId, TypeKind, TypeTable};
-use rcgjs_object::jsast;
 
+use crate::analysis::reach::{self, ReachPolicy};
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
 use crate::plan::native_types::NativeBody;
@@ -49,16 +50,25 @@ struct ScalarOrigin {
     size: u64,
 }
 
-/// Whether `item` is replaced whole during lowering by a pure host-delegated body with no
-/// outgoing Rust calls or byte views (`lower/semantic_ops/num.rs`), or is a Phase 3 typed-heap
-/// `Global` allocator hook whose fallback body only performs `Global` allocate/grow/shrink/deallocate
-/// without byte dereferences or escaping byte views.
-fn is_host_delegated_body(item: &LinkItem) -> bool {
-    matches!(
-        item.jir.body.as_ref().map(|b| b.semantic),
-        Some(rcgjs_object::jir::semantic::BodySemantic::Standard(op))
-            if crate::lower::semantic_ops::num::is_float_from_str(op) || op.is_typed_heap()
-    )
+/// Classification of a wide scalar type that lowers to `scale_scalar`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarView {
+    IntOrChar(ScalarOrigin),
+    Float,
+}
+
+impl ScalarView {
+    fn int_or_char(self) -> Option<ScalarOrigin> {
+        match self {
+            Self::IntOrChar(origin) => Some(origin),
+            Self::Float => None,
+        }
+    }
+}
+
+fn bv_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RCGJS_BV_DEBUG").is_some())
 }
 
 /// Computes the conservative whole-program [`ByteViewPlan`] over items reachable from program roots.
@@ -70,7 +80,7 @@ pub fn analyze_reachable(
 ) -> ByteViewPlan {
     let std_crate_ids = collect_std_crate_ids(table);
     let reachable_items = collect_reachable_items(table, funcs, native_bodies, extra_roots);
-    let debug = std::env::var_os("RCGJS_BV_DEBUG").is_some();
+    let debug = bv_debug_enabled();
     let mut raw_byte_derefs = false;
     let mut scalar_byte_views = false;
 
@@ -78,7 +88,10 @@ pub fn analyze_reachable(
         if native_bodies.contains_key(name) {
             continue;
         }
-        if table.get(name).is_some_and(is_host_delegated_body) {
+        if table
+            .get(name)
+            .is_some_and(|item| reach::is_host_delegated_body(item, true))
+        {
             continue;
         }
         let Some(entry) = funcs.get(name) else {
@@ -204,7 +217,7 @@ fn collect_std_crate_ids(table: &BTreeMap<JsName, LinkItem>) -> BTreeSet<u64> {
     ids
 }
 
-fn collect_const_refs(c: &ConstTree, interns: &Interns, out: &mut BTreeSet<JsName>) {
+fn collect_const_refs<'a>(c: &ConstTree, interns: &'a Interns, out: &mut BTreeSet<&'a str>) {
     match c {
         ConstTree::Global { target, .. }
         | ConstTree::StaticField { target, .. }
@@ -212,7 +225,7 @@ fn collect_const_refs(c: &ConstTree, interns: &Interns, out: &mut BTreeSet<JsNam
             GlobalReference::Function { link_name, .. }
             | GlobalReference::Static { link_name, .. } => {
                 if let Some(s) = interns.str(*link_name) {
-                    out.insert(JsName::new(s.to_owned()));
+                    out.insert(s);
                 }
             }
             GlobalReference::Type(_) => {}
@@ -220,7 +233,7 @@ fn collect_const_refs(c: &ConstTree, interns: &Interns, out: &mut BTreeSet<JsNam
         ConstTree::Dyn { data, vtable, .. } => {
             collect_const_refs(data, interns, out);
             if let Some(s) = interns.str(*vtable) {
-                out.insert(JsName::new(s.to_owned()));
+                out.insert(s);
             }
         }
         ConstTree::Reference(inner) => collect_const_refs(inner, interns, out),
@@ -242,46 +255,31 @@ fn collect_const_refs(c: &ConstTree, interns: &Interns, out: &mut BTreeSet<JsNam
     }
 }
 
-fn collect_reachable_items(
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    native_bodies: &BTreeMap<JsName, NativeBody>,
-    extra_roots: &[String],
-) -> BTreeSet<JsName> {
-    let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    for (name, item) in table {
-        if (item.linkage.root || extra_roots.iter().any(|r| r == name.as_str()))
-            && visited.insert(name.clone())
-        {
-            queue.push_back(name.clone());
-        }
-    }
+struct ByteViewReachPolicy<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    native_bodies: &'a BTreeMap<JsName, NativeBody>,
+}
 
-    while let Some(name) = queue.pop_front() {
-        if let Some(body) = native_bodies.get(&name) {
-            let mut idents = BTreeSet::new();
-            for stmt in &body.statements {
-                jsast::visit_idents(stmt, &mut |id| {
-                    idents.insert(JsName::new(id.to_owned()));
-                });
-            }
-            for r in idents {
-                if table.contains_key(&r) && visited.insert(r.clone()) {
-                    queue.push_back(r);
+impl ReachPolicy<JsName> for ByteViewReachPolicy<'_> {
+    fn expand(&mut self, name: &JsName, enqueue: &mut dyn FnMut(JsName)) {
+        if let Some(body) = self.native_bodies.get(name) {
+            for ident in reach::native_body_idents(body) {
+                if let Some((key, _)) = self.table.get_key_value(ident.as_str()) {
+                    enqueue(key.clone());
                 }
             }
-            continue;
+            return;
         }
-        let Some(item) = table.get(&name) else {
-            continue;
+        let Some(item) = self.table.get(name) else {
+            return;
         };
-        if is_host_delegated_body(item) {
-            continue;
+        if reach::is_host_delegated_body(item, true) {
+            return;
         }
-        if let (Some(Ok(func)), Some(interns)) = (funcs.get(&name), item.jir.interns()) {
+        if let (Some(Ok(func)), Some(interns)) = (self.funcs.get(name), item.jir.interns()) {
             let reached = reachable_blocks(func, &interns.types);
-            let mut reachable_refs = BTreeSet::new();
+            let mut reachable_refs: BTreeSet<&str> = BTreeSet::new();
             let mut has_closure_coercion = false;
             let mut has_host = false;
 
@@ -298,21 +296,20 @@ fn collect_reachable_items(
                             match callee {
                                 Callee::Direct { link_name, .. } => {
                                     if let Some(s) = interns.str(*link_name) {
-                                        reachable_refs.insert(JsName::new(s.to_owned()));
+                                        reachable_refs.insert(s);
                                     }
                                 }
                                 Callee::Foreign { symbol, .. } => {
                                     if let Some(s) = interns.str(*symbol) {
-                                        reachable_refs.insert(JsName::new(s.to_owned()));
+                                        reachable_refs.insert(s);
                                     }
                                 }
                                 Callee::Intrinsic {
                                     fallback: Some(d), ..
                                 } => {
                                     if let Some(s) = interns.str(d.link_name) {
-                                        let jn = JsName::new(s.to_owned());
-                                        if item.refs.contains(&jn) {
-                                            reachable_refs.insert(jn);
+                                        if item.refs.contains(s) {
+                                            reachable_refs.insert(s);
                                         }
                                     }
                                 }
@@ -333,16 +330,15 @@ fn collect_reachable_items(
                                     }) = value::kind(&interns.types, interns.types.peeled(ty))
                                     {
                                         if let Some(s) = interns.str(d.link_name) {
-                                            reachable_refs.insert(JsName::new(s.to_owned()));
+                                            reachable_refs.insert(s);
                                         }
                                     }
                                 }
                             }
                             if let Some(d) = fallback {
                                 if let Some(s) = interns.str(d.link_name) {
-                                    let jn = JsName::new(s.to_owned());
-                                    if item.refs.contains(&jn) {
-                                        reachable_refs.insert(jn);
+                                    if item.refs.contains(s) {
+                                        reachable_refs.insert(s);
                                     }
                                 }
                             }
@@ -352,7 +348,7 @@ fn collect_reachable_items(
                             ..
                         } => {
                             if let Some(s) = interns.str(*link_name) {
-                                reachable_refs.insert(JsName::new(s.to_owned()));
+                                reachable_refs.insert(s);
                             }
                         }
                         OpKind::Const(c) => {
@@ -364,7 +360,7 @@ fn collect_reachable_items(
                                     instance: Some(d), ..
                                 }) => {
                                     if let Some(s) = interns.str(d.link_name) {
-                                        reachable_refs.insert(JsName::new(s.to_owned()));
+                                        reachable_refs.insert(s);
                                     }
                                 }
                                 Some(TypeKind::Closure { .. }) => {
@@ -388,28 +384,41 @@ fn collect_reachable_items(
                 let s = r.as_str();
                 if has_host
                     || s.starts_with("vtable$")
-                    || !funcs.contains_key(r)
+                    || !self.funcs.contains_key(r)
                     || (has_closure_coercion && s.contains("closure"))
                 {
-                    reachable_refs.insert(r.clone());
+                    reachable_refs.insert(s);
                 }
             }
 
             for r in reachable_refs {
-                if table.contains_key(&r) && visited.insert(r.clone()) {
-                    queue.push_back(r);
+                if let Some((key, _)) = self.table.get_key_value(r) {
+                    enqueue(key.clone());
                 }
             }
         } else {
             for r in &item.refs {
-                if table.contains_key(r) && visited.insert(r.clone()) {
-                    queue.push_back(r.clone());
+                if self.table.contains_key(r) {
+                    enqueue(r.clone());
                 }
             }
         }
     }
+}
 
-    visited
+fn collect_reachable_items(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    native_bodies: &BTreeMap<JsName, NativeBody>,
+    extra_roots: &[String],
+) -> BTreeSet<JsName> {
+    let seeds = reach::root_seeds(table, extra_roots, false);
+    let mut policy = ByteViewReachPolicy {
+        table,
+        funcs,
+        native_bodies,
+    };
+    reach::walk_reachable(seeds, &mut policy)
 }
 
 /// Computes the set of reachable blocks in `func`, folding constant `Switch` branches such as
@@ -419,17 +428,17 @@ fn collect_reachable_items(
 /// integer bitwise `!`, signed integer comparisons, and floating-point comparisons are never
 /// mis-folded.
 fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
-    let mut consts: BTreeMap<ValueId, u128> = BTreeMap::new();
+    let mut consts: Vec<Option<u128>> = vec![None; func.values.len()];
     for block in &func.blocks {
         for op in &block.ops {
             let Some(res) = op.result else { continue };
             match &op.kind {
                 OpKind::Const(ConstTree::Scalar { bits, .. }) => {
-                    consts.insert(res, *bits);
+                    consts[res.0 as usize] = Some(*bits);
                 }
                 OpKind::Copy(v) | OpKind::Move(v) => {
-                    if let Some(&c) = consts.get(v) {
-                        consts.insert(res, c);
+                    if let Some(c) = consts[v.0 as usize] {
+                        consts[res.0 as usize] = Some(c);
                     }
                 }
                 OpKind::Unary {
@@ -441,9 +450,9 @@ fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
                         value::kind(ty_table, ty_table.peeled(*ty)),
                         Some(TypeKind::Bool)
                     ) {
-                        if let Some(&c) = consts.get(v) {
+                        if let Some(c) = consts[v.0 as usize] {
                             if c <= 1 {
-                                consts.insert(res, 1 - c);
+                                consts[res.0 as usize] = Some(1 - c);
                             }
                         }
                     }
@@ -453,7 +462,7 @@ fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
                         value::kind(ty_table, ty_table.peeled(*ty)),
                         Some(TypeKind::Bool | TypeKind::Integer { signed: false, .. })
                     ) {
-                        if let (Some(&lv), Some(&rv)) = (consts.get(l), consts.get(r)) {
+                        if let (Some(lv), Some(rv)) = (consts[l.0 as usize], consts[r.0 as usize]) {
                             let folded = match bop {
                                 BinaryOp::Eq => Some(u128::from(lv == rv)),
                                 BinaryOp::Ne => Some(u128::from(lv != rv)),
@@ -464,7 +473,7 @@ fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
                                 _ => None,
                             };
                             if let Some(c) = folded {
-                                consts.insert(res, c);
+                                consts[res.0 as usize] = Some(c);
                             }
                         }
                     }
@@ -512,7 +521,7 @@ fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
                     Some(TypeKind::Bool | TypeKind::Integer { .. } | TypeKind::Char)
                 );
                 if can_fold_switch {
-                    if let Some(&c) = consts.get(scrut) {
+                    if let Some(c) = consts[scrut.0 as usize] {
                         let target = cases
                             .iter()
                             .find(|(val, _, _)| *val == c)
@@ -546,6 +555,33 @@ fn reachable_blocks(func: &Func, ty_table: &TypeTable) -> BTreeSet<RBlockId> {
     reached
 }
 
+/// Collected candidate pointer-cast sites in one function that need escape analysis.
+#[derive(Default)]
+struct CastHits {
+    unscale_uninit_casts: Vec<(ValueId, Option<ValueId>)>,
+    non_scalar_scales: Vec<(ValueId, u64, TypeId)>,
+    scalar_scales: Vec<(ValueId, u64, TypeId, ScalarView)>,
+}
+
+/// Per-function context for byte-view escape and alignment checks.
+struct ByteViewFuncCx<'a> {
+    item: &'a LinkItem,
+    func: &'a Func,
+    table: &'a TypeTable,
+    interns: &'a Interns,
+    items: &'a BTreeMap<JsName, LinkItem>,
+    std_crate_ids: &'a BTreeSet<u64>,
+    in_stdlib_alloc: bool,
+    reached: BTreeSet<RBlockId>,
+    def_map: Vec<Option<&'a Op>>,
+    uses: Vec<Vec<UseSite<'a>>>,
+    cell_reads: Vec<Vec<ValueId>>,
+    zero_consts: Vec<bool>,
+    u_consts: Vec<Option<u128>>,
+    scalar_origins: Vec<Option<ScalarOrigin>>,
+    debug: bool,
+}
+
 /// Returns `(raw_byte_derefs, scalar_byte_views)` for a single function.
 fn analyze_func(
     item: &LinkItem,
@@ -565,10 +601,8 @@ fn analyze_func(
 
     let mut raw_bv = false;
     let mut scalar_bv = false;
-    let mut unscale_uninit_casts: Vec<(ValueId, Option<ValueId>)> = Vec::new(); // (src, res)
+    let mut cast_hits = CastHits::default();
     let mut wide_rawvec_byte_ptrs: Vec<(ValueId, u64)> = Vec::new();
-    let mut non_scalar_scales: Vec<(ValueId, u64, TypeId)> = Vec::new();
-    let mut scalar_scales: Vec<(ValueId, u64, TypeId, Option<ScalarOrigin>)> = Vec::new();
 
     for block in &func.blocks {
         if !reached.contains(&block.id) {
@@ -576,19 +610,8 @@ fn analyze_func(
         }
         for op in &block.ops {
             match &op.kind {
-                OpKind::Cast { kind, v, from, to } => {
-                    let hit = classify_cast(
-                        ty_table,
-                        *kind,
-                        *v,
-                        *from,
-                        *to,
-                        op.result,
-                        &mut non_scalar_scales,
-                        &mut scalar_scales,
-                        &mut unscale_uninit_casts,
-                    );
-                    if let Some((is_raw, reason)) = hit {
+                OpKind::Cast { .. } => {
+                    if let Some((is_raw, reason)) = classify_cast(ty_table, op, &mut cast_hits) {
                         if debug {
                             eprintln!(
                                 "[bv] {} ({}): {reason}",
@@ -701,82 +724,64 @@ fn analyze_func(
         }
     }
 
-    for (src, res) in unscale_uninit_casts {
-        if !unscale_uninit_source_is_private(func, &reached, &def_map, &uses, &cell_reads, src, res)
-        {
-            if debug {
-                eprintln!(
-                    "[bv] {} ({}): unscale_uninit_shared_or_escaped",
-                    item.name.as_str(),
-                    item.debug_path
-                );
-            }
-            raw_bv = true;
-        }
-    }
-
-    let scalar_scale_origins: Vec<(ValueId, Option<ScalarOrigin>)> = scalar_scales
+    let scalar_scale_origins: Vec<(ValueId, ScalarView)> = cast_hits
+        .scalar_scales
         .iter()
-        .map(|&(val, _, _, origin)| (val, origin))
+        .map(|&(val, _, _, view)| (val, view))
         .collect();
     let scalar_origins = propagate_scalar_origins(func, &reached, ty_table, &scalar_scale_origins);
 
-    for (val, elem_size, eff_from) in non_scalar_scales {
-        if let Some(why) = scale_value_escapes(
-            func,
-            ty_table,
-            interns,
-            items,
-            std_crate_ids,
-            in_stdlib_alloc,
-            &def_map,
-            &uses,
-            &cell_reads,
-            &zero_consts,
-            &u_consts,
-            &scalar_origins,
-            val,
-            elem_size,
-            eff_from,
-            None,
-            debug,
-        ) {
-            if debug {
+    let cx = ByteViewFuncCx {
+        item,
+        func,
+        table: ty_table,
+        interns,
+        items,
+        std_crate_ids,
+        in_stdlib_alloc,
+        reached,
+        def_map,
+        uses,
+        cell_reads,
+        zero_consts,
+        u_consts,
+        scalar_origins,
+        debug,
+    };
+
+    for (src, res) in cast_hits.unscale_uninit_casts {
+        if !cx.unscale_uninit_source_is_private(src, res) {
+            if cx.debug {
                 eprintln!(
-                    "[bv] {} ({}): non_scalar_scale_escape ({why})",
-                    item.name.as_str(),
-                    item.debug_path
+                    "[bv] {} ({}): unscale_uninit_shared_or_escaped",
+                    cx.item.name.as_str(),
+                    cx.item.debug_path
                 );
             }
             raw_bv = true;
         }
     }
 
-    for (val, elem_size, eff_from, origin) in scalar_scales {
-        if let Some(why) = scale_value_escapes(
-            func,
-            ty_table,
-            interns,
-            items,
-            std_crate_ids,
-            in_stdlib_alloc,
-            &def_map,
-            &uses,
-            &cell_reads,
-            &zero_consts,
-            &u_consts,
-            &scalar_origins,
-            val,
-            elem_size,
-            eff_from,
-            origin,
-            debug,
-        ) {
-            if debug {
+    for (val, elem_size, eff_from) in cast_hits.non_scalar_scales {
+        if let Some(why) = cx.scale_value_escapes(val, elem_size, eff_from, None) {
+            if cx.debug {
+                eprintln!(
+                    "[bv] {} ({}): non_scalar_scale_escape ({why})",
+                    cx.item.name.as_str(),
+                    cx.item.debug_path
+                );
+            }
+            raw_bv = true;
+        }
+    }
+
+    for (val, elem_size, eff_from, view) in cast_hits.scalar_scales {
+        if let Some(why) = cx.scale_value_escapes(val, elem_size, eff_from, view.int_or_char()) {
+            if cx.debug {
                 eprintln!(
                     "[bv] {} ({}): scalar_scale_escape ({why})",
-                    item.name.as_str(),
-                    item.debug_path
+                    cx.item.name.as_str(),
+                    cx.item.debug_path
                 );
             }
             scalar_bv = true;
@@ -784,23 +789,12 @@ fn analyze_func(
     }
 
     for (val, elem_size) in wide_rawvec_byte_ptrs {
-        if rawvec_byte_ptr_escapes(
-            func,
-            ty_table,
-            interns,
-            items,
-            std_crate_ids,
-            &uses,
-            &cell_reads,
-            val,
-            elem_size,
-            debug,
-        ) {
-            if debug {
+        if cx.rawvec_byte_ptr_escapes(val, elem_size) {
+            if cx.debug {
                 eprintln!(
                     "[bv] {} ({}): rawvec_byte_ptr_escape",
-                    item.name.as_str(),
-                    item.debug_path
+                    cx.item.name.as_str(),
+                    cx.item.debug_path
                 );
             }
             raw_bv = true;
@@ -810,117 +804,103 @@ fn analyze_func(
     (raw_bv, scalar_bv)
 }
 
-/// Checks whether an `unscale_uninit` cast's source pointer comes from a function-local cell
-/// (`OpKind::CellAlloc`) that is NEVER observed as bytes or escaped outside `unscale_uninit`
-/// casts (e.g., `core::slice::sort`'s local `MaybeUninit<[u8; N]>` scratch buffer).
-fn unscale_uninit_source_is_private(
-    func: &Func,
-    reached: &BTreeSet<RBlockId>,
-    def_map: &BTreeMap<ValueId, &Op>,
-    uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
-    cell_reads: &BTreeMap<CellId, Vec<ValueId>>,
-    src: ValueId,
-    cast_res: Option<ValueId>,
-) -> bool {
-    let Some(cell) = trace_to_local_cell(func, reached, def_map, src) else {
-        return false;
-    };
-    // Ensure `cell` is never written to via `CellStore` with a foreign value or read/borrowed
-    // for anything other than feeding an `unscale_uninit` cast (or `Drop` of `MaybeUninit`).
-    let mut visited = BTreeSet::new();
-    let mut queue: Vec<ValueId> = cell_reads.get(&cell).cloned().unwrap_or_default();
-    while let Some(v) = queue.pop() {
-        if !visited.insert(v) {
-            continue;
-        }
-        let Some(sites) = uses.get(&v) else {
-            continue;
+impl<'a> ByteViewFuncCx<'a> {
+    /// Checks whether an `unscale_uninit` cast's source pointer comes from a function-local cell
+    /// (`OpKind::CellAlloc`) that is NEVER observed as bytes or escaped outside `unscale_uninit`
+    /// casts (e.g., `core::slice::sort`'s local `MaybeUninit<[u8; N]>` scratch buffer).
+    fn unscale_uninit_source_is_private(&self, src: ValueId, cast_res: Option<ValueId>) -> bool {
+        let Some(cell) = self.trace_to_local_cell(src) else {
+            return false;
         };
-        for site in sites {
-            match site {
-                UseSite::EdgeArg(param) => queue.push(*param),
-                UseSite::Return | UseSite::OtherTerm => return false,
-                UseSite::Op(op) => match &op.kind {
-                    OpKind::Copy(_) | OpKind::Move(_) => {
-                        if let Some(r) = op.result {
-                            queue.push(r);
+        // Ensure `cell` is never written to via `CellStore` with a foreign value or read/borrowed
+        // for anything other than feeding an `unscale_uninit` cast (or `Drop` of `MaybeUninit`).
+        let mut visited = BTreeSet::new();
+        let mut queue: Vec<ValueId> = self.cell_reads[cell.0 as usize].clone();
+        while let Some(v) = queue.pop() {
+            if !visited.insert(v) {
+                continue;
+            }
+            for site in &self.uses[v.0 as usize] {
+                match site {
+                    UseSite::EdgeArg(param) => queue.push(*param),
+                    UseSite::Return | UseSite::OtherTerm => return false,
+                    UseSite::Op(op) => match &op.kind {
+                        OpKind::Copy(_) | OpKind::Move(_) => {
+                            if let Some(r) = op.result {
+                                queue.push(r);
+                            }
                         }
-                    }
-                    OpKind::Cast { .. } if op.result == cast_res => {
-                        // The `unscale_uninit` cast itself.
-                    }
-                    OpKind::Cast {
-                        kind: CastKind::PtrToPtr | CastKind::PointerCoercion,
-                        ..
-                    } => {
-                        if let Some(r) = op.result {
-                            queue.push(r);
+                        OpKind::Cast { .. } if op.result == cast_res => {
+                            // The `unscale_uninit` cast itself.
                         }
-                    }
-                    OpKind::BorrowView { path, .. } | OpKind::RawView { path, .. }
-                        if !path.iter().any(|p| matches!(p, Proj::Deref)) =>
-                    {
-                        if let Some(r) = op.result {
-                            queue.push(r);
+                        OpKind::Cast {
+                            kind: CastKind::PtrToPtr | CastKind::PointerCoercion,
+                            ..
+                        } => {
+                            if let Some(r) = op.result {
+                                queue.push(r);
+                            }
                         }
-                    }
-                    OpKind::Drop {
-                        glue: DropGlue::None,
-                        ..
-                    } => {}
-                    _ => return false,
-                },
+                        OpKind::BorrowView { path, .. } | OpKind::RawView { path, .. }
+                            if !path.iter().any(|p| matches!(p, Proj::Deref)) =>
+                        {
+                            if let Some(r) = op.result {
+                                queue.push(r);
+                            }
+                        }
+                        OpKind::Drop {
+                            glue: DropGlue::None,
+                            ..
+                        } => {}
+                        _ => return false,
+                    },
+                }
             }
         }
+        true
     }
-    true
-}
 
-fn trace_to_local_cell(
-    func: &Func,
-    reached: &BTreeSet<RBlockId>,
-    def_map: &BTreeMap<ValueId, &Op>,
-    start: ValueId,
-) -> Option<CellId> {
-    let mut cur = start;
-    let mut seen = BTreeSet::new();
-    while seen.insert(cur) {
-        let op = def_map.get(&cur)?;
-        match &op.kind {
-            OpKind::Copy(v) | OpKind::Move(v) | OpKind::Cast { v, .. } => cur = *v,
-            OpKind::BorrowView {
-                root: Root::Cell(cell),
-                path,
-                ..
+    fn trace_to_local_cell(&self, start: ValueId) -> Option<CellId> {
+        let mut cur = start;
+        let mut seen = BTreeSet::new();
+        while seen.insert(cur) {
+            let op = self.def_map[cur.0 as usize]?;
+            match &op.kind {
+                OpKind::Copy(v) | OpKind::Move(v) | OpKind::Cast { v, .. } => cur = *v,
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path,
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    path,
+                    ..
+                } if !path.iter().any(|p| matches!(p, Proj::Deref)) => {
+                    // Verify `cell` is locally allocated via `CellAlloc` (not a parameter cell).
+                    let is_local_alloc = self.func.blocks.iter().any(|b| {
+                        self.reached.contains(&b.id)
+                            && b.ops
+                                .iter()
+                                .any(|o| matches!(o.kind, OpKind::CellAlloc(c) if c == *cell))
+                    });
+                    return is_local_alloc.then_some(*cell);
+                }
+                OpKind::BorrowView {
+                    root: Root::Value(v),
+                    path,
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Value(v),
+                    path,
+                    ..
+                } if !path.iter().any(|p| matches!(p, Proj::Deref)) => cur = *v,
+                _ => return None,
             }
-            | OpKind::RawView {
-                root: Root::Cell(cell),
-                path,
-                ..
-            } if !path.iter().any(|p| matches!(p, Proj::Deref)) => {
-                // Verify `cell` is locally allocated via `CellAlloc` (not a parameter cell).
-                let is_local_alloc = func.blocks.iter().any(|b| {
-                    reached.contains(&b.id)
-                        && b.ops
-                            .iter()
-                            .any(|o| matches!(o.kind, OpKind::CellAlloc(c) if c == *cell))
-                });
-                return is_local_alloc.then_some(*cell);
-            }
-            OpKind::BorrowView {
-                root: Root::Value(v),
-                path,
-                ..
-            }
-            | OpKind::RawView {
-                root: Root::Value(v),
-                path,
-                ..
-            } if !path.iter().any(|p| matches!(p, Proj::Deref)) => cur = *v,
-            _ => return None,
         }
+        None
     }
-    None
 }
 
 fn is_stdlib_alloc_wrapper(item: &LinkItem, std_crate_ids: &BTreeSet<u64>) -> bool {
@@ -996,7 +976,7 @@ fn is_direct_alloc_callee(
             {
                 return true;
             }
-            if let Some(target) = items.get(&JsName::new(name.to_owned())) {
+            if let Some(target) = items.get(name) {
                 let dp = target.debug_path.as_str();
                 return matches!(
                     dp,
@@ -1024,27 +1004,27 @@ fn is_byte_int(table: &TypeTable, ty: TypeId) -> bool {
     )
 }
 
-/// Returns `Some(Some(ScalarOrigin))` for wide integer/char scalars, `Some(None)` for f32/f64,
-/// and `None` for non-scalar types.
-fn scalar_view_origin(table: &TypeTable, ty: TypeId) -> Option<Option<ScalarOrigin>> {
+/// Returns [`ScalarView::IntOrChar`] for wide integer/char scalars, [`ScalarView::Float`] for
+/// `f32`/`f64`, and `None` for non-scalar types.
+fn scalar_view_origin(table: &TypeTable, ty: TypeId) -> Option<ScalarView> {
     let peeled = table.peeled(ty);
     match value::kind(table, peeled) {
         Some(TypeKind::Integer {
             signed,
             bits: bits @ (16 | 32 | 64 | 128),
-        }) => Some(Some(ScalarOrigin {
+        }) => Some(ScalarView::IntOrChar(ScalarOrigin {
             bits: *bits,
             signed: *signed,
             is_char: false,
             size: u64::from(*bits / 8),
         })),
-        Some(TypeKind::Char) => Some(Some(ScalarOrigin {
+        Some(TypeKind::Char) => Some(ScalarView::IntOrChar(ScalarOrigin {
             bits: 32,
             signed: false,
             is_char: true,
             size: 4,
         })),
-        Some(TypeKind::Float { bits: 32 | 64 }) => Some(None),
+        Some(TypeKind::Float { bits: 32 | 64 }) => Some(ScalarView::Float),
         _ => None,
     }
 }
@@ -1083,18 +1063,11 @@ fn ptr_pointee_is_wide_or_erased(table: &TypeTable, ty: TypeId) -> bool {
 }
 
 /// Returns `Some((is_raw_bv, reason))` if the cast immediately requires byte-view machinery.
-#[allow(clippy::too_many_arguments)]
-fn classify_cast(
-    table: &TypeTable,
-    kind: CastKind,
-    src: ValueId,
-    from: TypeId,
-    to: TypeId,
-    result: Option<ValueId>,
-    non_scalar_scales: &mut Vec<(ValueId, u64, TypeId)>,
-    scalar_scales: &mut Vec<(ValueId, u64, TypeId, Option<ScalarOrigin>)>,
-    unscale_uninit_casts: &mut Vec<(ValueId, Option<ValueId>)>,
-) -> Option<(bool, &'static str)> {
+fn classify_cast(table: &TypeTable, op: &Op, hits: &mut CastHits) -> Option<(bool, &'static str)> {
+    let OpKind::Cast { kind, v, from, to } = op.kind else {
+        return None;
+    };
+    let result = op.result;
     let (Some(fp), Some(tp)) = (value::pointee_of(table, from), value::pointee_of(table, to))
     else {
         if kind == CastKind::Transmute
@@ -1114,7 +1087,7 @@ fn classify_cast(
 
     if table.crosses_transparent_union(fp) && from_size == Some(1) && to_size.is_some_and(|s| s > 1)
     {
-        unscale_uninit_casts.push((src, result));
+        hits.unscale_uninit_casts.push((v, result));
     }
 
     // Erased `()` -> 1-byte pointer (`thin(_, 1)`).
@@ -1149,16 +1122,16 @@ fn classify_cast(
     if to_size == Some(1) && !table.is_indirect(to_p) {
         if let Some(es) = eff_from_size.filter(|&s| s > 1) {
             if is_byte_int(table, to_p) {
-                if let Some(origin) = scalar_view_origin(table, eff_from) {
+                if let Some(view) = scalar_view_origin(table, eff_from) {
                     if let Some(res) = result {
-                        scalar_scales.push((res, es, eff_from, origin));
+                        hits.scalar_scales.push((res, es, eff_from, view));
                         return None;
                     }
                     return Some((false, "scale_scalar_no_result"));
                 }
             }
             if let Some(res) = result {
-                non_scalar_scales.push((res, es, eff_from));
+                hits.non_scalar_scales.push((res, es, eff_from));
             } else {
                 return Some((true, "scale_no_result"));
             }
@@ -1275,10 +1248,7 @@ fn root_wide_vec_elem_size(
     path: &[Proj],
     std_crate_ids: &BTreeSet<u64>,
 ) -> Option<u64> {
-    let mut ty = match root {
-        Root::Value(v) => func.values[v.0 as usize].ty,
-        Root::Cell(c) => func.cells[c.0 as usize].ty,
-    };
+    let mut ty = func.root_ty(*root)?;
     if let Some(sz) = wide_vec_or_rawvec_elem_size(table, interns, ty, std_crate_ids) {
         return Some(sz);
     }
@@ -1306,23 +1276,23 @@ enum UseSite<'a> {
     OtherTerm,
 }
 
-fn collect_def_map<'a>(func: &'a Func, reached: &BTreeSet<RBlockId>) -> BTreeMap<ValueId, &'a Op> {
-    let mut map = BTreeMap::new();
+fn collect_def_map<'a>(func: &'a Func, reached: &BTreeSet<RBlockId>) -> Vec<Option<&'a Op>> {
+    let mut map = vec![None; func.values.len()];
     for block in &func.blocks {
         if !reached.contains(&block.id) {
             continue;
         }
         for op in &block.ops {
             if let Some(res) = op.result {
-                map.insert(res, op);
+                map[res.0 as usize] = Some(op);
             }
         }
     }
     map
 }
 
-fn collect_zero_consts(func: &Func, reached: &BTreeSet<RBlockId>) -> BTreeSet<ValueId> {
-    let mut zeros = BTreeSet::new();
+fn collect_zero_consts(func: &Func, reached: &BTreeSet<RBlockId>) -> Vec<bool> {
+    let mut zeros = vec![false; func.values.len()];
     for block in &func.blocks {
         if !reached.contains(&block.id) {
             continue;
@@ -1331,10 +1301,10 @@ fn collect_zero_consts(func: &Func, reached: &BTreeSet<RBlockId>) -> BTreeSet<Va
             let Some(res) = op.result else { continue };
             match &op.kind {
                 OpKind::Const(ConstTree::Scalar { bits: 0, .. }) => {
-                    zeros.insert(res);
+                    zeros[res.0 as usize] = true;
                 }
-                OpKind::Copy(v) | OpKind::Move(v) if zeros.contains(v) => {
-                    zeros.insert(res);
+                OpKind::Copy(v) | OpKind::Move(v) if zeros[v.0 as usize] => {
+                    zeros[res.0 as usize] = true;
                 }
                 _ => {}
             }
@@ -1347,8 +1317,8 @@ fn collect_unsigned_consts(
     func: &Func,
     ty_table: &TypeTable,
     reached: &BTreeSet<RBlockId>,
-) -> BTreeMap<ValueId, u128> {
-    let mut map = BTreeMap::new();
+) -> Vec<Option<u128>> {
+    let mut map = vec![None; func.values.len()];
     for block in &func.blocks {
         if !reached.contains(&block.id) {
             continue;
@@ -1363,11 +1333,11 @@ fn collect_unsigned_consts(
                         Some(TypeKind::Integer { signed: false, .. })
                     ) =>
                 {
-                    map.insert(res, *bits);
+                    map[res.0 as usize] = Some(*bits);
                 }
                 OpKind::Copy(v) | OpKind::Move(v) => {
-                    if let Some(&c) = map.get(v) {
-                        map.insert(res, c);
+                    if let Some(c) = map[v.0 as usize] {
+                        map[res.0 as usize] = Some(c);
                     }
                 }
                 OpKind::Cast {
@@ -1390,8 +1360,8 @@ fn collect_unsigned_consts(
                         value::kind(ty_table, ty_table.peeled(*to)),
                     ) {
                         if tb >= fb {
-                            if let Some(&c) = map.get(v) {
-                                map.insert(res, c);
+                            if let Some(c) = map[v.0 as usize] {
+                                map[res.0 as usize] = Some(c);
                             }
                         }
                     }
@@ -1406,17 +1376,14 @@ fn collect_unsigned_consts(
 fn collect_value_uses<'a>(
     func: &'a Func,
     reached: &BTreeSet<RBlockId>,
-) -> (
-    BTreeMap<ValueId, Vec<UseSite<'a>>>,
-    BTreeMap<CellId, Vec<ValueId>>,
-) {
+) -> (Vec<Vec<UseSite<'a>>>, Vec<Vec<ValueId>>) {
     let block_params: BTreeMap<RBlockId, &[ValueId]> = func
         .blocks
         .iter()
         .map(|b| (b.id, b.params.as_slice()))
         .collect();
-    let mut map: BTreeMap<ValueId, Vec<UseSite<'a>>> = BTreeMap::new();
-    let mut cell_reads: BTreeMap<CellId, Vec<ValueId>> = BTreeMap::new();
+    let mut map: Vec<Vec<UseSite<'a>>> = (0..func.values.len()).map(|_| Vec::new()).collect();
+    let mut cell_reads: Vec<Vec<ValueId>> = vec![Vec::new(); func.cells.len()];
 
     for block in &func.blocks {
         if !reached.contains(&block.id) {
@@ -1424,12 +1391,12 @@ fn collect_value_uses<'a>(
         }
         for op in &block.ops {
             for used in op.kind.uses() {
-                map.entry(used).or_default().push(UseSite::Op(op));
+                map[used.0 as usize].push(UseSite::Op(op));
             }
             if let Some(res) = op.result {
                 match &op.kind {
                     OpKind::CellLoad(cell) => {
-                        cell_reads.entry(*cell).or_default().push(res);
+                        cell_reads[cell.0 as usize].push(res);
                     }
                     OpKind::BorrowView {
                         root: Root::Cell(cell),
@@ -1439,7 +1406,7 @@ fn collect_value_uses<'a>(
                         root: Root::Cell(cell),
                         ..
                     } => {
-                        cell_reads.entry(*cell).or_default().push(res);
+                        cell_reads[cell.0 as usize].push(res);
                     }
                     _ => {}
                 }
@@ -1447,14 +1414,14 @@ fn collect_value_uses<'a>(
         }
         match &block.term {
             RTerm::Return(Some(v)) => {
-                map.entry(*v).or_default().push(UseSite::Return);
+                map[v.0 as usize].push(UseSite::Return);
             }
             RTerm::Throw(Some(v)) => {
-                map.entry(*v).or_default().push(UseSite::OtherTerm);
+                map[v.0 as usize].push(UseSite::OtherTerm);
             }
             RTerm::Return(None) | RTerm::Throw(None) | RTerm::Unreachable => {}
             RTerm::Switch { scrut, .. } => {
-                map.entry(*scrut).or_default().push(UseSite::OtherTerm);
+                map[scrut.0 as usize].push(UseSite::OtherTerm);
                 for (target, args) in block.term.edges() {
                     if !reached.contains(&target) {
                         continue;
@@ -1462,9 +1429,9 @@ fn collect_value_uses<'a>(
                     let params = block_params.get(&target).copied().unwrap_or(&[]);
                     for (idx, arg) in args.iter().enumerate() {
                         if let Some(&param) = params.get(idx) {
-                            map.entry(*arg).or_default().push(UseSite::EdgeArg(param));
+                            map[arg.0 as usize].push(UseSite::EdgeArg(param));
                         } else {
-                            map.entry(*arg).or_default().push(UseSite::OtherTerm);
+                            map[arg.0 as usize].push(UseSite::OtherTerm);
                         }
                     }
                 }
@@ -1477,9 +1444,9 @@ fn collect_value_uses<'a>(
                     let params = block_params.get(&target).copied().unwrap_or(&[]);
                     for (idx, arg) in args.iter().enumerate() {
                         if let Some(&param) = params.get(idx) {
-                            map.entry(*arg).or_default().push(UseSite::EdgeArg(param));
+                            map[arg.0 as usize].push(UseSite::EdgeArg(param));
                         } else {
-                            map.entry(*arg).or_default().push(UseSite::OtherTerm);
+                            map[arg.0 as usize].push(UseSite::OtherTerm);
                         }
                     }
                 }
@@ -1518,10 +1485,10 @@ fn propagate_scalar_origins(
     func: &Func,
     reached: &BTreeSet<RBlockId>,
     table: &TypeTable,
-    scalar_scales: &[(ValueId, Option<ScalarOrigin>)],
-) -> BTreeMap<ValueId, Option<ScalarOrigin>> {
+    scalar_scales: &[(ValueId, ScalarView)],
+) -> Vec<Option<ScalarOrigin>> {
     if func.blocks.is_empty() {
-        return BTreeMap::new();
+        return vec![None; func.values.len()];
     }
 
     let entry_id = func.blocks[0].id;
@@ -1532,8 +1499,10 @@ fn propagate_scalar_origins(
         .collect();
 
     let mut scale_map: BTreeMap<ValueId, OriginLattice> = BTreeMap::new();
-    for &(val, origin) in scalar_scales {
-        let lat = origin.map_or(OriginLattice::Top, OriginLattice::Exact);
+    for &(val, view) in scalar_scales {
+        let lat = view
+            .int_or_char()
+            .map_or(OriginLattice::Top, OriginLattice::Exact);
         scale_map
             .entry(val)
             .and_modify(|cur| *cur = cur.meet(lat))
@@ -1722,124 +1691,150 @@ fn propagate_scalar_origins(
         }
     }
 
-    let mut origins = BTreeMap::new();
-    for (idx, &lat) in val_state.iter().enumerate() {
-        if let OriginLattice::Exact(o) = lat {
-            origins.insert(ValueId(idx as u32), Some(o));
-        }
-    }
-    origins
+    val_state
+        .into_iter()
+        .map(|lat| match lat {
+            OriginLattice::Exact(o) => Some(o),
+            OriginLattice::Bottom | OriginLattice::Top => None,
+        })
+        .collect()
 }
 
-/// Returns `true` if unsigned integer value `val` is statically proven to be a multiple of
-/// `elem_size` (which is always a power of 2 in `{2, 4, 8, 16}` for wide scalars).
-fn is_multiple_of_elem_size(
-    ty_table: &TypeTable,
-    def_map: &BTreeMap<ValueId, &Op>,
-    u_consts: &BTreeMap<ValueId, u128>,
-    val: ValueId,
-    elem_size: u64,
-) -> bool {
-    if elem_size <= 1 || !elem_size.is_power_of_two() {
-        return false;
+impl<'a> ByteViewFuncCx<'a> {
+    /// Returns `true` if unsigned integer value `val` is statically proven to be a multiple of
+    /// `elem_size` (which is always a power of 2 in `{2, 4, 8, 16}` for wide scalars).
+    fn is_multiple_of_elem_size(&self, val: ValueId, elem_size: u64) -> bool {
+        if elem_size <= 1 || !elem_size.is_power_of_two() {
+            return false;
+        }
+        let mut seen = BTreeSet::new();
+        self.is_multiple_of_rec(val, elem_size, &mut seen)
     }
-    let mut seen = BTreeSet::new();
-    is_multiple_of_rec(ty_table, def_map, u_consts, val, elem_size, &mut seen)
-}
 
-fn is_multiple_of_rec(
-    ty_table: &TypeTable,
-    def_map: &BTreeMap<ValueId, &Op>,
-    u_consts: &BTreeMap<ValueId, u128>,
-    val: ValueId,
-    elem_size: u64,
-    seen: &mut BTreeSet<ValueId>,
-) -> bool {
-    if !seen.insert(val) {
-        return false;
-    }
-    if let Some(&c) = u_consts.get(&val) {
-        return c % u128::from(elem_size) == 0;
-    }
-    let Some(op) = def_map.get(&val) else {
-        return false;
-    };
-    match &op.kind {
-        OpKind::Copy(v) | OpKind::Move(v) => {
-            is_multiple_of_rec(ty_table, def_map, u_consts, *v, elem_size, seen)
+    fn is_multiple_of_rec(
+        &self,
+        val: ValueId,
+        elem_size: u64,
+        seen: &mut BTreeSet<ValueId>,
+    ) -> bool {
+        if !seen.insert(val) {
+            return false;
         }
-        OpKind::Cast {
-            kind: CastKind::IntToInt,
-            v,
-            from,
-            to,
-        } => {
-            if let (
-                Some(TypeKind::Integer {
-                    signed: false,
-                    bits: fb,
-                }),
-                Some(TypeKind::Integer {
-                    signed: false,
-                    bits: tb,
-                }),
-            ) = (
-                value::kind(ty_table, ty_table.peeled(*from)),
-                value::kind(ty_table, ty_table.peeled(*to)),
-            ) {
-                if tb >= fb {
-                    return is_multiple_of_rec(ty_table, def_map, u_consts, *v, elem_size, seen);
-                }
-            }
-            false
+        if let Some(c) = self.u_consts[val.0 as usize] {
+            return c % u128::from(elem_size) == 0;
         }
-        OpKind::Binary { op: bop, l, r, ty } => {
-            let Some(TypeKind::Integer {
-                signed: false,
-                bits,
-            }) = value::kind(ty_table, ty_table.peeled(*ty))
-            else {
-                return false;
-            };
-            match bop {
-                BinaryOp::Mul | BinaryOp::MulUnchecked => {
-                    is_multiple_of_rec(ty_table, def_map, u_consts, *l, elem_size, seen)
-                        || is_multiple_of_rec(ty_table, def_map, u_consts, *r, elem_size, seen)
-                }
-                BinaryOp::Shl | BinaryOp::ShlUnchecked => u_consts.get(r).is_some_and(|&s| {
-                    s >= u128::from(elem_size.trailing_zeros()) && s < u128::from(*bits)
-                }),
-                BinaryOp::Add | BinaryOp::AddUnchecked | BinaryOp::Sub | BinaryOp::SubUnchecked => {
-                    is_multiple_of_rec(ty_table, def_map, u_consts, *l, elem_size, seen)
-                        && is_multiple_of_rec(ty_table, def_map, u_consts, *r, elem_size, seen)
-                }
-                _ => false,
-            }
-        }
-        OpKind::Field { base, field: 0, .. } => {
-            if let Some(base_op) = def_map.get(base) {
-                if let OpKind::Binary {
-                    op: BinaryOp::MulWithOverflow,
-                    l,
-                    r,
-                    ty,
-                } = &base_op.kind
-                {
-                    if matches!(
-                        value::kind(ty_table, ty_table.peeled(*ty)),
-                        Some(TypeKind::Integer { signed: false, .. })
-                    ) {
-                        return is_multiple_of_rec(
-                            ty_table, def_map, u_consts, *l, elem_size, seen,
-                        ) || is_multiple_of_rec(
-                            ty_table, def_map, u_consts, *r, elem_size, seen,
-                        );
+        let Some(op) = self.def_map[val.0 as usize] else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::Copy(v) | OpKind::Move(v) => self.is_multiple_of_rec(*v, elem_size, seen),
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v,
+                from,
+                to,
+            } => {
+                if let (
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: fb,
+                    }),
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: tb,
+                    }),
+                ) = (
+                    value::kind(self.table, self.table.peeled(*from)),
+                    value::kind(self.table, self.table.peeled(*to)),
+                ) {
+                    if tb >= fb {
+                        return self.is_multiple_of_rec(*v, elem_size, seen);
                     }
                 }
+                false
             }
-            false
+            OpKind::Binary { op: bop, l, r, ty } => {
+                let Some(TypeKind::Integer {
+                    signed: false,
+                    bits,
+                }) = value::kind(self.table, self.table.peeled(*ty))
+                else {
+                    return false;
+                };
+                match bop {
+                    BinaryOp::Mul | BinaryOp::MulUnchecked => {
+                        self.is_multiple_of_rec(*l, elem_size, seen)
+                            || self.is_multiple_of_rec(*r, elem_size, seen)
+                    }
+                    BinaryOp::Shl | BinaryOp::ShlUnchecked => self.u_consts[r.0 as usize]
+                        .is_some_and(|s| {
+                            s >= u128::from(elem_size.trailing_zeros()) && s < u128::from(*bits)
+                        }),
+                    BinaryOp::Add
+                    | BinaryOp::AddUnchecked
+                    | BinaryOp::Sub
+                    | BinaryOp::SubUnchecked => {
+                        self.is_multiple_of_rec(*l, elem_size, seen)
+                            && self.is_multiple_of_rec(*r, elem_size, seen)
+                    }
+                    _ => false,
+                }
+            }
+            OpKind::Field { base, field: 0, .. } => {
+                if let Some(base_op) = self.def_map[base.0 as usize] {
+                    if let OpKind::Binary {
+                        op: BinaryOp::MulWithOverflow,
+                        l,
+                        r,
+                        ty,
+                    } = &base_op.kind
+                    {
+                        if matches!(
+                            value::kind(self.table, self.table.peeled(*ty)),
+                            Some(TypeKind::Integer { signed: false, .. })
+                        ) {
+                            return self.is_multiple_of_rec(*l, elem_size, seen)
+                                || self.is_multiple_of_rec(*r, elem_size, seen);
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
         }
-        _ => false,
+    }
+
+    /// True if every use of `val` (the `i32` result of `compare_bytes`) is `val == 0` or `val != 0`.
+    fn only_used_for_zero_equality(&self, val: ValueId) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut queue = vec![val];
+        while let Some(v) = queue.pop() {
+            if !visited.insert(v) {
+                continue;
+            }
+            for site in &self.uses[v.0 as usize] {
+                match site {
+                    UseSite::EdgeArg(param) => queue.push(*param),
+                    UseSite::Return | UseSite::OtherTerm => return false,
+                    UseSite::Op(op) => match &op.kind {
+                        OpKind::Copy(_) | OpKind::Move(_) => {
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            }
+                        }
+                        OpKind::Binary {
+                            op: BinaryOp::Eq | BinaryOp::Ne,
+                            l,
+                            r,
+                            ..
+                        } if (*l == v && self.zero_consts[r.0 as usize])
+                            || (*r == v && self.zero_consts[l.0 as usize]) => {}
+                        _ => return false,
+                    },
+                }
+            }
+        }
+        true
     }
 }
 
@@ -1904,7 +1899,7 @@ fn is_safe_std_drop(
             }
             let name = interns.str(*link_name).unwrap_or("");
             items
-                .get(&JsName::new(name.to_owned()))
+                .get(name)
                 .is_some_and(|t| is_safe_std_drop_path(t.debug_path.as_str()))
         }
     }
@@ -1919,185 +1914,182 @@ fn is_pure_metadata_ret(table: &TypeTable, ty: TypeId) -> bool {
         )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn classify_stdlib_ptr_call(
-    callee: &Callee,
-    func: &Func,
-    table: &TypeTable,
-    interns: &Interns,
-    items: &BTreeMap<JsName, LinkItem>,
-    std_crate_ids: &BTreeSet<u64>,
-    result: Option<ValueId>,
-    elem_size: Option<u64>,
-    expected_origin: Option<ScalarOrigin>,
-    debug: bool,
-) -> CallEffect {
-    match callee {
-        Callee::Nop => CallEffect::Sink,
-        Callee::Runtime { member, .. } => match interns.str(*member).unwrap_or("") {
-            "dealloc" | "ptr_is_null" => CallEffect::Sink,
-            "realloc" => CallEffect::PropagateToResult,
-            m => {
-                if debug {
-                    eprintln!("[bv]   escape runtime callee: {m}");
+impl<'a> ByteViewFuncCx<'a> {
+    fn classify_stdlib_ptr_call(
+        &self,
+        callee: &Callee,
+        result: Option<ValueId>,
+        elem_size: Option<u64>,
+        expected_origin: Option<ScalarOrigin>,
+    ) -> CallEffect {
+        match callee {
+            Callee::Nop => CallEffect::Sink,
+            Callee::Runtime { member, .. } => match self.interns.str(*member).unwrap_or("") {
+                "dealloc" | "ptr_is_null" => CallEffect::Sink,
+                "realloc" => CallEffect::PropagateToResult,
+                m => {
+                    if self.debug {
+                        eprintln!("[bv]   escape runtime callee: {m}");
+                    }
+                    CallEffect::Escape
                 }
-                CallEffect::Escape
-            }
-        },
-        Callee::Foreign { symbol, .. } => {
-            let sym = interns.str(*symbol).unwrap_or("");
-            if sym.contains("__rust_dealloc") {
-                CallEffect::Sink
-            } else if sym.contains("__rust_realloc") {
-                CallEffect::PropagateToResult
-            } else {
-                if debug {
-                    eprintln!("[bv]   escape foreign callee: {sym}");
+            },
+            Callee::Foreign { symbol, .. } => {
+                let sym = self.interns.str(*symbol).unwrap_or("");
+                if sym.contains("__rust_dealloc") {
+                    CallEffect::Sink
+                } else if sym.contains("__rust_realloc") {
+                    CallEffect::PropagateToResult
+                } else {
+                    if self.debug {
+                        eprintln!("[bv]   escape foreign callee: {sym}");
+                    }
+                    CallEffect::Escape
                 }
-                CallEffect::Escape
             }
-        }
-        Callee::Direct { link_name, .. } => {
-            let name = interns.str(*link_name).unwrap_or("");
-            if name.contains("__rust_dealloc") {
-                return CallEffect::Sink;
-            }
-            if name.contains("__rust_realloc") {
-                return CallEffect::PropagateToResult;
-            }
-            let Some(target) = items.get(&JsName::new(name.to_owned())) else {
-                if debug {
-                    eprintln!("[bv]   escape unknown direct callee: {name}");
+            Callee::Direct { link_name, .. } => {
+                let name = self.interns.str(*link_name).unwrap_or("");
+                if name.contains("__rust_dealloc") {
+                    return CallEffect::Sink;
                 }
-                return CallEffect::Escape;
-            };
-            let dp = target.debug_path.as_str();
-            let target_is_std = target.crate_name == "core"
-                || target.crate_name == "alloc"
-                || target
-                    .jir
-                    .body
-                    .as_ref()
-                    .is_some_and(|b| std_crate_ids.contains(&b.item.definition.crate_id));
-            // True sinks (free memory or query nullness/metadata without returning a pointer).
-            if dp.starts_with("alloc::alloc::Global::deallocate")
-                || dp.starts_with("alloc::Global::deallocate")
-                || dp.starts_with("<alloc::alloc::Global as core::alloc::Allocator>::deallocate")
-                || dp.starts_with("<alloc::Global as core::alloc::Allocator>::deallocate")
-                || dp.starts_with("alloc::alloc::dealloc")
-                || dp.starts_with("core::ptr::const_ptr::<impl *const T>::is_null")
-                || dp.starts_with("core::ptr::mut_ptr::<impl *mut T>::is_null")
-                || is_safe_std_drop_path(dp)
-                || (target_is_std
-                    && (dp.ends_with("::deallocate")
-                        || dp.ends_with("::deallocate_managed")
-                        || dp.ends_with("::dealloc_elems")
-                        || dp.contains("rcgjs_typed_dealloc")))
-                || matches!(
-                    target.jir.body.as_ref().map(|b| b.semantic),
-                    Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
-                        rcgjs_object::jir::semantic::StandardOperation::TypedDealloc
-                            | rcgjs_object::jir::semantic::StandardOperation::TypedDeallocRaw
-                    ))
-                )
-            {
-                return CallEffect::Sink;
-            }
-            // Realloc propagates the pointer (possibly scaled) to its result.
-            if dp.starts_with("alloc::alloc::realloc")
-                || dp.starts_with("alloc::alloc::Global::grow_impl")
-                || dp.starts_with("alloc::Global::grow_impl")
-                || dp.starts_with("alloc::alloc::Global::shrink_impl")
-                || dp.starts_with("alloc::Global::shrink_impl")
-                || (target_is_std && dp.ends_with("::realloc_elems"))
-                || matches!(
-                    target.jir.body.as_ref().map(|b| b.semantic),
-                    Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
-                        rcgjs_object::jir::semantic::StandardOperation::TypedRealloc
-                    ))
-                )
-            {
-                return CallEffect::PropagateToResult;
-            }
-            // NonNull / Unique constructors & pointer accessors ONLY (never read/write/as_ref!).
-            if target_is_std
-                && (dp.starts_with("core::ptr::non_null::NonNull")
-                    || dp.starts_with("ptr::non_null::NonNull"))
-            {
-                if dp.ends_with("::new_unchecked")
-                    || dp.ends_with("::new")
-                    || dp.ends_with("::as_ptr")
+                if name.contains("__rust_realloc") {
+                    return CallEffect::PropagateToResult;
+                }
+                let Some(target) = self.items.get(name) else {
+                    if self.debug {
+                        eprintln!("[bv]   escape unknown direct callee: {name}");
+                    }
+                    return CallEffect::Escape;
+                };
+                let dp = target.debug_path.as_str();
+                let target_is_std =
+                    target.crate_name == "core"
+                        || target.crate_name == "alloc"
+                        || target.jir.body.as_ref().is_some_and(|b| {
+                            self.std_crate_ids.contains(&b.item.definition.crate_id)
+                        });
+                // True sinks (free memory or query nullness/metadata without returning a pointer).
+                if dp.starts_with("alloc::alloc::Global::deallocate")
+                    || dp.starts_with("alloc::Global::deallocate")
+                    || dp
+                        .starts_with("<alloc::alloc::Global as core::alloc::Allocator>::deallocate")
+                    || dp.starts_with("<alloc::Global as core::alloc::Allocator>::deallocate")
+                    || dp.starts_with("alloc::alloc::dealloc")
+                    || dp.starts_with("core::ptr::const_ptr::<impl *const T>::is_null")
+                    || dp.starts_with("core::ptr::mut_ptr::<impl *mut T>::is_null")
+                    || is_safe_std_drop_path(dp)
+                    || (target_is_std
+                        && (dp.ends_with("::deallocate")
+                            || dp.ends_with("::deallocate_managed")
+                            || dp.ends_with("::dealloc_elems")
+                            || dp.contains("rcgjs_typed_dealloc")))
+                    || matches!(
+                        target.jir.body.as_ref().map(|b| b.semantic),
+                        Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
+                            rcgjs_object::jir::semantic::StandardOperation::TypedDealloc
+                                | rcgjs_object::jir::semantic::StandardOperation::TypedDeallocRaw
+                        ))
+                    )
+                {
+                    return CallEffect::Sink;
+                }
+                // Realloc propagates the pointer (possibly scaled) to its result.
+                if dp.starts_with("alloc::alloc::realloc")
+                    || dp.starts_with("alloc::alloc::Global::grow_impl")
+                    || dp.starts_with("alloc::Global::grow_impl")
+                    || dp.starts_with("alloc::alloc::Global::shrink_impl")
+                    || dp.starts_with("alloc::Global::shrink_impl")
+                    || (target_is_std && dp.ends_with("::realloc_elems"))
+                    || matches!(
+                        target.jir.body.as_ref().map(|b| b.semantic),
+                        Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
+                            rcgjs_object::jir::semantic::StandardOperation::TypedRealloc
+                        ))
+                    )
                 {
                     return CallEffect::PropagateToResult;
                 }
-                if dp.ends_with("::cast") || dp.contains("::cast::<") {
-                    return classify_wrapper_cast_result(
-                        func,
-                        table,
-                        result,
-                        elem_size,
-                        expected_origin,
-                    );
-                }
-                if debug {
-                    eprintln!("[bv]   escape NonNull callee: {dp}");
-                }
-                return CallEffect::Escape;
-            }
-            if target_is_std
-                && (dp.starts_with("core::ptr::unique::Unique")
-                    || dp.starts_with("ptr::unique::Unique"))
-            {
-                if dp.ends_with("::new_unchecked")
-                    || dp.ends_with("::new")
-                    || dp.ends_with("::as_ptr")
-                    || dp.ends_with("::as_non_null_ptr")
+                // NonNull / Unique constructors & pointer accessors ONLY (never read/write/as_ref!).
+                if target_is_std
+                    && (dp.starts_with("core::ptr::non_null::NonNull")
+                        || dp.starts_with("ptr::non_null::NonNull"))
                 {
-                    return CallEffect::PropagateToResult;
-                }
-                if dp.ends_with("::cast") || dp.contains("::cast::<") {
-                    return classify_wrapper_cast_result(
-                        func,
-                        table,
-                        result,
-                        elem_size,
-                        expected_origin,
-                    );
-                }
-                if debug {
-                    eprintln!("[bv]   escape Unique callee: {dp}");
-                }
-                return CallEffect::Escape;
-            }
-            // `alloc::raw_vec` internal plumbing: deallocate/reserve/capacity/grow/etc.
-            if target_is_std
-                && (dp.starts_with("alloc::raw_vec::") || dp.starts_with("raw_vec::RawVecInner"))
-            {
-                if let Some(res) = result {
-                    let res_ty = func.values[res.0 as usize].ty;
-                    if is_pure_metadata_ret(table, res_ty) {
-                        return CallEffect::Sink;
+                    if dp.ends_with("::new_unchecked")
+                        || dp.ends_with("::new")
+                        || dp.ends_with("::as_ptr")
+                    {
+                        return CallEffect::PropagateToResult;
                     }
-                    // If `RawVec::ptr` / `non_null` casts back to the exact `T` element type/size,
-                    // it is equivalent to `unscale` back to `*mut T`.
-                    if matches_unscale_target(
-                        table,
-                        table.peeled(res_ty),
-                        elem_size,
-                        expected_origin,
-                    ) {
-                        return CallEffect::Sink;
+                    if dp.ends_with("::cast") || dp.contains("::cast::<") {
+                        return classify_wrapper_cast_result(
+                            self.func,
+                            self.table,
+                            result,
+                            elem_size,
+                            expected_origin,
+                        );
                     }
-                    return CallEffect::PropagateToResult;
+                    if self.debug {
+                        eprintln!("[bv]   escape NonNull callee: {dp}");
+                    }
+                    return CallEffect::Escape;
                 }
-                return CallEffect::Sink;
+                if target_is_std
+                    && (dp.starts_with("core::ptr::unique::Unique")
+                        || dp.starts_with("ptr::unique::Unique"))
+                {
+                    if dp.ends_with("::new_unchecked")
+                        || dp.ends_with("::new")
+                        || dp.ends_with("::as_ptr")
+                        || dp.ends_with("::as_non_null_ptr")
+                    {
+                        return CallEffect::PropagateToResult;
+                    }
+                    if dp.ends_with("::cast") || dp.contains("::cast::<") {
+                        return classify_wrapper_cast_result(
+                            self.func,
+                            self.table,
+                            result,
+                            elem_size,
+                            expected_origin,
+                        );
+                    }
+                    if self.debug {
+                        eprintln!("[bv]   escape Unique callee: {dp}");
+                    }
+                    return CallEffect::Escape;
+                }
+                // `alloc::raw_vec` internal plumbing: deallocate/reserve/capacity/grow/etc.
+                if target_is_std
+                    && (dp.starts_with("alloc::raw_vec::")
+                        || dp.starts_with("raw_vec::RawVecInner"))
+                {
+                    if let Some(res) = result {
+                        let res_ty = self.func.values[res.0 as usize].ty;
+                        if is_pure_metadata_ret(self.table, res_ty) {
+                            return CallEffect::Sink;
+                        }
+                        // If `RawVec::ptr` / `non_null` casts back to the exact `T` element type/size,
+                        // it is equivalent to `unscale` back to `*mut T`.
+                        if matches_unscale_target(
+                            self.table,
+                            self.table.peeled(res_ty),
+                            elem_size,
+                            expected_origin,
+                        ) {
+                            return CallEffect::Sink;
+                        }
+                        return CallEffect::PropagateToResult;
+                    }
+                    return CallEffect::Sink;
+                }
+                if self.debug {
+                    eprintln!("[bv]   escape direct callee: {dp} ({name})");
+                }
+                CallEffect::Escape
             }
-            if debug {
-                eprintln!("[bv]   escape direct callee: {dp} ({name})");
-            }
-            CallEffect::Escape
+            _ => CallEffect::Escape,
         }
-        _ => CallEffect::Escape,
     }
 }
 
@@ -2111,7 +2103,7 @@ fn matches_unscale_target(
         return false;
     };
     if let Some(orig) = expected_origin {
-        return scalar_view_origin(table, p) == Some(Some(orig));
+        return scalar_view_origin(table, p) == Some(ScalarView::IntOrChar(orig));
     }
     elem_size.is_some_and(|sz| value::size_of(table, p) == Some(sz))
 }
@@ -2220,46 +2212,6 @@ fn is_returnable_container(
     false
 }
 
-/// True if every use of `val` (the `i32` result of `compare_bytes`) is `val == 0` or `val != 0`.
-fn only_used_for_zero_equality(
-    uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
-    zero_consts: &BTreeSet<ValueId>,
-    val: ValueId,
-) -> bool {
-    let mut visited = BTreeSet::new();
-    let mut queue = vec![val];
-    while let Some(v) = queue.pop() {
-        if !visited.insert(v) {
-            continue;
-        }
-        let Some(sites) = uses.get(&v) else {
-            continue;
-        };
-        for site in sites {
-            match site {
-                UseSite::EdgeArg(param) => queue.push(*param),
-                UseSite::Return | UseSite::OtherTerm => return false,
-                UseSite::Op(op) => match &op.kind {
-                    OpKind::Copy(_) | OpKind::Move(_) => {
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        }
-                    }
-                    OpKind::Binary {
-                        op: BinaryOp::Eq | BinaryOp::Ne,
-                        l,
-                        r,
-                        ..
-                    } if (*l == v && zero_consts.contains(r))
-                        || (*r == v && zero_consts.contains(l)) => {}
-                    _ => return false,
-                },
-            }
-        }
-    }
-    true
-}
-
 /// True if `ty` is a wide stdlib `Vec<T>` or `RawVec<T>` whose element type matches
 /// `(elem_size, eff_from, expected_origin)`. Sealing a scaled byte pointer into such a container
 /// outside `in_stdlib_alloc` is safe because Rule 5 (`wide_rawvec_byte_ptrs`) guards any
@@ -2297,7 +2249,7 @@ fn is_sealed_wide_vec_container(
         return false;
     };
     if let Some(orig) = expected_origin {
-        return scalar_view_origin(table, elem) == Some(Some(orig));
+        return scalar_view_origin(table, elem) == Some(ScalarView::IntOrChar(orig));
     }
     if let Some(TypeKind::Float { bits }) = value::kind(table, eff_from) {
         return matches!(
@@ -2308,178 +2260,305 @@ fn is_sealed_wide_vec_container(
     scalar_view_origin(table, elem).is_none() && value::size_of(table, elem) == Some(elem_size)
 }
 
-/// Checks whether a `scale` / `scale_scalar` result escapes outside wide stdlib container
-/// plumbing (`RawVec`/`Vec`/`Box`/`IntoIter`/`dealloc`/`realloc`), or (when `origin` is
-/// `Some(ScalarOrigin)`) same-type whole-element `compare_bytes(a, b, n) == 0 / != 0`.
-/// Returns `Some(reason)` if it escapes.
-#[allow(clippy::too_many_arguments)]
-fn scale_value_escapes(
-    func: &Func,
-    table: &TypeTable,
-    interns: &Interns,
-    items: &BTreeMap<JsName, LinkItem>,
-    std_crate_ids: &BTreeSet<u64>,
-    in_stdlib_alloc: bool,
-    def_map: &BTreeMap<ValueId, &Op>,
-    uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
-    cell_reads: &BTreeMap<CellId, Vec<ValueId>>,
-    zero_consts: &BTreeSet<ValueId>,
-    u_consts: &BTreeMap<ValueId, u128>,
-    scalar_origins: &BTreeMap<ValueId, Option<ScalarOrigin>>,
-    start: ValueId,
-    elem_size: u64,
-    eff_from: TypeId,
-    origin: Option<ScalarOrigin>,
-    debug: bool,
-) -> Option<&'static str> {
-    let mut visited = BTreeSet::new();
-    let mut queue = vec![start];
-    while let Some(v) = queue.pop() {
-        if !visited.insert(v) {
-            continue;
-        }
-        let Some(sites) = uses.get(&v) else {
-            continue;
-        };
-        for site in sites {
-            match site {
-                UseSite::EdgeArg(param) => queue.push(*param),
-                UseSite::Return => {
-                    let ty = func.values[v.0 as usize].ty;
-                    if !is_returnable_container(table, interns, ty, std_crate_ids) {
-                        return Some("return");
-                    }
-                }
-                UseSite::OtherTerm => return Some("term"),
-                UseSite::Op(op) => match &op.kind {
-                    OpKind::Move(_) | OpKind::Copy(_) => {
-                        if let Some(res) = op.result {
-                            queue.push(res);
+impl<'a> ByteViewFuncCx<'a> {
+    /// Checks whether a `scale` / `scale_scalar` result escapes outside wide stdlib container
+    /// plumbing (`RawVec`/`Vec`/`Box`/`IntoIter`/`dealloc`/`realloc`), or (when `origin` is
+    /// `Some(ScalarOrigin)`) same-type whole-element `compare_bytes(a, b, n) == 0 / != 0`.
+    /// Returns `Some(reason)` if it escapes.
+    fn scale_value_escapes(
+        &self,
+        start: ValueId,
+        elem_size: u64,
+        eff_from: TypeId,
+        origin: Option<ScalarOrigin>,
+    ) -> Option<&'static str> {
+        let mut visited = BTreeSet::new();
+        let mut queue = vec![start];
+        while let Some(v) = queue.pop() {
+            if !visited.insert(v) {
+                continue;
+            }
+            for site in &self.uses[v.0 as usize] {
+                match site {
+                    UseSite::EdgeArg(param) => queue.push(*param),
+                    UseSite::Return => {
+                        let ty = self.func.values[v.0 as usize].ty;
+                        if !is_returnable_container(
+                            self.table,
+                            self.interns,
+                            ty,
+                            self.std_crate_ids,
+                        ) {
+                            return Some("return");
                         }
                     }
-                    OpKind::CellStore { cell, .. } => {
-                        if let Some(reads) = cell_reads.get(cell) {
-                            queue.extend(reads.iter().copied());
-                        }
-                    }
-                    // Mutability cast `*mut u8 -> *const u8` (same signedness byte ptr).
-                    OpKind::Cast { from, to, .. } if same_byte_ptr_sign(table, *from, *to) => {
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        }
-                    }
-                    OpKind::Aggregate { ty, .. }
-                        if !in_stdlib_alloc
-                            && is_sealed_wide_vec_container(
-                                table,
-                                interns,
-                                *ty,
-                                std_crate_ids,
-                                elem_size,
-                                eff_from,
-                                origin,
-                            ) =>
-                    {
-                        // Sealed inside a matching wide `Vec<T>` / `RawVec<T>`; Rule 5 guards
-                        // any subsequent extraction of its internal `RawVecInner` byte pointer.
-                    }
-                    OpKind::Aggregate { ty, .. }
-                        if is_wrapper_aggregate(table, interns, *ty, std_crate_ids) =>
-                    {
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        }
-                    }
-                    OpKind::Field { .. } => {
-                        if let Some(res) = op.result {
-                            let res_ty = func.values[res.0 as usize].ty;
-                            if !is_pure_metadata_ret(table, res_ty) {
+                    UseSite::OtherTerm => return Some("term"),
+                    UseSite::Op(op) => match &op.kind {
+                        OpKind::Move(_) | OpKind::Copy(_) => {
+                            if let Some(res) = op.result {
                                 queue.push(res);
                             }
                         }
-                    }
-                    OpKind::Call { callee, .. } => {
-                        match classify_stdlib_ptr_call(
-                            callee,
-                            func,
-                            table,
-                            interns,
-                            items,
-                            std_crate_ids,
-                            op.result,
-                            origin.map(|o| o.size),
-                            origin,
-                            debug,
-                        ) {
-                            CallEffect::Sink => {}
-                            CallEffect::PropagateToResult => {
-                                if let Some(res) = op.result {
+                        OpKind::CellStore { cell, .. } => {
+                            queue.extend(self.cell_reads[cell.0 as usize].iter().copied());
+                        }
+                        // Mutability cast `*mut u8 -> *const u8` (same signedness byte ptr).
+                        OpKind::Cast { from, to, .. }
+                            if same_byte_ptr_sign(self.table, *from, *to) =>
+                        {
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            }
+                        }
+                        OpKind::Aggregate { ty, .. }
+                            if !self.in_stdlib_alloc
+                                && is_sealed_wide_vec_container(
+                                    self.table,
+                                    self.interns,
+                                    *ty,
+                                    self.std_crate_ids,
+                                    elem_size,
+                                    eff_from,
+                                    origin,
+                                ) =>
+                        {
+                            // Sealed inside a matching wide `Vec<T>` / `RawVec<T>`; Rule 5 guards
+                            // any subsequent extraction of its internal `RawVecInner` byte pointer.
+                        }
+                        OpKind::Aggregate { ty, .. }
+                            if is_wrapper_aggregate(
+                                self.table,
+                                self.interns,
+                                *ty,
+                                self.std_crate_ids,
+                            ) =>
+                        {
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            }
+                        }
+                        OpKind::Field { .. } => {
+                            if let Some(res) = op.result {
+                                let res_ty = self.func.values[res.0 as usize].ty;
+                                if !is_pure_metadata_ret(self.table, res_ty) {
                                     queue.push(res);
                                 }
                             }
-                            CallEffect::Escape => return Some("call"),
                         }
-                    }
-                    OpKind::Intrinsic { name, args, .. }
-                        if origin.is_some() && interns.str(*name) == Some("compare_bytes") =>
-                    {
-                        let Some(res) = op.result else {
-                            return Some("compare_bytes_no_res");
-                        };
-                        if args.len() < 3 {
-                            return Some("compare_bytes_args");
+                        OpKind::Call { callee, .. } => {
+                            match self.classify_stdlib_ptr_call(
+                                callee,
+                                op.result,
+                                origin.map(|o| o.size),
+                                origin,
+                            ) {
+                                CallEffect::Sink => {}
+                                CallEffect::PropagateToResult => {
+                                    if let Some(res) = op.result {
+                                        queue.push(res);
+                                    }
+                                }
+                                CallEffect::Escape => return Some("call"),
+                            }
                         }
-                        let (Some(Some(o0)), Some(Some(o1))) =
-                            (scalar_origins.get(&args[0]), scalar_origins.get(&args[1]))
-                        else {
-                            return Some("compare_bytes_origin");
-                        };
-                        if o0 != o1 {
-                            return Some("compare_bytes_type_mismatch");
-                        }
-                        if !is_multiple_of_elem_size(table, def_map, u_consts, args[2], o0.size) {
-                            return Some("compare_bytes_unaligned_count");
-                        }
-                        if !only_used_for_zero_equality(uses, zero_consts, res) {
-                            return Some("compare_bytes_ord");
-                        }
-                    }
-                    OpKind::Drop { glue, .. } => {
-                        let dropped_ty = func.values[v.0 as usize].ty;
-                        if !is_safe_std_drop(glue, dropped_ty, table, interns, items, std_crate_ids)
+                        OpKind::Intrinsic { name, args, .. }
+                            if origin.is_some()
+                                && self.interns.str(*name) == Some("compare_bytes") =>
                         {
-                            return Some("drop");
+                            let Some(res) = op.result else {
+                                return Some("compare_bytes_no_res");
+                            };
+                            if args.len() < 3 {
+                                return Some("compare_bytes_args");
+                            }
+                            let (Some(o0), Some(o1)) = (
+                                self.scalar_origins[args[0].0 as usize],
+                                self.scalar_origins[args[1].0 as usize],
+                            ) else {
+                                return Some("compare_bytes_origin");
+                            };
+                            if o0 != o1 {
+                                return Some("compare_bytes_type_mismatch");
+                            }
+                            if !self.is_multiple_of_elem_size(args[2], o0.size) {
+                                return Some("compare_bytes_unaligned_count");
+                            }
+                            if !self.only_used_for_zero_equality(res) {
+                                return Some("compare_bytes_ord");
+                            }
                         }
-                    }
-                    OpKind::Aggregate { .. } => return Some("aggregate"),
-                    OpKind::Cast { .. } => return Some("cast"),
-                    OpKind::Intrinsic { .. } => return Some("intrinsic"),
-                    OpKind::SetField { .. } => return Some("set_field"),
-                    OpKind::StoreThrough { .. } => return Some("store_through"),
-                    OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                        // Taking a whole-container reference/pointer (`&Vec<T>`, `&mut Vec<T>`,
-                        // `&RawVec<T>`) does not expose its internal raw byte pointer directly;
-                        // any consumer that unpacks the buffer pointer is guarded by Rule 5.
-                        if path.is_empty()
-                            && matches!(root, Root::Value(rv) if *rv == v)
-                            && wide_vec_or_rawvec_elem_size(
-                                table,
-                                interns,
-                                func.values[v.0 as usize].ty,
-                                std_crate_ids,
-                            )
-                            .is_some()
-                        {
-                            continue;
+                        OpKind::Drop { glue, .. } => {
+                            let dropped_ty = self.func.values[v.0 as usize].ty;
+                            if !is_safe_std_drop(
+                                glue,
+                                dropped_ty,
+                                self.table,
+                                self.interns,
+                                self.items,
+                                self.std_crate_ids,
+                            ) {
+                                return Some("drop");
+                            }
                         }
-                        return Some("view");
-                    }
-                    _ => return Some("other_op"),
-                },
+                        OpKind::Aggregate { .. } => return Some("aggregate"),
+                        OpKind::Cast { .. } => return Some("cast"),
+                        OpKind::Intrinsic { .. } => return Some("intrinsic"),
+                        OpKind::SetField { .. } => return Some("set_field"),
+                        OpKind::StoreThrough { .. } => return Some("store_through"),
+                        OpKind::BorrowView { root, path, .. }
+                        | OpKind::RawView { root, path, .. } => {
+                            // Taking a whole-container reference/pointer (`&Vec<T>`, `&mut Vec<T>`,
+                            // `&RawVec<T>`) does not expose its internal raw byte pointer directly;
+                            // any consumer that unpacks the buffer pointer is guarded by Rule 5.
+                            if path.is_empty()
+                                && matches!(root, Root::Value(rv) if *rv == v)
+                                && wide_vec_or_rawvec_elem_size(
+                                    self.table,
+                                    self.interns,
+                                    self.func.values[v.0 as usize].ty,
+                                    self.std_crate_ids,
+                                )
+                                .is_some()
+                            {
+                                continue;
+                            }
+                            return Some("view");
+                        }
+                        _ => return Some("other_op"),
+                    },
+                }
             }
         }
+        None
     }
-    None
+
+    /// Checks whether a byte pointer projected out of a wide `Vec<T>` / `RawVec<T>` escapes
+    /// into any operation other than re-casting back to `T` (`unscale`/`unscale_scalar`),
+    /// rebuilding `RawVec`/`NonNull`, or calling `RawVecInner`/`dealloc`/`realloc`/`ptr_is_null`.
+    fn rawvec_byte_ptr_escapes(&self, start: ValueId, elem_size: u64) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut queue = vec![start];
+        while let Some(v) = queue.pop() {
+            if !visited.insert(v) {
+                continue;
+            }
+            for site in &self.uses[v.0 as usize] {
+                match site {
+                    UseSite::EdgeArg(param) => queue.push(*param),
+                    UseSite::Return => {
+                        let ty = self.func.values[v.0 as usize].ty;
+                        if !is_returnable_container(
+                            self.table,
+                            self.interns,
+                            ty,
+                            self.std_crate_ids,
+                        ) {
+                            return true;
+                        }
+                    }
+                    UseSite::OtherTerm => return true,
+                    UseSite::Op(op) => match &op.kind {
+                        OpKind::Move(_) | OpKind::Copy(_) => {
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            }
+                        }
+                        OpKind::CellStore { cell, .. } => {
+                            queue.extend(self.cell_reads[cell.0 as usize].iter().copied());
+                        }
+                        OpKind::Field { .. } => {
+                            if let Some(res) = op.result {
+                                let res_ty = self.func.values[res.0 as usize].ty;
+                                if !is_pure_metadata_ret(self.table, res_ty) {
+                                    queue.push(res);
+                                }
+                            }
+                        }
+                        OpKind::BorrowView { root, path, .. }
+                        | OpKind::RawView { root, path, .. } => {
+                            if path.iter().any(|p| matches!(p, Proj::Deref)) {
+                                return true;
+                            }
+                            if path.is_empty()
+                                && matches!(root, Root::Value(rv) if *rv == v)
+                                && wide_vec_or_rawvec_elem_size(
+                                    self.table,
+                                    self.interns,
+                                    self.func.values[v.0 as usize].ty,
+                                    self.std_crate_ids,
+                                )
+                                .is_some()
+                            {
+                                continue;
+                            }
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            } else {
+                                return true;
+                            }
+                        }
+                        OpKind::Aggregate { ty, .. }
+                            if is_wrapper_aggregate(
+                                self.table,
+                                self.interns,
+                                *ty,
+                                self.std_crate_ids,
+                            ) =>
+                        {
+                            if let Some(res) = op.result {
+                                queue.push(res);
+                            }
+                        }
+                        OpKind::Cast { from, to, .. } => {
+                            if same_byte_ptr_sign(self.table, *from, *to) {
+                                if let Some(res) = op.result {
+                                    queue.push(res);
+                                }
+                                continue;
+                            }
+                            let ok = value::pointee_of(self.table, *to)
+                                .and_then(|p| value::size_of(self.table, p))
+                                .is_some_and(|s| s == elem_size);
+                            if !ok {
+                                return true;
+                            }
+                        }
+                        OpKind::Call { callee, .. } => {
+                            match self.classify_stdlib_ptr_call(
+                                callee,
+                                op.result,
+                                Some(elem_size),
+                                None,
+                            ) {
+                                CallEffect::Sink => {}
+                                CallEffect::PropagateToResult => {
+                                    if let Some(res) = op.result {
+                                        queue.push(res);
+                                    }
+                                }
+                                CallEffect::Escape => return true,
+                            }
+                        }
+                        OpKind::Drop { glue, .. } => {
+                            let dropped_ty = self.func.values[v.0 as usize].ty;
+                            if !is_safe_std_drop(
+                                glue,
+                                dropped_ty,
+                                self.table,
+                                self.interns,
+                                self.items,
+                                self.std_crate_ids,
+                            ) {
+                                return true;
+                            }
+                        }
+                        _ => return true,
+                    },
+                }
+            }
+        }
+        false
+    }
 }
 
 fn same_byte_ptr_sign(table: &TypeTable, from: TypeId, to: TypeId) -> bool {
@@ -2503,140 +2582,6 @@ fn same_byte_ptr_sign(table: &TypeTable, from: TypeId, to: TypeId) -> bool {
             })
         ) if s1 == s2
     )
-}
-
-/// Checks whether a byte pointer projected out of a wide `Vec<T>` / `RawVec<T>` escapes
-/// into any operation other than re-casting back to `T` (`unscale`/`unscale_scalar`),
-/// rebuilding `RawVec`/`NonNull`, or calling `RawVecInner`/`dealloc`/`realloc`/`ptr_is_null`.
-#[allow(clippy::too_many_arguments)]
-fn rawvec_byte_ptr_escapes(
-    func: &Func,
-    table: &TypeTable,
-    interns: &Interns,
-    items: &BTreeMap<JsName, LinkItem>,
-    std_crate_ids: &BTreeSet<u64>,
-    uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
-    cell_reads: &BTreeMap<CellId, Vec<ValueId>>,
-    start: ValueId,
-    elem_size: u64,
-    debug: bool,
-) -> bool {
-    let mut visited = BTreeSet::new();
-    let mut queue = vec![start];
-    while let Some(v) = queue.pop() {
-        if !visited.insert(v) {
-            continue;
-        }
-        let Some(sites) = uses.get(&v) else {
-            continue;
-        };
-        for site in sites {
-            match site {
-                UseSite::EdgeArg(param) => queue.push(*param),
-                UseSite::Return => {
-                    let ty = func.values[v.0 as usize].ty;
-                    if !is_returnable_container(table, interns, ty, std_crate_ids) {
-                        return true;
-                    }
-                }
-                UseSite::OtherTerm => return true,
-                UseSite::Op(op) => match &op.kind {
-                    OpKind::Move(_) | OpKind::Copy(_) => {
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        }
-                    }
-                    OpKind::CellStore { cell, .. } => {
-                        if let Some(reads) = cell_reads.get(cell) {
-                            queue.extend(reads.iter().copied());
-                        }
-                    }
-                    OpKind::Field { .. } => {
-                        if let Some(res) = op.result {
-                            let res_ty = func.values[res.0 as usize].ty;
-                            if !is_pure_metadata_ret(table, res_ty) {
-                                queue.push(res);
-                            }
-                        }
-                    }
-                    OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
-                        if path.iter().any(|p| matches!(p, Proj::Deref)) {
-                            return true;
-                        }
-                        if path.is_empty()
-                            && matches!(root, Root::Value(rv) if *rv == v)
-                            && wide_vec_or_rawvec_elem_size(
-                                table,
-                                interns,
-                                func.values[v.0 as usize].ty,
-                                std_crate_ids,
-                            )
-                            .is_some()
-                        {
-                            continue;
-                        }
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        } else {
-                            return true;
-                        }
-                    }
-                    OpKind::Aggregate { ty, .. }
-                        if is_wrapper_aggregate(table, interns, *ty, std_crate_ids) =>
-                    {
-                        if let Some(res) = op.result {
-                            queue.push(res);
-                        }
-                    }
-                    OpKind::Cast { from, to, .. } => {
-                        if same_byte_ptr_sign(table, *from, *to) {
-                            if let Some(res) = op.result {
-                                queue.push(res);
-                            }
-                            continue;
-                        }
-                        let ok = value::pointee_of(table, *to)
-                            .and_then(|p| value::size_of(table, p))
-                            .is_some_and(|s| s == elem_size);
-                        if !ok {
-                            return true;
-                        }
-                    }
-                    OpKind::Call { callee, .. } => {
-                        match classify_stdlib_ptr_call(
-                            callee,
-                            func,
-                            table,
-                            interns,
-                            items,
-                            std_crate_ids,
-                            op.result,
-                            Some(elem_size),
-                            None,
-                            debug,
-                        ) {
-                            CallEffect::Sink => {}
-                            CallEffect::PropagateToResult => {
-                                if let Some(res) = op.result {
-                                    queue.push(res);
-                                }
-                            }
-                            CallEffect::Escape => return true,
-                        }
-                    }
-                    OpKind::Drop { glue, .. } => {
-                        let dropped_ty = func.values[v.0 as usize].ty;
-                        if !is_safe_std_drop(glue, dropped_ty, table, interns, items, std_crate_ids)
-                        {
-                            return true;
-                        }
-                    }
-                    _ => return true,
-                },
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -3087,11 +3032,15 @@ mod tests {
             ],
         );
         let reached = reachable_blocks(&f_phi, &table);
-        let origins =
-            propagate_scalar_origins(&f_phi, &reached, &table, &[(ValueId(1), Some(u32_origin))]);
-        assert_eq!(origins.get(&ValueId(1)), Some(&Some(u32_origin)));
+        let origins = propagate_scalar_origins(
+            &f_phi,
+            &reached,
+            &table,
+            &[(ValueId(1), ScalarView::IntOrChar(u32_origin))],
+        );
+        assert_eq!(origins[ValueId(1).0 as usize], Some(u32_origin));
         assert_eq!(
-            origins.get(&ValueId(3)),
+            origins[ValueId(3).0 as usize],
             None,
             "phi joining u32-scaled ptr with unknown ptr must collapse to Top"
         );

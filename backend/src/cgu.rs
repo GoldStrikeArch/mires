@@ -23,9 +23,6 @@ use crate::opts::Opts;
 pub(crate) struct CguCx<'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) namer: Namer<'tcx>,
-    /// Read by the lowering milestones that the flags in `opts.rs` are there for.
-    #[allow(dead_code)]
-    pub(crate) opts: &'static Opts,
     /// Items discovered while lowering, appended to the unit after the mono item walk.
     extra: RefCell<Vec<JsItem>>,
     /// The names already emitted into this unit, so an interned item is built exactly once.
@@ -40,7 +37,6 @@ impl<'tcx> CguCx<'tcx> {
         CguCx {
             tcx,
             namer: Namer::new(tcx, opts.names),
-            opts,
             extra: RefCell::new(Vec::new()),
             emitted: RefCell::new(BTreeSet::new()),
             interns: RefCell::new(Interns::new()),
@@ -54,7 +50,6 @@ impl<'tcx> CguCx<'tcx> {
     /// unit the ids are deterministic, because items are encoded in
     /// `items_in_deterministic_order`. The encoder takes the `RefCell` mutably while it encodes
     /// one item; nothing else may hold this borrow across an encode.
-    #[allow(dead_code)]
     pub(crate) fn interns(&self) -> Ref<'_, Interns> {
         self.interns.borrow()
     }
@@ -65,7 +60,6 @@ impl<'tcx> CguCx<'tcx> {
     }
 
     /// Takes the unit's interns, leaving empty tables behind.
-    #[allow(dead_code)]
     pub(crate) fn take_interns(&self) -> Interns {
         std::mem::take(&mut self.interns.borrow_mut())
     }
@@ -75,19 +69,10 @@ impl<'tcx> CguCx<'tcx> {
         self.emitted.borrow_mut().insert(name.clone())
     }
 
-    /// Adds a discovered item, unless one of that name is already there.
-    #[allow(dead_code)]
-    pub(crate) fn push_item(&self, item: JsItem) {
-        if self.claim(&item.name) {
-            self.extra.borrow_mut().push(item);
-        }
-    }
-
     /// Builds the item named `name` if this unit does not have it yet.
     ///
     /// The name is the interning key: two coercions to the same `dyn Trait` from the same type
     /// name the same vtable, so the second one costs nothing.
-    #[allow(dead_code)]
     pub(crate) fn intern(&self, name: JsName, build: impl FnOnce() -> JsItem) {
         if self.claim(&name) {
             let item = build();

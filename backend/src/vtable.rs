@@ -29,7 +29,7 @@ use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Ty, TyCtxt, VtblEntr
 use rustc_span::{Span, DUMMY_SP};
 
 use crate::cgu::CguCx;
-use crate::item::{ItemKind, JsItem, JsName, Linkage, ZombieKind, ZombieLog};
+use crate::item::{Decline, ItemKind, JsItem, JsItemJir, JsName, Linkage, ZombieKind, ZombieLog};
 use crate::jsast::{self, Expr};
 use crate::value::typing_env;
 
@@ -93,9 +93,12 @@ fn build<'tcx>(
         None => format!("<{ty}> vtable"),
     });
 
-    let (jir, jir_decline) = match crate::jir::encode::vtable(cgu, ty, trait_ref) {
-        Ok(item) => (Some(item), None),
-        Err(decline) => (None, Some(rcgjs_object::jir::Decline::Encode(decline))),
+    let jir = match crate::jir::encode::vtable(cgu, ty, trait_ref) {
+        Ok(item) => JsItemJir::from(item),
+        Err(decline) => JsItemJir::Declined {
+            item: None,
+            decline: Decline::Encode(decline),
+        },
     };
 
     JsItem::new(
@@ -106,7 +109,7 @@ fn build<'tcx>(
         Linkage::internal(),
         debug_path,
     )
-    .with_jir(jir, jir_decline)
+    .with_jir(jir)
 }
 
 /// Slot 0: the drop glue of the concrete type, or `null` when it has none.

@@ -266,7 +266,17 @@ pub fn binary(
                 _ => None,
             })
             .ok_or(Trap::Unsupported("integer operator at a non-integer type"))?;
-        return binary_int(op, l, r, signed, bits, left, right, ty, result_ty, table);
+        return binary_int(
+            IntBinaryInput {
+                op,
+                l,
+                r,
+                signed,
+                bits,
+                result_ty,
+            },
+            table,
+        );
     }
     match (op, left, right) {
         (_, Value::Float { value: l, bits }, Value::Float { value: r, .. }) => {
@@ -319,19 +329,24 @@ fn int_of(value: &Value) -> Option<i128> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn binary_int(
+struct IntBinaryInput {
     op: BinaryOp,
     l: i128,
     r: i128,
     signed: bool,
     bits: u32,
-    left: &Value,
-    right: &Value,
-    ty: TypeId,
     result_ty: TypeId,
-    table: &TypeTable,
-) -> Result<Value, Trap> {
+}
+
+fn binary_int(input: IntBinaryInput, table: &TypeTable) -> Result<Value, Trap> {
+    let IntBinaryInput {
+        op,
+        l,
+        r,
+        signed,
+        bits,
+        result_ty,
+    } = input;
     let wrap = |v: i128| Value::Int {
         value: normalize_int(v, bits, signed),
         bits,
@@ -438,10 +453,7 @@ fn binary_int(
                 fields: Vec::new(),
             })
         }
-        BinaryOp::Offset => {
-            let _ = (left, right, ty);
-            Err(Trap::Unsupported("integer Offset"))
-        }
+        BinaryOp::Offset => Err(Trap::Unsupported("integer Offset")),
     }
 }
 

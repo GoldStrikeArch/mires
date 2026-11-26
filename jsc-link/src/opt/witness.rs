@@ -5,7 +5,11 @@
 //! baseline text and the link goes on. Whole-program `prune_invoke` rewrites are additionally
 //! validated by [`check_invoke_pruning`].
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use std::num::NonZeroU128;
+use std::sync::OnceLock;
 
 use crate::analysis::arena::{ArenaFieldKind, ProgramBoundsFacts};
 use crate::analysis::heap::is_global_vec_ty;
@@ -14,7 +18,7 @@ use crate::item::AllocatorProvider;
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
-use crate::jir::repr::{CellId, Dominators, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId};
+use crate::jir::repr::{CellId, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId};
 use crate::jir::semantic::{
     BinaryOp, BodyKind, CallSemantic, Callee, CastKind, ConstTree, DefinitionId, DropGlue,
     HostPayload, ItemId, TypeId, UnaryOp, VtableEntry,
@@ -22,10 +26,303 @@ use crate::jir::semantic::{
 use crate::jir::types::TypeKind;
 use crate::jir::TypeTable;
 
+use super::cfg::{mask, mask_bits, sign_extend, Cfg, DefUse};
 use super::prune_invoke::{
     check_noop_unwind_chain, host_payload_cannot_throw, is_non_throwing_sysroot_shim_member,
     is_panic_impl_item, type_contains_fn_ptr,
 };
+
+/// Raw scalar constant bits paired with their byte width for [`Witness::ConstFold`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScalarBits {
+    pub bits: u128,
+    pub bytes: u8,
+}
+
+/// Sentinel value paired with the dominating guard that ruled it out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SentinelGuard {
+    pub value: u128,
+    pub block: RBlockId,
+    pub cond: ValueId,
+}
+
+/// Constant subtraction offset on a [`BoundsFact::LocalBoundedVec`] index.
+///
+/// Any non-zero offset structurally requires its dominating guard block and condition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubOffset {
+    Zero,
+    Guarded {
+        offset: NonZeroU128,
+        block: RBlockId,
+        cond: ValueId,
+    },
+}
+
+/// Failure returned by independent witness verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitnessError {
+    /// Top-level witness check failure naming the failing witness and its cause.
+    Witness {
+        witness: Box<Witness>,
+        cause: Box<WitnessError>,
+    },
+    UnsupportedConstFoldType(TypeId),
+    UnsupportedConstFoldOp(BinaryOp),
+    ConstFoldMismatch {
+        computed: bool,
+        claimed: bool,
+    },
+    BranchFoldMismatch {
+        selected: RBlockId,
+        claimed: RBlockId,
+    },
+    MissingBlock(RBlockId),
+    OperandsOutOfRange,
+    NumericBoundInvalid {
+        index_hi: u128,
+        length_lo: u128,
+    },
+    DominatingOffsetNotImplied {
+        offset_index: u128,
+        offset_fact: u128,
+    },
+    BlockDoesNotDominate {
+        role: &'static str,
+        dominator: RBlockId,
+        target: RBlockId,
+    },
+    GuardConditionMissing {
+        role: &'static str,
+        cond: ValueId,
+    },
+    BitmaskOperandOutOfRange,
+    BitmaskIndexMismatch {
+        index: ValueId,
+        and_val: ValueId,
+    },
+    NotBitAnd(ValueId),
+    BitmaskNotUnsigned,
+    BitmaskMaskNotOperand {
+        mask: ValueId,
+        and_val: ValueId,
+    },
+    BitmaskLengthMismatch {
+        len_val: ValueId,
+        assert_len: ValueId,
+    },
+    BitmaskNotProvenBelow {
+        mask_val: ValueId,
+        len_val: ValueId,
+    },
+    ArenaFactsMissing,
+    ArenaIndexNotUnsigned,
+    ArenaNotProven(DefinitionId),
+    ArenaSentinelMismatch {
+        field: u32,
+        expected: u128,
+        actual: Option<u128>,
+    },
+    ArenaFieldNotProven {
+        field: u32,
+        kind: &'static str,
+    },
+    ArenaParamNotCertified {
+        idx_param: Option<usize>,
+        elem_def: DefinitionId,
+    },
+    ArenaCalleeMismatch {
+        callee: ItemId,
+        detail: &'static str,
+    },
+    NotBlockParam(ValueId),
+    LocalVecRootInvalid {
+        root: LocalVecRoot,
+        detail: &'static str,
+    },
+    LoadValOutOfRange(ValueId),
+    LoadValNotDeref(ValueId),
+    LocalVecIndexMismatch {
+        index: ValueId,
+        load_val: ValueId,
+        sub_offset: Option<NonZeroU128>,
+    },
+    AlignedPrefixMismatch {
+        expected: Option<bool>,
+    },
+    InvokePruneFaultInjected,
+    InvokePruneNoSites,
+    InvokePruneMissingBlock(RBlockId),
+    InvokePruneNotInvoke(RBlockId),
+    InvokePruneNoopChain(String),
+    InvokePruneMayThrow(String),
+}
+
+impl fmt::Display for WitnessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Witness { witness, cause } => write!(f, "{witness:?}: {cause}"),
+            Self::UnsupportedConstFoldType(ty) => {
+                write!(f, "unsupported ConstFold operand type t{}", ty.0)
+            }
+            Self::UnsupportedConstFoldOp(op) => {
+                write!(f, "unsupported ConstFold comparison {op:?}")
+            }
+            Self::ConstFoldMismatch { computed, claimed } => {
+                write!(f, "the evaluator computed {computed}, not {claimed}")
+            }
+            Self::BranchFoldMismatch { selected, claimed } => {
+                write!(
+                    f,
+                    "case selection lands on {}, not {}",
+                    selected.0, claimed.0
+                )
+            }
+            Self::MissingBlock(block) => write!(f, "block {} is gone", block.0),
+            Self::OperandsOutOfRange => f.write_str("the assert's operands are gone"),
+            Self::NumericBoundInvalid {
+                index_hi,
+                length_lo,
+            } => write!(f, "{index_hi} is not below {length_lo}"),
+            Self::DominatingOffsetNotImplied {
+                offset_index,
+                offset_fact,
+            } => write!(
+                f,
+                "offset {offset_index} is not inside the fact's {offset_fact}"
+            ),
+            Self::BlockDoesNotDominate {
+                role,
+                dominator,
+                target,
+            } => write!(
+                f,
+                "{role} block {} does not dominate block {}",
+                dominator.0, target.0
+            ),
+            Self::GuardConditionMissing { role, cond } => {
+                write!(f, "{role} v{} is no longer present", cond.0)
+            }
+            Self::BitmaskOperandOutOfRange => {
+                f.write_str("bitmask witness operand is out of range")
+            }
+            Self::BitmaskIndexMismatch { index, and_val } => {
+                write!(
+                    f,
+                    "index v{} does not peel to BitAnd v{}",
+                    index.0, and_val.0
+                )
+            }
+            Self::NotBitAnd(v) => write!(f, "v{} is not a BinaryOp::BitAnd", v.0),
+            Self::BitmaskNotUnsigned => f.write_str("bitmask BitAnd operand type is not unsigned"),
+            Self::BitmaskMaskNotOperand { mask, and_val } => {
+                write!(
+                    f,
+                    "mask v{} is not an operand of BitAnd v{}",
+                    mask.0, and_val.0
+                )
+            }
+            Self::BitmaskLengthMismatch {
+                len_val,
+                assert_len,
+            } => write!(
+                f,
+                "bitmask len_val v{} does not match assert length v{}",
+                len_val.0, assert_len.0
+            ),
+            Self::BitmaskNotProvenBelow { mask_val, len_val } => write!(
+                f,
+                "mask v{} is not structurally proven below nonzero length v{}",
+                mask_val.0, len_val.0
+            ),
+            Self::ArenaFactsMissing => {
+                f.write_str("MonotoneArena witness requires whole-program arena facts")
+            }
+            Self::ArenaIndexNotUnsigned => {
+                f.write_str("MonotoneArena index is not an unsigned integer")
+            }
+            Self::ArenaNotProven(elem_def) => write!(f, "arena {elem_def:?} is not proven"),
+            Self::ArenaSentinelMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "field {field} requires sentinel {expected} guard, got {actual:?}"
+            ),
+            Self::ArenaFieldNotProven { field, kind } => {
+                write!(f, "field {field} is not a proven {kind} field")
+            }
+            Self::ArenaParamNotCertified {
+                idx_param: None, ..
+            } => f.write_str("function has no certified ParamArenaIndex facts"),
+            Self::ArenaParamNotCertified {
+                idx_param: Some(idx_param),
+                elem_def,
+            } => write!(
+                f,
+                "param {idx_param} is not certified for arena {elem_def:?}"
+            ),
+            Self::ArenaCalleeMismatch { callee, detail } => {
+                write!(f, "callee {callee:?} {detail}")
+            }
+            Self::NotBlockParam(param) => write!(f, "v{} is not a block parameter", param.0),
+            Self::LocalVecRootInvalid { root, detail } => match root {
+                LocalVecRoot::Cell(cell) => write!(f, "local vec cell {} {detail}", cell.0),
+                LocalVecRoot::Value(val) => write!(f, "local vec value v{} {detail}", val.0),
+            },
+            Self::LoadValOutOfRange(v) => write!(f, "load_val v{} is out of range", v.0),
+            Self::LoadValNotDeref(v) => write!(f, "load_val v{} is not a Deref load", v.0),
+            Self::LocalVecIndexMismatch {
+                index,
+                load_val,
+                sub_offset: None,
+            } => write!(
+                f,
+                "index v{} does not match load_val v{}",
+                index.0, load_val.0
+            ),
+            Self::LocalVecIndexMismatch {
+                index,
+                load_val,
+                sub_offset: Some(offset),
+            } => write!(
+                f,
+                "index v{} is not load_val v{} - {offset}",
+                index.0, load_val.0
+            ),
+            Self::AlignedPrefixMismatch {
+                expected: Some(expected),
+            } => write!(f, "the aligned-prefix relation evaluates to {expected}"),
+            Self::AlignedPrefixMismatch { expected: None } => {
+                f.write_str("the operands are not a proven aligned-prefix relation")
+            }
+            Self::InvokePruneFaultInjected => f.write_str("injected prune-invoke witness fault"),
+            Self::InvokePruneNoSites => f.write_str("no invoke pruning sites recorded"),
+            Self::InvokePruneMissingBlock(block) => {
+                write!(f, "pruned block bb{} does not exist", block.0)
+            }
+            Self::InvokePruneNotInvoke(block) => {
+                write!(
+                    f,
+                    "pruned block bb{} did not terminate in RTerm::Invoke",
+                    block.0
+                )
+            }
+            Self::InvokePruneNoopChain(msg) | Self::InvokePruneMayThrow(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for WitnessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Witness { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// One recorded semantic rewrite whose claim can be re-derived independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,8 +331,8 @@ pub enum Witness {
     ConstFold {
         op: BinaryOp,
         ty: TypeId,
-        l: (u128, u8),
-        r: (u128, u8),
+        l: ScalarBits,
+        r: ScalarBits,
         result: bool,
     },
     /// A `Switch` on a known scrutinee took one edge: a constant fold, a statically fixed
@@ -43,9 +340,9 @@ pub enum Witness {
     BranchFold {
         scrut: u128,
         bytes: u8,
-        cases: Vec<(u128, u32)>,
-        default: u32,
-        taken: u32,
+        cases: Vec<(u128, RBlockId)>,
+        default: RBlockId,
+        taken: RBlockId,
     },
     /// A bounds-check `Assert` was deleted because a dominating fact implies its condition.
     BoundsRemoved {
@@ -89,8 +386,7 @@ pub enum BoundsFact {
     /// Whole-program monotone-arena invariant proves `index < length` via [`ProgramBoundsFacts`].
     MonotoneArena {
         elem_def: DefinitionId,
-        sentinel: Option<u128>,
-        sentinel_guard: Option<(RBlockId, ValueId)>,
+        sentinel: Option<SentinelGuard>,
         source: ArenaIndexSource,
     },
     /// Local non-escaping bounded-element `Vec` invariant: `index` is `load_val - sub_offset`
@@ -98,8 +394,7 @@ pub enum BoundsFact {
     LocalBoundedVec {
         vec_root: LocalVecRoot,
         load_val: ValueId,
-        sub_offset: u128,
-        guard: Option<(RBlockId, ValueId)>,
+        sub_offset: SubOffset,
     },
 }
 
@@ -124,17 +419,28 @@ pub enum ArenaIndexSource {
 impl Witness {
     /// Re-derives this witness's claim against `func`, independently of the pass that made it.
     #[cfg(test)]
-    pub fn check(&self, func: &Func, table: &TypeTable) -> Result<(), String> {
+    pub fn check(&self, func: &Func, table: &TypeTable) -> Result<(), WitnessError> {
         self.check_with_context(func, table, None)
     }
 
     /// Re-derives this witness's claim with optional whole-program [`ProgramBoundsFacts`].
+    #[cfg(test)]
     pub fn check_with_context(
         &self,
         func: &Func,
         table: &TypeTable,
         arena_facts: Option<&ProgramBoundsFacts>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WitnessError> {
+        let cx = WitnessCheckCx::new(func);
+        self.check_with_cx(&cx, table, arena_facts)
+    }
+
+    fn check_with_cx(
+        &self,
+        cx: &WitnessCheckCx<'_>,
+        table: &TypeTable,
+        arena_facts: Option<&ProgramBoundsFacts>,
+    ) -> Result<(), WitnessError> {
         match self {
             Self::ConstFold {
                 op,
@@ -155,19 +461,33 @@ impl Witness {
                 index,
                 length,
                 fact,
-            } => check_bounds_removed(func, table, arena_facts, *block, *index, *length, fact),
+            } => check_bounds_removed(
+                cx,
+                table,
+                arena_facts,
+                BoundsSite {
+                    block: *block,
+                    index: *index,
+                    length: *length,
+                },
+                fact,
+            ),
             Self::AlignedPrefix {
                 left,
                 right,
                 op,
                 result,
-            } => check_aligned_prefix(func, table, *left, *right, *op, *result),
+            } => check_aligned_prefix(cx, table, *left, *right, *op, *result),
         }
     }
 }
 
 /// Checks every witness; the first failure names the witness and the reason.
-pub fn check_all(witnesses: &[Witness], func: &Func, table: &TypeTable) -> Result<(), String> {
+pub fn check_all(
+    witnesses: &[Witness],
+    func: &Func,
+    table: &TypeTable,
+) -> Result<(), WitnessError> {
     check_all_with_context(witnesses, func, table, None)
 }
 
@@ -177,59 +497,120 @@ pub fn check_all_with_context(
     func: &Func,
     table: &TypeTable,
     arena_facts: Option<&ProgramBoundsFacts>,
-) -> Result<(), String> {
+) -> Result<(), WitnessError> {
+    let cx = WitnessCheckCx::new(func);
     for witness in witnesses {
         witness
-            .check_with_context(func, table, arena_facts)
-            .map_err(|why| format!("{witness:?}: {why}"))?;
+            .check_with_cx(&cx, table, arena_facts)
+            .map_err(|cause| WitnessError::Witness {
+                witness: Box::new(witness.clone()),
+                cause: Box::new(cause),
+            })?;
     }
     Ok(())
+}
+
+/// Lazily computed per-function indices shared across a batch of witness checks.
+struct WitnessCheckCx<'a> {
+    func: &'a Func,
+    cfg: OnceCell<Cfg>,
+    def_use: OnceCell<DefUse>,
+}
+
+impl<'a> WitnessCheckCx<'a> {
+    fn new(func: &'a Func) -> Self {
+        Self {
+            func,
+            cfg: OnceCell::new(),
+            def_use: OnceCell::new(),
+        }
+    }
+
+    fn cfg(&self) -> &Cfg {
+        self.cfg.get_or_init(|| Cfg::of(self.func))
+    }
+
+    fn def_use(&self) -> &DefUse {
+        self.def_use.get_or_init(|| DefUse::of(self.func))
+    }
+
+    fn def_kind(&self, v: ValueId) -> Option<&'a OpKind> {
+        self.def_use().def_kind(self.func, v)
+    }
+
+    fn cond_present(&self, cond: ValueId) -> bool {
+        self.func.blocks.iter().any(|b| {
+            matches!(&b.term, RTerm::Switch { scrut, .. } if *scrut == cond)
+                || b.ops
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::Assert { cond: c, .. } if *c == cond))
+        })
+    }
+
+    fn check_dominating_guard(
+        &self,
+        role: &'static str,
+        guard_block: RBlockId,
+        guard_cond: ValueId,
+        target_block: RBlockId,
+    ) -> Result<(), WitnessError> {
+        if !self.cfg().doms.dominates(guard_block, target_block) {
+            return Err(WitnessError::BlockDoesNotDominate {
+                role,
+                dominator: guard_block,
+                target: target_block,
+            });
+        }
+        if !self.cond_present(guard_cond) {
+            return Err(WitnessError::GuardConditionMissing {
+                role,
+                cond: guard_cond,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The bounds-check assert location and operands verified by [`check_bounds_removed`].
+#[derive(Clone, Copy)]
+struct BoundsSite {
+    block: RBlockId,
+    index: ValueId,
+    length: ValueId,
 }
 
 /// Whether the independent checks run: always in debug builds, and wherever
 /// `RCGJS_WITNESS_CHECK=1` asks for them (CI on release artifacts).
 pub fn enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os("RCGJS_WITNESS_CHECK").is_some()
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RCGJS_WITNESS_CHECK").is_some())
 }
 
-fn mask(bits: u128, bytes: u8) -> u128 {
-    match bytes {
-        0 => 0,
-        1..=15 => bits & ((1u128 << (bytes as u32 * 8)) - 1),
-        _ => bits,
-    }
-}
-
-fn mask_bits(bits: u128, width: u32) -> u128 {
-    match width {
-        0 => 0,
-        1..=127 => bits & ((1u128 << width) - 1),
-        _ => bits,
-    }
-}
-
-fn sign_extend(bits: u128, width: u32) -> i128 {
-    let masked = mask_bits(bits, width);
-    if width == 0 || width >= 128 {
-        masked as i128
-    } else {
-        let shift = 128 - width;
-        ((masked << shift) as i128) >> shift
-    }
+/// Cached process-wide `RCGJS_WITNESS_FAULT` value, if set.
+pub(crate) fn env_witness_fault() -> Option<&'static str> {
+    static FAULT: OnceLock<Option<String>> = OnceLock::new();
+    FAULT
+        .get_or_init(|| {
+            std::env::var_os("RCGJS_WITNESS_FAULT").map(|v| v.to_string_lossy().into_owned())
+        })
+        .as_deref()
 }
 
 /// `ConstFold`: directly evaluates the folded integer/bool comparison independently of the pass.
 fn check_const_fold(
     op: BinaryOp,
     ty: TypeId,
-    l: (u128, u8),
-    r: (u128, u8),
+    l: ScalarBits,
+    r: ScalarBits,
     result: bool,
     table: &TypeTable,
-) -> Result<(), String> {
+) -> Result<(), WitnessError> {
     let ordering = if let Some((signed, bits)) = table.int_info(ty) {
-        let ml = mask_bits(l.0, bits);
-        let mr = mask_bits(r.0, bits);
+        let ml = mask_bits(l.bits, bits);
+        let mr = mask_bits(r.bits, bits);
         if signed {
             sign_extend(ml, bits).cmp(&sign_extend(mr, bits))
         } else {
@@ -239,9 +620,9 @@ fn check_const_fold(
         table.get(table.peeled(ty)).map(|d| &d.kind),
         Some(TypeKind::Bool)
     ) {
-        (mask(l.0, l.1) != 0).cmp(&(mask(r.0, r.1) != 0))
+        (mask(l.bits, l.bytes) != 0).cmp(&(mask(r.bits, r.bytes) != 0))
     } else {
-        return Err(format!("unsupported ConstFold operand type t{}", ty.0));
+        return Err(WitnessError::UnsupportedConstFoldType(ty));
     };
     let computed = match op {
         BinaryOp::Eq => ordering.is_eq(),
@@ -250,12 +631,15 @@ fn check_const_fold(
         BinaryOp::Le => ordering.is_le(),
         BinaryOp::Gt => ordering.is_gt(),
         BinaryOp::Ge => ordering.is_ge(),
-        other => return Err(format!("unsupported ConstFold comparison {other:?}")),
+        other => return Err(WitnessError::UnsupportedConstFoldOp(other)),
     };
     if computed == result {
         Ok(())
     } else {
-        Err(format!("the evaluator computed {computed}, not {result}"))
+        Err(WitnessError::ConstFoldMismatch {
+            computed,
+            claimed: result,
+        })
     }
 }
 
@@ -263,10 +647,10 @@ fn check_const_fold(
 fn check_branch_fold(
     scrut: u128,
     bytes: u8,
-    cases: &[(u128, u32)],
-    default: u32,
-    taken: u32,
-) -> Result<(), String> {
+    cases: &[(u128, RBlockId)],
+    default: RBlockId,
+    taken: RBlockId,
+) -> Result<(), WitnessError> {
     let value = mask(scrut, bytes);
     let selected = cases
         .iter()
@@ -276,21 +660,16 @@ fn check_branch_fold(
     if selected == taken {
         Ok(())
     } else {
-        Err(format!("case selection lands on {selected}, not {taken}"))
+        Err(WitnessError::BranchFoldMismatch {
+            selected,
+            claimed: taken,
+        })
     }
 }
 
-fn find_def(func: &Func, v: ValueId) -> Option<&OpKind> {
-    func.blocks
-        .iter()
-        .flat_map(|b| &b.ops)
-        .find(|op| op.result == Some(v))
-        .map(|op| &op.kind)
-}
-
-fn peel_transparent(func: &Func, table: &TypeTable, mut v: ValueId) -> ValueId {
+fn peel_transparent(cx: &WitnessCheckCx<'_>, table: &TypeTable, mut v: ValueId) -> ValueId {
     for _ in 0..8 {
-        match find_def(func, v) {
+        match cx.def_kind(v) {
             Some(OpKind::Copy(src) | OpKind::Move(src)) => v = *src,
             Some(OpKind::Cast {
                 kind: CastKind::IntToInt,
@@ -307,27 +686,26 @@ fn peel_transparent(func: &Func, table: &TypeTable, mut v: ValueId) -> ValueId {
             None => {
                 let mut rep: Option<ValueId> = None;
                 let mut same = true;
-                if let Some(blk) = func.blocks.iter().skip(1).find(|b| b.params.contains(&v)) {
-                    if let Some(pos) = blk.params.iter().position(|&p| p == v) {
-                        for pred in &func.blocks {
-                            for (target, args) in pred.term.edges() {
-                                if target != blk.id {
-                                    continue;
-                                }
-                                let Some(&arg) = args.get(pos) else {
+                if let Some((blk_id, pos)) = cx.def_use().param_site(v).filter(|(b, _)| b.0 != 0) {
+                    for &pred_id in &cx.cfg().preds[blk_id.0 as usize] {
+                        let pred = &cx.func.blocks[pred_id.0 as usize];
+                        for (target, args) in pred.term.edges() {
+                            if target != blk_id {
+                                continue;
+                            }
+                            let Some(&arg) = args.get(pos) else {
+                                same = false;
+                                break;
+                            };
+                            if arg == v {
+                                continue;
+                            }
+                            match rep {
+                                None => rep = Some(arg),
+                                Some(prev) if prev == arg => {}
+                                Some(_) => {
                                     same = false;
                                     break;
-                                };
-                                if arg == v {
-                                    continue;
-                                }
-                                match rep {
-                                    None => rep = Some(arg),
-                                    Some(prev) if prev == arg => {}
-                                    Some(_) => {
-                                        same = false;
-                                        break;
-                                    }
                                 }
                             }
                         }
@@ -349,416 +727,467 @@ fn peel_transparent(func: &Func, table: &TypeTable, mut v: ValueId) -> ValueId {
 
 /// `BoundsRemoved`: re-runs dominance and the implying fact on the final `Func`.
 fn check_bounds_removed(
-    func: &Func,
+    cx: &WitnessCheckCx<'_>,
     table: &TypeTable,
     arena_facts: Option<&ProgramBoundsFacts>,
-    block: RBlockId,
-    index: ValueId,
-    length: ValueId,
+    site: BoundsSite,
     fact: &BoundsFact,
-) -> Result<(), String> {
-    if func.blocks.get(block.0 as usize).is_none() {
-        return Err(format!("block {} is gone", block.0));
+) -> Result<(), WitnessError> {
+    let func = cx.func;
+    if func.blocks.get(site.block.0 as usize).is_none() {
+        return Err(WitnessError::MissingBlock(site.block));
     }
-    if (index.0 as usize) >= func.values.len() || (length.0 as usize) >= func.values.len() {
-        return Err("the assert's operands are gone".to_owned());
+    if (site.index.0 as usize) >= func.values.len() || (site.length.0 as usize) >= func.values.len()
+    {
+        return Err(WitnessError::OperandsOutOfRange);
     }
-    let cond_present = |cond: ValueId| -> bool {
-        func.blocks.iter().any(|b| {
-            matches!(&b.term, RTerm::Switch { scrut, .. } if *scrut == cond)
-                || b.ops
-                    .iter()
-                    .any(|op| matches!(&op.kind, OpKind::Assert { cond: c, .. } if *c == cond))
-        })
-    };
 
     match fact {
         BoundsFact::Numeric {
             index_hi,
             length_lo,
-        } => {
-            if index_hi < length_lo {
-                Ok(())
-            } else {
-                Err(format!("{index_hi} is not below {length_lo}"))
-            }
-        }
+        } => check_bounds_numeric(*index_hi, *length_lo),
         BoundsFact::Dominating {
             block: fact_block,
             cond,
             offset_index,
             offset_fact,
             strict,
-        } => {
-            let implied = match strict {
-                true => offset_index <= offset_fact,
-                false => offset_index < offset_fact,
-            };
-            if !implied {
-                return Err(format!(
-                    "offset {offset_index} is not inside the fact's {offset_fact}"
-                ));
-            }
-            let doms = Dominators::of(func);
-            if !dominates(&doms, *fact_block, block) {
-                return Err(format!(
-                    "block {} does not dominate block {}",
-                    fact_block.0, block.0
-                ));
-            }
-            if cond_present(*cond) {
-                Ok(())
-            } else {
-                Err(format!("no switch or assert on v{} remains", cond.0))
-            }
-        }
+        } => check_bounds_dominating(
+            cx,
+            site.block,
+            *fact_block,
+            *cond,
+            *offset_index,
+            *offset_fact,
+            *strict,
+        ),
         BoundsFact::Bitmask {
             and_val,
             mask_val,
             len_val,
             nonzero_site,
-        } => {
-            if (and_val.0 as usize) >= func.values.len()
-                || (mask_val.0 as usize) >= func.values.len()
-                || (len_val.0 as usize) >= func.values.len()
-            {
-                return Err("bitmask witness operand is out of range".to_owned());
-            }
-            let p_idx = peel_transparent(func, table, index);
-            let p_and = peel_transparent(func, table, *and_val);
-            if p_idx != p_and {
-                return Err(format!(
-                    "index v{} does not peel to BitAnd v{}",
-                    index.0, and_val.0
-                ));
-            }
-            let Some(OpKind::Binary {
-                op: BinaryOp::BitAnd,
-                l,
-                r,
-                ty,
-            }) = find_def(func, p_and)
-            else {
-                return Err(format!("v{} is not a BinaryOp::BitAnd", p_and.0));
-            };
-            if !matches!(table.int_info(*ty), Some((false, _))) {
-                return Err("bitmask BitAnd operand type is not unsigned".to_owned());
-            }
-            let p_mask = peel_transparent(func, table, *mask_val);
-            if peel_transparent(func, table, *l) != p_mask
-                && peel_transparent(func, table, *r) != p_mask
-            {
-                return Err(format!(
-                    "mask v{} is not an operand of BitAnd v{}",
-                    mask_val.0, and_val.0
-                ));
-            }
-            if let Some((nz_blk, nz_cond)) = nonzero_site {
-                let doms = Dominators::of(func);
-                if !dominates(&doms, *nz_blk, block) {
-                    return Err(format!(
-                        "bitmask nonzero block {} does not dominate block {}",
-                        nz_blk.0, block.0
-                    ));
-                }
-                if !cond_present(*nz_cond) {
-                    return Err(format!(
-                        "bitmask nonzero guard v{} is no longer present",
-                        nz_cond.0
-                    ));
-                }
-            }
-            let p_len = peel_transparent(func, table, *len_val);
-            let p_assert_len = peel_transparent(func, table, length);
-            let len_matches_assert = p_len == p_assert_len
-                || same_one_shl_term(func, table, p_len, p_assert_len)
-                || assert_len_matches_target(func, table, arena_facts, p_assert_len, p_len);
-            if !len_matches_assert {
-                return Err(format!(
-                    "bitmask len_val v{} does not match assert length v{}",
-                    len_val.0, length.0
-                ));
-            }
-            let len_proven_nonzero = nonzero_site.is_some()
-                || is_one_shl(func, table, p_len)
-                || matches!(
-                    find_def(func, p_len),
-                    Some(OpKind::Const(ConstTree::Scalar { bits, bytes })) if mask(*bits, *bytes) >= 1
-                )
-                || is_positive_doubling_param(func, table, p_len);
-            let sub_one_match = len_proven_nonzero
-                && match find_def(func, p_mask) {
-                    Some(OpKind::Binary {
-                        op: BinaryOp::Sub | BinaryOp::SubUnchecked,
-                        l: sub_l,
-                        r: sub_r,
-                        ..
-                    }) => {
-                        let is_one = matches!(
-                            find_def(func, peel_transparent(func, table, *sub_r)),
-                            Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
-                        );
-                        if !is_one {
-                            false
-                        } else {
-                            let p_sub_l = peel_transparent(func, table, *sub_l);
-                            p_sub_l == p_len
-                                || same_one_shl_term(func, table, p_sub_l, p_len)
-                                || p_sub_l == p_assert_len
-                        }
-                    }
-                    _ => false,
-                };
-            let const_match = match (find_def(func, p_mask), find_def(func, p_len)) {
-                (
-                    Some(OpKind::Const(ConstTree::Scalar {
-                        bits: mb,
-                        bytes: mby,
-                    })),
-                    Some(OpKind::Const(ConstTree::Scalar {
-                        bits: lb,
-                        bytes: lby,
-                    })),
-                ) => mask(*mb, *mby) < mask(*lb, *lby),
-                (
-                    Some(OpKind::Const(ConstTree::Scalar { bits: 0, .. })),
-                    Some(OpKind::Binary {
-                        op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
-                        l: shl_l,
-                        ..
-                    }),
-                ) => matches!(
-                    find_def(func, peel_transparent(func, table, *shl_l)),
-                    Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
-                ),
-                _ => false,
-            };
-            if sub_one_match || const_match {
-                Ok(())
-            } else {
-                Err(format!(
-                    "mask v{} is not structurally proven below nonzero length v{}",
-                    mask_val.0, len_val.0
-                ))
-            }
-        }
+        } => check_bounds_bitmask(
+            cx,
+            table,
+            arena_facts,
+            site,
+            (*and_val, *mask_val, *len_val, *nonzero_site),
+        ),
         BoundsFact::MonotoneArena {
             elem_def,
             sentinel,
-            sentinel_guard,
             source,
         } => {
-            let Some(facts) = arena_facts else {
-                return Err("MonotoneArena witness requires whole-program arena facts".to_owned());
-            };
-            if !matches!(
-                table.int_info(table.peeled(func.values[index.0 as usize].ty)),
-                Some((false, _))
-            ) {
-                return Err("MonotoneArena index is not an unsigned integer".to_owned());
-            }
-            if sentinel.is_some() {
-                let Some((gb, gc)) = sentinel_guard else {
-                    return Err("sentinel-tagged MonotoneArena witness missing guard".to_owned());
-                };
-                let doms = Dominators::of(func);
-                if !dominates(&doms, *gb, block) {
-                    return Err(format!(
-                        "sentinel guard block {} does not dominate block {}",
-                        gb.0, block.0
-                    ));
-                }
-                if !cond_present(*gc) {
-                    return Err(format!(
-                        "sentinel guard condition v{} is no longer present",
-                        gc.0
-                    ));
-                }
-            }
-            match source {
-                ArenaIndexSource::Field(f) => {
-                    let inv = facts
-                        .arenas
-                        .get(elem_def)
-                        .ok_or_else(|| format!("arena {elem_def:?} is not proven"))?;
-                    match inv.fields.get(f) {
-                        Some(ArenaFieldKind::AlwaysValid) => Ok(()),
-                        Some(ArenaFieldKind::ValidOrSentinel { sentinel: s }) => {
-                            if *sentinel == Some(*s) {
-                                Ok(())
-                            } else {
-                                Err(format!(
-                                    "field {f} requires sentinel {s} guard, got {sentinel:?}"
-                                ))
-                            }
-                        }
-                        _ => Err(format!("field {f} is not a proven scalar arena field")),
-                    }
-                }
-                ArenaIndexSource::VecField(f) => {
-                    let inv = facts
-                        .arenas
-                        .get(elem_def)
-                        .ok_or_else(|| format!("arena {elem_def:?} is not proven"))?;
-                    if matches!(inv.fields.get(f), Some(ArenaFieldKind::VecOfValidIndices)) {
-                        Ok(())
-                    } else {
-                        Err(format!("field {f} is not a proven VecOfValidIndices field"))
-                    }
-                }
-                ArenaIndexSource::Param { idx_param } => {
-                    let Some(list) = facts.param_arena_indices.get(&func.item) else {
-                        return Err("function has no certified ParamArenaIndex facts".to_owned());
-                    };
-                    let ok = list.iter().any(|p| {
-                        p.idx_param == *idx_param
-                            && p.elem_def == *elem_def
-                            && (p.sentinel.is_none() || p.sentinel == *sentinel)
-                    });
-                    if ok {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "param {idx_param} is not certified for arena {elem_def:?}"
-                        ))
-                    }
-                }
-                ArenaIndexSource::CallReturn { callee } => {
-                    let Some(ret) = facts.return_arena_index.get(callee) else {
-                        return Err(format!(
-                            "callee {callee:?} has no certified ReturnArenaIndex"
-                        ));
-                    };
-                    if ret.elem_def == *elem_def
-                        && (ret.sentinel.is_none() || ret.sentinel == *sentinel)
-                    {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "callee {callee:?} return arena summary does not match witness"
-                        ))
-                    }
-                }
-                ArenaIndexSource::ReturnVecElem { callee } => {
-                    if facts.return_vec_elem_bound.contains_key(callee) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "callee {callee:?} has no certified ReturnVecElemBound"
-                        ))
-                    }
-                }
-                ArenaIndexSource::BlockParam { param } => {
-                    if !facts.arenas.contains_key(elem_def) {
-                        return Err(format!("arena {elem_def:?} is not proven"));
-                    }
-                    if func.blocks.iter().skip(1).any(|b| b.params.contains(param)) {
-                        Ok(())
-                    } else {
-                        Err(format!("v{} is not a block parameter", param.0))
-                    }
-                }
-            }
+            check_bounds_monotone_arena(cx, table, arena_facts, site, *elem_def, *sentinel, *source)
         }
         BoundsFact::LocalBoundedVec {
             vec_root,
             load_val,
             sub_offset,
-            guard,
-        } => {
-            match vec_root {
-                LocalVecRoot::Cell(cell) => {
-                    let Some(cdef) = func.cells.get(cell.0 as usize) else {
-                        return Err(format!("local vec cell {} is gone", cell.0));
-                    };
-                    if !is_global_vec_ty(table, cdef.ty) {
-                        return Err(format!("cell {} is not a Vec<T, Global>", cell.0));
-                    }
-                    if func.blocks.iter().any(|b| {
-                        b.ops.iter().any(|op| {
-                            matches!(&op.kind, OpKind::RawView { root: Root::Cell(c), .. } if c == cell)
-                        })
-                    }) {
-                        return Err(format!("cell {} has an unsafe RawView", cell.0));
-                    }
-                }
-                LocalVecRoot::Value(val) => {
-                    let Some(vdef) = func.values.get(val.0 as usize) else {
-                        return Err(format!("local vec value v{} is gone", val.0));
-                    };
-                    if !is_global_vec_ty(table, vdef.ty) {
-                        return Err(format!("value v{} is not a Vec<T, Global>", val.0));
-                    }
-                    if func.blocks.iter().any(|b| {
-                        b.ops.iter().any(|op| {
-                            matches!(&op.kind, OpKind::RawView { root: Root::Value(v), .. } if v == val)
-                        })
-                    }) {
-                        return Err(format!("value v{} has an unsafe RawView", val.0));
-                    }
-                }
-            }
-            if (load_val.0 as usize) >= func.values.len() {
-                return Err(format!("load_val v{} is out of range", load_val.0));
-            }
-            let p_load = peel_transparent(func, table, *load_val);
-            if !matches!(find_def(func, p_load), Some(OpKind::Deref(_))) {
-                return Err(format!("load_val v{} is not a Deref load", load_val.0));
-            }
-            let p_idx = peel_transparent(func, table, index);
-            if *sub_offset == 0 {
-                if p_idx != p_load {
-                    return Err(format!(
-                        "index v{} does not match load_val v{}",
-                        index.0, load_val.0
-                    ));
-                }
-            } else {
-                let sub_ok = matches!(
-                    find_def(func, p_idx),
-                    Some(OpKind::Binary {
-                        op: BinaryOp::Sub | BinaryOp::SubUnchecked,
-                        l,
-                        r,
-                        ..
-                    }) if peel_transparent(func, table, *l) == p_load
-                        && matches!(
-                            find_def(func, peel_transparent(func, table, *r)),
-                            Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
-                                if mask(*bits, *bytes) == *sub_offset
-                        )
+        } => check_bounds_local_bounded_vec(cx, table, site, *vec_root, *load_val, *sub_offset),
+    }
+}
+
+fn check_bounds_numeric(index_hi: u128, length_lo: u128) -> Result<(), WitnessError> {
+    if index_hi < length_lo {
+        Ok(())
+    } else {
+        Err(WitnessError::NumericBoundInvalid {
+            index_hi,
+            length_lo,
+        })
+    }
+}
+
+fn check_bounds_dominating(
+    cx: &WitnessCheckCx<'_>,
+    block: RBlockId,
+    fact_block: RBlockId,
+    cond: ValueId,
+    offset_index: u128,
+    offset_fact: u128,
+    strict: bool,
+) -> Result<(), WitnessError> {
+    let implied = if strict {
+        offset_index <= offset_fact
+    } else {
+        offset_index < offset_fact
+    };
+    if !implied {
+        return Err(WitnessError::DominatingOffsetNotImplied {
+            offset_index,
+            offset_fact,
+        });
+    }
+    cx.check_dominating_guard("dominating fact", fact_block, cond, block)
+}
+
+fn check_bounds_bitmask(
+    cx: &WitnessCheckCx<'_>,
+    table: &TypeTable,
+    arena_facts: Option<&ProgramBoundsFacts>,
+    site: BoundsSite,
+    (and_val, mask_val, len_val, nonzero_site): (
+        ValueId,
+        ValueId,
+        ValueId,
+        Option<(RBlockId, ValueId)>,
+    ),
+) -> Result<(), WitnessError> {
+    let func = cx.func;
+    if (and_val.0 as usize) >= func.values.len()
+        || (mask_val.0 as usize) >= func.values.len()
+        || (len_val.0 as usize) >= func.values.len()
+    {
+        return Err(WitnessError::BitmaskOperandOutOfRange);
+    }
+    let p_idx = peel_transparent(cx, table, site.index);
+    let p_and = peel_transparent(cx, table, and_val);
+    if p_idx != p_and {
+        return Err(WitnessError::BitmaskIndexMismatch {
+            index: site.index,
+            and_val,
+        });
+    }
+    let Some(OpKind::Binary {
+        op: BinaryOp::BitAnd,
+        l,
+        r,
+        ty,
+    }) = cx.def_kind(p_and)
+    else {
+        return Err(WitnessError::NotBitAnd(p_and));
+    };
+    if !matches!(table.int_info(*ty), Some((false, _))) {
+        return Err(WitnessError::BitmaskNotUnsigned);
+    }
+    let p_mask = peel_transparent(cx, table, mask_val);
+    if peel_transparent(cx, table, *l) != p_mask && peel_transparent(cx, table, *r) != p_mask {
+        return Err(WitnessError::BitmaskMaskNotOperand {
+            mask: mask_val,
+            and_val,
+        });
+    }
+    if let Some((nz_blk, nz_cond)) = nonzero_site {
+        cx.check_dominating_guard("bitmask nonzero", nz_blk, nz_cond, site.block)?;
+    }
+    let p_len = peel_transparent(cx, table, len_val);
+    let p_assert_len = peel_transparent(cx, table, site.length);
+    let len_matches_assert = p_len == p_assert_len
+        || same_one_shl_term(cx, table, p_len, p_assert_len)
+        || assert_len_matches_target(cx, table, arena_facts, p_assert_len, p_len);
+    if !len_matches_assert {
+        return Err(WitnessError::BitmaskLengthMismatch {
+            len_val,
+            assert_len: site.length,
+        });
+    }
+    let len_proven_nonzero = nonzero_site.is_some()
+        || is_one_shl(cx, table, p_len)
+        || matches!(
+            cx.def_kind(p_len),
+            Some(OpKind::Const(ConstTree::Scalar { bits, bytes })) if mask(*bits, *bytes) >= 1
+        )
+        || is_positive_doubling_param(cx, table, p_len);
+    let sub_one_match = len_proven_nonzero
+        && match cx.def_kind(p_mask) {
+            Some(OpKind::Binary {
+                op: BinaryOp::Sub | BinaryOp::SubUnchecked,
+                l: sub_l,
+                r: sub_r,
+                ..
+            }) => {
+                let is_one = matches!(
+                    cx.def_kind(peel_transparent(cx, table, *sub_r)),
+                    Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
                 );
-                if !sub_ok {
-                    return Err(format!(
-                        "index v{} is not load_val v{} - {sub_offset}",
-                        index.0, load_val.0
-                    ));
-                }
-                let Some((gb, gc)) = guard else {
-                    return Err("LocalBoundedVec with sub_offset > 0 requires guard".to_owned());
-                };
-                let doms = Dominators::of(func);
-                if !dominates(&doms, *gb, block) {
-                    return Err(format!(
-                        "LocalBoundedVec guard block {} does not dominate block {}",
-                        gb.0, block.0
-                    ));
-                }
-                if !cond_present(*gc) {
-                    return Err(format!(
-                        "LocalBoundedVec guard v{} is no longer present",
-                        gc.0
-                    ));
+                if !is_one {
+                    false
+                } else {
+                    let p_sub_l = peel_transparent(cx, table, *sub_l);
+                    p_sub_l == p_len
+                        || same_one_shl_term(cx, table, p_sub_l, p_len)
+                        || p_sub_l == p_assert_len
                 }
             }
-            Ok(())
+            _ => false,
+        };
+    let const_match = match (cx.def_kind(p_mask), cx.def_kind(p_len)) {
+        (
+            Some(OpKind::Const(ConstTree::Scalar {
+                bits: mb,
+                bytes: mby,
+            })),
+            Some(OpKind::Const(ConstTree::Scalar {
+                bits: lb,
+                bytes: lby,
+            })),
+        ) => mask(*mb, *mby) < mask(*lb, *lby),
+        (
+            Some(OpKind::Const(ConstTree::Scalar { bits: 0, .. })),
+            Some(OpKind::Binary {
+                op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
+                l: shl_l,
+                ..
+            }),
+        ) => matches!(
+            cx.def_kind(peel_transparent(cx, table, *shl_l)),
+            Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
+        ),
+        _ => false,
+    };
+    if sub_one_match || const_match {
+        Ok(())
+    } else {
+        Err(WitnessError::BitmaskNotProvenBelow { mask_val, len_val })
+    }
+}
+
+fn check_bounds_monotone_arena(
+    cx: &WitnessCheckCx<'_>,
+    table: &TypeTable,
+    arena_facts: Option<&ProgramBoundsFacts>,
+    site: BoundsSite,
+    elem_def: DefinitionId,
+    sentinel: Option<SentinelGuard>,
+    source: ArenaIndexSource,
+) -> Result<(), WitnessError> {
+    let func = cx.func;
+    let Some(facts) = arena_facts else {
+        return Err(WitnessError::ArenaFactsMissing);
+    };
+    if !matches!(
+        table.int_info(table.peeled(func.values[site.index.0 as usize].ty)),
+        Some((false, _))
+    ) {
+        return Err(WitnessError::ArenaIndexNotUnsigned);
+    }
+    if let Some(guard) = sentinel {
+        cx.check_dominating_guard("sentinel guard", guard.block, guard.cond, site.block)?;
+    }
+    let sentinel_val = sentinel.map(|g| g.value);
+    match source {
+        ArenaIndexSource::Field(f) => {
+            let inv = facts
+                .arenas
+                .get(&elem_def)
+                .ok_or(WitnessError::ArenaNotProven(elem_def))?;
+            match inv.fields.get(&f) {
+                Some(ArenaFieldKind::AlwaysValid) => Ok(()),
+                Some(ArenaFieldKind::ValidOrSentinel { sentinel: s }) => {
+                    if sentinel_val == Some(*s) {
+                        Ok(())
+                    } else {
+                        Err(WitnessError::ArenaSentinelMismatch {
+                            field: f,
+                            expected: *s,
+                            actual: sentinel_val,
+                        })
+                    }
+                }
+                _ => Err(WitnessError::ArenaFieldNotProven {
+                    field: f,
+                    kind: "scalar arena",
+                }),
+            }
+        }
+        ArenaIndexSource::VecField(f) => {
+            let inv = facts
+                .arenas
+                .get(&elem_def)
+                .ok_or(WitnessError::ArenaNotProven(elem_def))?;
+            if matches!(inv.fields.get(&f), Some(ArenaFieldKind::VecOfValidIndices)) {
+                Ok(())
+            } else {
+                Err(WitnessError::ArenaFieldNotProven {
+                    field: f,
+                    kind: "VecOfValidIndices",
+                })
+            }
+        }
+        ArenaIndexSource::Param { idx_param } => {
+            let Some(list) = facts.param_arena_indices.get(&func.item) else {
+                return Err(WitnessError::ArenaParamNotCertified {
+                    idx_param: None,
+                    elem_def,
+                });
+            };
+            let ok = list.iter().any(|p| {
+                p.idx_param == idx_param
+                    && p.elem_def == elem_def
+                    && (p.sentinel.is_none() || p.sentinel == sentinel_val)
+            });
+            if ok {
+                Ok(())
+            } else {
+                Err(WitnessError::ArenaParamNotCertified {
+                    idx_param: Some(idx_param),
+                    elem_def,
+                })
+            }
+        }
+        ArenaIndexSource::CallReturn { callee } => {
+            let Some(ret) = facts.return_arena_index.get(&callee) else {
+                return Err(WitnessError::ArenaCalleeMismatch {
+                    callee,
+                    detail: "has no certified ReturnArenaIndex",
+                });
+            };
+            if ret.elem_def == elem_def && (ret.sentinel.is_none() || ret.sentinel == sentinel_val)
+            {
+                Ok(())
+            } else {
+                Err(WitnessError::ArenaCalleeMismatch {
+                    callee,
+                    detail: "return arena summary does not match witness",
+                })
+            }
+        }
+        ArenaIndexSource::ReturnVecElem { callee } => {
+            if facts.return_vec_elem_bound.contains_key(&callee) {
+                Ok(())
+            } else {
+                Err(WitnessError::ArenaCalleeMismatch {
+                    callee,
+                    detail: "has no certified ReturnVecElemBound",
+                })
+            }
+        }
+        ArenaIndexSource::BlockParam { param } => {
+            if !facts.arenas.contains_key(&elem_def) {
+                return Err(WitnessError::ArenaNotProven(elem_def));
+            }
+            if cx
+                .def_use()
+                .param_site(param)
+                .is_some_and(|(blk, _)| blk.0 != 0)
+            {
+                Ok(())
+            } else {
+                Err(WitnessError::NotBlockParam(param))
+            }
         }
     }
 }
 
-fn is_one_shl(func: &Func, table: &TypeTable, v: ValueId) -> bool {
+fn check_bounds_local_bounded_vec(
+    cx: &WitnessCheckCx<'_>,
+    table: &TypeTable,
+    site: BoundsSite,
+    vec_root: LocalVecRoot,
+    load_val: ValueId,
+    sub_offset: SubOffset,
+) -> Result<(), WitnessError> {
+    let func = cx.func;
+    match vec_root {
+        LocalVecRoot::Cell(cell) => {
+            let Some(cdef) = func.cells.get(cell.0 as usize) else {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "is gone",
+                });
+            };
+            if !is_global_vec_ty(table, cdef.ty) {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "is not a Vec<T, Global>",
+                });
+            }
+            if func.blocks.iter().any(|b| {
+                b.ops.iter().any(|op| {
+                    matches!(&op.kind, OpKind::RawView { root: Root::Cell(c), .. } if *c == cell)
+                })
+            }) {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "has an unsafe RawView",
+                });
+            }
+        }
+        LocalVecRoot::Value(val) => {
+            let Some(vdef) = func.values.get(val.0 as usize) else {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "is gone",
+                });
+            };
+            if !is_global_vec_ty(table, vdef.ty) {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "is not a Vec<T, Global>",
+                });
+            }
+            if func.blocks.iter().any(|b| {
+                b.ops.iter().any(|op| {
+                    matches!(&op.kind, OpKind::RawView { root: Root::Value(v), .. } if *v == val)
+                })
+            }) {
+                return Err(WitnessError::LocalVecRootInvalid {
+                    root: vec_root,
+                    detail: "has an unsafe RawView",
+                });
+            }
+        }
+    }
+    if (load_val.0 as usize) >= func.values.len() {
+        return Err(WitnessError::LoadValOutOfRange(load_val));
+    }
+    let p_load = peel_transparent(cx, table, load_val);
+    if !matches!(cx.def_kind(p_load), Some(OpKind::Deref(_))) {
+        return Err(WitnessError::LoadValNotDeref(load_val));
+    }
+    let p_idx = peel_transparent(cx, table, site.index);
+    match sub_offset {
+        SubOffset::Zero => {
+            if p_idx != p_load {
+                return Err(WitnessError::LocalVecIndexMismatch {
+                    index: site.index,
+                    load_val,
+                    sub_offset: None,
+                });
+            }
+        }
+        SubOffset::Guarded {
+            offset,
+            block: guard_block,
+            cond: guard_cond,
+        } => {
+            let sub_ok = matches!(
+                cx.def_kind(p_idx),
+                Some(OpKind::Binary {
+                    op: BinaryOp::Sub | BinaryOp::SubUnchecked,
+                    l,
+                    r,
+                    ..
+                }) if peel_transparent(cx, table, *l) == p_load
+                    && matches!(
+                        cx.def_kind(peel_transparent(cx, table, *r)),
+                        Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
+                            if mask(*bits, *bytes) == offset.get()
+                    )
+            );
+            if !sub_ok {
+                return Err(WitnessError::LocalVecIndexMismatch {
+                    index: site.index,
+                    load_val,
+                    sub_offset: Some(offset),
+                });
+            }
+            cx.check_dominating_guard(
+                "LocalBoundedVec guard",
+                guard_block,
+                guard_cond,
+                site.block,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn is_one_shl(cx: &WitnessCheckCx<'_>, table: &TypeTable, v: ValueId) -> bool {
     matches!(
-        find_def(func, peel_transparent(func, table, v)),
+        cx.def_kind(peel_transparent(cx, table, v)),
         Some(OpKind::Binary {
             op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
             l,
@@ -766,24 +1195,22 @@ fn is_one_shl(func: &Func, table: &TypeTable, v: ValueId) -> bool {
             ..
         }) if matches!(table.int_info(*ty), Some((false, _)))
             && matches!(
-                find_def(func, peel_transparent(func, table, *l)),
+                cx.def_kind(peel_transparent(cx, table, *l)),
                 Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
             )
     )
 }
 
-fn is_positive_doubling_param(func: &Func, table: &TypeTable, v: ValueId) -> bool {
-    let Some(header) = func.blocks.iter().skip(1).find(|b| b.params.contains(&v)) else {
-        return false;
-    };
-    let Some(pos) = header.params.iter().position(|&p| p == v) else {
+fn is_positive_doubling_param(cx: &WitnessCheckCx<'_>, table: &TypeTable, v: ValueId) -> bool {
+    let Some((header_id, pos)) = cx.def_use().param_site(v).filter(|(b, _)| b.0 != 0) else {
         return false;
     };
     let mut has_pos_init = false;
     let mut all_ok = true;
-    for b in &func.blocks {
+    for &pred_id in &cx.cfg().preds[header_id.0 as usize] {
+        let b = &cx.func.blocks[pred_id.0 as usize];
         for (target, args) in b.term.edges() {
-            if target != header.id {
+            if target != header_id {
                 continue;
             }
             let Some(&arg) = args.get(pos) else {
@@ -792,7 +1219,7 @@ fn is_positive_doubling_param(func: &Func, table: &TypeTable, v: ValueId) -> boo
             if arg == v {
                 continue;
             }
-            match find_def(func, arg) {
+            match cx.def_kind(arg) {
                 Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
                     if mask(*bits, *bytes) >= 1 =>
                 {
@@ -806,7 +1233,7 @@ fn is_positive_doubling_param(func: &Func, table: &TypeTable, v: ValueId) -> boo
                 }) if matches!(table.int_info(*ty), Some((false, _)))
                     && *l == v
                     && matches!(
-                        find_def(func, *r),
+                        cx.def_kind(*r),
                         Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
                     ) => {}
                 _ => {
@@ -819,7 +1246,7 @@ fn is_positive_doubling_param(func: &Func, table: &TypeTable, v: ValueId) -> boo
 }
 
 fn assert_len_matches_target(
-    func: &Func,
+    cx: &WitnessCheckCx<'_>,
     table: &TypeTable,
     arena_facts: Option<&ProgramBoundsFacts>,
     assert_len: ValueId,
@@ -828,13 +1255,14 @@ fn assert_len_matches_target(
     use crate::analysis::arena::ReturnVecLen;
     use crate::jir::semantic::StandardOperation;
 
+    let func = cx.func;
     let same_val = |a: ValueId, b: ValueId| -> bool {
-        let pa = peel_transparent(func, table, a);
-        let pb = peel_transparent(func, table, b);
+        let pa = peel_transparent(cx, table, a);
+        let pb = peel_transparent(cx, table, b);
         if pa == pb {
             return true;
         }
-        match (find_def(func, pa), find_def(func, pb)) {
+        match (cx.def_kind(pa), cx.def_kind(pb)) {
             (
                 Some(OpKind::Cast {
                     kind: CastKind::IntToInt,
@@ -849,7 +1277,7 @@ fn assert_len_matches_target(
                     to: tb,
                 }),
             ) => {
-                peel_transparent(func, table, *va) == peel_transparent(func, table, *vb)
+                peel_transparent(cx, table, *va) == peel_transparent(cx, table, *vb)
                     && table.int_info(*fa) == table.int_info(*fb)
                     && table.int_info(*ta) == table.int_info(*tb)
             }
@@ -868,22 +1296,22 @@ fn assert_len_matches_target(
         stores.next().is_none().then_some(init_v)
     };
 
-    let mut cur = peel_transparent(func, table, assert_len);
+    let mut cur = peel_transparent(cx, table, assert_len);
     for _ in 0..8 {
-        if cur == target_len || same_one_shl_term(func, table, cur, target_len) {
+        if cur == target_len || same_one_shl_term(cx, table, cur, target_len) {
             return true;
         }
-        match find_def(func, cur) {
+        match cx.def_kind(cur) {
             Some(OpKind::Unary {
                 op: UnaryOp::PtrMetadata,
                 v,
                 ..
-            }) => cur = peel_transparent(func, table, *v),
-            Some(OpKind::SliceView { len, .. }) => cur = peel_transparent(func, table, *len),
+            }) => cur = peel_transparent(cx, table, *v),
+            Some(OpKind::SliceView { len, .. }) => cur = peel_transparent(cx, table, *len),
             Some(OpKind::BorrowView {
                 root: Root::Value(v),
                 ..
-            }) => cur = peel_transparent(func, table, *v),
+            }) => cur = peel_transparent(cx, table, *v),
             Some(OpKind::BorrowView {
                 root: Root::Cell(c),
                 path,
@@ -892,15 +1320,15 @@ fn assert_len_matches_target(
                 let Some(init_v) = unique_cell_store(*c) else {
                     return false;
                 };
-                cur = peel_transparent(func, table, init_v);
+                cur = peel_transparent(cx, table, init_v);
             }
             Some(OpKind::CellLoad(c)) => {
                 let Some(init_v) = unique_cell_store(*c) else {
                     return false;
                 };
-                cur = peel_transparent(func, table, init_v);
+                cur = peel_transparent(cx, table, init_v);
             }
-            Some(OpKind::Field { base, .. }) => cur = peel_transparent(func, table, *base),
+            Some(OpKind::Field { base, .. }) => cur = peel_transparent(cx, table, *base),
             Some(OpKind::Call {
                 callee,
                 semantic,
@@ -915,9 +1343,9 @@ fn assert_len_matches_target(
                     | StandardOperation::VecLen
                     | StandardOperation::VecClone
                     | StandardOperation::NativeVecFromElemZeroed,
-                ) if !args.is_empty() => cur = peel_transparent(func, table, args[0]),
+                ) if !args.is_empty() => cur = peel_transparent(cx, table, args[0]),
                 CallSemantic::Standard(StandardOperation::VecFromElem) if args.len() >= 2 => {
-                    cur = peel_transparent(func, table, args[1]);
+                    cur = peel_transparent(cx, table, args[1]);
                 }
                 CallSemantic::Ordinary => {
                     let Callee::Direct { item, .. } = callee else {
@@ -935,7 +1363,7 @@ fn assert_len_matches_target(
                             let Some(&av) = args.get(*cond_param) else {
                                 return false;
                             };
-                            match find_def(func, peel_transparent(func, table, av)) {
+                            match cx.def_kind(peel_transparent(cx, table, av)) {
                                 Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. })) => {
                                     when_true.as_ref()
                                 }
@@ -952,14 +1380,14 @@ fn assert_len_matches_target(
                             let Some(&ak) = args.get(*k) else {
                                 return false;
                             };
-                            cur = peel_transparent(func, table, ak);
+                            cur = peel_transparent(cx, table, ak);
                         }
                         ReturnVecLen::OneShlParam { shift_param, .. } => {
                             let Some(&ak) = args.get(*shift_param) else {
                                 return false;
                             };
-                            let shift_p = peel_transparent(func, table, ak);
-                            return match find_def(func, target_len) {
+                            let shift_p = peel_transparent(cx, table, ak);
+                            return match cx.def_kind(target_len) {
                                 Some(OpKind::Binary {
                                     op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
                                     l,
@@ -967,7 +1395,7 @@ fn assert_len_matches_target(
                                     ..
                                 }) => {
                                     matches!(
-                                        find_def(func, peel_transparent(func, table, *l)),
+                                        cx.def_kind(peel_transparent(cx, table, *l)),
                                         Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
                                     ) && same_val(*r, shift_p)
                                 }
@@ -976,7 +1404,7 @@ fn assert_len_matches_target(
                         }
                         ReturnVecLen::Const(c) => {
                             return matches!(
-                                find_def(func, target_len),
+                                cx.def_kind(target_len),
                                 Some(OpKind::Const(ConstTree::Scalar { bits, bytes }))
                                     if mask(*bits, *bytes) == *c
                             );
@@ -989,52 +1417,52 @@ fn assert_len_matches_target(
             _ => return false,
         }
     }
-    cur == target_len || same_one_shl_term(func, table, cur, target_len)
+    cur == target_len || same_one_shl_term(cx, table, cur, target_len)
 }
 
-fn same_one_shl_term(func: &Func, table: &TypeTable, a: ValueId, b: ValueId) -> bool {
+fn same_one_shl_term(cx: &WitnessCheckCx<'_>, table: &TypeTable, a: ValueId, b: ValueId) -> bool {
     let one_shl_arg = |v: ValueId| -> Option<ValueId> {
         let OpKind::Binary {
             op: BinaryOp::Shl | BinaryOp::ShlUnchecked,
             l,
             r,
             ..
-        } = find_def(func, peel_transparent(func, table, v))?
+        } = cx.def_kind(peel_transparent(cx, table, v))?
         else {
             return None;
         };
         matches!(
-            find_def(func, peel_transparent(func, table, *l)),
+            cx.def_kind(peel_transparent(cx, table, *l)),
             Some(OpKind::Const(ConstTree::Scalar { bits: 1, .. }))
         )
-        .then(|| peel_transparent(func, table, *r))
+        .then(|| peel_transparent(cx, table, *r))
     };
     matches!((one_shl_arg(a), one_shl_arg(b)), (Some(ka), Some(kb)) if ka == kb)
 }
 
 /// Independently checks the modular-arithmetic identity the range pass folds.
 fn check_aligned_prefix(
-    func: &Func,
+    cx: &WitnessCheckCx<'_>,
     table: &TypeTable,
     left: ValueId,
     right: ValueId,
     op: BinaryOp,
     result: bool,
-) -> Result<(), String> {
-    fn copy_root(func: &Func, mut value: ValueId) -> ValueId {
+) -> Result<(), WitnessError> {
+    fn copy_root(cx: &WitnessCheckCx<'_>, mut value: ValueId) -> ValueId {
         for _ in 0..8 {
-            match find_def(func, value) {
+            match cx.def_kind(value) {
                 Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
                 _ => break,
             }
         }
         value
     }
-    fn same_term(func: &Func, left: ValueId, right: ValueId) -> bool {
-        let (left, right) = (copy_root(func, left), copy_root(func, right));
+    fn same_term(cx: &WitnessCheckCx<'_>, left: ValueId, right: ValueId) -> bool {
+        let (left, right) = (copy_root(cx, left), copy_root(cx, right));
         left == right
             || matches!(
-                (find_def(func, left), find_def(func, right)),
+                (cx.def_kind(left), cx.def_kind(right)),
                 (
                     Some(OpKind::Unary {
                         op: UnaryOp::PtrMetadata,
@@ -1046,22 +1474,22 @@ fn check_aligned_prefix(
                         v: right,
                         ..
                     })
-                ) if copy_root(func, *left) == copy_root(func, *right)
+                ) if copy_root(cx, *left) == copy_root(cx, *right)
             )
     }
-    fn zero(func: &Func, value: ValueId) -> bool {
+    fn zero(cx: &WitnessCheckCx<'_>, value: ValueId) -> bool {
         matches!(
-            find_def(func, copy_root(func, value)),
+            cx.def_kind(copy_root(cx, value)),
             Some(OpKind::Const(ConstTree::Scalar { bits: 0, .. }))
         )
     }
-    fn prefix_base(func: &Func, table: &TypeTable, value: ValueId) -> Option<ValueId> {
+    fn prefix_base(cx: &WitnessCheckCx<'_>, table: &TypeTable, value: ValueId) -> Option<ValueId> {
         let OpKind::Binary {
             op: BinaryOp::Sub | BinaryOp::SubUnchecked,
             l: base,
             r: remainder,
             ty,
-        } = find_def(func, copy_root(func, value))?
+        } = cx.def_kind(copy_root(cx, value))?
         else {
             return None;
         };
@@ -1073,14 +1501,14 @@ fn check_aligned_prefix(
             l: dividend,
             r: divisor,
             ty: remainder_ty,
-        } = find_def(func, copy_root(func, *remainder))?
+        } = cx.def_kind(copy_root(cx, *remainder))?
         else {
             return None;
         };
-        if remainder_ty != ty || !same_term(func, *base, *dividend) {
+        if remainder_ty != ty || !same_term(cx, *base, *dividend) {
             return None;
         }
-        match find_def(func, copy_root(func, *divisor)) {
+        match cx.def_kind(copy_root(cx, *divisor)) {
             Some(OpKind::Const(ConstTree::Scalar { bits, bytes })) if mask(*bits, *bytes) != 0 => {
                 Some(*base)
             }
@@ -1088,14 +1516,14 @@ fn check_aligned_prefix(
         }
     }
 
-    let expected = if let Some(base) = prefix_base(func, table, left) {
-        if same_term(func, right, base) {
+    let expected = if let Some(base) = prefix_base(cx, table, left) {
+        if same_term(cx, right, base) {
             match op {
                 BinaryOp::Le => Some(true),
                 BinaryOp::Gt => Some(false),
                 _ => None,
             }
-        } else if zero(func, right) {
+        } else if zero(cx, right) {
             match op {
                 BinaryOp::Lt => Some(false),
                 BinaryOp::Ge => Some(true),
@@ -1104,14 +1532,14 @@ fn check_aligned_prefix(
         } else {
             None
         }
-    } else if let Some(base) = prefix_base(func, table, right) {
-        if same_term(func, left, base) {
+    } else if let Some(base) = prefix_base(cx, table, right) {
+        if same_term(cx, left, base) {
             match op {
                 BinaryOp::Ge => Some(true),
                 BinaryOp::Lt => Some(false),
                 _ => None,
             }
-        } else if zero(func, left) {
+        } else if zero(cx, left) {
             match op {
                 BinaryOp::Gt => Some(false),
                 BinaryOp::Le => Some(true),
@@ -1125,23 +1553,7 @@ fn check_aligned_prefix(
     };
     match expected {
         Some(expected) if expected == result => Ok(()),
-        Some(expected) => Err(format!(
-            "the aligned-prefix relation evaluates to {expected}"
-        )),
-        None => Err("the operands are not a proven aligned-prefix relation".to_owned()),
-    }
-}
-
-fn dominates(doms: &Dominators, a: RBlockId, b: RBlockId) -> bool {
-    let mut at = b;
-    loop {
-        if at == a {
-            return true;
-        }
-        match doms.idom.get(at.0 as usize).copied().flatten() {
-            Some(up) if up != at => at = up,
-            _ => return false,
-        }
+        other => Err(WitnessError::AlignedPrefixMismatch { expected: other }),
     }
 }
 
@@ -1191,7 +1603,7 @@ fn current_witness_fault() -> Option<String> {
     if let Some(val) = TEST_WITNESS_FAULT.with(|cell| cell.borrow().clone()) {
         return Some(val);
     }
-    std::env::var("RCGJS_WITNESS_FAULT").ok()
+    env_witness_fault().map(str::to_owned)
 }
 
 /// Independent validator for `prune_invoke`: re-derives every pruned `Invoke` claim against
@@ -1203,17 +1615,17 @@ pub(crate) fn check_invoke_pruning(
     table: &BTreeMap<JsName, LinkItem>,
     pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     live: &BTreeSet<JsName>,
-) -> Result<(), String> {
+) -> Result<(), WitnessError> {
     if let Some(fault) = current_witness_fault() {
         if fault
             .split(|c: char| c == ',' || c.is_whitespace())
             .any(|tok| matches!(tok, "prune-invoke" | "all" | "1"))
         {
-            return Err("injected prune-invoke witness fault".to_owned());
+            return Err(WitnessError::InvokePruneFaultInjected);
         }
     }
     if sites.is_empty() {
-        return Err("no invoke pruning sites recorded".to_owned());
+        return Err(WitnessError::InvokePruneNoSites);
     }
 
     let mut cx = InvokeCheckCx::new(table, pre_funcs, live);
@@ -1221,21 +1633,20 @@ pub(crate) fn check_invoke_pruning(
         let block = pre_func
             .blocks
             .get(site.block.0 as usize)
-            .ok_or_else(|| format!("pruned block bb{} does not exist", site.block.0))?;
+            .ok_or(WitnessError::InvokePruneMissingBlock(site.block))?;
         let RTerm::Invoke { unwind, .. } = &block.term else {
-            return Err(format!(
-                "pruned block bb{} did not terminate in RTerm::Invoke",
-                site.block.0
-            ));
+            return Err(WitnessError::InvokePruneNotInvoke(site.block));
         };
         match site.reason {
             InvokePruneReason::NoopUnwindChain => {
                 check_noop_unwind_chain(pre_func, interns, unwind.0, |link_name| {
                     verify_empty_return_callee(interns, link_name, pre_funcs)
-                })?;
+                })
+                .map_err(WitnessError::InvokePruneNoopChain)?;
             }
             InvokePruneReason::ProtectedOpCannotThrow => {
-                verify_protected_block_cannot_throw(pre_func, block, interns, &mut cx)?;
+                verify_protected_block_cannot_throw(pre_func, block, interns, &mut cx)
+                    .map_err(WitnessError::InvokePruneMayThrow)?;
             }
         }
     }
@@ -1250,9 +1661,8 @@ fn verify_empty_return_callee(
     let name = interns
         .str(link_name)
         .ok_or_else(|| format!("unresolvable str#{} in unwind noop call", link_name.0))?;
-    let js_name = JsName::new(name.to_owned());
     let callee = pre_funcs
-        .get(&js_name)
+        .get(name)
         .and_then(|res| res.as_ref().ok())
         .ok_or_else(|| format!("unwind callee `{name}` has no compiled JIR body"))?;
     if callee.blocks.len() == 1
@@ -1456,11 +1866,7 @@ fn build_witness_indirect_scope(
                             .get(name)
                             .and_then(|it| it.jir.interns())
                             .and_then(|i| i.str(*symbol))
-                            .is_some_and(|s| {
-                                pre_funcs
-                                    .get(&JsName::new(s.to_owned()))
-                                    .is_some_and(Result::is_ok)
-                            });
+                            .is_some_and(|s| pre_funcs.get(s).is_some_and(Result::is_ok));
                         (!known_ok).then_some(args.as_slice())
                     }
                     _ => None,
@@ -1548,8 +1954,8 @@ fn drain_callee_queue(
                 match &cb.term {
                     RTerm::Invoke { normal, unwind } => {
                         work.push(normal.0 .0 as usize);
-                        if let Some((last, prefix)) = cb.ops.split_last() {
-                            for op in prefix {
+                        if let Some(protected_idx) = cb.protected_op_index() {
+                            for op in &cb.ops[..protected_idx] {
                                 check_op_no_throw(
                                     callee_func,
                                     op,
@@ -1559,16 +1965,18 @@ fn drain_callee_queue(
                                     queue,
                                 )?;
                             }
-                            if op_no_throw_isolated(
-                                callee_func,
-                                last,
-                                callee_interns,
-                                cx,
-                                visited_callees,
-                            )
-                            .is_err()
-                            {
-                                work.push(unwind.0 .0 as usize);
+                            if let Some(protected) = cb.protected_op() {
+                                if op_no_throw_isolated(
+                                    callee_func,
+                                    protected,
+                                    callee_interns,
+                                    cx,
+                                    visited_callees,
+                                )
+                                .is_err()
+                                {
+                                    work.push(unwind.0 .0 as usize);
+                                }
                             }
                         }
                     }
@@ -1640,6 +2048,14 @@ fn enqueue_callee(name: JsName, visited: &mut BTreeSet<JsName>, queue: &mut VecD
     }
 }
 
+fn enqueue_callee_str(name: &str, visited: &mut BTreeSet<JsName>, queue: &mut VecDeque<JsName>) {
+    if !visited.contains(name) {
+        let owned = JsName::new(name.to_owned());
+        visited.insert(owned.clone());
+        queue.push_back(owned);
+    }
+}
+
 fn check_intrinsic_without_fallback(
     func: &Func,
     name: StrId,
@@ -1681,7 +2097,7 @@ fn check_intrinsic_without_fallback(
                     "const_eval_select target `{target}` is a host marker"
                 ));
             }
-            enqueue_callee(JsName::new(target.to_owned()), visited, queue);
+            enqueue_callee_str(target, visited, queue);
             Ok(())
         }
         _ => Ok(()),
@@ -1704,10 +2120,9 @@ fn check_op_no_throw(
     visited: &mut BTreeSet<JsName>,
     queue: &mut VecDeque<JsName>,
 ) -> Result<(), String> {
-    let resolve = |id: StrId, label: &str| -> Result<JsName, String> {
+    let resolve = |id: StrId, label: &str| -> Result<&str, String> {
         interns
             .str(id)
-            .map(|s| JsName::new(s.to_owned()))
             .ok_or_else(|| format!("unresolvable {label} str#{}", id.0))
     };
     match &op.kind {
@@ -1715,7 +2130,7 @@ fn check_op_no_throw(
         OpKind::Intrinsic {
             fallback: Some(d), ..
         } => {
-            enqueue_callee(resolve(d.link_name, "intrinsic fallback")?, visited, queue);
+            enqueue_callee_str(resolve(d.link_name, "intrinsic fallback")?, visited, queue);
             Ok(())
         }
         OpKind::Intrinsic {
@@ -1727,7 +2142,7 @@ fn check_op_no_throw(
         OpKind::Drop { glue, .. } => match glue {
             DropGlue::None => Ok(()),
             DropGlue::Direct { link_name, .. } => {
-                enqueue_callee(resolve(*link_name, "direct drop")?, visited, queue);
+                enqueue_callee_str(resolve(*link_name, "direct drop")?, visited, queue);
                 Ok(())
             }
             DropGlue::Dynamic => {
@@ -1759,13 +2174,13 @@ fn check_op_no_throw(
                     if crate::lower::js::host::is_marker_name(s) {
                         return Err(format!("marker-named direct call `{s}` may throw"));
                     }
-                    enqueue_callee(JsName::new(s.to_owned()), visited, queue);
+                    enqueue_callee_str(s, visited, queue);
                     Ok(())
                 }
                 Callee::Intrinsic {
                     fallback: Some(d), ..
                 } => {
-                    enqueue_callee(resolve(d.link_name, "intrinsic fallback")?, visited, queue);
+                    enqueue_callee_str(resolve(d.link_name, "intrinsic fallback")?, visited, queue);
                     Ok(())
                 }
                 Callee::Intrinsic {
@@ -1790,11 +2205,10 @@ fn check_op_no_throw(
                     let sym = interns
                         .str(*symbol)
                         .ok_or_else(|| format!("unresolvable foreign symbol str#{}", symbol.0))?;
-                    let js_name = JsName::new(sym.to_owned());
-                    if !cx.table.contains_key(&js_name) {
+                    if !cx.table.contains_key(sym) {
                         return Err(format!("unresolved foreign symbol `{sym}` may throw"));
                     }
-                    enqueue_callee(js_name, visited, queue);
+                    enqueue_callee_str(sym, visited, queue);
                     Ok(())
                 }
                 Callee::Virtual { slot, .. } => {
@@ -1916,8 +2330,11 @@ mod tests {
         let fold = |result| Witness::ConstFold {
             op: BinaryOp::Lt,
             ty: I32,
-            l: (u32::MAX as u128, 4),
-            r: (4, 4),
+            l: ScalarBits {
+                bits: u32::MAX as u128,
+                bytes: 4,
+            },
+            r: ScalarBits { bits: 4, bytes: 4 },
             result,
         };
         assert!(fold(true).check(&func, &table).is_ok());
@@ -1930,9 +2347,9 @@ mod tests {
         let fold = |taken| Witness::BranchFold {
             scrut: 0x1_0000_0001,
             bytes: 4,
-            cases: vec![(1, 7), (2, 8)],
-            default: 9,
-            taken,
+            cases: vec![(1, RBlockId(7)), (2, RBlockId(8))],
+            default: RBlockId(9),
+            taken: RBlockId(taken),
         };
         assert!(fold(7).check(&func, &table).is_ok());
         assert!(fold(9).check(&func, &table).is_err());
@@ -2129,7 +2546,7 @@ mod tests {
             &empty_live,
         )
         .expect_err("witness must reject cycle in cleanup DAG");
-        assert!(err.contains("cycle"), "unexpected error: {err}");
+        assert!(err.to_string().contains("cycle"), "unexpected error: {err}");
 
         // 3. CellStore to an escaped cell (via RawView) must be rejected.
         let mut esc = FuncBuilder::new(item, sig.clone());
@@ -2188,7 +2605,10 @@ mod tests {
             &empty_live,
         )
         .expect_err("witness must reject escaped cell store");
-        assert!(err.contains("escaped cell"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("escaped cell"),
+            "unexpected error: {err}"
+        );
 
         // 4. Exceeding 64-block bound (65 blocks) must be rejected.
         let mut big = FuncBuilder::new(item, sig);
@@ -2230,7 +2650,10 @@ mod tests {
             &empty_live,
         )
         .expect_err("witness must reject 65-block cleanup DAG");
-        assert!(err.contains("64-block"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("64-block"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2385,13 +2808,12 @@ mod tests {
             fact: BoundsFact::MonotoneArena {
                 elem_def: node_def,
                 sentinel: None,
-                sentinel_guard: None,
                 source: ArenaIndexSource::Field(0),
             },
         }];
         assert!(check_all_with_context(&arena_w, &func, &tbl, None).is_err());
 
-        // 3. MonotoneArena ValidOrSentinel without sentinel/guard MUST fail closed.
+        // 3. MonotoneArena ValidOrSentinel without sentinel/guard or with bogus guard MUST fail closed.
         let mut facts = ProgramBoundsFacts::default();
         let mut fields = BTreeMap::new();
         fields.insert(
@@ -2409,20 +2831,23 @@ mod tests {
             },
         );
         assert!(check_all_with_context(&arena_w, &func, &tbl, Some(&facts)).is_err());
-        let arena_missing_guard = [Witness::BoundsRemoved {
+        let arena_bogus_guard = [Witness::BoundsRemoved {
             block: FuncBuilder::ENTRY,
             index: x,
             length: len,
             fact: BoundsFact::MonotoneArena {
                 elem_def: node_def,
-                sentinel: Some(u32::MAX as u128),
-                sentinel_guard: None,
+                sentinel: Some(SentinelGuard {
+                    value: u32::MAX as u128,
+                    block: FuncBuilder::ENTRY,
+                    cond: x,
+                }),
                 source: ArenaIndexSource::Field(0),
             },
         }];
-        assert!(check_all_with_context(&arena_missing_guard, &func, &tbl, Some(&facts)).is_err());
+        assert!(check_all_with_context(&arena_bogus_guard, &func, &tbl, Some(&facts)).is_err());
 
-        // 4. LocalBoundedVec with non-Vec root / missing guard MUST fail closed.
+        // 4. LocalBoundedVec with non-Vec root / bogus guard MUST fail closed.
         let bad_local_vec = [Witness::BoundsRemoved {
             block: FuncBuilder::ENTRY,
             index: x,
@@ -2430,8 +2855,11 @@ mod tests {
             fact: BoundsFact::LocalBoundedVec {
                 vec_root: LocalVecRoot::Value(x),
                 load_val: x,
-                sub_offset: 1,
-                guard: None,
+                sub_offset: SubOffset::Guarded {
+                    offset: NonZeroU128::new(1).unwrap(),
+                    block: FuncBuilder::ENTRY,
+                    cond: x,
+                },
             },
         }];
         assert!(check_all_with_context(&bad_local_vec, &func, &tbl, None).is_err());

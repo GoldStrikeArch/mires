@@ -56,16 +56,18 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
     /// paid for by the programs that read them.
     pub(crate) fn record_type_name(&mut self, ty: Ty<'tcx>) -> Result<(), EncodeDecline> {
         let id = self.type_id(ty)?;
-        let Some(descriptor) = self.interns.types.get(id) else {
-            return Ok(());
-        };
-        if descriptor.name.is_some() {
+        if self
+            .interns
+            .types
+            .get(id)
+            .is_none_or(|descriptor| descriptor.name.is_some())
+        {
             return Ok(());
         }
-        let mut descriptor = descriptor.clone();
-        let name = type_name(ty);
-        descriptor.name = Some(self.str(&name));
-        self.interns.types.replace(descriptor);
+        let name = self.str(&type_name(ty));
+        if let Some(descriptor) = self.interns.types.get_mut(id) {
+            descriptor.name = Some(name);
+        }
         Ok(())
     }
 

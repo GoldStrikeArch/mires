@@ -140,6 +140,17 @@ struct FuncState<'a> {
     ret_grounded: bool,
 }
 
+/// Shared whole-program inputs for ASCII provenance computation.
+struct AsciiInput<'a> {
+    funcs: &'a BTreeMap<JsName, &'a Func>,
+    table: &'a BTreeMap<JsName, LinkItem>,
+    repr: &'a ReprOutcome,
+    abi: &'a AbiPlan,
+    roots: &'a BTreeSet<JsName>,
+    defined: &'a BTreeSet<JsName>,
+    live: &'a BTreeSet<JsName>,
+}
+
 /// Computes [`AsciiFacts`] across the program's post-optimization JIR functions.
 pub fn compute(
     funcs: &BTreeMap<JsName, &Func>,
@@ -150,44 +161,109 @@ pub fn compute(
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
 ) -> AsciiFacts {
-    compute_with_interns(
+    let input = AsciiInput {
         funcs,
         table,
-        |name| table.get(name).and_then(|item| item.jir.interns()),
         repr,
         abi,
         roots,
         defined,
         live,
-    )
+    };
+    compute_with_interns(&input, |name| {
+        table.get(name).and_then(|item| item.jir.interns())
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_with_interns<'a, F>(
-    funcs: &BTreeMap<JsName, &'a Func>,
-    table: &BTreeMap<JsName, LinkItem>,
-    get_interns: F,
-    repr: &ReprOutcome,
-    abi: &AbiPlan,
-    roots: &BTreeSet<JsName>,
-    defined: &BTreeSet<JsName>,
-    live: &BTreeSet<JsName>,
-) -> AsciiFacts
+fn compute_with_interns<'a, F>(input: &AsciiInput<'a>, get_interns: F) -> AsciiFacts
 where
     F: Fn(&JsName) -> Option<&'a Interns>,
 {
     let mut name_to_idx: BTreeMap<JsName, usize> = BTreeMap::new();
-    let mut names: Vec<JsName> = Vec::with_capacity(funcs.len());
-    for name in funcs.keys() {
+    let mut names: Vec<JsName> = Vec::with_capacity(input.funcs.len());
+    for name in input.funcs.keys() {
         name_to_idx.insert(name.clone(), names.len());
         names.push(name.clone());
     }
 
     // 1. Collect all non-direct references (`RefScan` + unlowered items + roots/exports).
+    let (mut open_names, mut open_items) = collect_open_items(input, &get_interns);
+
+    // Locate authentic `core::str::slice_error_fail` if live and keeping its standard 4-arg ABI,
+    // plus authenticated `core::slice::{reverse,revswap,starts_with,ends_with}` items.
+    let slice_error_fail = find_slice_error_fail(input, &get_interns);
+    if let Some(fail_name) = &slice_error_fail {
+        // Outlined `StrIndex` jumps directly to `slice_error_fail` without modifying JIR calls.
+        open_names.insert(fail_name.clone());
+    }
+    let core_slice_items = find_core_slice_items(input, &get_interns);
+
+    // 2. Build per-function value metadata, intra-procedural rules, and direct call edges.
+    let mut incoming_calls: Vec<Vec<Vec<(usize, ValueId)>>> = input
+        .funcs
+        .values()
+        .map(|f| vec![Vec::new(); f.params.len()])
+        .collect();
+    let mut force_open_idx = vec![false; input.funcs.len()];
+
+    let mut calls = FuncCallCollector {
+        caller_idx: 0,
+        funcs: input.funcs,
+        open_names: &open_names,
+        open_items: &mut open_items,
+        incoming_calls: &mut incoming_calls,
+        force_open_idx: &mut force_open_idx,
+    };
+    let mut states: Vec<FuncState<'_>> = Vec::with_capacity(input.funcs.len());
+    for (caller_idx, name) in names.iter().enumerate() {
+        let func = input.funcs[name];
+        let Some(interns) = get_interns(name) else {
+            return AsciiFacts {
+                funcs: BTreeMap::new(),
+                slice_error_fail,
+                slice_reverse: core_slice_items.reverse,
+                slice_revswap: core_slice_items.revswap,
+                slice_starts_with: core_slice_items.starts_with,
+                slice_ends_with: core_slice_items.ends_with,
+            };
+        };
+        calls.caller_idx = caller_idx;
+        let state = build_func_state(name, func, interns, input, &name_to_idx, &mut calls);
+        states.push(state);
+    }
+
+    // 3. Wire entry parameter rules using already-classified caller `val_types`.
+    wire_entry_params(
+        &mut states,
+        &mut incoming_calls,
+        &force_open_idx,
+        &open_items,
+    );
+
+    // 4. Solve Phase A (GFP) + Phase B (LFP) and publish proven ASCII values.
+    let out = solve_ascii_fixpoints(&mut states);
+
+    AsciiFacts {
+        funcs: out,
+        slice_error_fail,
+        slice_reverse: core_slice_items.reverse,
+        slice_revswap: core_slice_items.revswap,
+        slice_starts_with: core_slice_items.starts_with,
+        slice_ends_with: core_slice_items.ends_with,
+    }
+}
+
+fn collect_open_items<'a, F>(
+    input: &AsciiInput<'a>,
+    get_interns: &F,
+) -> (BTreeSet<JsName>, BTreeSet<ItemId>)
+where
+    F: Fn(&JsName) -> Option<&'a Interns>,
+{
     let mut scan = RefScan::default();
     let mut open_names: BTreeSet<JsName> = BTreeSet::new();
 
-    for (name, func) in funcs {
+    for (name, func) in input.funcs {
         let types = get_interns(name).map(|i| &i.types);
         for block in &func.blocks {
             for op in &block.ops {
@@ -203,16 +279,16 @@ where
 
     // Items outside `funcs` (statics, vtables, `NativeBody` overrides, declined/baseline items)
     // may call or take pointers to anything in their `refs`.
-    for (name, item) in table {
+    for (name, item) in input.table {
         if item.linkage.exported
             || item.linkage.root
-            || roots.contains(name)
-            || !defined.contains(name)
-            || !live.contains(name)
+            || input.roots.contains(name)
+            || !input.defined.contains(name)
+            || !input.live.contains(name)
         {
             open_names.insert(name.clone());
         }
-        if !funcs.contains_key(name) {
+        if !input.funcs.contains_key(name) {
             open_names.insert(name.clone());
             for referenced in &item.refs {
                 open_names.insert(referenced.clone());
@@ -220,46 +296,58 @@ where
         }
     }
 
-    let mut open_items = scan.ineligible();
+    (open_names, scan.ineligible())
+}
 
-    // Locate authentic `core::str::slice_error_fail` if live and keeping its standard 4-arg ABI,
-    // plus authenticated `core::slice::{reverse,revswap,starts_with,ends_with}` items.
-    let slice_error_fail =
-        find_slice_error_fail(funcs, table, &get_interns, repr, abi, defined, live);
-    if let Some(fail_name) = &slice_error_fail {
-        // Outlined `StrIndex` jumps directly to `slice_error_fail` without modifying JIR calls.
-        open_names.insert(fail_name.clone());
-    }
-    let core_slice_items =
-        find_core_slice_items(funcs, table, &get_interns, repr, abi, defined, live);
+struct FuncCallCollector<'a> {
+    caller_idx: usize,
+    funcs: &'a BTreeMap<JsName, &'a Func>,
+    open_names: &'a BTreeSet<JsName>,
+    open_items: &'a mut BTreeSet<ItemId>,
+    incoming_calls: &'a mut [Vec<Vec<(usize, ValueId)>>],
+    force_open_idx: &'a mut [bool],
+}
 
-    // 2. Build per-function value metadata, intra-procedural rules, and direct call edges.
-    let mut incoming_calls: Vec<Vec<Vec<(usize, ValueId)>>> = funcs
-        .values()
-        .map(|f| vec![Vec::new(); f.params.len()])
-        .collect();
-    let mut force_open_idx = vec![false; funcs.len()];
+fn build_func_state<'a>(
+    caller_name: &'a JsName,
+    func: &'a Func,
+    interns: &'a Interns,
+    input: &AsciiInput<'a>,
+    name_to_idx: &'a BTreeMap<JsName, usize>,
+    calls: &mut FuncCallCollector<'_>,
+) -> FuncState<'a> {
+    AsciiFuncCx::new(caller_name, func, interns, input, name_to_idx).build_state(calls)
+}
 
-    let mut states: Vec<FuncState<'_>> = Vec::with_capacity(funcs.len());
-    for (caller_idx, name) in names.iter().enumerate() {
-        let func = funcs[name];
-        let Some(interns) = get_interns(name) else {
-            return AsciiFacts {
-                funcs: BTreeMap::new(),
-                slice_error_fail,
-                slice_reverse: core_slice_items.reverse,
-                slice_revswap: core_slice_items.revswap,
-                slice_starts_with: core_slice_items.starts_with,
-                slice_ends_with: core_slice_items.ends_with,
-            };
-        };
+/// Per-function context for building intra-procedural ASCII provenance rules.
+struct AsciiFuncCx<'a> {
+    caller_name: &'a JsName,
+    func: &'a Func,
+    interns: &'a Interns,
+    defs: Vec<Option<&'a Op>>,
+    val_types: Vec<AsciiType>,
+    owned_strings: OwnedStringAnalysis,
+    disqualified: BTreeSet<ValueId>,
+    repr: &'a ReprOutcome,
+    abi: &'a AbiPlan,
+    name_to_idx: &'a BTreeMap<JsName, usize>,
+}
+
+impl<'a> AsciiFuncCx<'a> {
+    fn new(
+        caller_name: &'a JsName,
+        func: &'a Func,
+        interns: &'a Interns,
+        input: &AsciiInput<'a>,
+        name_to_idx: &'a BTreeMap<JsName, usize>,
+    ) -> Self {
         let type_table = &interns.types;
         let val_types: Vec<AsciiType> = func
             .values
             .iter()
             .map(|v| classify_value_type(type_table, interns, v.ty, v.carrier))
             .collect();
-        let mut defs: Vec<Option<&Op>> = vec![None; func.values.len()];
+        let mut defs: Vec<Option<&'a Op>> = vec![None; func.values.len()];
         for block in &func.blocks {
             for op in &block.ops {
                 if let Some(res) = op.result {
@@ -269,7 +357,23 @@ where
         }
         let owned_strings = analyze_owned_strings(func, &defs, &val_types, type_table);
         let disqualified = collect_disqualified(func, &owned_strings.accounted_mut_values);
+        Self {
+            caller_name,
+            func,
+            interns,
+            defs,
+            val_types,
+            owned_strings,
+            disqualified,
+            repr: input.repr,
+            abi: input.abi,
+            name_to_idx,
+        }
+    }
 
+    fn build_state(self, calls: &mut FuncCallCollector<'_>) -> FuncState<'a> {
+        let func = self.func;
+        let type_table = &self.interns.types;
         let mut rules = vec![Rule::Never; func.values.len()];
 
         // Incoming edges for every non-entry block parameter.
@@ -302,17 +406,19 @@ where
                 continue;
             }
             for (param_idx, &val) in block.params.iter().enumerate() {
-                if disqualified.contains(&val) || val_types[val.0 as usize] == AsciiType::Other {
+                if self.disqualified.contains(&val)
+                    || self.val_types[val.0 as usize] == AsciiType::Other
+                {
                     continue;
                 }
                 let incoming = std::mem::take(&mut block_incoming[block_idx][param_idx]);
                 if incoming.is_empty() {
                     continue;
                 }
-                let src_ty = val_types[val.0 as usize];
+                let src_ty = self.val_types[val.0 as usize];
                 if incoming
                     .iter()
-                    .all(|&src| val_types[src.0 as usize] == src_ty)
+                    .all(|&src| self.val_types[src.0 as usize] == src_ty)
                 {
                     rules[val.0 as usize] = Rule::BlockParam(incoming);
                 }
@@ -332,47 +438,54 @@ where
                     ..
                 } = &op.kind
                 {
-                    if let Some(target_name) =
-                        resolve_callee(name, *item, *link_name, interns, repr, abi)
-                    {
-                        if let Some(&callee_idx) = name_to_idx.get(&target_name) {
-                            let callee = funcs[&target_name];
+                    if let Some(target_name) = resolve_callee(
+                        self.caller_name,
+                        *item,
+                        *link_name,
+                        self.interns,
+                        self.repr,
+                        self.abi,
+                    ) {
+                        if let Some(&callee_idx) = self.name_to_idx.get(&target_name) {
+                            let callee = calls.funcs[&target_name];
                             let expected = args.len() + usize::from(callee.sig.abi.caller_location);
                             if callee.params.len() == expected {
                                 for (i, &arg) in args.iter().enumerate() {
-                                    incoming_calls[callee_idx][i].push((caller_idx, arg));
+                                    calls.incoming_calls[callee_idx][i]
+                                        .push((calls.caller_idx, arg));
                                 }
                             } else {
-                                force_open_idx[callee_idx] = true;
+                                calls.force_open_idx[callee_idx] = true;
                             }
                         }
                     } else {
-                        open_items.insert(*item);
+                        calls.open_items.insert(*item);
                     }
                 }
 
                 let Some(result) = op.result else { continue };
                 let r_idx = result.0 as usize;
-                let r_ty = val_types[r_idx];
-                if disqualified.contains(&result) || r_ty == AsciiType::Other {
+                let r_ty = self.val_types[r_idx];
+                if self.disqualified.contains(&result) || r_ty == AsciiType::Other {
                     continue;
                 }
                 let mut rule = match &op.kind {
                     OpKind::Const(tree) => {
-                        if is_ascii_const(type_table, interns, tree, r_ty) {
+                        if is_ascii_const(type_table, self.interns, tree, r_ty) {
                             Rule::Root
                         } else {
                             Rule::Never
                         }
                     }
                     OpKind::Move(src) | OpKind::Copy(src) => {
-                        if val_types[src.0 as usize] == r_ty {
+                        if self.val_types[src.0 as usize] == r_ty {
                             Rule::Single(*src)
                         } else {
                             Rule::Never
                         }
                     }
-                    OpKind::CellLoad(cell) if r_ty == AsciiType::OwnedString => owned_strings
+                    OpKind::CellLoad(cell) if r_ty == AsciiType::OwnedString => self
+                        .owned_strings
                         .cell_deps
                         .get(cell)
                         .map(|deps| Rule::All(deps.clone()))
@@ -382,7 +495,7 @@ where
                         path,
                         mutable: false,
                     } if r_ty == AsciiType::SharedStr
-                        && val_types[src.0 as usize] == AsciiType::SharedStr
+                        && self.val_types[src.0 as usize] == AsciiType::SharedStr
                         && matches!(path.as_slice(), [Proj::Deref]) =>
                     {
                         Rule::Single(*src)
@@ -411,7 +524,7 @@ where
                                         AsciiType::SharedStr
                                     };
                                     if let Some(&fv) = fields.get(fidx as usize) {
-                                        if val_types[fv.0 as usize] == expected_ty {
+                                        if self.val_types[fv.0 as usize] == expected_ty {
                                             Rule::Single(fv)
                                         } else {
                                             Rule::Never
@@ -429,9 +542,9 @@ where
                         variant: Some(variant),
                         field,
                     } if matches!(r_ty, AsciiType::SharedStr | AsciiType::OwnedString)
-                        && !disqualified.contains(base) =>
+                        && !self.disqualified.contains(base) =>
                     {
-                        match val_types[base.0 as usize] {
+                        match self.val_types[base.0 as usize] {
                             AsciiType::EnumStr { v0, v1 } => {
                                 let spec = match *variant {
                                     0 => v0,
@@ -463,26 +576,11 @@ where
                         semantic,
                         host: None,
                         ..
-                    } => classify_call_result(
-                        name,
-                        func,
-                        r_ty,
-                        *semantic,
-                        callee,
-                        args,
-                        &defs,
-                        &disqualified,
-                        &owned_strings.cell_deps,
-                        &val_types,
-                        interns,
-                        repr,
-                        abi,
-                        &name_to_idx,
-                    ),
+                    } => self.classify_call_result(r_ty, *semantic, callee, args),
                     _ => Rule::Never,
                 };
                 if r_ty == AsciiType::OwnedString {
-                    if let Some(mut_deps) = owned_strings.val_mut_deps.get(&result) {
+                    if let Some(mut_deps) = self.owned_strings.val_mut_deps.get(&result) {
                         if !mut_deps.is_empty() {
                             rule = match rule {
                                 Rule::Root => Rule::All(mut_deps.clone()),
@@ -509,13 +607,14 @@ where
             }
         }
 
-        let is_open = open_names.contains(name) || open_items.contains(&func.item);
+        let is_open =
+            calls.open_names.contains(self.caller_name) || calls.open_items.contains(&func.item);
         let num_vals = func.values.len();
         let ret_ascii = !returns.is_empty();
-        states.push(FuncState {
-            name: name.clone(),
+        FuncState {
+            name: self.caller_name.clone(),
             func,
-            val_types,
+            val_types: self.val_types,
             rules,
             returns,
             is_open,
@@ -523,35 +622,171 @@ where
             grounded: vec![false; num_vals],
             ret_ascii,
             ret_grounded: false,
-        });
+        }
     }
 
-    // Wire entry parameter rules now that every direct call site has been gathered.
-    for (idx, state) in states.iter_mut().enumerate() {
-        if force_open_idx[idx] {
-            state.is_open = true;
+    fn classify_call_result(
+        &self,
+        r_ty: AsciiType,
+        semantic: CallSemantic,
+        callee: &Callee,
+        args: &[ValueId],
+    ) -> Rule {
+        let is_owned_ret = matches!(r_ty, AsciiType::HostString | AsciiType::OwnedString);
+        if let CallSemantic::Standard(std_op) = semantic {
+            match std_op {
+                StandardOperation::IntToString
+                | StandardOperation::BoolToString
+                | StandardOperation::F64SpecToString
+                | StandardOperation::NativeStrNew
+                | StandardOperation::NativeStrWithCapacity
+                | StandardOperation::StringNew
+                | StandardOperation::StringWithCapacity
+                    if is_owned_ret =>
+                {
+                    return Rule::Root;
+                }
+                StandardOperation::CharToString if is_owned_ret => {
+                    if let Some(&ch) = args.first() {
+                        if is_proven_ascii_char(self.func, &self.defs, &self.interns.types, ch) {
+                            return Rule::Root;
+                        }
+                    }
+                    return Rule::Never;
+                }
+                StandardOperation::StrToLowercase
+                | StandardOperation::StrToUppercase
+                | StandardOperation::NativeStrFromStr
+                | StandardOperation::NativeStrToAsciiLowercase
+                | StandardOperation::NativeStrToAsciiUppercase
+                | StandardOperation::NativeStrRepeat
+                    if is_owned_ret =>
+                {
+                    if let Some(&recv) = args.first() {
+                        if self.val_types[recv.0 as usize] == AsciiType::SharedStr {
+                            return Rule::Single(recv);
+                        }
+                    }
+                    return Rule::Never;
+                }
+                StandardOperation::StrIndex
+                | StandardOperation::StrTrim
+                | StandardOperation::StrTrimStart
+                | StandardOperation::StrTrimEnd
+                | StandardOperation::StrSliceUnchecked
+                    if r_ty == AsciiType::SharedStr =>
+                {
+                    if let Some(&recv) = args.first() {
+                        if self.val_types[recv.0 as usize] == AsciiType::SharedStr {
+                            return Rule::Single(recv);
+                        }
+                    }
+                    return Rule::Never;
+                }
+                StandardOperation::StrGet
+                | StandardOperation::StrStripPrefix
+                | StandardOperation::StrStripSuffix
+                    if matches!(r_ty, AsciiType::EnumStr { .. }) =>
+                {
+                    if let Some(&recv) = args.first() {
+                        if self.val_types[recv.0 as usize] == AsciiType::SharedStr {
+                            return Rule::Single(recv);
+                        }
+                    }
+                    return Rule::Never;
+                }
+                // Immutable whole-value borrow of an SSA `HostString` or tracked `OwnedString`
+                // value/cell preserves ASCII across `String::as_str` / `rcgjs_str_as_str`.
+                StandardOperation::StringAsStr | StandardOperation::NativeStrAsStr
+                    if r_ty == AsciiType::SharedStr =>
+                {
+                    if let Some(&recv) = args.first() {
+                        match peel_shared_string_borrow(
+                            &self.defs,
+                            &self.val_types,
+                            &self.disqualified,
+                            &self.owned_strings.cell_deps,
+                            recv,
+                        ) {
+                            Some(StringBorrowSource::Value(v)) => return Rule::Single(v),
+                            Some(StringBorrowSource::Cell(deps)) => {
+                                return Rule::All(deps.to_vec())
+                            }
+                            None => {}
+                        }
+                    }
+                    return Rule::Never;
+                }
+                // Explicit safeguard: arbitrary `String::as_str`, `char::to_string`, `format!` remain unproven.
+                StandardOperation::StringAsStr
+                | StandardOperation::NativeStrAsStr
+                | StandardOperation::CharToString
+                | StandardOperation::FormatArgsToString => return Rule::Never,
+                _ => {}
+            }
         }
-        for (param_idx, &val) in state.func.params.iter().enumerate() {
-            let v_idx = val.0 as usize;
-            let val_ty = state.val_types[v_idx];
-            if state.is_open || val_ty == AsciiType::Other {
-                continue;
-            }
-            let callers = std::mem::take(&mut incoming_calls[idx][param_idx]);
-            if callers.is_empty() {
-                continue;
-            }
-            if callers.iter().all(|&(c_idx, arg)| {
-                states_pre_match(&names, funcs, c_idx, arg, val_ty, &get_interns)
-            }) {
-                state.rules[v_idx] = Rule::FuncParam(callers);
+
+        let Callee::Direct { item, link_name } = callee else {
+            return Rule::Never;
+        };
+        let Some(target) = resolve_callee(
+            self.caller_name,
+            *item,
+            *link_name,
+            self.interns,
+            self.repr,
+            self.abi,
+        ) else {
+            return Rule::Never;
+        };
+        let Some(&callee_idx) = self.name_to_idx.get(&target) else {
+            return Rule::Never;
+        };
+        Rule::CallReturn(callee_idx)
+    }
+}
+
+fn wire_entry_params(
+    states: &mut [FuncState<'_>],
+    incoming_calls: &mut [Vec<Vec<(usize, ValueId)>>],
+    force_open_idx: &[bool],
+    open_items: &BTreeSet<ItemId>,
+) {
+    for idx in 0..states.len() {
+        if force_open_idx[idx] || open_items.contains(&states[idx].func.item) {
+            states[idx].is_open = true;
+        }
+        if !states[idx].is_open {
+            let param_count = states[idx].func.params.len();
+            for (param_idx, incoming_slot) in
+                incoming_calls[idx].iter_mut().enumerate().take(param_count)
+            {
+                let val = states[idx].func.params[param_idx];
+                let v_idx = val.0 as usize;
+                let val_ty = states[idx].val_types[v_idx];
+                if val_ty == AsciiType::Other {
+                    continue;
+                }
+                let callers = std::mem::take(incoming_slot);
+                if callers.is_empty() {
+                    continue;
+                }
+                if callers.iter().all(|&(c_idx, arg)| {
+                    let actual = states[c_idx].val_types[arg.0 as usize];
+                    actual != AsciiType::Other && actual == val_ty
+                }) {
+                    states[idx].rules[v_idx] = Rule::FuncParam(callers);
+                }
             }
         }
+        let state = &mut states[idx];
         for (v_idx, rule) in state.rules.iter().enumerate() {
             state.ascii[v_idx] = !matches!(rule, Rule::Never);
         }
     }
+}
 
+fn solve_ascii_fixpoints(states: &mut [FuncState<'_>]) -> BTreeMap<JsName, BTreeSet<ValueId>> {
     // Phase A: Greatest Fixpoint (shrink optimistic `ascii` until stable).
     loop {
         let mut changed = false;
@@ -654,7 +889,7 @@ where
 
     // Publish only scalar `&str` and `Carrier::HostString` values proven in both phases.
     let mut out = BTreeMap::new();
-    for state in &states {
+    for state in states.iter() {
         let mut known = BTreeSet::new();
         for (v_idx, &ty) in state.val_types.iter().enumerate() {
             if matches!(ty, AsciiType::SharedStr | AsciiType::HostString)
@@ -668,157 +903,12 @@ where
             out.insert(state.name.clone(), known);
         }
     }
-
-    AsciiFacts {
-        funcs: out,
-        slice_error_fail,
-        slice_reverse: core_slice_items.reverse,
-        slice_revswap: core_slice_items.revswap,
-        slice_starts_with: core_slice_items.starts_with,
-        slice_ends_with: core_slice_items.ends_with,
-    }
-}
-
-fn states_pre_match<'a, F>(
-    names: &[JsName],
-    funcs: &BTreeMap<JsName, &'a Func>,
-    caller_idx: usize,
-    arg: ValueId,
-    expected: AsciiType,
-    get_interns: &F,
-) -> bool
-where
-    F: Fn(&JsName) -> Option<&'a Interns>,
-{
-    let caller_name = &names[caller_idx];
-    let caller_func = funcs[caller_name];
-    let Some(interns) = get_interns(caller_name) else {
-        return false;
-    };
-    let arg_def = caller_func.values[arg.0 as usize];
-    let actual = classify_value_type(&interns.types, interns, arg_def.ty, arg_def.carrier);
-    actual != AsciiType::Other && actual == expected
+    out
 }
 
 enum StringBorrowSource<'a> {
     Value(ValueId),
     Cell(&'a [ValueId]),
-}
-
-#[allow(clippy::too_many_arguments)]
-fn classify_call_result(
-    caller_name: &JsName,
-    func: &Func,
-    r_ty: AsciiType,
-    semantic: CallSemantic,
-    callee: &Callee,
-    args: &[ValueId],
-    defs: &[Option<&Op>],
-    disqualified: &BTreeSet<ValueId>,
-    cell_deps: &BTreeMap<CellId, Vec<ValueId>>,
-    val_types: &[AsciiType],
-    interns: &Interns,
-    repr: &ReprOutcome,
-    abi: &AbiPlan,
-    name_to_idx: &BTreeMap<JsName, usize>,
-) -> Rule {
-    let is_owned_ret = matches!(r_ty, AsciiType::HostString | AsciiType::OwnedString);
-    if let CallSemantic::Standard(std_op) = semantic {
-        match std_op {
-            StandardOperation::IntToString
-            | StandardOperation::BoolToString
-            | StandardOperation::F64SpecToString
-            | StandardOperation::NativeStrNew
-            | StandardOperation::NativeStrWithCapacity
-            | StandardOperation::StringNew
-            | StandardOperation::StringWithCapacity
-                if is_owned_ret =>
-            {
-                return Rule::Root;
-            }
-            StandardOperation::CharToString if is_owned_ret => {
-                if let Some(&ch) = args.first() {
-                    if is_proven_ascii_char(func, defs, &interns.types, ch) {
-                        return Rule::Root;
-                    }
-                }
-                return Rule::Never;
-            }
-            StandardOperation::StrToLowercase
-            | StandardOperation::StrToUppercase
-            | StandardOperation::NativeStrFromStr
-            | StandardOperation::NativeStrToAsciiLowercase
-            | StandardOperation::NativeStrToAsciiUppercase
-            | StandardOperation::NativeStrRepeat
-                if is_owned_ret =>
-            {
-                if let Some(&recv) = args.first() {
-                    if val_types[recv.0 as usize] == AsciiType::SharedStr {
-                        return Rule::Single(recv);
-                    }
-                }
-                return Rule::Never;
-            }
-            StandardOperation::StrIndex
-            | StandardOperation::StrTrim
-            | StandardOperation::StrTrimStart
-            | StandardOperation::StrTrimEnd
-            | StandardOperation::StrSliceUnchecked
-                if r_ty == AsciiType::SharedStr =>
-            {
-                if let Some(&recv) = args.first() {
-                    if val_types[recv.0 as usize] == AsciiType::SharedStr {
-                        return Rule::Single(recv);
-                    }
-                }
-                return Rule::Never;
-            }
-            StandardOperation::StrGet
-            | StandardOperation::StrStripPrefix
-            | StandardOperation::StrStripSuffix
-                if matches!(r_ty, AsciiType::EnumStr { .. }) =>
-            {
-                if let Some(&recv) = args.first() {
-                    if val_types[recv.0 as usize] == AsciiType::SharedStr {
-                        return Rule::Single(recv);
-                    }
-                }
-                return Rule::Never;
-            }
-            // Immutable whole-value borrow of an SSA `HostString` or tracked `OwnedString`
-            // value/cell preserves ASCII across `String::as_str` / `rcgjs_str_as_str`.
-            StandardOperation::StringAsStr | StandardOperation::NativeStrAsStr
-                if r_ty == AsciiType::SharedStr =>
-            {
-                if let Some(&recv) = args.first() {
-                    match peel_shared_string_borrow(defs, val_types, disqualified, cell_deps, recv)
-                    {
-                        Some(StringBorrowSource::Value(v)) => return Rule::Single(v),
-                        Some(StringBorrowSource::Cell(deps)) => return Rule::All(deps.to_vec()),
-                        None => {}
-                    }
-                }
-                return Rule::Never;
-            }
-            // Explicit safeguard: arbitrary `String::as_str`, `char::to_string`, `format!` remain unproven.
-            StandardOperation::StringAsStr
-            | StandardOperation::NativeStrAsStr
-            | StandardOperation::CharToString
-            | StandardOperation::FormatArgsToString => return Rule::Never,
-            _ => {}
-        }
-    }
-
-    let Callee::Direct { item, link_name } = callee else {
-        return Rule::Never;
-    };
-    let Some(target) = resolve_callee(caller_name, *item, *link_name, interns, repr, abi) else {
-        return Rule::Never;
-    };
-    let Some(&callee_idx) = name_to_idx.get(&target) else {
-        return Rule::Never;
-    };
-    Rule::CallReturn(callee_idx)
 }
 
 fn peel_shared_string_borrow<'a>(
@@ -884,6 +974,15 @@ struct OwnedStringAnalysis {
     accounted_mut_values: BTreeSet<ValueId>,
 }
 
+struct OwnedStringState {
+    owned_cells: BTreeSet<CellId>,
+    bad: BTreeSet<StringTarget>,
+    cell_stores: BTreeMap<CellId, Vec<ValueId>>,
+    mut_refs: BTreeMap<ValueId, StringTarget>,
+    has_mut_borrow: BTreeSet<StringTarget>,
+    mut_deps: BTreeMap<StringTarget, Vec<ValueId>>,
+}
+
 fn analyze_owned_strings(
     func: &Func,
     defs: &[Option<&Op>],
@@ -901,36 +1000,52 @@ fn analyze_owned_strings(
         return OwnedStringAnalysis::default();
     }
 
-    let mut bad: BTreeSet<StringTarget> = BTreeSet::new();
-    let mut cell_stores: BTreeMap<CellId, Vec<ValueId>> = BTreeMap::new();
-    let mut mut_refs: BTreeMap<ValueId, StringTarget> = BTreeMap::new();
-    let mut has_mut_borrow: BTreeSet<StringTarget> = BTreeSet::new();
+    let mut state = OwnedStringState {
+        owned_cells,
+        bad: BTreeSet::new(),
+        cell_stores: BTreeMap::new(),
+        mut_refs: BTreeMap::new(),
+        has_mut_borrow: BTreeSet::new(),
+        mut_deps: BTreeMap::new(),
+    };
+    let cx = OwnedStringCx {
+        func,
+        defs,
+        val_types,
+        table,
+    };
+    collect_owned_string_ops(func, val_types, &mut state);
+    propagate_mut_string_refs(func, &mut state.mut_refs);
+    audit_mut_string_ref_uses(&cx, &mut state);
+    finalize_owned_string_analysis(state)
+}
 
+fn collect_owned_string_ops(func: &Func, val_types: &[AsciiType], state: &mut OwnedStringState) {
     for block in &func.blocks {
         for op in &block.ops {
             match &op.kind {
-                OpKind::CellStore { cell, v } if owned_cells.contains(cell) => {
+                OpKind::CellStore { cell, v } if state.owned_cells.contains(cell) => {
                     if val_types.get(v.0 as usize).copied() == Some(AsciiType::OwnedString) {
-                        cell_stores.entry(*cell).or_default().push(*v);
+                        state.cell_stores.entry(*cell).or_default().push(*v);
                     } else {
-                        bad.insert(StringTarget::Cell(*cell));
+                        state.bad.insert(StringTarget::Cell(*cell));
                     }
                 }
                 OpKind::BorrowView {
                     root: Root::Cell(cell),
                     path,
                     mutable: true,
-                } if owned_cells.contains(cell) => {
+                } if state.owned_cells.contains(cell) => {
                     let target = StringTarget::Cell(*cell);
-                    has_mut_borrow.insert(target);
+                    state.has_mut_borrow.insert(target);
                     if path.is_empty() {
                         if let Some(res) = op.result {
-                            mut_refs.insert(res, target);
+                            state.mut_refs.insert(res, target);
                         } else {
-                            bad.insert(target);
+                            state.bad.insert(target);
                         }
                     } else {
-                        bad.insert(target);
+                        state.bad.insert(target);
                     }
                 }
                 OpKind::BorrowView {
@@ -939,40 +1054,42 @@ fn analyze_owned_strings(
                     mutable: true,
                 } if val_types.get(v.0 as usize).copied() == Some(AsciiType::OwnedString) => {
                     let target = StringTarget::Value(*v);
-                    has_mut_borrow.insert(target);
+                    state.has_mut_borrow.insert(target);
                     if path.is_empty() {
                         if let Some(res) = op.result {
-                            mut_refs.insert(res, target);
+                            state.mut_refs.insert(res, target);
                         } else {
-                            bad.insert(target);
+                            state.bad.insert(target);
                         }
                     } else {
-                        bad.insert(target);
+                        state.bad.insert(target);
                     }
                 }
                 OpKind::RawView {
                     root: Root::Cell(cell),
                     ..
-                } if owned_cells.contains(cell) => {
-                    bad.insert(StringTarget::Cell(*cell));
+                } if state.owned_cells.contains(cell) => {
+                    state.bad.insert(StringTarget::Cell(*cell));
                 }
                 OpKind::RawView {
                     root: Root::Value(v),
                     ..
                 } if val_types.get(v.0 as usize).copied() == Some(AsciiType::OwnedString) => {
-                    bad.insert(StringTarget::Value(*v));
+                    state.bad.insert(StringTarget::Value(*v));
                 }
                 OpKind::SetField { base, .. } | OpKind::SetDiscriminant { base, .. }
                     if val_types.get(base.0 as usize).copied() == Some(AsciiType::OwnedString) =>
                 {
-                    bad.insert(StringTarget::Value(*base));
+                    state.bad.insert(StringTarget::Value(*base));
                 }
                 _ => {}
             }
         }
     }
+}
 
-    // Transitively propagate mutable `&mut String` reference aliases (`Move`, `Copy`, `&mut *r`).
+/// Transitively propagates mutable `&mut String` reference aliases (`Move`, `Copy`, `&mut *r`).
+fn propagate_mut_string_refs(func: &Func, mut_refs: &mut BTreeMap<ValueId, StringTarget>) {
     loop {
         let mut changed = false;
         for block in &func.blocks {
@@ -1000,22 +1117,30 @@ fn analyze_owned_strings(
             break;
         }
     }
+}
 
-    // Inspect EVERY use of EVERY mutable reference in `mut_refs`.
+struct OwnedStringCx<'a> {
+    func: &'a Func,
+    defs: &'a [Option<&'a Op>],
+    val_types: &'a [AsciiType],
+    table: &'a TypeTable,
+}
+
+/// Inspects EVERY use of EVERY mutable reference in `state.mut_refs`.
+fn audit_mut_string_ref_uses(cx: &OwnedStringCx<'_>, state: &mut OwnedStringState) {
     let mut use_counts: BTreeMap<ValueId, usize> = BTreeMap::new();
-    let mut mut_deps: BTreeMap<StringTarget, Vec<ValueId>> = BTreeMap::new();
 
-    for block in &func.blocks {
+    for block in &cx.func.blocks {
         for used in block.term.uses() {
-            if let Some(&target) = mut_refs.get(&used) {
-                bad.insert(target);
+            if let Some(&target) = state.mut_refs.get(&used) {
+                state.bad.insert(target);
             }
         }
         for op in &block.ops {
             let uses = op.kind.uses();
             let mut touched: Vec<(ValueId, StringTarget)> = Vec::new();
             for u in &uses {
-                if let Some(&target) = mut_refs.get(u) {
+                if let Some(&target) = state.mut_refs.get(u) {
                     touched.push((*u, target));
                 }
             }
@@ -1045,66 +1170,11 @@ fn analyze_owned_strings(
                 } if touched.len() == 1 && args.first().copied() == Some(touched[0].0) => {
                     let (r, target) = touched[0];
                     *use_counts.entry(r).or_insert(0) += 1;
-                    match std_op {
-                        StandardOperation::NativeStrClear
-                        | StandardOperation::StringClear
-                        | StandardOperation::NativeStrTruncate
-                        | StandardOperation::NativeStrReserve
-                        | StandardOperation::NativeStrShrinkTo
-                        | StandardOperation::NativeStrExtendWithin
-                        | StandardOperation::NativeStrLen
-                        | StandardOperation::NativeStrCapacity
-                        | StandardOperation::StringLen
-                        | StandardOperation::StringCapacity
-                        | StandardOperation::NativeStrAsStr
-                        | StandardOperation::StringAsStr
-                        | StandardOperation::StringDrop => {}
-                        StandardOperation::NativeStrPush
-                        | StandardOperation::StringPush
-                        | StandardOperation::StringFmtWriteChar => {
-                            if args.len() != 2 || !is_proven_ascii_char(func, defs, table, args[1])
-                            {
-                                bad.insert(target);
-                            }
-                        }
-                        StandardOperation::NativeStrPushStr
-                        | StandardOperation::StringPushStr
-                        | StandardOperation::StringFmtWriteStr => {
-                            if args.len() == 2
-                                && val_types.get(args[1].0 as usize).copied()
-                                    == Some(AsciiType::SharedStr)
-                            {
-                                mut_deps.entry(target).or_default().push(args[1]);
-                            } else {
-                                bad.insert(target);
-                            }
-                        }
-                        StandardOperation::NativeStrReplaceSlice => {
-                            if args.len() == 4
-                                && val_types.get(args[3].0 as usize).copied()
-                                    == Some(AsciiType::SharedStr)
-                            {
-                                mut_deps.entry(target).or_default().push(args[3]);
-                            } else {
-                                bad.insert(target);
-                            }
-                        }
-                        StandardOperation::NativeStrCloneFrom if args.len() == 2 => {
-                            // Only track immutable whole-value borrow of an SSA OwnedString.
-                            if let Some(src_v) = peel_owned_ssa_ref(defs, val_types, args[1]) {
-                                mut_deps.entry(target).or_default().push(src_v);
-                            } else {
-                                bad.insert(target);
-                            }
-                        }
-                        _ => {
-                            bad.insert(target);
-                        }
-                    }
+                    audit_mut_string_std_call(cx, *std_op, args, target, state);
                 }
                 _ => {
                     for (_, target) in touched {
-                        bad.insert(target);
+                        state.bad.insert(target);
                     }
                 }
             }
@@ -1113,39 +1183,103 @@ fn analyze_owned_strings(
 
     // Require every mutable borrow to have at least one accounted use (dead synthetic borrows
     // remain conservative).
-    for (r, target) in &mut_refs {
+    for (r, target) in &state.mut_refs {
         if use_counts.get(r).copied().unwrap_or(0) == 0 {
-            bad.insert(*target);
+            state.bad.insert(*target);
         }
     }
+}
 
+fn audit_mut_string_std_call(
+    cx: &OwnedStringCx<'_>,
+    std_op: StandardOperation,
+    args: &[ValueId],
+    target: StringTarget,
+    state: &mut OwnedStringState,
+) {
+    match std_op {
+        StandardOperation::NativeStrClear
+        | StandardOperation::StringClear
+        | StandardOperation::NativeStrTruncate
+        | StandardOperation::NativeStrReserve
+        | StandardOperation::NativeStrShrinkTo
+        | StandardOperation::NativeStrExtendWithin
+        | StandardOperation::NativeStrLen
+        | StandardOperation::NativeStrCapacity
+        | StandardOperation::StringLen
+        | StandardOperation::StringCapacity
+        | StandardOperation::NativeStrAsStr
+        | StandardOperation::StringAsStr
+        | StandardOperation::StringDrop => {}
+        StandardOperation::NativeStrPush
+        | StandardOperation::StringPush
+        | StandardOperation::StringFmtWriteChar => {
+            if args.len() != 2 || !is_proven_ascii_char(cx.func, cx.defs, cx.table, args[1]) {
+                state.bad.insert(target);
+            }
+        }
+        StandardOperation::NativeStrPushStr
+        | StandardOperation::StringPushStr
+        | StandardOperation::StringFmtWriteStr => {
+            if args.len() == 2
+                && cx.val_types.get(args[1].0 as usize).copied() == Some(AsciiType::SharedStr)
+            {
+                state.mut_deps.entry(target).or_default().push(args[1]);
+            } else {
+                state.bad.insert(target);
+            }
+        }
+        StandardOperation::NativeStrReplaceSlice => {
+            if args.len() == 4
+                && cx.val_types.get(args[3].0 as usize).copied() == Some(AsciiType::SharedStr)
+            {
+                state.mut_deps.entry(target).or_default().push(args[3]);
+            } else {
+                state.bad.insert(target);
+            }
+        }
+        StandardOperation::NativeStrCloneFrom if args.len() == 2 => {
+            // Only track immutable whole-value borrow of an SSA OwnedString.
+            if let Some(src_v) = peel_owned_ssa_ref(cx.defs, cx.val_types, args[1]) {
+                state.mut_deps.entry(target).or_default().push(src_v);
+            } else {
+                state.bad.insert(target);
+            }
+        }
+        _ => {
+            state.bad.insert(target);
+        }
+    }
+}
+
+fn finalize_owned_string_analysis(mut state: OwnedStringState) -> OwnedStringAnalysis {
     let mut out = OwnedStringAnalysis::default();
-    for cell in owned_cells {
+    for cell in state.owned_cells {
         let target = StringTarget::Cell(cell);
-        if bad.contains(&target) {
+        if state.bad.contains(&target) {
             continue;
         }
-        let Some(stores) = cell_stores.get(&cell) else {
+        let Some(stores) = state.cell_stores.get(&cell) else {
             continue;
         };
         if stores.is_empty() {
             continue;
         }
         let mut deps = stores.clone();
-        if let Some(extra) = mut_deps.get(&target) {
+        if let Some(extra) = state.mut_deps.get(&target) {
             deps.extend_from_slice(extra);
         }
         out.cell_deps.insert(cell, deps);
     }
-    for target in has_mut_borrow {
+    for target in state.has_mut_borrow {
         let StringTarget::Value(v) = target else {
             continue;
         };
-        if bad.contains(&target) {
+        if state.bad.contains(&target) {
             continue;
         }
         out.accounted_mut_values.insert(v);
-        if let Some(extra) = mut_deps.remove(&target) {
+        if let Some(extra) = state.mut_deps.remove(&target) {
             out.val_mut_deps.insert(v, extra);
         }
     }
@@ -1386,15 +1520,7 @@ struct CoreSliceItems {
 /// Authenticates live `core::slice::<impl [T]>::{reverse,reverse::revswap,starts_with,ends_with}`
 /// items via an unforgeable unique `core` `StableCrateId`, origin metadata, and exact JIR
 /// parameter/return types, propagating authenticated IDs to any `bstr_abi` synthetic clones.
-fn find_core_slice_items<'a, F>(
-    funcs: &BTreeMap<JsName, &'a Func>,
-    table: &BTreeMap<JsName, LinkItem>,
-    get_interns: &F,
-    repr: &ReprOutcome,
-    abi: &AbiPlan,
-    defined: &BTreeSet<JsName>,
-    live: &BTreeSet<JsName>,
-) -> CoreSliceItems
+fn find_core_slice_items<'a, F>(input: &AsciiInput<'a>, get_interns: &F) -> CoreSliceItems
 where
     F: Fn(&JsName) -> Option<&'a Interns>,
 {
@@ -1414,11 +1540,14 @@ where
     };
     let mut std_core_crates = BTreeSet::new();
     let mut named_core_crates = BTreeSet::new();
-    for (name, func) in funcs {
-        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+    for (name, func) in input.funcs {
+        if !input.defined.contains(name)
+            || !input.live.contains(name)
+            || input.repr.bodies.contains_key(name)
+        {
             continue;
         }
-        if let Some(item) = table.get(name) {
+        if let Some(item) = input.table.get(name) {
             if matches!(
                 item.jir.body.as_ref().map(|b| b.semantic),
                 Some(BodySemantic::Standard(op)) if is_core_std_op(op)
@@ -1460,19 +1589,24 @@ where
     if core_crate_ids.len() != 1 {
         return CoreSliceItems::default();
     }
-    let core_crate_id = *core_crate_ids.iter().next().unwrap();
+    let Some(&core_crate_id) = core_crate_ids.iter().next() else {
+        return CoreSliceItems::default();
+    };
 
     // Map source item names to their `bstr_abi` / `abi_flat` synthetic clone `ItemId`s.
     let mut clones_of: BTreeMap<&JsName, Vec<ItemId>> = BTreeMap::new();
-    for (clone_name, source_name) in abi.clones() {
-        if let Some(&synth_id) = abi.synthetic_items.get(clone_name) {
+    for (clone_name, source_name) in input.abi.clones() {
+        if let Some(&synth_id) = input.abi.synthetic_items.get(clone_name) {
             clones_of.entry(source_name).or_default().push(synth_id);
         }
     }
 
     let mut out = CoreSliceItems::default();
-    for (name, func) in funcs {
-        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+    for (name, func) in input.funcs {
+        if !input.defined.contains(name)
+            || !input.live.contains(name)
+            || input.repr.bodies.contains_key(name)
+        {
             continue;
         }
         if func.item.definition.crate_id != core_crate_id
@@ -1481,7 +1615,7 @@ where
         {
             continue;
         }
-        let Some(item) = table.get(name) else {
+        let Some(item) = input.table.get(name) else {
             continue;
         };
         if item.crate_name != "core" {
@@ -1588,21 +1722,16 @@ where
 /// Locates the unique live `core::str::slice_error_fail` item authenticated by `StrIndex`
 /// callees' `StableCrateId` (`core` by Rust coherence/orphan rules), origin metadata, and exact
 /// 4-parameter `(s: &str, start: usize, end: usize, $loc) -> !` ABI without a flat call shape.
-fn find_slice_error_fail<'a, F>(
-    funcs: &BTreeMap<JsName, &'a Func>,
-    table: &BTreeMap<JsName, LinkItem>,
-    get_interns: &F,
-    repr: &ReprOutcome,
-    abi: &AbiPlan,
-    defined: &BTreeSet<JsName>,
-    live: &BTreeSet<JsName>,
-) -> Option<JsName>
+fn find_slice_error_fail<'a, F>(input: &AsciiInput<'a>, get_interns: &F) -> Option<JsName>
 where
     F: Fn(&JsName) -> Option<&'a Interns>,
 {
     let mut core_crate_ids = BTreeSet::new();
-    for (name, func) in funcs {
-        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+    for (name, func) in input.funcs {
+        if !input.defined.contains(name)
+            || !input.live.contains(name)
+            || input.repr.bodies.contains_key(name)
+        {
             continue;
         }
         for block in &func.blocks {
@@ -1626,14 +1755,17 @@ where
     let core_crate_id = *core_crate_ids.iter().next()?;
 
     let mut candidates = Vec::new();
-    for (name, func) in funcs {
-        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+    for (name, func) in input.funcs {
+        if !input.defined.contains(name)
+            || !input.live.contains(name)
+            || input.repr.bodies.contains_key(name)
+        {
             continue;
         }
         if func.item.definition.crate_id != core_crate_id {
             continue;
         }
-        let Some(item) = table.get(name) else {
+        let Some(item) = input.table.get(name) else {
             continue;
         };
         if item.crate_name != "core" {
@@ -1659,7 +1791,7 @@ where
         }
         if !func.sig.abi.caller_location
             || func.params.len() != 4
-            || abi.call_signature(func.item).is_some()
+            || input.abi.call_signature(func.item).is_some()
         {
             continue;
         }
@@ -1981,16 +2113,18 @@ mod tests {
         let refs: BTreeMap<JsName, &Func> = funcs.iter().map(|(k, v)| (k.clone(), v)).collect();
         let defined: BTreeSet<JsName> = table.keys().cloned().collect();
         let live: BTreeSet<JsName> = table.keys().cloned().collect();
-        compute_with_interns(
-            &refs,
+        let repr = ReprOutcome::default();
+        let abi = AbiPlan::default();
+        let input = AsciiInput {
+            funcs: &refs,
             table,
-            |_| Some(interns),
-            &ReprOutcome::default(),
-            &AbiPlan::default(),
+            repr: &repr,
+            abi: &abi,
             roots,
-            &defined,
-            &live,
-        )
+            defined: &defined,
+            live: &live,
+        };
+        compute_with_interns(&input, |_| Some(interns))
     }
 
     #[test]

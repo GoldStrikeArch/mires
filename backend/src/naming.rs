@@ -128,7 +128,6 @@ impl<'tcx> Namer<'tcx> {
     /// relative to the crate printing it and two crates that intern one vtable have to name it
     /// identically -- see [`Namer::hash_key`] for the same rule on functions. The hash covers both
     /// types, which is what makes the name unique; the readable half is a hint.
-    #[allow(dead_code)]
     pub(crate) fn vtable_name(
         &self,
         ty: Ty<'tcx>,

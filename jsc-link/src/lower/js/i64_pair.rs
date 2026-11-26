@@ -98,17 +98,12 @@ pub fn literal_pair(raw: u128) -> (Expr, Expr) {
 
 /// If `expr` is an integer numeric literal in signed/unsigned 32-bit range, returns its `i32` bits.
 pub fn const_i32(expr: &Expr) -> Option<i32> {
-    match expr {
-        Expr::Num(n) if n.is_finite() && n.fract() == 0.0 => {
-            let v = *n as i64;
-            i32::try_from(v)
-                .ok()
-                .or_else(|| u32::try_from(v).ok().map(|u| u as i32))
-        }
-        Expr::RawNum(s) => s
-            .parse::<i32>()
+    if let Some(v) = super::ast_util::exact_int_lit(expr) {
+        return i32::try_from(v)
             .ok()
-            .or_else(|| s.parse::<u32>().ok().map(|u| u as i32)),
+            .or_else(|| u32::try_from(v).ok().map(|u| u as i32));
+    }
+    match expr {
         Expr::Unary(JsUnOp::Neg, inner) => const_i32(inner).map(i32::wrapping_neg),
         Expr::Unary(JsUnOp::BitNot, inner) => const_i32(inner).map(|v| !v),
         Expr::Binary(JsBinOp::BitOr, lhs, rhs) if const_i32(rhs) == Some(0) => const_i32(lhs),
@@ -126,13 +121,7 @@ pub fn is_trivial(expr: &Expr) -> bool {
 
 /// Captures `expr` into a `$tN` temporary in `stmts` unless it is already trivial.
 pub fn materialize(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, expr: Expr) -> Expr {
-    if is_trivial(&expr) {
-        expr
-    } else {
-        let (bind, tmp) = cx.temp(expr);
-        stmts.push(bind);
-        tmp
-    }
+    cx.bind_atom(expr, stmts)
 }
 
 /// Materializes `(lo, hi)` only when either lane is non-trivial.
@@ -185,60 +174,6 @@ pub fn emit_unpack_bigint(
     stmts.push(jsast::assign_stmt(jsast::id(dst_hi), hi));
 }
 
-fn expr_mentions_ident(expr: &Expr, name: &str) -> bool {
-    match expr {
-        Expr::Ident(id) => id == name,
-        Expr::Member(obj, _) => expr_mentions_ident(obj, name),
-        Expr::Index(obj, idx) => expr_mentions_ident(obj, name) || expr_mentions_ident(idx, name),
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            expr_mentions_ident(callee, name) || args.iter().any(|a| expr_mentions_ident(a, name))
-        }
-        Expr::Unary(_, inner) => expr_mentions_ident(inner, name),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-            expr_mentions_ident(l, name) || expr_mentions_ident(r, name)
-        }
-        Expr::Cond(c, t, e) => {
-            expr_mentions_ident(c, name)
-                || expr_mentions_ident(t, name)
-                || expr_mentions_ident(e, name)
-        }
-        Expr::Object(fields) => fields.iter().any(|(_, v)| expr_mentions_ident(v, name)),
-        Expr::Array(items) | Expr::Seq(items) => items.iter().any(|e| expr_mentions_ident(e, name)),
-        Expr::Arrow(_, _) | Expr::Raw(_) => true,
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => false,
-    }
-}
-
-fn expr_has_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call(_, _) | Expr::New(_, _) | Expr::Raw(_) => true,
-        Expr::Member(obj, _) => expr_has_call(obj),
-        Expr::Index(obj, idx) => expr_has_call(obj) || expr_has_call(idx),
-        Expr::Unary(_, inner) => expr_has_call(inner),
-        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
-            expr_has_call(l) || expr_has_call(r)
-        }
-        Expr::Cond(c, t, e) => expr_has_call(c) || expr_has_call(t) || expr_has_call(e),
-        Expr::Object(fields) => fields.iter().any(|(_, v)| expr_has_call(v)),
-        Expr::Array(items) | Expr::Seq(items) => items.iter().any(expr_has_call),
-        Expr::Arrow(_, _)
-        | Expr::Ident(_)
-        | Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => false,
-    }
-}
-
 /// Assigns `(lo, hi)` into `(dst_lo, dst_hi)` without clobbering either lane if the other lane's
 /// expression reads it (for example in-place `x = x + y` or `x = x.rotate_left(k)`).
 pub fn emit_assign_pair(
@@ -248,20 +183,20 @@ pub fn emit_assign_pair(
     dst_hi: &str,
     (lo, hi): (Expr, Expr),
 ) {
-    let hi_reads_dst_lo = expr_mentions_ident(&hi, dst_lo);
+    let hi_reads_dst_lo = super::ast_util::expr_mentions_ident(&hi, dst_lo);
     if !hi_reads_dst_lo {
         stmts.push(jsast::assign_stmt(jsast::id(dst_lo), lo));
         stmts.push(jsast::assign_stmt(jsast::id(dst_hi), hi));
         return;
     }
-    if expr_has_call(&lo) {
+    if super::ast_util::expr_has_call(&lo) {
         let (bind_lo, tmp_lo) = cx.temp(lo);
         stmts.push(bind_lo);
         stmts.push(jsast::assign_stmt(jsast::id(dst_hi), hi));
         stmts.push(jsast::assign_stmt(jsast::id(dst_lo), tmp_lo));
         return;
     }
-    if !expr_mentions_ident(&lo, dst_hi) {
+    if !super::ast_util::expr_mentions_ident(&lo, dst_hi) {
         stmts.push(jsast::assign_stmt(jsast::id(dst_hi), hi));
         stmts.push(jsast::assign_stmt(jsast::id(dst_lo), lo));
         return;
@@ -1528,6 +1463,23 @@ pub fn needed_helper_items(
     referenced: &BTreeSet<JsName>,
     existing: &BTreeSet<JsName>,
 ) -> Vec<LinkItem> {
+    let need = expand_needed_helpers(referenced);
+    let mut out = Vec::new();
+    for &name in HELPER_NAMES {
+        if !need.contains(name) || existing.contains(&JsName::new(name.to_owned())) {
+            continue;
+        }
+        let item = static_helper(name, &need, existing)
+            .or_else(|| mul_helpers(name))
+            .or_else(|| div_rem_helpers(name))
+            .or_else(|| float_conv_helpers(name))
+            .unwrap_or_else(|| unreachable!("unhandled i64 helper `{name}`"));
+        out.push(item);
+    }
+    out
+}
+
+fn expand_needed_helpers(referenced: &BTreeSet<JsName>) -> BTreeSet<&'static str> {
     let mut need: BTreeSet<&'static str> = BTreeSet::new();
     for name in HELPER_NAMES {
         if referenced.contains(&JsName::new((*name).to_owned())) {
@@ -1567,8 +1519,16 @@ pub fn needed_helper_items(
     if need.contains(HELPER_I32_VIEW) {
         need.insert(HELPER_F64_VIEW);
     }
+    need
+}
 
-    let make = |name: &'static str, kind: ItemKind, refs: &[&'static str], js: String| LinkItem {
+fn synth_i64_item(
+    name: &'static str,
+    kind: ItemKind,
+    refs: &[&'static str],
+    js: String,
+) -> LinkItem {
+    LinkItem {
         js,
         name: JsName::new(name.to_owned()),
         kind,
@@ -1583,618 +1543,643 @@ pub fn needed_helper_items(
         optimization: Default::default(),
         allocator_provider: Default::default(),
         jir: Default::default(),
-    };
+    }
+}
 
+fn synth_i64_helper(
+    name: &'static str,
+    refs: &[&'static str],
+    params: &str,
+    body_js: String,
+) -> LinkItem {
+    synth_i64_item(
+        name,
+        ItemKind::Fn,
+        refs,
+        format!("\nfunction {name}({params}) {{\n{body_js}}}\n"),
+    )
+}
+
+fn active_writers(
+    writers: &[&'static str],
+    need: &BTreeSet<&'static str>,
+    existing: &BTreeSet<JsName>,
+) -> Vec<&'static str> {
+    writers
+        .iter()
+        .copied()
+        .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
+        .collect()
+}
+
+fn static_helper(
+    name: &'static str,
+    need: &BTreeSet<&'static str>,
+    existing: &BTreeSet<JsName>,
+) -> Option<LinkItem> {
     // Co-locate shared mutable static registers with every active writer function so ESM chunk
     // splitting never separates a writer from its `let` binding (ESM imports are read-only).
-    let active_hi_writers: Vec<&'static str> = [
-        HELPER_MUL,
-        HELPER_MUL_OVF,
-        HELPER_DIV,
-        HELPER_DIVREM,
-        HELPER_SDIV,
-        HELPER_UDIV,
-        HELPER_SREM,
-        HELPER_UREM,
-        HELPER_SDIVREM,
-        HELPER_UDIVREM,
-        HELPER_F2I,
-        HELPER_F64_TO_BITS,
-    ]
-    .into_iter()
-    .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
-    .collect();
-    let active_ovf_writers: Vec<&'static str> = [HELPER_MUL_OVF]
-        .into_iter()
-        .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
-        .collect();
-    let active_rem_writers: Vec<&'static str> = [HELPER_DIVREM, HELPER_SDIVREM, HELPER_UDIVREM]
-        .into_iter()
-        .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
-        .collect();
-
-    let mut out = Vec::new();
-    for &name in HELPER_NAMES {
-        if !need.contains(name) || existing.contains(&JsName::new(name.to_owned())) {
-            continue;
-        }
-        let item = match name {
-            HELPER_HI => make(
+    match name {
+        HELPER_HI => {
+            let writers = active_writers(
+                &[
+                    HELPER_MUL,
+                    HELPER_MUL_OVF,
+                    HELPER_DIV,
+                    HELPER_DIVREM,
+                    HELPER_SDIV,
+                    HELPER_UDIV,
+                    HELPER_SREM,
+                    HELPER_UREM,
+                    HELPER_SDIVREM,
+                    HELPER_UDIVREM,
+                    HELPER_F2I,
+                    HELPER_F64_TO_BITS,
+                ],
+                need,
+                existing,
+            );
+            Some(synth_i64_item(
                 name,
                 ItemKind::Static,
-                &active_hi_writers,
+                &writers,
                 format!("\nlet {HELPER_HI} = 0;\n"),
-            ),
-            HELPER_OVF => make(
+            ))
+        }
+        HELPER_OVF => {
+            let writers = active_writers(&[HELPER_MUL_OVF], need, existing);
+            Some(synth_i64_item(
                 name,
                 ItemKind::Static,
-                &active_ovf_writers,
+                &writers,
                 format!("\nlet {HELPER_OVF} = false;\n"),
-            ),
-            HELPER_RL => make(
+            ))
+        }
+        HELPER_RL => {
+            let writers = active_writers(
+                &[HELPER_DIVREM, HELPER_SDIVREM, HELPER_UDIVREM],
+                need,
+                existing,
+            );
+            Some(synth_i64_item(
                 name,
                 ItemKind::Static,
-                &active_rem_writers,
+                &writers,
                 format!("\nlet {HELPER_RL} = 0;\n"),
-            ),
-            HELPER_RH => make(
+            ))
+        }
+        HELPER_RH => {
+            let writers = active_writers(
+                &[HELPER_DIVREM, HELPER_SDIVREM, HELPER_UDIVREM],
+                need,
+                existing,
+            );
+            Some(synth_i64_item(
                 name,
                 ItemKind::Static,
-                &active_rem_writers,
+                &writers,
                 format!("\nlet {HELPER_RH} = 0;\n"),
-            ),
-            HELPER_F64_VIEW => make(
-                name,
-                ItemKind::Static,
-                &[],
-                format!("\nconst {HELPER_F64_VIEW} = new Float64Array(new ArrayBuffer(8));\n"),
-            ),
-            HELPER_I32_VIEW => make(
-                name,
-                ItemKind::Static,
-                &[HELPER_F64_VIEW],
-                format!("\nconst {HELPER_I32_VIEW} = new Int32Array({HELPER_F64_VIEW}.buffer);\n"),
-            ),
-            HELPER_MUL => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI],
-                format!(
-                    "\nfunction {HELPER_MUL}(al, ah, bl, bh) {{\n  \
-                     const a0 = al & 65535, a1 = (al >>> 16) | 0;\n  \
-                     const b0 = bl & 65535, b1 = (bl >>> 16) | 0;\n  \
-                     const p00 = Math.imul(a0, b0);\n  \
-                     const v = (((p00 >>> 16) | 0) + Math.imul(a1, b0)) | 0;\n  \
-                     const f = ((v & 65535) + Math.imul(a0, b1)) | 0;\n  \
-                     {HELPER_HI} = (((Math.imul(ah, bl) + Math.imul(a1, b1)) | 0) + Math.imul(al, bh) + (v >>> 16) + (f >>> 16)) | 0;\n  \
-                     return (p00 & 65535) | (f << 16);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_MUL_OVF => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_OVF],
-                format!(
-                    "\nfunction {HELPER_MUL_OVF}(al, ah, bl, bh, signed) {{\n  \
-                     let negA = false, negB = false, ual = al, uah = ah, ubl = bl, ubh = bh;\n  \
-                     if (signed) {{\n    \
-                       if (ah < 0) {{ negA = true; ual = (-al) | 0; uah = (~ah + (ual === 0 ? 1 : 0)) | 0; }}\n    \
-                       if (bh < 0) {{ negB = true; ubl = (-bl) | 0; ubh = (~bh + (ubl === 0 ? 1 : 0)) | 0; }}\n  \
-                     }}\n  \
-                     const a0 = ual & 65535, a1 = (ual >>> 16) | 0;\n  \
-                     const b0 = ubl & 65535, b1 = (ubl >>> 16) | 0;\n  \
-                     const p00 = Math.imul(a0, b0);\n  \
-                     const v = (((p00 >>> 16) | 0) + Math.imul(a1, b0)) | 0;\n  \
-                     const f = ((v & 65535) + Math.imul(a0, b1)) | 0;\n  \
-                     let lo = (p00 & 65535) | (f << 16);\n  \
-                     const crossHi = (uah >>> 0) * (ubl >>> 0) + (ual >>> 0) * (ubh >>> 0) + a1 * b1 + (v >>> 16) + (f >>> 16);\n  \
-                     let hi = (((Math.imul(uah, ubl) + Math.imul(a1, b1)) | 0) + Math.imul(ual, ubh) + (v >>> 16) + (f >>> 16)) | 0;\n  \
-                     const uovf = (uah !== 0 && ubh !== 0) || crossHi > 4294967295;\n  \
-                     if (signed) {{\n    \
-                       const negRes = negA !== negB;\n    \
-                       {HELPER_OVF} = uovf || (negRes ? (hi < 0 && (lo !== 0 || hi !== -2147483648)) : hi < 0);\n    \
-                       if (negRes) {{ lo = (-lo) | 0; hi = (~hi + (lo === 0 ? 1 : 0)) | 0; }}\n  \
-                     }} else {{\n    \
-                       {HELPER_OVF} = uovf;\n  \
-                     }}\n  \
-                     {HELPER_HI} = hi;\n  \
-                     return lo;\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_DIV => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI],
-                format!(
-                    "\nfunction {HELPER_DIV}(al, ah, bl, bh, signed, rem) {{\n  \
-                     if (!signed && (ah | bh) === 0 && bl !== 0) {{\n    \
-                       const u = al >>> 0, v = bl >>> 0;\n    \
-                       {HELPER_HI} = 0;\n    \
-                       return rem ? (u % v) | 0 : ((u / v) >>> 0) | 0;\n  \
-                     }}\n  \
-                     if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
-                       const r = rem ? (al % bl) | 0 : (al / bl) | 0;\n    \
-                       {HELPER_HI} = r >> 31;\n    \
-                       return r;\n  \
-                     }}\n  \
-                     if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
-                       const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
-                       const q = Math.trunc(fa / fb);\n    \
-                       const v = rem ? fa - q * fb : q;\n    \
-                       {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
-                       return v | 0;\n  \
-                     }}\n  \
-                     if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
-                       const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
-                       const q = Math.floor(fa / fb);\n    \
-                       const v = rem ? fa - q * fb : q;\n    \
-                       {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
-                       return v | 0;\n  \
-                     }}\n  \
-                     let negA = false, negB = false;\n  \
-                     if (signed) {{\n    \
-                       if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
-                       if (bh < 0) {{ negB = true; bl = (-bl) | 0; bh = (~bh + (bl === 0 ? 1 : 0)) | 0; }}\n  \
-                     }}\n  \
-                     const ual = al >>> 0, uah = ah >>> 0, ubl = bl >>> 0, ubh = bh >>> 0;\n  \
-                     let ql = 0, qh = 0, rl = 0, rh = 0;\n  \
-                     if (ubh === 0) {{\n    \
-                       if (uah === 0) {{\n      \
-                         if (rem) rl = ual % ubl; else ql = (ual / ubl) >>> 0;\n    \
-                       }} else if (ubl <= 2097152) {{\n      \
-                         qh = (uah / ubl) >>> 0;\n      \
-                         const mid = (uah - qh * ubl) * 4294967296 + ual;\n      \
-                         ql = (mid / ubl) >>> 0;\n      \
-                         if (rem) rl = (mid - ql * ubl) >>> 0;\n    \
-                       }} else {{\n      \
-                         qh = (uah / ubl) >>> 0;\n      \
-                         const r0 = uah - qh * ubl;\n      \
-                         let est = Math.floor((r0 * 4294967296 + ual) / ubl);\n      \
-                         if (est > 4294967295) est = 4294967295;\n      \
-                         const t0 = est * (ubl & 65535);\n      \
-                         const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n      \
-                         let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n      \
-                         let phi = Math.floor(t1 / 65536);\n      \
-                         while (phi > r0 || (phi === r0 && plo > ual)) {{\n        \
-                           est--;\n        \
-                           if (plo < ubl) phi--;\n        \
-                           plo = (plo - ubl) >>> 0;\n      \
-                         }}\n      \
-                         let rlo = (ual - plo) >>> 0;\n      \
-                         let rhi = r0 - phi - (ual < plo ? 1 : 0);\n      \
-                         while (rhi > 0 || rlo >= ubl) {{\n        \
-                           est++;\n        \
-                           if (rlo < ubl) rhi--;\n        \
-                           rlo = (rlo - ubl) >>> 0;\n      \
-                         }}\n      \
-                         ql = est >>> 0;\n      \
-                         rl = rlo;\n    \
-                       }}\n  \
-                     }} else if (ubh > uah || (ubh === uah && ubl > ual)) {{\n    \
-                       rl = ual; rh = uah;\n  \
-                     }} else if (uah < 2097152 && ubh < 2097152) {{\n    \
-                       const fa = uah * 4294967296 + ual;\n    \
-                       const fb = ubh * 4294967296 + ubl;\n    \
-                       const q = Math.floor(fa / fb);\n    \
-                       if (rem) {{\n      \
-                         const r = fa - q * fb;\n      \
-                         rh = Math.floor(r / 4294967296) >>> 0;\n      \
-                         rl = (r - rh * 4294967296) >>> 0;\n    \
-                       }} else {{\n      \
-                         ql = q >>> 0;\n    \
-                       }}\n  \
-                     }} else {{\n    \
-                       const fa = uah * 4294967296 + ual;\n    \
-                       const fb = ubh * 4294967296 + ubl;\n    \
-                       let est = Math.floor(fa / fb);\n    \
-                       if (est > 4294967295) est = 4294967295;\n    \
-                       const t0 = est * (ubl & 65535);\n    \
-                       const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n    \
-                       let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n    \
-                       let phi = est * ubh + Math.floor(t1 / 65536);\n    \
-                       while (phi > uah || (phi === uah && plo > ual)) {{\n      \
-                         est--;\n      \
-                         const b = plo < ubl ? 1 : 0;\n      \
-                         plo = (plo - ubl) >>> 0;\n      \
-                         phi -= ubh + b;\n    \
-                       }}\n    \
-                       let rlo = (ual - plo) >>> 0;\n    \
-                       let rhi = uah - phi - (ual < plo ? 1 : 0);\n    \
-                       while (rhi > ubh || (rhi === ubh && rlo >= ubl)) {{\n      \
-                         est++;\n      \
-                         const b = rlo < ubl ? 1 : 0;\n      \
-                         rlo = (rlo - ubl) >>> 0;\n      \
-                         rhi -= ubh + b;\n    \
-                       }}\n    \
-                       ql = est >>> 0;\n    \
-                       rl = rlo;\n    \
-                       rh = rhi >>> 0;\n  \
-                     }}\n  \
-                     let lo = (rem ? rl : ql) | 0;\n  \
-                     let hi = (rem ? rh : qh) | 0;\n  \
-                     if (signed && (rem ? negA : negA !== negB)) {{\n    \
-                       lo = (-lo) | 0;\n    \
-                       hi = (~hi + (lo === 0 ? 1 : 0)) | 0;\n  \
-                     }}\n  \
-                     {HELPER_HI} = hi;\n  \
-                     return lo;\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_DIVREM => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_RL, HELPER_RH],
-                format!(
-                    "\nfunction {HELPER_DIVREM}(al, ah, bl, bh, signed) {{\n  \
-                     if (!signed && (ah | bh) === 0 && bl !== 0) {{\n    \
-                       const u = al >>> 0, v = bl >>> 0;\n    \
-                       const q = (u / v) >>> 0;\n    \
-                       {HELPER_HI} = 0;\n    \
-                       {HELPER_RL} = (u - q * v) | 0;\n    \
-                       {HELPER_RH} = 0;\n    \
-                       return q | 0;\n  \
-                     }}\n  \
-                     if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
-                       const q = (al / bl) | 0;\n    \
-                       const r = (al - Math.imul(q, bl)) | 0;\n    \
-                       {HELPER_HI} = q >> 31;\n    \
-                       {HELPER_RL} = r;\n    \
-                       {HELPER_RH} = r >> 31;\n    \
-                       return q;\n  \
-                     }}\n  \
-                     if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
-                       const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
-                       const q = Math.trunc(fa / fb);\n    \
-                       const r = fa - q * fb;\n    \
-                       {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
-                       {HELPER_RL} = r | 0;\n    \
-                       {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
-                       return q | 0;\n  \
-                     }}\n  \
-                     if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
-                       const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
-                       const q = Math.floor(fa / fb);\n    \
-                       const r = fa - q * fb;\n    \
-                       {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
-                       {HELPER_RL} = r | 0;\n    \
-                       {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
-                       return q | 0;\n  \
-                     }}\n  \
-                     let negA = false, negB = false;\n  \
-                     if (signed) {{\n    \
-                       if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
-                       if (bh < 0) {{ negB = true; bl = (-bl) | 0; bh = (~bh + (bl === 0 ? 1 : 0)) | 0; }}\n  \
-                     }}\n  \
-                     const ual = al >>> 0, uah = ah >>> 0, ubl = bl >>> 0, ubh = bh >>> 0;\n  \
-                     let ql = 0, qh = 0, rl = 0, rh = 0;\n  \
-                     if (ubh === 0) {{\n    \
-                       if (uah === 0) {{\n      \
-                         ql = (ual / ubl) >>> 0;\n      \
-                         rl = (ual - ql * ubl) >>> 0;\n    \
-                       }} else if (ubl <= 2097152) {{\n      \
-                         qh = (uah / ubl) >>> 0;\n      \
-                         const mid = (uah - qh * ubl) * 4294967296 + ual;\n      \
-                         ql = (mid / ubl) >>> 0;\n      \
-                         rl = (mid - ql * ubl) >>> 0;\n    \
-                       }} else {{\n      \
-                         qh = (uah / ubl) >>> 0;\n      \
-                         const r0 = uah - qh * ubl;\n      \
-                         let est = Math.floor((r0 * 4294967296 + ual) / ubl);\n      \
-                         if (est > 4294967295) est = 4294967295;\n      \
-                         const t0 = est * (ubl & 65535);\n      \
-                         const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n      \
-                         let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n      \
-                         let phi = Math.floor(t1 / 65536);\n      \
-                         while (phi > r0 || (phi === r0 && plo > ual)) {{\n        \
-                           est--;\n        \
-                           if (plo < ubl) phi--;\n        \
-                           plo = (plo - ubl) >>> 0;\n      \
-                         }}\n      \
-                         let rlo = (ual - plo) >>> 0;\n      \
-                         let rhi = r0 - phi - (ual < plo ? 1 : 0);\n      \
-                         while (rhi > 0 || rlo >= ubl) {{\n        \
-                           est++;\n        \
-                           if (rlo < ubl) rhi--;\n        \
-                           rlo = (rlo - ubl) >>> 0;\n      \
-                         }}\n      \
-                         ql = est >>> 0;\n      \
-                         rl = rlo;\n    \
-                       }}\n  \
-                     }} else if (ubh > uah || (ubh === uah && ubl > ual)) {{\n    \
-                       rl = ual; rh = uah;\n  \
-                     }} else if (uah < 2097152 && ubh < 2097152) {{\n    \
-                       const fa = uah * 4294967296 + ual;\n    \
-                       const fb = ubh * 4294967296 + ubl;\n    \
-                       const q = Math.floor(fa / fb);\n    \
-                       ql = q >>> 0;\n    \
-                       const r = fa - q * fb;\n    \
-                       rh = Math.floor(r / 4294967296) >>> 0;\n    \
-                       rl = (r - rh * 4294967296) >>> 0;\n  \
-                     }} else {{\n    \
-                       const fa = uah * 4294967296 + ual;\n    \
-                       const fb = ubh * 4294967296 + ubl;\n    \
-                       let est = Math.floor(fa / fb);\n    \
-                       if (est > 4294967295) est = 4294967295;\n    \
-                       const t0 = est * (ubl & 65535);\n    \
-                       const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n    \
-                       let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n    \
-                       let phi = est * ubh + Math.floor(t1 / 65536);\n    \
-                       while (phi > uah || (phi === uah && plo > ual)) {{\n      \
-                         est--;\n      \
-                         const b = plo < ubl ? 1 : 0;\n      \
-                         plo = (plo - ubl) >>> 0;\n      \
-                         phi -= ubh + b;\n    \
-                       }}\n    \
-                       let rlo = (ual - plo) >>> 0;\n    \
-                       let rhi = uah - phi - (ual < plo ? 1 : 0);\n    \
-                       while (rhi > ubh || (rhi === ubh && rlo >= ubl)) {{\n      \
-                         est++;\n      \
-                         const b = rlo < ubl ? 1 : 0;\n      \
-                         rlo = (rlo - ubl) >>> 0;\n      \
-                         rhi -= ubh + b;\n    \
-                       }}\n    \
-                       ql = est >>> 0;\n    \
-                       rl = rlo;\n    \
-                       rh = rhi >>> 0;\n  \
-                     }}\n  \
-                     let qlo = ql | 0, qhi = qh | 0, rlo = rl | 0, rhi = rh | 0;\n  \
-                     if (signed) {{\n    \
-                       if (negA !== negB) {{\n      \
-                         qlo = (-qlo) | 0;\n      \
-                         qhi = (~qhi + (qlo === 0 ? 1 : 0)) | 0;\n    \
-                       }}\n    \
-                       if (negA) {{\n      \
-                         rlo = (-rlo) | 0;\n      \
-                         rhi = (~rhi + (rlo === 0 ? 1 : 0)) | 0;\n    \
-                       }}\n  \
-                     }}\n  \
-                     {HELPER_HI} = qhi;\n  \
-                     {HELPER_RL} = rlo;\n  \
-                     {HELPER_RH} = rhi;\n  \
-                     return qlo;\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_SDIV => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_DIV],
-                format!(
-                    "\nfunction {HELPER_SDIV}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
-                       const m = ah >> 31;\n    \
-                       const sal = ((al ^ m) - m) | 0;\n    \
-                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
-                       const qh = (sah / bl) >>> 0;\n    \
-                       const ql = (((sah - qh * bl) * 4294967296 + (sal >>> 0)) / bl) | 0;\n    \
-                       const lo = ((ql ^ m) - m) | 0;\n    \
-                       {HELPER_HI} = ((qh ^ m) + ((lo === 0 ? 1 : 0) & m)) | 0;\n    \
-                       return lo;\n  \
-                     }}\n  \
-                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
-                       const q = (al / bl) | 0;\n    \
-                       {HELPER_HI} = q >> 31;\n    \
-                       return q;\n  \
-                     }}\n  \
-                     return {HELPER_DIV}(al, ah, bl, bh, true, false);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_UDIV => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_DIV],
-                format!(
-                    "\nfunction {HELPER_UDIV}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl !== 0) {{\n    \
-                       const v = bl >>> 0;\n    \
-                       if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) / v) | 0; }}\n    \
-                       if (v <= 2097152) {{\n      \
-                         const uh = ah >>> 0;\n      \
-                         const qh = (uh / v) >>> 0;\n      \
-                         {HELPER_HI} = qh | 0;\n      \
-                         return (((uh - qh * v) * 4294967296 + (al >>> 0)) / v) | 0;\n    \
-                       }}\n  \
-                     }}\n  \
-                     return {HELPER_DIV}(al, ah, bl, bh, false, false);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_SREM => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_DIV],
-                format!(
-                    "\nfunction {HELPER_SREM}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
-                       const m = ah >> 31;\n    \
-                       const sal = ((al ^ m) - m) | 0;\n    \
-                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
-                       const qh = (sah / bl) >>> 0;\n    \
-                       const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
-                       const r = (mid - ((mid / bl) >>> 0) * bl) | 0;\n    \
-                       const lo = ((r ^ m) - m) | 0;\n    \
-                       {HELPER_HI} = lo >> 31;\n    \
-                       return lo;\n  \
-                     }}\n  \
-                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
-                       const r = (al % bl) | 0;\n    \
-                       {HELPER_HI} = r >> 31;\n    \
-                       return r;\n  \
-                     }}\n  \
-                     return {HELPER_DIV}(al, ah, bl, bh, true, true);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_UREM => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_DIV],
-                format!(
-                    "\nfunction {HELPER_UREM}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl !== 0) {{\n    \
-                       const v = bl >>> 0;\n    \
-                       if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) % v) | 0; }}\n    \
-                       if (v <= 2097152) {{\n      \
-                         const uh = ah >>> 0;\n      \
-                         const qh = (uh / v) >>> 0;\n      \
-                         const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
-                         {HELPER_HI} = 0;\n      \
-                         return (mid - ((mid / v) >>> 0) * v) | 0;\n    \
-                       }}\n  \
-                     }}\n  \
-                     return {HELPER_DIV}(al, ah, bl, bh, false, true);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_SDIVREM => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_RL, HELPER_RH, HELPER_DIVREM],
-                format!(
-                    "\nfunction {HELPER_SDIVREM}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
-                       const m = ah >> 31;\n    \
-                       const sal = ((al ^ m) - m) | 0;\n    \
-                       const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
-                       const qh = (sah / bl) >>> 0;\n    \
-                       const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
-                       const ql = (mid / bl) >>> 0;\n    \
-                       const r = (mid - ql * bl) | 0;\n    \
-                       const rlo = ((r ^ m) - m) | 0;\n    \
-                       const qlo = ((ql ^ m) - m) | 0;\n    \
-                       {HELPER_HI} = ((qh ^ m) + ((qlo === 0 ? 1 : 0) & m)) | 0;\n    \
-                       {HELPER_RL} = rlo;\n    \
-                       {HELPER_RH} = rlo >> 31;\n    \
-                       return qlo;\n  \
-                     }}\n  \
-                     if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
-                       const q = (al / bl) | 0;\n    \
-                       const r = (al - Math.imul(q, bl)) | 0;\n    \
-                       {HELPER_HI} = q >> 31;\n    \
-                       {HELPER_RL} = r;\n    \
-                       {HELPER_RH} = r >> 31;\n    \
-                       return q;\n  \
-                     }}\n  \
-                     return {HELPER_DIVREM}(al, ah, bl, bh, true);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_UDIVREM => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_RL, HELPER_RH, HELPER_DIVREM],
-                format!(
-                    "\nfunction {HELPER_UDIVREM}(al, ah, bl, bh) {{\n  \
-                     if (bh === 0 && bl !== 0) {{\n    \
-                       const v = bl >>> 0;\n    \
-                       if ((v & (v - 1)) === 0) {{\n      \
-                         const s = 31 - Math.clz32(v);\n      \
-                         {HELPER_RL} = al & (v - 1);\n      \
-                         {HELPER_RH} = 0;\n      \
-                         {HELPER_HI} = (ah >>> s) | 0;\n      \
-                         return s === 0 ? al | 0 : (al >>> s) | (ah << (32 - s));\n    \
-                       }}\n    \
-                       if (ah === 0) {{\n      \
-                         const u = al >>> 0;\n      \
-                         const q = (u / v) >>> 0;\n      \
-                         {HELPER_HI} = 0;\n      \
-                         {HELPER_RL} = (u - q * v) | 0;\n      \
-                         {HELPER_RH} = 0;\n      \
-                         return q | 0;\n    \
-                       }}\n    \
-                       if (v <= 2097152) {{\n      \
-                         const uh = ah >>> 0;\n      \
-                         const qh = (uh / v) >>> 0;\n      \
-                         const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
-                         const ql = (mid / v) >>> 0;\n      \
-                         {HELPER_HI} = qh | 0;\n      \
-                         {HELPER_RL} = (mid - ql * v) | 0;\n      \
-                         {HELPER_RH} = 0;\n      \
-                         return ql | 0;\n    \
-                       }}\n  \
-                     }}\n  \
-                     return {HELPER_DIVREM}(al, ah, bl, bh, false);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_F2I => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI],
-                format!(
-                    "\nfunction {HELPER_F2I}(x, signed) {{\n  \
-                     if (Number.isNaN(x)) {{ {HELPER_HI} = 0; return 0; }}\n  \
-                     if (signed) {{\n    \
-                       if (x <= -9223372036854775808) {{ {HELPER_HI} = -2147483648; return 0; }}\n    \
-                       if (x >= 9223372036854775808) {{ {HELPER_HI} = 2147483647; return -1; }}\n  \
-                     }} else {{\n    \
-                       if (x <= 0) {{ {HELPER_HI} = 0; return 0; }}\n    \
-                       if (x >= 18446744073709551616) {{ {HELPER_HI} = -1; return -1; }}\n  \
-                     }}\n  \
-                     const t = Math.trunc(x);\n  \
-                     const h = Math.floor(t / 4294967296) | 0;\n  \
-                     {HELPER_HI} = h;\n  \
-                     return (t - (signed ? h : (h >>> 0)) * 4294967296) | 0;\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_F64_TO_BITS => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_HI, HELPER_F64_VIEW, HELPER_I32_VIEW],
-                format!(
-                    "\nfunction {HELPER_F64_TO_BITS}(x) {{\n  \
-                     {HELPER_F64_VIEW}[0] = x;\n  \
-                     {HELPER_HI} = {HELPER_I32_VIEW}[1];\n  \
-                     return {HELPER_I32_VIEW}[0];\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_BITS_TO_F64 => make(
-                name,
-                ItemKind::Fn,
-                &[HELPER_F64_VIEW, HELPER_I32_VIEW],
-                format!(
-                    "\nfunction {HELPER_BITS_TO_F64}(lo, hi) {{\n  \
-                     {HELPER_I32_VIEW}[0] = lo;\n  \
-                     {HELPER_I32_VIEW}[1] = hi;\n  \
-                     return {HELPER_F64_VIEW}[0];\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_U64_F32 => make(
-                name,
-                ItemKind::Fn,
-                &[],
-                format!(
-                    "\nfunction {HELPER_U64_F32}(lo, hi) {{\n  \
-                     const h = hi >>> 0;\n  \
-                     const l = h >= 2097152 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
-                     return Math.fround(h * 4294967296 + l);\n\
-                     }}\n"
-                ),
-            ),
-            HELPER_I64_F32 => make(
-                name,
-                ItemKind::Fn,
-                &[],
-                format!(
-                    "\nfunction {HELPER_I64_F32}(lo, hi) {{\n  \
-                     const h = hi | 0;\n  \
-                     const l = (((h + 2097152) | 0) >>> 0) >= 4194304 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
-                     return Math.fround(h * 4294967296 + l);\n\
-                     }}\n"
-                ),
-            ),
-            _ => unreachable!(),
-        };
-        out.push(item);
+            ))
+        }
+        HELPER_F64_VIEW => Some(synth_i64_item(
+            name,
+            ItemKind::Static,
+            &[],
+            format!("\nconst {HELPER_F64_VIEW} = new Float64Array(new ArrayBuffer(8));\n"),
+        )),
+        HELPER_I32_VIEW => Some(synth_i64_item(
+            name,
+            ItemKind::Static,
+            &[HELPER_F64_VIEW],
+            format!("\nconst {HELPER_I32_VIEW} = new Int32Array({HELPER_F64_VIEW}.buffer);\n"),
+        )),
+        _ => None,
     }
-    out
+}
+
+fn mul_helpers(name: &'static str) -> Option<LinkItem> {
+    match name {
+        HELPER_MUL => Some(synth_i64_helper(
+            name,
+            &[HELPER_HI],
+            "al, ah, bl, bh",
+            format!(
+                "  const a0 = al & 65535, a1 = (al >>> 16) | 0;\n  \
+                 const b0 = bl & 65535, b1 = (bl >>> 16) | 0;\n  \
+                 const p00 = Math.imul(a0, b0);\n  \
+                 const v = (((p00 >>> 16) | 0) + Math.imul(a1, b0)) | 0;\n  \
+                 const f = ((v & 65535) + Math.imul(a0, b1)) | 0;\n  \
+                 {HELPER_HI} = (((Math.imul(ah, bl) + Math.imul(a1, b1)) | 0) + Math.imul(al, bh) + (v >>> 16) + (f >>> 16)) | 0;\n  \
+                 return (p00 & 65535) | (f << 16);\n"
+            ),
+        )),
+        HELPER_MUL_OVF => Some(synth_i64_helper(
+            name,
+            &[HELPER_HI, HELPER_OVF],
+            "al, ah, bl, bh, signed",
+            format!(
+                "  let negA = false, negB = false, ual = al, uah = ah, ubl = bl, ubh = bh;\n  \
+                 if (signed) {{\n    \
+                   if (ah < 0) {{ negA = true; ual = (-al) | 0; uah = (~ah + (ual === 0 ? 1 : 0)) | 0; }}\n    \
+                   if (bh < 0) {{ negB = true; ubl = (-bl) | 0; ubh = (~bh + (ubl === 0 ? 1 : 0)) | 0; }}\n  \
+                 }}\n  \
+                 const a0 = ual & 65535, a1 = (ual >>> 16) | 0;\n  \
+                 const b0 = ubl & 65535, b1 = (ubl >>> 16) | 0;\n  \
+                 const p00 = Math.imul(a0, b0);\n  \
+                 const v = (((p00 >>> 16) | 0) + Math.imul(a1, b0)) | 0;\n  \
+                 const f = ((v & 65535) + Math.imul(a0, b1)) | 0;\n  \
+                 let lo = (p00 & 65535) | (f << 16);\n  \
+                 const crossHi = (uah >>> 0) * (ubl >>> 0) + (ual >>> 0) * (ubh >>> 0) + a1 * b1 + (v >>> 16) + (f >>> 16);\n  \
+                 let hi = (((Math.imul(uah, ubl) + Math.imul(a1, b1)) | 0) + Math.imul(ual, ubh) + (v >>> 16) + (f >>> 16)) | 0;\n  \
+                 const uovf = (uah !== 0 && ubh !== 0) || crossHi > 4294967295;\n  \
+                 if (signed) {{\n    \
+                   const negRes = negA !== negB;\n    \
+                   {HELPER_OVF} = uovf || (negRes ? (hi < 0 && (lo !== 0 || hi !== -2147483648)) : hi < 0);\n    \
+                   if (negRes) {{ lo = (-lo) | 0; hi = (~hi + (lo === 0 ? 1 : 0)) | 0; }}\n  \
+                 }} else {{\n    \
+                   {HELPER_OVF} = uovf;\n  \
+                 }}\n  \
+                 {HELPER_HI} = hi;\n  \
+                 return lo;\n"
+            ),
+        )),
+        _ => None,
+    }
+}
+
+fn div_rem_helpers(name: &'static str) -> Option<LinkItem> {
+    match name {
+        HELPER_DIV => Some(div_generic_helper()),
+        HELPER_DIVREM => Some(divrem_generic_helper()),
+        HELPER_SDIV | HELPER_UDIV | HELPER_SREM | HELPER_UREM => div_specialized_helpers(name),
+        HELPER_SDIVREM | HELPER_UDIVREM => divrem_specialized_helpers(name),
+        _ => None,
+    }
+}
+
+fn div_generic_helper() -> LinkItem {
+    synth_i64_helper(
+        HELPER_DIV,
+        &[HELPER_HI],
+        "al, ah, bl, bh, signed, rem",
+        format!(
+            "  if (!signed && (ah | bh) === 0 && bl !== 0) {{\n    \
+               const u = al >>> 0, v = bl >>> 0;\n    \
+               {HELPER_HI} = 0;\n    \
+               return rem ? (u % v) | 0 : ((u / v) >>> 0) | 0;\n  \
+             }}\n  \
+             if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+               const r = rem ? (al % bl) | 0 : (al / bl) | 0;\n    \
+               {HELPER_HI} = r >> 31;\n    \
+               return r;\n  \
+             }}\n  \
+             if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
+               const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
+               const q = Math.trunc(fa / fb);\n    \
+               const v = rem ? fa - q * fb : q;\n    \
+               {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
+               return v | 0;\n  \
+             }}\n  \
+             if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
+               const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
+               const q = Math.floor(fa / fb);\n    \
+               const v = rem ? fa - q * fb : q;\n    \
+               {HELPER_HI} = Math.floor(v / 4294967296) | 0;\n    \
+               return v | 0;\n  \
+             }}\n  \
+             let negA = false, negB = false;\n  \
+             if (signed) {{\n    \
+               if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
+               if (bh < 0) {{ negB = true; bl = (-bl) | 0; bh = (~bh + (bl === 0 ? 1 : 0)) | 0; }}\n  \
+             }}\n  \
+             const ual = al >>> 0, uah = ah >>> 0, ubl = bl >>> 0, ubh = bh >>> 0;\n  \
+             let ql = 0, qh = 0, rl = 0, rh = 0;\n  \
+             if (ubh === 0) {{\n    \
+               if (uah === 0) {{\n      \
+                 if (rem) rl = ual % ubl; else ql = (ual / ubl) >>> 0;\n    \
+               }} else if (ubl <= 2097152) {{\n      \
+                 qh = (uah / ubl) >>> 0;\n      \
+                 const mid = (uah - qh * ubl) * 4294967296 + ual;\n      \
+                 ql = (mid / ubl) >>> 0;\n      \
+                 if (rem) rl = (mid - ql * ubl) >>> 0;\n    \
+               }} else {{\n      \
+                 qh = (uah / ubl) >>> 0;\n      \
+                 const r0 = uah - qh * ubl;\n      \
+                 let est = Math.floor((r0 * 4294967296 + ual) / ubl);\n      \
+                 if (est > 4294967295) est = 4294967295;\n      \
+                 const t0 = est * (ubl & 65535);\n      \
+                 const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n      \
+                 let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n      \
+                 let phi = Math.floor(t1 / 65536);\n      \
+                 while (phi > r0 || (phi === r0 && plo > ual)) {{\n        \
+                   est--;\n        \
+                   if (plo < ubl) phi--;\n        \
+                   plo = (plo - ubl) >>> 0;\n      \
+                 }}\n      \
+                 let rlo = (ual - plo) >>> 0;\n      \
+                 let rhi = r0 - phi - (ual < plo ? 1 : 0);\n      \
+                 while (rhi > 0 || rlo >= ubl) {{\n        \
+                   est++;\n        \
+                   if (rlo < ubl) rhi--;\n        \
+                   rlo = (rlo - ubl) >>> 0;\n      \
+                 }}\n      \
+                 ql = est >>> 0;\n      \
+                 rl = rlo;\n    \
+               }}\n  \
+             }} else if (ubh > uah || (ubh === uah && ubl > ual)) {{\n    \
+               rl = ual; rh = uah;\n  \
+             }} else if (uah < 2097152 && ubh < 2097152) {{\n    \
+               const fa = uah * 4294967296 + ual;\n    \
+               const fb = ubh * 4294967296 + ubl;\n    \
+               const q = Math.floor(fa / fb);\n    \
+               if (rem) {{\n      \
+                 const r = fa - q * fb;\n      \
+                 rh = Math.floor(r / 4294967296) >>> 0;\n      \
+                 rl = (r - rh * 4294967296) >>> 0;\n    \
+               }} else {{\n      \
+                 ql = q >>> 0;\n    \
+               }}\n  \
+             }} else {{\n    \
+               const fa = uah * 4294967296 + ual;\n    \
+               const fb = ubh * 4294967296 + ubl;\n    \
+               let est = Math.floor(fa / fb);\n    \
+               if (est > 4294967295) est = 4294967295;\n    \
+               const t0 = est * (ubl & 65535);\n    \
+               const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n    \
+               let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n    \
+               let phi = est * ubh + Math.floor(t1 / 65536);\n    \
+               while (phi > uah || (phi === uah && plo > ual)) {{\n      \
+                 est--;\n      \
+                 const b = plo < ubl ? 1 : 0;\n      \
+                 plo = (plo - ubl) >>> 0;\n      \
+                 phi -= ubh + b;\n    \
+               }}\n    \
+               let rlo = (ual - plo) >>> 0;\n    \
+               let rhi = uah - phi - (ual < plo ? 1 : 0);\n    \
+               while (rhi > ubh || (rhi === ubh && rlo >= ubl)) {{\n      \
+                 est++;\n      \
+                 const b = rlo < ubl ? 1 : 0;\n      \
+                 rlo = (rlo - ubl) >>> 0;\n      \
+                 rhi -= ubh + b;\n    \
+               }}\n    \
+               ql = est >>> 0;\n    \
+               rl = rlo;\n    \
+               rh = rhi >>> 0;\n  \
+             }}\n  \
+             let lo = (rem ? rl : ql) | 0;\n  \
+             let hi = (rem ? rh : qh) | 0;\n  \
+             if (signed && (rem ? negA : negA !== negB)) {{\n    \
+               lo = (-lo) | 0;\n    \
+               hi = (~hi + (lo === 0 ? 1 : 0)) | 0;\n  \
+             }}\n  \
+             {HELPER_HI} = hi;\n  \
+             return lo;\n"
+        ),
+    )
+}
+
+fn divrem_generic_helper() -> LinkItem {
+    synth_i64_helper(
+        HELPER_DIVREM,
+        &[HELPER_HI, HELPER_RL, HELPER_RH],
+        "al, ah, bl, bh, signed",
+        format!(
+            "  if (!signed && (ah | bh) === 0 && bl !== 0) {{\n    \
+               const u = al >>> 0, v = bl >>> 0;\n    \
+               const q = (u / v) >>> 0;\n    \
+               {HELPER_HI} = 0;\n    \
+               {HELPER_RL} = (u - q * v) | 0;\n    \
+               {HELPER_RH} = 0;\n    \
+               return q | 0;\n  \
+             }}\n  \
+             if (signed && ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+               const q = (al / bl) | 0;\n    \
+               const r = (al - Math.imul(q, bl)) | 0;\n    \
+               {HELPER_HI} = q >> 31;\n    \
+               {HELPER_RL} = r;\n    \
+               {HELPER_RH} = r >> 31;\n    \
+               return q;\n  \
+             }}\n  \
+             if (signed && ((ah + 2097152) >>> 0) < 4194304 && ((bh + 2097152) >>> 0) < 4194304) {{\n    \
+               const fa = ah * 4294967296 + (al >>> 0), fb = bh * 4294967296 + (bl >>> 0);\n    \
+               const q = Math.trunc(fa / fb);\n    \
+               const r = fa - q * fb;\n    \
+               {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
+               {HELPER_RL} = r | 0;\n    \
+               {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
+               return q | 0;\n  \
+             }}\n  \
+             if (!signed && (ah >>> 0) < 2097152 && (bh >>> 0) < 2097152) {{\n    \
+               const fa = (ah >>> 0) * 4294967296 + (al >>> 0), fb = (bh >>> 0) * 4294967296 + (bl >>> 0);\n    \
+               const q = Math.floor(fa / fb);\n    \
+               const r = fa - q * fb;\n    \
+               {HELPER_HI} = Math.floor(q / 4294967296) | 0;\n    \
+               {HELPER_RL} = r | 0;\n    \
+               {HELPER_RH} = Math.floor(r / 4294967296) | 0;\n    \
+               return q | 0;\n  \
+             }}\n  \
+             let negA = false, negB = false;\n  \
+             if (signed) {{\n    \
+               if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
+               if (bh < 0) {{ negB = true; bl = (-bl) | 0; bh = (~bh + (bl === 0 ? 1 : 0)) | 0; }}\n  \
+             }}\n  \
+             const ual = al >>> 0, uah = ah >>> 0, ubl = bl >>> 0, ubh = bh >>> 0;\n  \
+             let ql = 0, qh = 0, rl = 0, rh = 0;\n  \
+             if (ubh === 0) {{\n    \
+               if (uah === 0) {{\n      \
+                 ql = (ual / ubl) >>> 0;\n      \
+                 rl = (ual - ql * ubl) >>> 0;\n    \
+               }} else if (ubl <= 2097152) {{\n      \
+                 qh = (uah / ubl) >>> 0;\n      \
+                 const mid = (uah - qh * ubl) * 4294967296 + ual;\n      \
+                 ql = (mid / ubl) >>> 0;\n      \
+                 rl = (mid - ql * ubl) >>> 0;\n    \
+               }} else {{\n      \
+                 qh = (uah / ubl) >>> 0;\n      \
+                 const r0 = uah - qh * ubl;\n      \
+                 let est = Math.floor((r0 * 4294967296 + ual) / ubl);\n      \
+                 if (est > 4294967295) est = 4294967295;\n      \
+                 const t0 = est * (ubl & 65535);\n      \
+                 const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n      \
+                 let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n      \
+                 let phi = Math.floor(t1 / 65536);\n      \
+                 while (phi > r0 || (phi === r0 && plo > ual)) {{\n        \
+                   est--;\n        \
+                   if (plo < ubl) phi--;\n        \
+                   plo = (plo - ubl) >>> 0;\n      \
+                 }}\n      \
+                 let rlo = (ual - plo) >>> 0;\n      \
+                 let rhi = r0 - phi - (ual < plo ? 1 : 0);\n      \
+                 while (rhi > 0 || rlo >= ubl) {{\n        \
+                   est++;\n        \
+                   if (rlo < ubl) rhi--;\n        \
+                   rlo = (rlo - ubl) >>> 0;\n      \
+                 }}\n      \
+                 ql = est >>> 0;\n      \
+                 rl = rlo;\n    \
+               }}\n  \
+             }} else if (ubh > uah || (ubh === uah && ubl > ual)) {{\n    \
+               rl = ual; rh = uah;\n  \
+             }} else if (uah < 2097152 && ubh < 2097152) {{\n    \
+               const fa = uah * 4294967296 + ual;\n    \
+               const fb = ubh * 4294967296 + ubl;\n    \
+               const q = Math.floor(fa / fb);\n    \
+               ql = q >>> 0;\n    \
+               const r = fa - q * fb;\n    \
+               rh = Math.floor(r / 4294967296) >>> 0;\n    \
+               rl = (r - rh * 4294967296) >>> 0;\n  \
+             }} else {{\n    \
+               const fa = uah * 4294967296 + ual;\n    \
+               const fb = ubh * 4294967296 + ubl;\n    \
+               let est = Math.floor(fa / fb);\n    \
+               if (est > 4294967295) est = 4294967295;\n    \
+               const t0 = est * (ubl & 65535);\n    \
+               const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n    \
+               let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n    \
+               let phi = est * ubh + Math.floor(t1 / 65536);\n    \
+               while (phi > uah || (phi === uah && plo > ual)) {{\n      \
+                 est--;\n      \
+                 const b = plo < ubl ? 1 : 0;\n      \
+                 plo = (plo - ubl) >>> 0;\n      \
+                 phi -= ubh + b;\n    \
+               }}\n    \
+               let rlo = (ual - plo) >>> 0;\n    \
+               let rhi = uah - phi - (ual < plo ? 1 : 0);\n    \
+               while (rhi > ubh || (rhi === ubh && rlo >= ubl)) {{\n      \
+                 est++;\n      \
+                 const b = rlo < ubl ? 1 : 0;\n      \
+                 rlo = (rlo - ubl) >>> 0;\n      \
+                 rhi -= ubh + b;\n    \
+               }}\n    \
+               ql = est >>> 0;\n    \
+               rl = rlo;\n    \
+               rh = rhi >>> 0;\n  \
+             }}\n  \
+             let qlo = ql | 0, qhi = qh | 0, rlo = rl | 0, rhi = rh | 0;\n  \
+             if (signed) {{\n    \
+               if (negA !== negB) {{\n      \
+                 qlo = (-qlo) | 0;\n      \
+                 qhi = (~qhi + (qlo === 0 ? 1 : 0)) | 0;\n    \
+               }}\n    \
+               if (negA) {{\n      \
+                 rlo = (-rlo) | 0;\n      \
+                 rhi = (~rhi + (rlo === 0 ? 1 : 0)) | 0;\n    \
+               }}\n  \
+             }}\n  \
+             {HELPER_HI} = qhi;\n  \
+             {HELPER_RL} = rlo;\n  \
+             {HELPER_RH} = rhi;\n  \
+             return qlo;\n"
+        ),
+    )
+}
+
+fn div_specialized_helpers(name: &'static str) -> Option<LinkItem> {
+    let body = match name {
+        HELPER_SDIV => format!(
+            "  if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+               const m = ah >> 31;\n    \
+               const sal = ((al ^ m) - m) | 0;\n    \
+               const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+               const qh = (sah / bl) >>> 0;\n    \
+               const ql = (((sah - qh * bl) * 4294967296 + (sal >>> 0)) / bl) | 0;\n    \
+               const lo = ((ql ^ m) - m) | 0;\n    \
+               {HELPER_HI} = ((qh ^ m) + ((lo === 0 ? 1 : 0) & m)) | 0;\n    \
+               return lo;\n  \
+             }}\n  \
+             if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+               const q = (al / bl) | 0;\n    \
+               {HELPER_HI} = q >> 31;\n    \
+               return q;\n  \
+             }}\n  \
+             return {HELPER_DIV}(al, ah, bl, bh, true, false);\n"
+        ),
+        HELPER_UDIV => format!(
+            "  if (bh === 0 && bl !== 0) {{\n    \
+               const v = bl >>> 0;\n    \
+               if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) / v) | 0; }}\n    \
+               if (v <= 2097152) {{\n      \
+                 const uh = ah >>> 0;\n      \
+                 const qh = (uh / v) >>> 0;\n      \
+                 {HELPER_HI} = qh | 0;\n      \
+                 return (((uh - qh * v) * 4294967296 + (al >>> 0)) / v) | 0;\n    \
+               }}\n  \
+             }}\n  \
+             return {HELPER_DIV}(al, ah, bl, bh, false, false);\n"
+        ),
+        HELPER_SREM => format!(
+            "  if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+               const m = ah >> 31;\n    \
+               const sal = ((al ^ m) - m) | 0;\n    \
+               const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+               const qh = (sah / bl) >>> 0;\n    \
+               const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
+               const r = (mid - ((mid / bl) >>> 0) * bl) | 0;\n    \
+               const lo = ((r ^ m) - m) | 0;\n    \
+               {HELPER_HI} = lo >> 31;\n    \
+               return lo;\n  \
+             }}\n  \
+             if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+               const r = (al % bl) | 0;\n    \
+               {HELPER_HI} = r >> 31;\n    \
+               return r;\n  \
+             }}\n  \
+             return {HELPER_DIV}(al, ah, bl, bh, true, true);\n"
+        ),
+        HELPER_UREM => format!(
+            "  if (bh === 0 && bl !== 0) {{\n    \
+               const v = bl >>> 0;\n    \
+               if (ah === 0) {{ {HELPER_HI} = 0; return ((al >>> 0) % v) | 0; }}\n    \
+               if (v <= 2097152) {{\n      \
+                 const uh = ah >>> 0;\n      \
+                 const qh = (uh / v) >>> 0;\n      \
+                 const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
+                 {HELPER_HI} = 0;\n      \
+                 return (mid - ((mid / v) >>> 0) * v) | 0;\n    \
+               }}\n  \
+             }}\n  \
+             return {HELPER_DIV}(al, ah, bl, bh, false, true);\n"
+        ),
+        _ => return None,
+    };
+    Some(synth_i64_helper(
+        name,
+        &[HELPER_HI, HELPER_DIV],
+        "al, ah, bl, bh",
+        body,
+    ))
+}
+
+fn divrem_specialized_helpers(name: &'static str) -> Option<LinkItem> {
+    let body = match name {
+        HELPER_SDIVREM => format!(
+            "  if (bh === 0 && bl > 0 && bl <= 2097152) {{\n    \
+               const m = ah >> 31;\n    \
+               const sal = ((al ^ m) - m) | 0;\n    \
+               const sah = ((ah ^ m) + ((sal === 0 ? 1 : 0) & m)) >>> 0;\n    \
+               const qh = (sah / bl) >>> 0;\n    \
+               const mid = (sah - qh * bl) * 4294967296 + (sal >>> 0);\n    \
+               const ql = (mid / bl) >>> 0;\n    \
+               const r = (mid - ql * bl) | 0;\n    \
+               const rlo = ((r ^ m) - m) | 0;\n    \
+               const qlo = ((ql ^ m) - m) | 0;\n    \
+               {HELPER_HI} = ((qh ^ m) + ((qlo === 0 ? 1 : 0) & m)) | 0;\n    \
+               {HELPER_RL} = rlo;\n    \
+               {HELPER_RH} = rlo >> 31;\n    \
+               return qlo;\n  \
+             }}\n  \
+             if (ah === (al >> 31) && bh === (bl >> 31) && (al !== -2147483648 || bl !== -1)) {{\n    \
+               const q = (al / bl) | 0;\n    \
+               const r = (al - Math.imul(q, bl)) | 0;\n    \
+               {HELPER_HI} = q >> 31;\n    \
+               {HELPER_RL} = r;\n    \
+               {HELPER_RH} = r >> 31;\n    \
+               return q;\n  \
+             }}\n  \
+             return {HELPER_DIVREM}(al, ah, bl, bh, true);\n"
+        ),
+        HELPER_UDIVREM => format!(
+            "  if (bh === 0 && bl !== 0) {{\n    \
+               const v = bl >>> 0;\n    \
+               if ((v & (v - 1)) === 0) {{\n      \
+                 const s = 31 - Math.clz32(v);\n      \
+                 {HELPER_RL} = al & (v - 1);\n      \
+                 {HELPER_RH} = 0;\n      \
+                 {HELPER_HI} = (ah >>> s) | 0;\n      \
+                 return s === 0 ? al | 0 : (al >>> s) | (ah << (32 - s));\n    \
+               }}\n    \
+               if (ah === 0) {{\n      \
+                 const u = al >>> 0;\n      \
+                 const q = (u / v) >>> 0;\n      \
+                 {HELPER_HI} = 0;\n      \
+                 {HELPER_RL} = (u - q * v) | 0;\n      \
+                 {HELPER_RH} = 0;\n      \
+                 return q | 0;\n    \
+               }}\n    \
+               if (v <= 2097152) {{\n      \
+                 const uh = ah >>> 0;\n      \
+                 const qh = (uh / v) >>> 0;\n      \
+                 const mid = (uh - qh * v) * 4294967296 + (al >>> 0);\n      \
+                 const ql = (mid / v) >>> 0;\n      \
+                 {HELPER_HI} = qh | 0;\n      \
+                 {HELPER_RL} = (mid - ql * v) | 0;\n      \
+                 {HELPER_RH} = 0;\n      \
+                 return ql | 0;\n    \
+               }}\n  \
+             }}\n  \
+             return {HELPER_DIVREM}(al, ah, bl, bh, false);\n"
+        ),
+        _ => return None,
+    };
+    Some(synth_i64_helper(
+        name,
+        &[HELPER_HI, HELPER_RL, HELPER_RH, HELPER_DIVREM],
+        "al, ah, bl, bh",
+        body,
+    ))
+}
+
+fn float_conv_helpers(name: &'static str) -> Option<LinkItem> {
+    match name {
+        HELPER_F2I => Some(synth_i64_helper(
+            name,
+            &[HELPER_HI],
+            "x, signed",
+            format!(
+                "  if (Number.isNaN(x)) {{ {HELPER_HI} = 0; return 0; }}\n  \
+                 if (signed) {{\n    \
+                   if (x <= -9223372036854775808) {{ {HELPER_HI} = -2147483648; return 0; }}\n    \
+                   if (x >= 9223372036854775808) {{ {HELPER_HI} = 2147483647; return -1; }}\n  \
+                 }} else {{\n    \
+                   if (x <= 0) {{ {HELPER_HI} = 0; return 0; }}\n    \
+                   if (x >= 18446744073709551616) {{ {HELPER_HI} = -1; return -1; }}\n  \
+                 }}\n  \
+                 const t = Math.trunc(x);\n  \
+                 const h = Math.floor(t / 4294967296) | 0;\n  \
+                 {HELPER_HI} = h;\n  \
+                 return (t - (signed ? h : (h >>> 0)) * 4294967296) | 0;\n"
+            ),
+        )),
+        HELPER_F64_TO_BITS => Some(synth_i64_helper(
+            name,
+            &[HELPER_HI, HELPER_F64_VIEW, HELPER_I32_VIEW],
+            "x",
+            format!(
+                "  {HELPER_F64_VIEW}[0] = x;\n  \
+                 {HELPER_HI} = {HELPER_I32_VIEW}[1];\n  \
+                 return {HELPER_I32_VIEW}[0];\n"
+            ),
+        )),
+        HELPER_BITS_TO_F64 => Some(synth_i64_helper(
+            name,
+            &[HELPER_F64_VIEW, HELPER_I32_VIEW],
+            "lo, hi",
+            format!(
+                "  {HELPER_I32_VIEW}[0] = lo;\n  \
+                 {HELPER_I32_VIEW}[1] = hi;\n  \
+                 return {HELPER_F64_VIEW}[0];\n"
+            ),
+        )),
+        HELPER_U64_F32 => Some(synth_i64_helper(
+            name,
+            &[],
+            "lo, hi",
+            "  const h = hi >>> 0;\n  \
+             const l = h >= 2097152 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
+             return Math.fround(h * 4294967296 + l);\n"
+                .to_owned(),
+        )),
+        HELPER_I64_F32 => Some(synth_i64_helper(
+            name,
+            &[],
+            "lo, hi",
+            "  const h = hi | 0;\n  \
+             const l = (((h + 2097152) | 0) >>> 0) >= 4194304 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
+             return Math.fround(h * 4294967296 + l);\n"
+                .to_owned(),
+        )),
+        _ => None,
+    }
 }
 
 /// Concatenated JS text of all helper items, for standalone unit-test harnesses.

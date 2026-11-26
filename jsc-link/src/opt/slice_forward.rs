@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::jir::repr::{Dominators, Func, Op, OpKind, Proj, Root, ValueDef, ValueId};
+use crate::jir::repr::{Func, Op, OpKind, Proj, Root, ValueId};
 use crate::jir::semantic::{BinaryOp, TypeId};
 use crate::jir::types::{PointerForm, TypeKind};
 use crate::jir::TypeTable;
+
+use super::cfg::Cfg;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct View {
@@ -20,86 +22,89 @@ struct View {
 
 /// Rewrites indexed borrows and returns their count.
 pub fn run(func: &mut Func, table: &TypeTable) -> u32 {
-    let incoming = incoming(func);
-    let doms = Dominators::of(func);
+    let cfg = Cfg::of(func);
     let mut views: BTreeMap<ValueId, View> = BTreeMap::new();
 
-    // Copies, whole-view reborrows, and block parameters can form short chains. A small monotone
-    // fixpoint discovers them all without changing the function.
-    for _ in 0..4 {
-        let before = views.len();
-        for &block in &doms.rpo {
-            if block.0 != 0 {
-                for (position, param) in func.blocks[block.0 as usize].params.iter().enumerate() {
-                    let mut agreed: Option<View> = None;
-                    let mut valid = true;
-                    for args in &incoming[block.0 as usize] {
-                        let Some(arg) = args.get(position) else {
-                            valid = false;
-                            break;
-                        };
-                        if arg == param {
-                            continue;
-                        }
-                        let Some(view) = views.get(arg).copied() else {
-                            valid = false;
-                            break;
-                        };
-                        match agreed {
-                            None => agreed = Some(view),
-                            Some(known) if known == view => {}
-                            Some(_) => {
+    {
+        let incoming = Cfg::incoming_args(func);
+        // Copies, whole-view reborrows, and block parameters can form short chains. A small monotone
+        // fixpoint discovers them all without changing the function.
+        for _ in 0..4 {
+            let before = views.len();
+            for &block in &cfg.doms.rpo {
+                if block.0 != 0 {
+                    for (position, param) in func.blocks[block.0 as usize].params.iter().enumerate()
+                    {
+                        let mut agreed: Option<View> = None;
+                        let mut valid = true;
+                        for args in &incoming[block.0 as usize] {
+                            let Some(arg) = args.get(position) else {
                                 valid = false;
                                 break;
+                            };
+                            if arg == param {
+                                continue;
+                            }
+                            let Some(view) = views.get(arg).copied() else {
+                                valid = false;
+                                break;
+                            };
+                            match agreed {
+                                None => agreed = Some(view),
+                                Some(known) if known == view => {}
+                                Some(_) => {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if valid {
+                            if let Some(view) = agreed {
+                                views.insert(*param, view);
                             }
                         }
                     }
-                    if valid {
-                        if let Some(view) = agreed {
-                            views.insert(*param, view);
+                }
+                for op in &func.blocks[block.0 as usize].ops {
+                    let Some(result) = op.result else {
+                        continue;
+                    };
+                    let view = match &op.kind {
+                        OpKind::SliceView { ptr, len }
+                            if slice_view_ptr_matches_element(
+                                table,
+                                func.values[ptr.0 as usize].ty,
+                                func.values[result.0 as usize].ty,
+                            ) =>
+                        {
+                            Some(View {
+                                ptr: *ptr,
+                                len: *len,
+                            })
                         }
+                        OpKind::Copy(value) | OpKind::Move(value) => views.get(value).copied(),
+                        OpKind::BorrowView {
+                            root: Root::Value(value),
+                            path,
+                            mutable: false,
+                        } if matches!(path.as_slice(), [Proj::Deref])
+                            && super::range::is_slice_pointer(
+                                table,
+                                func.values[result.0 as usize].ty,
+                            ) =>
+                        {
+                            views.get(value).copied()
+                        }
+                        _ => None,
+                    };
+                    if let Some(view) = view {
+                        views.insert(result, view);
                     }
                 }
             }
-            for op in &func.blocks[block.0 as usize].ops {
-                let Some(result) = op.result else {
-                    continue;
-                };
-                let view = match &op.kind {
-                    OpKind::SliceView { ptr, len }
-                        if slice_view_ptr_matches_element(
-                            table,
-                            func.values[ptr.0 as usize].ty,
-                            func.values[result.0 as usize].ty,
-                        ) =>
-                    {
-                        Some(View {
-                            ptr: *ptr,
-                            len: *len,
-                        })
-                    }
-                    OpKind::Copy(value) | OpKind::Move(value) => views.get(value).copied(),
-                    OpKind::BorrowView {
-                        root: Root::Value(value),
-                        path,
-                        mutable: false,
-                    } if matches!(path.as_slice(), [Proj::Deref])
-                        && super::range::is_slice_pointer(
-                            table,
-                            func.values[result.0 as usize].ty,
-                        ) =>
-                    {
-                        views.get(value).copied()
-                    }
-                    _ => None,
-                };
-                if let Some(view) = view {
-                    views.insert(result, view);
-                }
+            if views.len() == before {
+                break;
             }
-        }
-        if views.len() == before {
-            break;
         }
     }
     if views.is_empty() {
@@ -129,12 +134,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> u32 {
                 continue;
             };
             let ptr_def = func.values[view.ptr.0 as usize];
-            let offset = ValueId(func.values.len() as u32);
-            func.values.push(ValueDef {
-                ty: ptr_def.ty,
-                carrier: ptr_def.carrier,
-                origin: op.origin,
-            });
+            let offset = func.push_value(ptr_def.ty, ptr_def.carrier, op.origin);
             rewritten.push(Op {
                 result: Some(offset),
                 origin: op.origin,
@@ -170,10 +170,10 @@ fn slice_view_ptr_matches_element(table: &TypeTable, ptr_ty: TypeId, result_ty: 
     {
         return false;
     }
-    let Some(ptr_pointee) = pointee_of(table, ptr_ty) else {
+    let Some(ptr_pointee) = table.pointee(ptr_ty) else {
         return false;
     };
-    let Some(result_pointee) = pointee_of(table, result_ty) else {
+    let Some(result_pointee) = table.pointee(result_ty) else {
         return false;
     };
     let Some(TypeKind::Slice(element)) = table.get(table.peeled(result_pointee)).map(|d| &d.kind)
@@ -181,25 +181,6 @@ fn slice_view_ptr_matches_element(table: &TypeTable, ptr_ty: TypeId, result_ty: 
         return false;
     };
     !table.is_zst(*element) && table.peeled(ptr_pointee) == table.peeled(*element)
-}
-
-fn pointee_of(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
-    match table.get(table.peeled(ty)).map(|d| &d.kind) {
-        Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
-            Some(*pointee)
-        }
-        _ => None,
-    }
-}
-
-fn incoming(func: &Func) -> Vec<Vec<Vec<ValueId>>> {
-    let mut incoming = vec![Vec::new(); func.blocks.len()];
-    for block in &func.blocks {
-        for (target, args) in block.term.edges() {
-            incoming[target.0 as usize].push(args.to_vec());
-        }
-    }
-    incoming
 }
 
 #[cfg(test)]

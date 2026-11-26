@@ -57,11 +57,11 @@
 //! with a parameter of the same name and expecting to capture it outside the arrow works, but doing
 //! it the other way round does not: pick a different name.
 
-mod block;
 mod lexer;
 
 use std::collections::BTreeMap;
 
+use mires_marker_abi::block;
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
@@ -81,9 +81,12 @@ pub(crate) struct Js {
     source: String,
     /// Where the block as a whole is, which is where a block wide error is reported.
     span: Span,
-    /// Where each identifier the block wrote was written. A capture is emitted at its own span, so
-    /// "cannot find value" points at the name rather than at the macro.
-    spans: BTreeMap<String, Span>,
+    /// Character offset of each reconstructed identifier token -> its original span.
+    ///
+    /// Keying by character offset (rather than by identifier name) ensures a non-free occurrence
+    /// such as a property access `a.foo` or an object key `{ foo: 1 }` never hijacks the span of a
+    /// subsequent free capture `foo`.
+    ident_spans: BTreeMap<usize, Span>,
 }
 
 impl Js {
@@ -106,21 +109,20 @@ impl Js {
         // expression, so only the raw spelling switches forms, which is what makes the two
         // unambiguous.
         if let Some(literal) = raw_string(&input) {
-            let text: syn::LitStr = syn::parse2(literal.clone())?;
+            let text: syn::LitStr = syn::parse2(literal)?;
             return Ok(Self {
                 source: text.value(),
                 span: text.span(),
-                spans: BTreeMap::new(),
+                ident_spans: BTreeMap::new(),
             });
         }
 
-        let mut source = String::new();
-        let mut spans = BTreeMap::new();
-        write_tokens(&mut source, &mut spans, input, &mut false);
+        let mut builder = SourceBuilder::new();
+        builder.write_tokens(input);
         Ok(Self {
-            source,
+            source: builder.out,
             span,
-            spans,
+            ident_spans: builder.ident_spans,
         })
     }
 
@@ -137,7 +139,8 @@ impl Js {
         let captures: Vec<syn::Ident> = analysis
             .free
             .iter()
-            .map(|name| self.capture(name))
+            .zip(&analysis.free_offsets)
+            .map(|(name, &offset)| self.capture(name, offset))
             .collect::<syn::Result<_>>()?;
         let block = block::Block {
             slots: captures.len(),
@@ -180,9 +183,9 @@ impl Js {
         }})
     }
 
-    /// The Rust identifier a free name captures, at the span it was written.
-    fn capture(&self, name: &str) -> syn::Result<syn::Ident> {
-        let span = self.spans.get(name).copied().unwrap_or(self.span);
+    /// The Rust identifier a free name captures, at the span of its first free occurrence.
+    fn capture(&self, name: &str, offset: usize) -> syn::Result<syn::Ident> {
+        let span = self.ident_spans.get(&offset).copied().unwrap_or(self.span);
         // Asked of `syn` rather than of `Ident::new`, which panics on a keyword and on `_`.
         if syn::parse_str::<syn::Ident>(name).is_err() {
             return Err(syn::Error::new(
@@ -207,13 +210,15 @@ fn raw_string(input: &TokenStream) -> Option<TokenStream> {
         return None;
     }
     let text = literal.to_string();
-    match text.starts_with("r\"") || text.starts_with("r#") {
-        true => Some(TokenStream::from(TokenTree::Literal(literal))),
-        false => None,
+    if text.starts_with("r\"") || text.starts_with("r#") {
+        Some(TokenStream::from(TokenTree::Literal(literal)))
+    } else {
+        None
     }
 }
 
-/// Writes `tokens` back out as the JavaScript they were written as.
+/// Reconstructs JavaScript source text from Rust tokens while recording the character offset and
+/// original [`Span`] of every identifier token.
 ///
 /// Rust's lexer has already run, so this is a reconstruction and not the source: comments are gone
 /// and a backtick could never have got this far, which is what the raw string form is for. What it
@@ -221,58 +226,82 @@ fn raw_string(input: &TokenStream) -> Option<TokenStream> {
 /// are kept apart and two written together are kept together, so `?.` stays an optional chain and
 /// `a - -b` does not become a decrement. Nothing else needs a space, because an identifier or a
 /// literal after punctuation can never lex as part of it.
-fn write_tokens(
-    out: &mut String,
-    spans: &mut BTreeMap<String, Span>,
-    tokens: TokenStream,
-    word: &mut bool,
-) {
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(token) = tokens.next() {
-        match token {
-            TokenTree::Group(group) => {
-                let (open, close) = match group.delimiter() {
-                    Delimiter::Parenthesis => ("(", ")"),
-                    Delimiter::Brace => ("{", "}"),
-                    Delimiter::Bracket => ("[", "]"),
-                    // An invisible group is a fragment another macro substituted, so its ends are
-                    // not token boundaries and whatever is inside carries the state through.
-                    Delimiter::None => ("", ""),
-                };
-                out.push_str(open);
-                if group.delimiter() != Delimiter::None {
-                    *word = false;
+struct SourceBuilder {
+    out: String,
+    char_len: usize,
+    ident_spans: BTreeMap<usize, Span>,
+    word: bool,
+}
+
+impl SourceBuilder {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            char_len: 0,
+            ident_spans: BTreeMap::new(),
+            word: false,
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        self.out.push(ch);
+        self.char_len += 1;
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.out.push_str(text);
+        self.char_len += text.chars().count();
+    }
+
+    fn write_tokens(&mut self, tokens: TokenStream) {
+        let mut tokens = tokens.into_iter().peekable();
+        while let Some(token) = tokens.next() {
+            match token {
+                TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        Delimiter::Parenthesis => ("(", ")"),
+                        Delimiter::Brace => ("{", "}"),
+                        Delimiter::Bracket => ("[", "]"),
+                        // An invisible group is a fragment another macro substituted, so its ends
+                        // are not token boundaries and whatever is inside carries the state
+                        // through.
+                        Delimiter::None => ("", ""),
+                    };
+                    self.push_str(open);
+                    if group.delimiter() != Delimiter::None {
+                        self.word = false;
+                    }
+                    self.write_tokens(group.stream());
+                    self.push_str(close);
+                    if group.delimiter() != Delimiter::None {
+                        self.word = false;
+                    }
                 }
-                write_tokens(out, spans, group.stream(), word);
-                out.push_str(close);
-                if group.delimiter() != Delimiter::None {
-                    *word = false;
+                TokenTree::Ident(ident) => {
+                    // Two words written together would lex as one, and nothing else would.
+                    if self.word {
+                        self.push_char(' ');
+                    }
+                    let name = ident.to_string();
+                    self.ident_spans.insert(self.char_len, ident.span());
+                    self.push_str(&name);
+                    self.word = true;
                 }
-            }
-            TokenTree::Ident(ident) => {
-                // Two words written together would lex as one, and nothing else would.
-                if *word {
-                    out.push(' ');
+                TokenTree::Literal(literal) => {
+                    if self.word {
+                        self.push_char(' ');
+                    }
+                    self.push_str(&literal.to_string());
+                    self.word = true;
                 }
-                let name = ident.to_string();
-                spans.entry(name.clone()).or_insert_with(|| ident.span());
-                out.push_str(&name);
-                *word = true;
-            }
-            TokenTree::Literal(literal) => {
-                if *word {
-                    out.push(' ');
+                TokenTree::Punct(punct) => {
+                    self.push_char(punct.as_char());
+                    let apart = punct.spacing() == proc_macro2::Spacing::Alone;
+                    if apart && matches!(tokens.peek(), Some(TokenTree::Punct(_))) {
+                        self.push_char(' ');
+                    }
+                    self.word = false;
                 }
-                out.push_str(&literal.to_string());
-                *word = true;
-            }
-            TokenTree::Punct(punct) => {
-                out.push(punct.as_char());
-                let apart = punct.spacing() == proc_macro2::Spacing::Alone;
-                if apart && matches!(tokens.peek(), Some(TokenTree::Punct(_))) {
-                    out.push(' ');
-                }
-                *word = false;
             }
         }
     }
@@ -317,7 +346,7 @@ mod tests {
         assert_eq!(source("a?.b"), "a?.b");
         assert_eq!(source("r => r.text()"), "r=>r.text()");
         assert_eq!(source("new X(y)"), "new X(y)");
-        assert_eq!(source(r#"{ "content-type": v }"#), r#"{"content-type":v}"#);
+        assert_eq!(r#"{"content-type":v}"#, source(r#"{ "content-type": v }"#));
         assert_eq!(source("a === b"), "a===b");
         assert_eq!(source("a ?? b"), "a??b");
         // Two marks written apart stay apart, so a subtraction of a negation is not a decrement.
@@ -364,6 +393,36 @@ b"#"##
             ),
             "rcgjs.js.1.3.globalThis.fetch(_$js0,{method:\"POST\",headers:\
              {\"content-type\":_$js1},body: _$js2})",
+        );
+    }
+
+    #[test]
+    fn contextual_keywords_expand_as_captures_end_to_end() {
+        let (encoded, captures) = Js::parse(tokens("f(get, set, of)"))
+            .expect("it parses")
+            .section()
+            .expect("it expands");
+        assert_eq!(encoded, "rcgjs.js.1.4._$js0(_$js1,_$js2,_$js3)");
+        let names: Vec<String> = captures.iter().map(ToString::to_string).collect();
+        assert_eq!(names, ["f", "get", "set", "of"]);
+        // `async` is a Rust keyword, so when used as a value in JS it is reported free and
+        // diagnosed rather than silently treated as a reserved JS keyword.
+        assert!(error("f(async)").contains("globalThis"));
+    }
+
+    #[test]
+    fn a_property_access_does_not_hijack_the_span_table_of_a_later_free_capture() {
+        let js = Js::parse(tokens("a.foo + foo")).expect("it parses");
+        assert_eq!(js.source, "a.foo+foo");
+        let analysis = lexer::analyze(&js.source).expect("it analyzes");
+        assert_eq!(analysis.free, ["a", "foo"]);
+        // `.foo` lives at offset 2; the free `foo` lives at offset 6.
+        assert_eq!(analysis.free_offsets, [0, 6]);
+        assert!(js.ident_spans.contains_key(&2));
+        assert!(js.ident_spans.contains_key(&6));
+        assert_eq!(
+            js.section().expect("it expands").0,
+            "rcgjs.js.1.2._$js0.foo+_$js1"
         );
     }
 

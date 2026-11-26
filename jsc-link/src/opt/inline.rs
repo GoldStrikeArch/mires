@@ -21,20 +21,22 @@
 //!
 //! Budgets (D6, enforced as `cost.budget` declines, counted in [`InlineStats`]): the caller may
 //! not exceed twice its size at group entry, a site may not grow the caller past its own size
-//! plus the callee's (which keeps every recorded [`Witness::Inline`] checkable), a size-criterion
+//! plus the callee's, a size-criterion
 //! site must not grow the measured caller/callee sum under allocated item names, and the ledger —
 //! every accepted site pays at least [`MIN_SITE_CHARGE`] — may not pass the program budget (+0.5%
 //! of the measured bytes, floored for small programs). The ledger is what holds the compressed-size
 //! exit gates: on the idiomatic FingerprintJS port unbounded inlining shrank the minified bundle
 //! while growing its brotli form past the gate, so the pass is deliberately stingy and records what
-//! it declined. A declined site is reverted whole — no partial inline. Every applied site records a
-//! [`Witness::Inline`] and the func is re-verified under its observed carriers; a verify or
-//! witness failure reverts the site too.
+//! it declined. A declined site is reverted whole — no partial inline. Every applied site is
+//! re-verified under its observed carriers; a verify failure reverts the site too.
 //!
 //! Everything is deterministic: components in the graph's order, sites processed back-to-front
 //! within a caller, all maps `BTreeMap`.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 
 use crate::analysis::callgraph::Callgraph;
 use crate::item::JsName;
@@ -42,7 +44,7 @@ use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
 use crate::jir::origin::{OriginId, SourceFactId};
 use crate::jir::repr::{
-    CellId, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
+    CellId, Func, Op, OpKind, RAssertMessage, RBlock, RBlockId, RTerm, ValueId,
 };
 use crate::jir::semantic::{
     BinaryOp, CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, TypeId,
@@ -50,6 +52,7 @@ use crate::jir::semantic::{
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
 use crate::lower::js::host::ItemIndex;
 
+use super::cfg::Cfg;
 use super::{candidates, observed_carriers};
 
 mod remap;
@@ -85,6 +88,93 @@ const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
 const SPEED_CALLER_CAP: u64 = 32_768;
 const SPEED_BUDGET_FLOOR: u64 = 24_576;
 
+/// Why a candidate call site was not inlined.
+///
+/// Variants are ordered alphabetically by [`Self::as_code`] so `BTreeMap` iteration
+/// matches `str` ordering (byte-identical JSON) and [`Borrow<str>`] satisfies its `Ord` contract.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InlineDecline {
+    AbiUnsupported,
+    BodyUnavailable,
+    CarrierBoundary,
+    CarrierConversionUnsupported,
+    CleanupInvalid,
+    CoroutineUnsupported,
+    CostNoOpportunity,
+    CostRejected,
+    CostUnavailable,
+    ExceptionalControlFlow,
+    HostBoundary,
+    MetadataUnavailable,
+    Never,
+    ObjectIncompatible,
+    OriginBudget,
+    OriginInvalid,
+    OriginUnavailable,
+    RecursiveBudget,
+    ReprRetarget,
+    SemanticBoundary,
+    SignatureInvalid,
+    SourceInvalid,
+    SpliceInvalid,
+    StringInvalid,
+    TrackCallerUnavailable,
+    TypeBudget,
+    TypeConflict,
+    TypeOpaque,
+    TypeUnavailable,
+    Zombie,
+}
+
+impl InlineDecline {
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::AbiUnsupported => "inline.abi-unsupported",
+            Self::BodyUnavailable => "inline.body-unavailable",
+            Self::CarrierBoundary => "inline.carrier-boundary",
+            Self::CarrierConversionUnsupported => "inline.carrier-conversion-unsupported",
+            Self::CleanupInvalid => "inline.cleanup-invalid",
+            Self::CoroutineUnsupported => "inline.coroutine-unsupported",
+            Self::CostNoOpportunity => "inline.cost-no-opportunity",
+            Self::CostRejected => "inline.cost-rejected",
+            Self::CostUnavailable => "inline.cost-unavailable",
+            Self::ExceptionalControlFlow => "inline.exceptional-control-flow",
+            Self::HostBoundary => "inline.host-boundary",
+            Self::MetadataUnavailable => "inline.metadata-unavailable",
+            Self::Never => "inline.never",
+            Self::ObjectIncompatible => "inline.object-incompatible",
+            Self::OriginBudget => "inline.origin-budget",
+            Self::OriginInvalid => "inline.origin-invalid",
+            Self::OriginUnavailable => "inline.origin-unavailable",
+            Self::RecursiveBudget => "inline.recursive-budget",
+            Self::ReprRetarget => "inline.repr-retarget",
+            Self::SemanticBoundary => "inline.semantic-boundary",
+            Self::SignatureInvalid => "inline.signature-invalid",
+            Self::SourceInvalid => "inline.source-invalid",
+            Self::SpliceInvalid => "inline.splice-invalid",
+            Self::StringInvalid => "inline.string-invalid",
+            Self::TrackCallerUnavailable => "inline.track-caller-unavailable",
+            Self::TypeBudget => "inline.type-budget",
+            Self::TypeConflict => "inline.type-conflict",
+            Self::TypeOpaque => "inline.type-opaque",
+            Self::TypeUnavailable => "inline.type-unavailable",
+            Self::Zombie => "inline.zombie",
+        }
+    }
+}
+
+impl Borrow<str> for InlineDecline {
+    fn borrow(&self) -> &str {
+        self.as_code()
+    }
+}
+
+impl Hash for InlineDecline {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_code().hash(state);
+    }
+}
+
 /// What the pass did, for the sidecar's `inline` block and the driver's accounting.
 #[derive(Clone, Debug, Default)]
 pub struct InlineStats {
@@ -95,7 +185,7 @@ pub struct InlineStats {
     /// Candidate sites refused by a budget: the `cost.budget` declines.
     pub declined_budget: u32,
     /// Candidate refusals, including metadata, semantic, verification, and cost boundaries.
-    pub declined: BTreeMap<&'static str, u32>,
+    pub declined: BTreeMap<InlineDecline, u32>,
     /// The summed entry bytes of every caller that took at least one inline.
     pub bytes_before: u64,
     /// The summed final bytes of those same callers.
@@ -109,7 +199,7 @@ pub struct InlineStats {
 }
 
 impl InlineStats {
-    fn decline(&mut self, reason: &'static str) {
+    fn decline(&mut self, reason: InlineDecline) {
         *self.declined.entry(reason).or_default() += 1;
     }
 
@@ -120,7 +210,7 @@ impl InlineStats {
             if index != 0 {
                 out.push(',');
             }
-            crate::lane_report::push_string(&mut out, reason);
+            crate::lane_report::push_string(&mut out, reason.as_code());
             let _ = write!(out, ":{count}");
         }
         out.push('}');
@@ -139,614 +229,1310 @@ struct Site {
 
 type Measurement = (u64, BTreeSet<JsName>);
 
-/// Runs the inliner over every `Ok` func, in place.
-///
-/// `measure` prices one func as the item's minified bytes (`plan::cost::measure_item` behind a
-/// lane closure); `None` skips the caller. `sole_referrer(callee, caller)` answers the
-/// single-caller criterion from the live reference counts. `program_bytes` is the measured
-/// program total the +0.5% budget is taken of.
-#[allow(dead_code)] // Called by inline unit tests; `lane.rs` calls `run_with_mode`.
-#[allow(clippy::too_many_arguments)] // One call site (the lane driver); the arguments are the
-                                     // pass's oracles.
-pub(crate) fn run(
-    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
-    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
-    graph: &Callgraph,
-    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    zombie_free: &dyn Fn(&JsName) -> bool,
-    program_bytes: u64,
-    sizes: &BTreeMap<JsName, u64>,
-) -> InlineStats {
-    run_with_profile(
-        funcs,
-        metadata,
-        graph,
-        &ItemIndex::new(),
-        measure,
-        sole_referrer,
-        zombie_free,
-        program_bytes,
-        sizes,
-        false,
-        None,
-    )
+/// Cached `RCGJS_O_DEBUG_FUNC` filter, read once per process.
+fn debug_func_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("RCGJS_O_DEBUG_FUNC").ok())
+        .as_deref()
 }
 
-/// Runs the inliner, optionally admitting non-specialized `CallSemantic::Standard` calls after
-/// representation specialization (`allow_std_post_repr`).
-#[allow(dead_code)] // Called by inline unit tests; `lane.rs` calls `run_with_profile`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_with_mode(
-    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
-    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
-    graph: &Callgraph,
-    items: &ItemIndex,
-    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    zombie_free: &dyn Fn(&JsName) -> bool,
-    program_bytes: u64,
-    sizes: &BTreeMap<JsName, u64>,
-    allow_std_post_repr: bool,
-) -> InlineStats {
-    run_with_profile(
-        funcs,
-        metadata,
-        graph,
-        items,
-        measure,
-        sole_referrer,
-        zombie_free,
-        program_bytes,
-        sizes,
-        allow_std_post_repr,
-        None,
-    )
+/// Inputs and policy configuration for one run of the cost-guided inliner.
+pub(crate) struct InlineConfig<'a> {
+    pub graph: &'a Callgraph,
+    pub items: &'a ItemIndex,
+    pub measure: &'a dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
+    pub sole_referrer: &'a dyn Fn(&JsName, &JsName) -> bool,
+    pub zombie_free: &'a dyn Fn(&JsName) -> bool,
+    pub program_bytes: u64,
+    pub sizes: &'a BTreeMap<JsName, u64>,
+    pub allow_std_post_repr: bool,
+    pub profile: Option<crate::opts::Profile>,
+    pub call_retargets: Option<&'a BTreeMap<JsName, crate::lower::CallRetargets>>,
 }
 
-/// Runs the inliner under `profile` (`ReleaseSpeed` widens budgets and honors `#[inline]` hints).
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_with_profile(
+/// Runs the inliner over every `Ok` func in place using `config`.
+pub(crate) fn run_with_config(
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
     metadata: &mut BTreeMap<JsName, Metadata<'_>>,
-    graph: &Callgraph,
-    items: &ItemIndex,
-    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    zombie_free: &dyn Fn(&JsName) -> bool,
-    program_bytes: u64,
-    sizes: &BTreeMap<JsName, u64>,
-    allow_std_post_repr: bool,
-    profile: Option<crate::opts::Profile>,
+    config: InlineConfig<'_>,
 ) -> InlineStats {
-    run_with_profile_and_retargets(
-        funcs,
-        metadata,
-        graph,
-        items,
-        measure,
-        sole_referrer,
-        zombie_free,
-        program_bytes,
-        sizes,
-        allow_std_post_repr,
-        profile,
-        None,
-    )
+    InlineCx::new(config).run(funcs, metadata)
 }
 
-/// Runs the inliner under `profile`, respecting per-caller representation `call_retargets`
-/// (skipping retargeted call sites and refusing to inline callees that themselves have retargets).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_with_profile_and_retargets(
-    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
-    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
-    graph: &Callgraph,
-    items: &ItemIndex,
-    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    zombie_free: &dyn Fn(&JsName) -> bool,
-    program_bytes: u64,
-    sizes: &BTreeMap<JsName, u64>,
-    allow_std_post_repr: bool,
-    profile: Option<crate::opts::Profile>,
-    call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
-) -> InlineStats {
-    let mut stats = InlineStats::default();
-    let mut sizes = sizes.clone();
-    // Run aggressive speed-first inlining only in the post-representation O pass so pre-repr
-    // carrier analysis (`NativeVec`/`NativeMap`/`HostString`) always sees clean, un-poisoned
-    // standard-library boundaries.
-    let speed = allow_std_post_repr && matches!(profile, Some(crate::opts::Profile::ReleaseSpeed));
-    let budget = if speed {
-        (program_bytes / 2).max(SPEED_BUDGET_FLOOR)
-    } else {
-        (program_bytes / PROGRAM_BUDGET_DENOMINATOR).max(BUDGET_FLOOR)
-    };
-    // Growth spent so far, signed: a site that shrinks its caller gives headroom back.
-    let mut growth: i64 = 0;
-    // Mutually-recursive sole-caller helpers already spliced into their sole caller (now dead).
-    let mut inlined_mutual_callees: BTreeSet<JsName> = BTreeSet::new();
-    let order: Vec<JsName> = graph.sccs.iter().flatten().cloned().collect();
-    for caller in &order {
-        if inlined_mutual_callees.contains(caller) {
-            continue;
-        }
-        let Some(mut current_metadata) = metadata.get(caller).cloned() else {
-            continue;
+/// Budget and growth-ledger evaluator for candidate inline sites.
+struct CostModel {
+    speed: bool,
+    budget: u64,
+    /// Growth spent so far, signed: a site that shrinks its caller gives headroom back.
+    growth: i64,
+}
+
+struct SiteCostInput<'a> {
+    caller: &'a JsName,
+    site: &'a Site,
+    criterion: Criterion,
+    is_sole: bool,
+    caller_recursive: bool,
+    in_loop: bool,
+    entry_bytes: u64,
+    limit: u64,
+    bytes: u64,
+    after: u64,
+    callee_bytes: u64,
+    removed: u64,
+    trivial_leaf: bool,
+    iterator_step: bool,
+    callee_func: &'a Func,
+}
+
+struct AcceptedCost {
+    charge: i64,
+    charge_growth: bool,
+}
+
+impl CostModel {
+    fn new(speed: bool, program_bytes: u64) -> Self {
+        let budget = if speed {
+            (program_bytes / 2).max(SPEED_BUDGET_FLOOR)
+        } else {
+            (program_bytes / PROGRAM_BUDGET_DENOMINATOR).max(BUDGET_FLOOR)
         };
-        let Some(Ok(func)) = funcs.get(caller) else {
-            continue;
-        };
-        let sites = collect_sites(
-            caller,
-            func,
-            &current_metadata,
-            metadata,
-            funcs,
-            graph,
-            items,
-            sole_referrer,
-            zombie_free,
-            allow_std_post_repr,
+        Self {
             speed,
-            call_retargets,
-            &inlined_mutual_callees,
-            &mut stats,
-        );
-        if sites.is_empty() {
-            continue;
+            budget,
+            growth: 0,
         }
-        let entry_bytes = match sizes.get(caller).copied() {
-            Some(bytes) => bytes,
-            None => match measure(caller, func, &current_metadata) {
-                Some((bytes, _)) => bytes,
-                None => continue,
-            },
-        };
-        let limit = if speed {
+    }
+
+    fn caller_limit(&self, entry_bytes: u64) -> u64 {
+        if self.speed {
             entry_bytes
                 .saturating_mul(2)
                 .max(4_096)
                 .min(entry_bytes.saturating_add(8_192).max(SPEED_CALLER_CAP))
         } else {
             entry_bytes.saturating_mul(2)
-        };
-        let mut current = funcs
-            .get(caller)
-            .and_then(|f| f.as_ref().ok())
-            .cloned()
-            .expect("checked Ok above");
-        let looping = looping_blocks(&current);
-        let mut bytes = entry_bytes;
-        let mut applied_here = 0u32;
-        let mut accepted = None;
-        // Back to front within each block, so an earlier splice never moves a later site in the
-        // same block (splicing only splits `site.block` and appends new blocks). Under speed-first
-        // mode, prioritize sites inside loops before cold pre/post-loop sites so cold callees
-        // cannot consume the caller size cap before inner-loop leaf helpers (e.g. SHA-512's
-        // `Word::{ror,add}` inside the 80-round compression loop) get inlined for PEA.
-        let mut site_order: Vec<usize> = (0..sites.len()).rev().collect();
-        if speed {
-            site_order.sort_by_key(|&idx| {
-                let s = &sites[idx];
-                (
-                    !looping.contains(&(s.block as u32)),
-                    std::cmp::Reverse(s.block),
-                    std::cmp::Reverse(s.op),
-                )
-            });
         }
-        for site_idx in site_order {
-            let site = &sites[site_idx];
-            let Some(criterion) = qualifies(
-                caller,
-                &site.callee,
-                &current,
-                site,
-                funcs,
-                &sizes,
-                sole_referrer,
-                &current_metadata.interns.types,
-                &looping,
-                speed,
-            ) else {
-                stats.decline("inline.cost-no-opportunity");
-                continue;
-            };
-            let is_sole = sole_referrer(&site.callee, caller);
-            if site.host_boundary
-                && count_item_refs(&current, &current_metadata.interns, site.callee.as_str()) != 1
-            {
-                stats.decline("inline.host-boundary");
+    }
+
+    fn evaluate_site(&self, input: &SiteCostInput<'_>) -> Result<AcceptedCost, InlineDecline> {
+        let delta = input.after as i64 - input.bytes as i64;
+        let net = delta.saturating_sub(input.removed.min(i64::MAX as u64) as i64);
+        let tiny_accessor_slack = if matches!(input.criterion, Criterion::SmallCallee)
+            && input.callee_bytes <= 36
+            && net > 0
+            && net <= 2
+        {
+            net
+        } else {
+            0
+        };
+        let trivial_leaf_slack = if !input.site.host_boundary
+            && input.trivial_leaf
+            && matches!(
+                input.criterion,
+                Criterion::SmallCallee | Criterion::SoleCaller
+            )
+            && net > 0
+            && net <= 16
+        {
+            net
+        } else {
+            0
+        };
+        let charge = if self.speed {
+            net.max(0)
+        } else if net <= 0 || trivial_leaf_slack > 0 {
+            0
+        } else if tiny_accessor_slack > 0 {
+            tiny_accessor_slack
+        } else {
+            net.max(MIN_SITE_CHARGE)
+        };
+        if debug_func_filter().is_some_and(|filter| input.caller.as_str().contains(filter)) {
+            eprintln!(
+                "inline {:?} <- {:?}: {:?}, before={}, after={}, callee={}, delta={delta}, removed={}, net={net}, limit={}, growth={}, charge={charge}, budget={}",
+                input.caller,
+                input.site.callee,
+                input.criterion,
+                input.bytes,
+                input.after,
+                input.callee_bytes,
+                input.removed,
+                input.limit,
+                self.growth,
+                self.budget,
+            );
+        }
+        // Only loop virtualization (or <=2B tiny accessors, or <=16B trivial pure leaves) may spend
+        // temporary net growth under size/balanced profiles. Speed-first mode permits bounded
+        // growth for every qualifying criterion.
+        let growth_allowed = self.speed
+            || matches!(input.criterion, Criterion::LoopVirtualizable)
+            || tiny_accessor_slack > 0
+            || trivial_leaf_slack > 0;
+        // A small loop helper may expose enough scalar replacement to repay a modest
+        // pre-cleanup growth in the later per-item pipeline. Bound both the duplicated body
+        // and that temporary growth; this is the iterator-state case, not a general license
+        // to spend the whole-program compression budget.
+        let bounded_loop_virtualization = matches!(input.criterion, Criterion::LoopVirtualizable)
+            && input.iterator_step
+            && input.callee_bytes <= 560
+            && input.after <= input.bytes.saturating_add(360);
+        // Under speed-first mode, never let earlier cold callees starve tiny leaf helpers
+        // called inside loops (e.g., `Word::add` inside SHA-512's 80-round compression loop,
+        // `Range::into_iter`, `Ord::min`, `Vec::len`, `Vec::index`, `compare$closure_1`).
+        let callee_is_leaf = callee_is_inline_leaf(input.callee_func);
+        let callee_total_ops: usize = input.callee_func.blocks.iter().map(|b| b.ops.len()).sum();
+        let speed_tiny_exempt = self.speed
+            && (input.trivial_leaf
+                || (callee_is_leaf
+                    && (input.callee_bytes <= 120
+                        || (input.callee_func.blocks.len() <= 2
+                            && callee_total_ops <= 8
+                            && input.callee_bytes <= 256))));
+        let speed_hot_loop = self.speed
+            && input.in_loop
+            && callee_is_leaf
+            && input.callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT;
+        let speed_tiny_leaf = speed_tiny_exempt
+            || (self.speed
+                && callee_is_leaf
+                && (input.callee_bytes <= 180
+                    || ((input.callee_func.sig.abi.inline_hint
+                        || input.callee_func.sig.abi.inline_always
+                        || input.site.has_track_caller)
+                        && input.callee_bytes <= 384)));
+        const SPEED_SOLE_RECURSIVE_FOOTPRINT: u64 = 2_560;
+        let speed_sole_loop = self.speed
+            && input.is_sole
+            && ((input.in_loop && input.callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT)
+                || (input.caller_recursive
+                    && input.callee_bytes <= SPEED_SOLE_RECURSIVE_FOOTPRINT));
+        let speed_budget_free = speed_hot_loop || speed_tiny_leaf || speed_sole_loop;
+        // Inlining a `#[track_caller]` callee substitutes a `{filename,line,col}` literal
+        // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller,
+        // loop-virtualizable, or tiny leaf helper into a large caller may add temporary
+        // local-renaming / `try/catch` scaffolding before downstream cleanup.
+        // Account for that pre-cleanup slack under `ReleaseSpeed`.
+        let effective_callee_bytes = if speed_sole_loop {
+            input.callee_bytes.saturating_add(256)
+        } else if self.speed
+            && (input.site.has_track_caller
+                || input.is_sole
+                || speed_tiny_leaf
+                || matches!(input.criterion, Criterion::LoopVirtualizable))
+        {
+            input.callee_bytes.saturating_add(96)
+        } else {
+            input.callee_bytes
+        };
+        let size_limit = if speed_tiny_exempt {
+            input
+                .limit
+                .max(input.entry_bytes.saturating_add(8_192))
+                .max(SPEED_CALLER_CAP)
+                .max(input.bytes.saturating_add(effective_callee_bytes))
+        } else if speed_budget_free {
+            input
+                .limit
+                .max(input.entry_bytes.saturating_add(8_192))
+                .max(SPEED_CALLER_CAP)
+        } else if input.is_sole && net <= 0 {
+            input
+                .limit
+                .max(if self.speed { SPEED_CALLER_CAP } else { 16_384 })
+        } else if self.speed && input.is_sole && input.callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
+            input.limit.max(SPEED_CALLER_CAP)
+        } else {
+            input.limit
+        };
+        if input.after > size_limit
+            || input.after > input.bytes.saturating_add(effective_callee_bytes)
+            || (!bounded_loop_virtualization
+                && !speed_budget_free
+                && self.growth + charge > self.budget as i64)
+            || (!growth_allowed && net > 0)
+        {
+            return Err(InlineDecline::CostRejected);
+        }
+        Ok(AcceptedCost {
+            charge,
+            charge_growth: !bounded_loop_virtualization && !speed_tiny_leaf,
+        })
+    }
+
+    fn commit(&mut self, accepted: AcceptedCost) {
+        if accepted.charge_growth {
+            self.growth += accepted.charge;
+        }
+    }
+}
+
+/// Read-only view of the function and metadata tables shared across site collection and splicing.
+#[derive(Clone, Copy)]
+struct SiteLookup<'a, 'm> {
+    funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    metadata: &'a BTreeMap<JsName, Metadata<'m>>,
+}
+
+/// ABI facts of one call site passed to `body_decline` and `prepare_callee_for_site`.
+#[derive(Clone, Copy)]
+struct CallSiteAbi {
+    args_len: usize,
+    caller_caller_location: bool,
+    track_caller: Option<SourceFactId>,
+}
+
+/// Mutable state for the caller currently being processed.
+struct CallerState<'a, 'm> {
+    caller: &'a JsName,
+    current: Func,
+    metadata: Metadata<'m>,
+    entry_bytes: u64,
+    limit: u64,
+    bytes: u64,
+    looping: Vec<bool>,
+    applied_here: u32,
+    accepted: Option<Func>,
+}
+
+/// Verified result of atomically inlining every remaining call site to a sole-caller callee.
+struct InlinedBatch<'m> {
+    candidate: Func,
+    metadata: Metadata<'m>,
+    after_bytes: u64,
+    sites_applied: u32,
+    cross_object: u32,
+}
+
+/// Shared execution context across callers for one inliner pass.
+struct InlineCx<'a> {
+    config: InlineConfig<'a>,
+    sizes: BTreeMap<JsName, u64>,
+    cost: CostModel,
+    /// Mutually-recursive sole-caller helpers already spliced into their sole caller (now dead).
+    inlined_mutual_callees: BTreeSet<JsName>,
+    stats: InlineStats,
+}
+
+impl<'a> InlineCx<'a> {
+    fn new(config: InlineConfig<'a>) -> Self {
+        // Run aggressive speed-first inlining only in the post-representation O pass so pre-repr
+        // carrier analysis (`NativeVec`/`NativeMap`/`HostString`) always sees clean, un-poisoned
+        // standard-library boundaries.
+        let speed = config.allow_std_post_repr
+            && matches!(config.profile, Some(crate::opts::Profile::ReleaseSpeed));
+        let sizes = config.sizes.clone();
+        let cost = CostModel::new(speed, config.program_bytes);
+        Self {
+            config,
+            sizes,
+            cost,
+            inlined_mutual_callees: BTreeSet::new(),
+            stats: InlineStats::default(),
+        }
+    }
+
+    fn run<'m>(
+        mut self,
+        funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+        metadata: &mut BTreeMap<JsName, Metadata<'m>>,
+    ) -> InlineStats {
+        let order: Vec<JsName> = self.config.graph.sccs.iter().flatten().cloned().collect();
+        for caller in &order {
+            if self.inlined_mutual_callees.contains(caller) {
                 continue;
             }
-            let Some(Ok(callee_func)) = funcs.get(&site.callee) else {
+            let Some(current_metadata) = metadata.get(caller).cloned() else {
                 continue;
             };
-            let callee_bytes = sizes.get(&site.callee).copied().unwrap_or(u64::MAX);
-            let trivial_leaf = trivial_pure_leaf(callee_func);
-            let iterator_step = metadata
-                .get(&site.callee)
-                .is_some_and(|meta| bounded_iterator_step(callee_func, &meta.interns.types));
-            let Some(provider) = metadata.get(&site.callee) else {
+            let Some(Ok(func)) = funcs.get(caller) else {
                 continue;
             };
-            let origin = current.blocks[site.block].ops[site.op].origin;
+            let lookup = SiteLookup { funcs, metadata };
+            let sites = self.collect_sites(caller, func, &current_metadata, lookup, true);
+            if sites.is_empty() {
+                continue;
+            }
+            let entry_bytes = match self.sizes.get(caller).copied() {
+                Some(bytes) => bytes,
+                None => match (self.config.measure)(caller, func, &current_metadata) {
+                    Some((bytes, _)) => bytes,
+                    None => continue,
+                },
+            };
+            let current = func.clone();
+            let looping = Cfg::of(&current).looping_blocks();
+            let mut state = CallerState {
+                caller,
+                current,
+                metadata: current_metadata,
+                entry_bytes,
+                limit: self.cost.caller_limit(entry_bytes),
+                bytes: entry_bytes,
+                looping,
+                applied_here: 0,
+                accepted: None,
+            };
+            // Back to front within each block, so an earlier splice never moves a later site in
+            // the same block (splicing only splits `site.block` and appends new blocks). Under
+            // speed-first mode, prioritize sites inside loops before cold pre/post-loop sites so
+            // cold callees cannot consume the caller size cap before inner-loop leaf helpers (e.g.
+            // SHA-512's `Word::{ror,add}` inside the 80-round compression loop) get inlined for
+            // PEA.
+            let mut site_order: Vec<usize> = (0..sites.len()).rev().collect();
+            if self.cost.speed {
+                site_order.sort_by_key(|&idx| {
+                    let s = &sites[idx];
+                    (
+                        !state.looping.get(s.block).copied().unwrap_or(false),
+                        std::cmp::Reverse(s.block),
+                        std::cmp::Reverse(s.op),
+                    )
+                });
+            }
+            for site_idx in site_order {
+                self.try_inline_site(&mut state, &sites[site_idx], lookup);
+            }
+
+            // Multi-site sole-caller batching: when a callee has K > 1 sites in its sole referrer
+            // and intermediate sites left `removed == 0` with `net > 0`, try splicing all
+            // remaining sites to that callee as one atomic transaction.
+            let mut sole_site_counts: BTreeMap<JsName, usize> = BTreeMap::new();
+            for site in &sites {
+                if !site.host_boundary && (self.config.sole_referrer)(&site.callee, caller) {
+                    *sole_site_counts.entry(site.callee.clone()).or_default() += 1;
+                }
+            }
+            let batch_callees: Vec<JsName> = sole_site_counts
+                .into_iter()
+                .filter_map(|(callee, count)| (count > 1).then_some(callee))
+                .collect();
+            if !batch_callees.is_empty() {
+                if let Some(clean) = state.accepted.as_ref() {
+                    state.current = clean.clone();
+                }
+                for callee in batch_callees {
+                    let remaining: Vec<Site> = self
+                        .collect_sites(state.caller, &state.current, &state.metadata, lookup, false)
+                        .into_iter()
+                        .filter(|site| site.callee == callee)
+                        .collect();
+                    if remaining.is_empty()
+                        || remaining.iter().any(|site| site.host_boundary)
+                        || count_item_refs(&state.current, &state.metadata.interns, callee.as_str())
+                            != remaining.len()
+                    {
+                        continue;
+                    }
+                    let Some(Ok(callee_func)) = funcs.get(&callee) else {
+                        continue;
+                    };
+                    let Some(provider) = metadata.get(&callee) else {
+                        continue;
+                    };
+                    match self.try_inline_sole_caller_batch(
+                        &state,
+                        &callee,
+                        &remaining,
+                        callee_func,
+                        provider,
+                    ) {
+                        Ok(batch) => {
+                            self.stats.witnesses_recorded += 1;
+                            state.bytes = batch.after_bytes;
+                            state.applied_here += batch.sites_applied;
+                            self.stats.cross_object_applied += batch.cross_object;
+                            state.metadata = batch.metadata;
+                            state.current = batch.candidate.clone();
+                            state.accepted = Some(batch.candidate);
+                        }
+                        Err(reason) => {
+                            if reason == InlineDecline::CostRejected {
+                                self.stats.declined_budget += 1;
+                            }
+                            self.stats.decline(reason);
+                        }
+                    }
+                }
+            }
+
+            if let Some(current) = state.accepted {
+                self.stats.applied += state.applied_here;
+                self.stats.bytes_before += state.entry_bytes;
+                self.stats.bytes_after += state.bytes;
+                self.stats.items.insert(caller.clone());
+                self.sizes.insert(caller.clone(), state.bytes);
+                funcs.insert(caller.clone(), Ok(current));
+                metadata.insert(caller.clone(), state.metadata);
+            }
+        }
+        self.stats
+    }
+
+    /// Evaluates, splices, cleans, measures, and cost-checks one candidate call site.
+    ///
+    /// Leaves `state` untouched on any decline so no manual rollback is needed.
+    fn try_inline_site<'m>(
+        &mut self,
+        state: &mut CallerState<'_, 'm>,
+        site: &Site,
+        lookup: SiteLookup<'_, 'm>,
+    ) {
+        let Some(criterion) = self.qualifies(state, site, lookup.funcs) else {
+            self.stats.decline(InlineDecline::CostNoOpportunity);
+            return;
+        };
+        let is_sole = (self.config.sole_referrer)(&site.callee, state.caller);
+        if site.host_boundary
+            && count_item_refs(
+                &state.current,
+                &state.metadata.interns,
+                site.callee.as_str(),
+            ) != 1
+        {
+            self.stats.decline(InlineDecline::HostBoundary);
+            return;
+        }
+        let Some(Ok(callee_func)) = lookup.funcs.get(&site.callee) else {
+            return;
+        };
+        let callee_bytes = self.sizes.get(&site.callee).copied().unwrap_or(u64::MAX);
+        let trivial_leaf = trivial_pure_leaf(callee_func);
+        let iterator_step = lookup
+            .metadata
+            .get(&site.callee)
+            .is_some_and(|meta| bounded_iterator_step(callee_func, &meta.interns.types));
+        let Some(provider) = lookup.metadata.get(&site.callee) else {
+            return;
+        };
+        let origin = state.current.blocks[site.block].ops[site.op].origin;
+        let (site_args_len, site_track_caller) =
+            match &state.current.blocks[site.block].ops[site.op].kind {
+                OpKind::Call {
+                    args, track_caller, ..
+                } => (args.len(), *track_caller),
+                _ => return,
+            };
+        let site_abi = CallSiteAbi {
+            args_len: site_args_len,
+            caller_caller_location: state.current.sig.abi.caller_location,
+            track_caller: site_track_caller,
+        };
+        let (callee_func, imported, sentinel_assert_origin) = match self.prepare_callee_for_site(
+            &state.metadata,
+            provider,
+            callee_func,
+            origin,
+            site_abi,
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.stats.decline(reason);
+                return;
+            }
+        };
+        let table = &imported.interns.types;
+        let mut spliced = state.current.clone();
+        splice(&mut spliced, site.block, site.op, &callee_func);
+        if spliced
+            .verify_carriers(table, observed_carriers(&spliced))
+            .is_err()
+        {
+            self.stats.decline(InlineDecline::SpliceInvalid);
+            return;
+        }
+        // Clean a clone so the remaining collected sites keep their block/op positions.
+        // Price and retain the same verified shape, including merges, cell unboxing, and DCE cleanup.
+        let mut candidate = spliced.clone();
+        if let Err(reason) = clean_candidate(&mut candidate, table, sentinel_assert_origin) {
+            self.stats.decline(reason);
+            return;
+        }
+        let Some((after, refs)) = (self.config.measure)(state.caller, &candidate, &imported) else {
+            self.stats.decline(InlineDecline::CostUnavailable);
+            return;
+        };
+        if site.host_boundary && refs.contains(&site.callee) {
+            self.stats.decline(InlineDecline::HostBoundary);
+            return;
+        }
+        // The sole-referrer oracle excludes public and explicitly rooted items. Credit deletion
+        // only after the emitted caller also lost every reference to the callee, including
+        // function-pointer constants and retained indirect uses in this caller.
+        let removed = if is_sole && !refs.contains(&site.callee) {
+            self.sizes.get(&site.callee).copied().unwrap_or_default()
+        } else {
+            0
+        };
+        let accepted_cost = match self.cost.evaluate_site(&SiteCostInput {
+            caller: state.caller,
+            site,
+            criterion,
+            is_sole,
+            caller_recursive: self.config.graph.recursive(state.caller),
+            in_loop: state.looping.get(site.block).copied().unwrap_or(false),
+            entry_bytes: state.entry_bytes,
+            limit: state.limit,
+            bytes: state.bytes,
+            after,
+            callee_bytes,
+            removed,
+            trivial_leaf,
+            iterator_step,
+            callee_func: &callee_func,
+        }) {
+            Ok(cost) => cost,
+            Err(reason) => {
+                // `cost.budget`: the whole site is reverted, never a partial inline.
+                self.stats.declined_budget += 1;
+                self.stats.decline(reason);
+                return;
+            }
+        };
+        self.stats.witnesses_recorded += 1;
+        self.cost.commit(accepted_cost);
+        if self.config.graph.recursive(&site.callee) {
+            self.inlined_mutual_callees.insert(site.callee.clone());
+        }
+        self.stats.cross_object_applied +=
+            u32::from(!std::ptr::eq(state.metadata.universe, provider.universe));
+        state.current = spliced;
+        state.metadata = imported;
+        state.bytes = after;
+        state.applied_here += 1;
+        state.accepted = Some(candidate);
+    }
+
+    /// Atomically splices all `remaining` sites of sole-caller `callee` into a cloned trial copy
+    /// of `state`, returning [`InlinedBatch`] only if verification, cleanup, and cost all pass.
+    fn try_inline_sole_caller_batch<'m>(
+        &self,
+        state: &CallerState<'_, 'm>,
+        callee: &JsName,
+        remaining: &[Site],
+        callee_func: &Func,
+        provider: &Metadata<'m>,
+    ) -> Result<InlinedBatch<'m>, InlineDecline> {
+        let callee_bytes = self.sizes.get(callee).copied().unwrap_or(u64::MAX);
+        let mut trial_func = state.current.clone();
+        let mut trial_meta = state.metadata.clone();
+        let mut sentinel_origin: Option<OriginId> = None;
+
+        for site in remaining.iter().rev() {
+            let origin = trial_func.blocks[site.block].ops[site.op].origin;
             let (site_args_len, site_track_caller) =
-                match &current.blocks[site.block].ops[site.op].kind {
+                match &trial_func.blocks[site.block].ops[site.op].kind {
                     OpKind::Call {
                         args, track_caller, ..
                     } => (args.len(), *track_caller),
-                    _ => continue,
+                    _ => return Err(InlineDecline::SpliceInvalid),
                 };
-            let (callee_func, imported, sentinel_assert_origin) = match prepare_callee_for_site(
-                &current_metadata,
-                provider,
-                callee_func,
-                origin,
-                site_args_len,
-                current.sig.abi.caller_location,
-                site_track_caller,
-                items,
-            ) {
-                Ok(value) => value,
-                Err(reason) => {
-                    stats.decline(reason);
-                    continue;
-                }
+            let site_abi = CallSiteAbi {
+                args_len: site_args_len,
+                caller_caller_location: trial_func.sig.abi.caller_location,
+                track_caller: site_track_caller,
             };
-            let table = &imported.interns.types;
-            let backup = current.clone();
-            splice(&mut current, site.block, site.op, &callee_func);
-            if current
-                .verify_carriers(table, observed_carriers(&current))
+            let (prepared, next_meta, site_sentinel) =
+                self.prepare_callee_for_site(&trial_meta, provider, callee_func, origin, site_abi)?;
+            if sentinel_origin.is_none() {
+                sentinel_origin = site_sentinel;
+            }
+            splice(&mut trial_func, site.block, site.op, &prepared);
+            if trial_func
+                .verify_carriers(&next_meta.interns.types, observed_carriers(&trial_func))
                 .is_err()
             {
-                current = backup;
-                stats.decline("inline.splice-invalid");
-                continue;
+                return Err(InlineDecline::SpliceInvalid);
             }
-            // Clean a clone so the remaining collected sites keep their block/op positions.
-            // Price and retain the same verified shape, including the merges, cell unboxing, and DCE cleanup.
-            let mut candidate = current.clone();
-            if let Err(reason) = clean_candidate(&mut candidate, table, sentinel_assert_origin) {
-                current = backup;
-                stats.decline(reason);
-                continue;
-            }
-            let Some((after, refs)) = measure(caller, &candidate, &imported) else {
-                current = backup;
-                stats.decline("inline.cost-unavailable");
-                continue;
-            };
-            if site.host_boundary && refs.contains(&site.callee) {
-                current = backup;
-                stats.decline("inline.host-boundary");
-                continue;
-            }
-            let delta = after as i64 - bytes as i64;
-            // The sole-referrer oracle excludes public and explicitly rooted items. Credit
-            // deletion only after the emitted caller also lost every reference to the callee,
-            // including function-pointer constants and retained indirect uses in this caller.
-            let removed = if is_sole && !refs.contains(&site.callee) {
-                sizes.get(&site.callee).copied().unwrap_or_default()
-            } else {
-                0
-            };
-            let net = delta.saturating_sub(removed.min(i64::MAX as u64) as i64);
-            let tiny_accessor_slack = if matches!(criterion, Criterion::SmallCallee)
-                && callee_bytes <= 36
-                && net > 0
-                && net <= 2
-            {
-                net
-            } else {
-                0
-            };
-            let trivial_leaf_slack = if !site.host_boundary
-                && trivial_leaf
-                && matches!(criterion, Criterion::SmallCallee | Criterion::SoleCaller)
-                && net > 0
-                && net <= 16
-            {
-                net
-            } else {
-                0
-            };
-            let charge = if speed {
-                net.max(0)
-            } else if net <= 0 || trivial_leaf_slack > 0 {
-                0
-            } else if tiny_accessor_slack > 0 {
-                tiny_accessor_slack
-            } else {
-                net.max(MIN_SITE_CHARGE)
-            };
-            if std::env::var("RCGJS_O_DEBUG_FUNC")
-                .is_ok_and(|filter| caller.as_str().contains(&filter))
-            {
-                eprintln!(
-                    "inline {caller:?} <- {:?}: {criterion:?}, before={bytes}, after={after}, callee={callee_bytes}, delta={delta}, removed={removed}, net={net}, limit={limit}, growth={growth}, charge={charge}, budget={budget}",
-                    site.callee,
-                );
-            }
-            // Only loop virtualization (or <=2B tiny accessors, or <=16B trivial pure leaves) may spend
-            // temporary net growth under size/balanced profiles. Speed-first mode permits bounded
-            // growth for every qualifying criterion.
-            let growth_allowed = speed
-                || matches!(criterion, Criterion::LoopVirtualizable)
-                || tiny_accessor_slack > 0
-                || trivial_leaf_slack > 0;
-            // A small loop helper may expose enough scalar replacement to repay a modest
-            // pre-cleanup growth in the later per-item pipeline. Bound both the duplicated body
-            // and that temporary growth; this is the iterator-state case, not a general license
-            // to spend the whole-program compression budget.
-            let bounded_loop_virtualization = matches!(criterion, Criterion::LoopVirtualizable)
-                && iterator_step
-                && callee_bytes <= 560
-                && after <= bytes.saturating_add(360);
-            // Under speed-first mode, never let earlier cold callees starve tiny leaf helpers
-            // called inside loops (e.g., `Word::add` inside SHA-512's 80-round compression loop,
-            // `Range::into_iter`, `Ord::min`, `Vec::len`, `Vec::index`, `compare$closure_1`).
-            let callee_is_leaf = callee_is_inline_leaf(&callee_func);
-            let callee_total_ops: usize = callee_func.blocks.iter().map(|b| b.ops.len()).sum();
-            let speed_tiny_exempt = speed
-                && (trivial_leaf
-                    || (callee_is_leaf
-                        && (callee_bytes <= 120
-                            || (callee_func.blocks.len() <= 2
-                                && callee_total_ops <= 8
-                                && callee_bytes <= 256))));
-            let speed_hot_loop = speed
-                && looping.contains(&(site.block as u32))
-                && callee_is_leaf
-                && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT;
-            let speed_tiny_leaf = speed_tiny_exempt
-                || (speed
-                    && callee_is_leaf
-                    && (callee_bytes <= 180
-                        || ((callee_func.sig.abi.inline_hint
-                            || callee_func.sig.abi.inline_always
-                            || site.has_track_caller)
-                            && callee_bytes <= 384)));
-            const SPEED_SOLE_RECURSIVE_FOOTPRINT: u64 = 2_560;
-            let speed_sole_loop = speed
-                && is_sole
-                && ((looping.contains(&(site.block as u32))
-                    && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT)
-                    || (graph.recursive(caller) && callee_bytes <= SPEED_SOLE_RECURSIVE_FOOTPRINT));
-            let speed_budget_free = speed_hot_loop || speed_tiny_leaf || speed_sole_loop;
-            // Inlining a `#[track_caller]` callee substitutes a `{filename,line,col}` literal
-            // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller,
-            // loop-virtualizable, or tiny leaf helper into a large caller may add temporary
-            // local-renaming / `try/catch` scaffolding before downstream cleanup.
-            // Account for that pre-cleanup slack under `ReleaseSpeed`.
-            let effective_callee_bytes = if speed_sole_loop {
-                callee_bytes.saturating_add(256)
-            } else if speed
-                && (site.has_track_caller
-                    || is_sole
-                    || speed_tiny_leaf
-                    || matches!(criterion, Criterion::LoopVirtualizable))
-            {
-                callee_bytes.saturating_add(96)
-            } else {
-                callee_bytes
-            };
-            let size_limit = if speed_tiny_exempt {
-                limit
-                    .max(entry_bytes.saturating_add(8_192))
-                    .max(SPEED_CALLER_CAP)
-                    .max(bytes.saturating_add(effective_callee_bytes))
-            } else if speed_budget_free {
-                limit
-                    .max(entry_bytes.saturating_add(8_192))
-                    .max(SPEED_CALLER_CAP)
-            } else if is_sole && net <= 0 {
-                limit.max(if speed { SPEED_CALLER_CAP } else { 16_384 })
-            } else if speed && is_sole && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
-                limit.max(SPEED_CALLER_CAP)
-            } else {
-                limit
-            };
-            if after > size_limit
-                || after > bytes.saturating_add(effective_callee_bytes)
-                || (!bounded_loop_virtualization
-                    && !speed_budget_free
-                    && growth + charge > budget as i64)
-                || (!growth_allowed && net > 0)
-            {
-                // `cost.budget`: the whole site is reverted, never a partial inline.
-                current = backup;
-                stats.declined_budget += 1;
-                stats.decline("inline.cost-rejected");
-                continue;
-            }
-            stats.witnesses_recorded += 1;
-            if !bounded_loop_virtualization && !speed_tiny_leaf {
-                growth += charge;
-            }
-            if graph.recursive(&site.callee) {
-                inlined_mutual_callees.insert(site.callee.clone());
-            }
-            bytes = after;
-            applied_here += 1;
-            stats.cross_object_applied +=
-                u32::from(!std::ptr::eq(current_metadata.universe, provider.universe));
-            current_metadata = imported;
-            accepted = Some(candidate);
+            trial_meta = next_meta;
         }
 
-        // Multi-site sole-caller batching: when a callee has K > 1 sites in its sole referrer
-        // and intermediate sites left `removed == 0` with `net > 0`, try splicing all remaining
-        // sites to that callee as one atomic transaction.
-        let mut sole_site_counts: BTreeMap<JsName, usize> = BTreeMap::new();
-        for site in &sites {
-            if !site.host_boundary && sole_referrer(&site.callee, caller) {
-                *sole_site_counts.entry(site.callee.clone()).or_default() += 1;
-            }
+        let mut candidate = trial_func;
+        clean_candidate(&mut candidate, &trial_meta.interns.types, sentinel_origin)?;
+        let (after, refs) = (self.config.measure)(state.caller, &candidate, &trial_meta)
+            .ok_or(InlineDecline::CostUnavailable)?;
+        let delta = after as i64 - state.bytes as i64;
+        let removed = if !refs.contains(callee) {
+            callee_bytes
+        } else {
+            0
+        };
+        let net = delta.saturating_sub(removed.min(i64::MAX as u64) as i64);
+        let size_limit = state.limit.max(16_384);
+        if debug_func_filter().is_some_and(|filter| state.caller.as_str().contains(filter)) {
+            eprintln!(
+                "inline-batch {:?} <- {callee:?} ({} sites): before={}, after={after}, callee={callee_bytes}, delta={delta}, removed={removed}, net={net}, limit={size_limit}",
+                state.caller,
+                remaining.len(),
+                state.bytes,
+            );
         }
-        let batch_callees: Vec<JsName> = sole_site_counts
-            .into_iter()
-            .filter_map(|(callee, count)| (count > 1).then_some(callee))
-            .collect();
-        if !batch_callees.is_empty() {
-            if let Some(clean) = accepted.as_ref() {
-                current = clean.clone();
-            }
-            for callee in batch_callees {
-                let mut throwaway_stats = InlineStats::default();
-                let remaining: Vec<Site> = collect_sites(
-                    caller,
-                    &current,
-                    &current_metadata,
-                    metadata,
-                    funcs,
-                    graph,
-                    items,
-                    sole_referrer,
-                    zombie_free,
-                    allow_std_post_repr,
-                    speed,
-                    call_retargets,
-                    &inlined_mutual_callees,
-                    &mut throwaway_stats,
-                )
-                .into_iter()
-                .filter(|site| site.callee == callee)
-                .collect();
-                if remaining.is_empty()
-                    || remaining.iter().any(|site| site.host_boundary)
-                    || count_item_refs(&current, &current_metadata.interns, callee.as_str())
-                        != remaining.len()
-                {
-                    continue;
-                }
-                let Some(Ok(callee_func)) = funcs.get(&callee) else {
-                    continue;
-                };
-                let Some(provider) = metadata.get(&callee) else {
-                    continue;
-                };
-                let callee_bytes = sizes.get(&callee).copied().unwrap_or(u64::MAX);
-                let batch_backup = current.clone();
-                let batch_meta = current_metadata.clone();
-                let batch_bytes = bytes;
-                let mut sentinel_origin: Option<OriginId> = None;
-                let mut batch_err: Option<&'static str> = None;
+        if net > 0 || after > size_limit || after > state.bytes.saturating_add(callee_bytes) {
+            return Err(InlineDecline::CostRejected);
+        }
+        let cross_object = (remaining.len() as u32)
+            * u32::from(!std::ptr::eq(state.metadata.universe, provider.universe));
+        Ok(InlinedBatch {
+            candidate,
+            metadata: trial_meta,
+            after_bytes: after,
+            sites_applied: remaining.len() as u32,
+            cross_object,
+        })
+    }
 
-                for site in remaining.iter().rev() {
-                    let origin = current.blocks[site.block].ops[site.op].origin;
-                    let (site_args_len, site_track_caller) =
-                        match &current.blocks[site.block].ops[site.op].kind {
-                            OpKind::Call {
-                                args, track_caller, ..
-                            } => (args.len(), *track_caller),
-                            _ => {
-                                batch_err = Some("inline.splice-invalid");
-                                break;
-                            }
-                        };
-                    let (prepared, next_meta, site_sentinel) = match prepare_callee_for_site(
-                        &current_metadata,
-                        provider,
-                        callee_func,
-                        origin,
-                        site_args_len,
-                        current.sig.abi.caller_location,
-                        site_track_caller,
-                        items,
-                    ) {
-                        Ok(value) => value,
-                        Err(reason) => {
-                            batch_err = Some(reason);
-                            break;
+    /// Prepares an imported callee for splicing at a call site, resolving any `#[track_caller]`
+    /// location substitution, importing panic lang-item dependencies for non-optional `Assert` ops
+    /// into the caller's summary when unambiguous, and tagging any still-unresolved callee `Assert`
+    /// ops with a sentinel origin so any assert surviving DCE rejects inlining.
+    fn prepare_callee_for_site<'m>(
+        &self,
+        current_metadata: &Metadata<'m>,
+        provider: &Metadata<'m>,
+        callee_func: &Func,
+        origin: OriginId,
+        site_abi: CallSiteAbi,
+    ) -> Result<(Func, Metadata<'m>, Option<OriginId>), InlineDecline> {
+        let (mut callee_func, mut imported) =
+            current_metadata.import(provider, callee_func, origin)?;
+        let mut sentinel_assert_origin = None;
+        if callee_func.sig.abi.caller_location && callee_func.params.len() == site_abi.args_len + 1
+        {
+            for block in &mut callee_func.blocks {
+                for op in &mut block.ops {
+                    if let OpKind::Assert { msg, .. } = &op.kind {
+                        if is_optional_assert(&op.kind) {
+                            continue;
                         }
-                    };
-                    if sentinel_origin.is_none() {
-                        sentinel_origin = site_sentinel;
+                        if !try_import_assert_panic_dep(&mut imported, provider, msg) {
+                            op.origin = SENTINEL_ASSERT_ORIGIN;
+                            sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
+                        }
                     }
-                    splice(&mut current, site.block, site.op, &prepared);
-                    if current
-                        .verify_carriers(&next_meta.interns.types, observed_carriers(&current))
-                        .is_err()
-                    {
-                        batch_err = Some("inline.splice-invalid");
-                        break;
+                }
+            }
+            if let Some(site_fact) = site_abi.track_caller {
+                rewrite_forwarded_track_caller(
+                    &mut callee_func,
+                    site_fact,
+                    self.config.items,
+                    &imported.interns,
+                );
+                if !unused_caller_location(&callee_func) {
+                    bind_caller_location_param(
+                        &mut callee_func,
+                        site_fact,
+                        &imported.interns,
+                        origin,
+                    )?;
+                }
+            }
+            strip_unused_last_param(&mut callee_func);
+        } else {
+            for block in &callee_func.blocks {
+                for op in &block.ops {
+                    if let OpKind::Assert { msg, .. } = &op.kind {
+                        if !is_optional_assert(&op.kind) {
+                            let _ = try_import_assert_panic_dep(&mut imported, provider, msg);
+                        }
                     }
-                    current_metadata = next_meta;
                 }
-                if let Some(reason) = batch_err {
-                    current = batch_backup;
-                    current_metadata = batch_meta;
-                    bytes = batch_bytes;
-                    stats.decline(reason);
-                    continue;
-                }
-
-                let mut candidate = current.clone();
-                let table = &current_metadata.interns.types;
-                if let Err(reason) = clean_candidate(&mut candidate, table, sentinel_origin) {
-                    current = batch_backup;
-                    current_metadata = batch_meta;
-                    bytes = batch_bytes;
-                    stats.decline(reason);
-                    continue;
-                }
-                let Some((after, refs)) = measure(caller, &candidate, &current_metadata) else {
-                    current = batch_backup;
-                    current_metadata = batch_meta;
-                    bytes = batch_bytes;
-                    stats.decline("inline.cost-unavailable");
-                    continue;
-                };
-                let delta = after as i64 - batch_bytes as i64;
-                let removed = if !refs.contains(&callee) {
-                    callee_bytes
-                } else {
-                    0
-                };
-                let net = delta.saturating_sub(removed.min(i64::MAX as u64) as i64);
-                let size_limit = limit.max(16_384);
-                if std::env::var("RCGJS_O_DEBUG_FUNC")
-                    .is_ok_and(|filter| caller.as_str().contains(&filter))
-                {
-                    eprintln!(
-                        "inline-batch {caller:?} <- {callee:?} ({} sites): before={batch_bytes}, after={after}, callee={callee_bytes}, delta={delta}, removed={removed}, net={net}, limit={size_limit}",
-                        remaining.len(),
-                    );
-                }
-                if net > 0 || after > size_limit || after > batch_bytes.saturating_add(callee_bytes)
-                {
-                    current = batch_backup;
-                    current_metadata = batch_meta;
-                    bytes = batch_bytes;
-                    stats.declined_budget += 1;
-                    stats.decline("inline.cost-rejected");
-                    continue;
-                }
-                stats.witnesses_recorded += 1;
-                bytes = after;
-                applied_here += remaining.len() as u32;
-                stats.cross_object_applied += (remaining.len() as u32)
-                    * u32::from(!std::ptr::eq(batch_meta.universe, provider.universe));
-                current = candidate.clone();
-                accepted = Some(candidate);
             }
         }
-        if let Some(current) = accepted {
-            stats.applied += applied_here;
-            stats.bytes_before += entry_bytes;
-            stats.bytes_after += bytes;
-            stats.items.insert(caller.clone());
-            sizes.insert(caller.clone(), bytes);
-            funcs.insert(caller.clone(), Ok(current));
-            metadata.insert(caller.clone(), current_metadata);
+        Ok((callee_func, imported, sentinel_assert_origin))
+    }
+
+    /// The criterion one located site meets, if any (the checks that need the graph and interns
+    /// were made when the site was collected). The loop shape is checked first: it is the one that
+    /// may grow, so a site meeting it and a size criterion keeps the wider allowance.
+    fn qualifies(
+        &self,
+        state: &CallerState<'_, '_>,
+        site: &Site,
+        funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    ) -> Option<Criterion> {
+        let caller = state.caller;
+        let callee = &site.callee;
+        let func = &state.current;
+        let table = &state.metadata.interns.types;
+        let looping = &state.looping;
+        let speed = self.cost.speed;
+        if site.host_boundary {
+            return (self.config.sole_referrer)(callee, caller).then_some(Criterion::SoleCaller);
+        }
+        let callee_bytes = self.sizes.get(callee).copied().unwrap_or(u64::MAX);
+        if speed {
+            // Check loop sites BEFORE `#[inline]` hints so hot-loop helpers (e.g. `Ord::min`,
+            // `Vec::len`, `Vec::index`, `Range::into_iter`, `compare$closure_1`) receive the wider
+            // `LoopVirtualizable` budget and slack instead of being shadowed by `InlineHint`.
+            if looping.get(site.block).copied().unwrap_or(false)
+                && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT
+            {
+                return Some(Criterion::LoopVirtualizable);
+            }
+            if let Some(Ok(callee_func)) = funcs.get(callee) {
+                if (callee_func.sig.abi.inline_always
+                    && callee_bytes <= SPEED_INLINE_ALWAYS_FOOTPRINT)
+                    || (callee_func.sig.abi.inline_hint
+                        && callee_bytes <= SPEED_INLINE_HINT_FOOTPRINT)
+                {
+                    return Some(Criterion::InlineHint);
+                }
+            }
+        }
+        let loop_shape = || -> bool {
+            if !looping.get(site.block).copied().unwrap_or(false) {
+                return false;
+            }
+            let ty_of = |v: ValueId| func.values[v.0 as usize].ty;
+            let Some(op) = func
+                .blocks
+                .get(site.block)
+                .and_then(|block| block.ops.get(site.op))
+            else {
+                return false;
+            };
+            let OpKind::Call { args, .. } = &op.kind else {
+                return false;
+            };
+            args.iter()
+                .map(|arg| ty_of(*arg))
+                .chain(op.result.map(ty_of))
+                .any(|ty| virtualizable(table, ty))
+        };
+        if loop_shape() {
+            return Some(Criterion::LoopVirtualizable);
+        }
+        if (self.config.sole_referrer)(callee, caller) {
+            return Some(Criterion::SoleCaller);
+        }
+        // A small callee at a shared site duplicates its body per site. The raw bytes can still
+        // shrink, but the *compressed* program grows: N identical call sites are nearly free under
+        // brotli, N copies of a body are not — measured on the idiomatic FingerprintJS bundle,
+        // where accepting these sites cost ~500 brotli bytes while the minified count fell. So the
+        // small-callee criterion only stands where the duplication is degenerate: a body at or
+        // under the call's own post-minify footprint, or a trivial 1..=3 op pure scalar wrapper.
+        let footprint_limit = match (speed, site.has_track_caller) {
+            (true, true) => SPEED_TRACK_CALLER_SHARED_FOOTPRINT,
+            (true, false) => SPEED_SHARED_CALLEE_FOOTPRINT,
+            (false, true) => TRACK_CALLER_SHARED_FOOTPRINT,
+            (false, false) => SHARED_CALLEE_FOOTPRINT,
+        };
+        if callee_bytes <= footprint_limit
+            || funcs
+                .get(callee)
+                .and_then(|res| res.as_ref().ok())
+                .is_some_and(trivial_pure_leaf)
+        {
+            return Some(Criterion::SmallCallee);
+        }
+        None
+    }
+
+    /// The candidate call sites of one caller, in block-and-op order.
+    fn collect_sites(
+        &mut self,
+        caller: &JsName,
+        func: &Func,
+        caller_metadata: &Metadata<'_>,
+        lookup: SiteLookup<'_, '_>,
+        record_declines: bool,
+    ) -> Vec<Site> {
+        let cx = CollectSiteCx {
+            caller,
+            func,
+            caller_metadata,
+            lookup,
+            caller_retargets: self.config.call_retargets.and_then(|map| map.get(caller)),
+            direct_site_counts: if self.cost.speed {
+                count_direct_sites(func, &caller_metadata.interns)
+            } else {
+                BTreeMap::new()
+            },
+        };
+        let mut sites = Vec::new();
+        for (block_index, block) in func.blocks.iter().enumerate() {
+            for op_index in 0..block.ops.len() {
+                match self.evaluate_call_site(&cx, block_index, op_index) {
+                    Some(Ok(site)) => sites.push(site),
+                    Some(Err(reason)) if record_declines => self.stats.decline(reason),
+                    Some(Err(_)) | None => {}
+                }
+            }
+        }
+        sites
+    }
+
+    /// Evaluates one op in `cx.func` as a candidate inline call site.
+    ///
+    /// Returns `None` for non-direct-call ops (or unresolved link names) that do not record an
+    /// inline decline, `Some(Err(reason))` for declined direct call sites, and `Some(Ok(site))`
+    /// for accepted candidates.
+    fn evaluate_call_site(
+        &self,
+        cx: &CollectSiteCx<'_, '_>,
+        block_index: usize,
+        op_index: usize,
+    ) -> Option<Result<Site, InlineDecline>> {
+        let speed = self.cost.speed;
+        let block = &cx.func.blocks[block_index];
+        let op = &block.ops[op_index];
+        let OpKind::Call {
+            callee: Callee::Direct { item, link_name },
+            function: None,
+            args,
+            track_caller,
+            semantic,
+            host,
+        } = &op.kind
+        else {
+            return None;
+        };
+        if cx
+            .caller_retargets
+            .is_some_and(|retargets| retargets.contains_key(item))
+        {
+            return Some(Err(InlineDecline::ReprRetarget));
+        }
+        let is_invoke =
+            matches!(block.term, RTerm::Invoke { .. }) && op_index + 1 == block.ops.len();
+        if is_invoke {
+            let unwind_uses_result = matches!(
+                &block.term,
+                RTerm::Invoke { unwind, .. }
+                    if op.result.is_some_and(|r| unwind.1.contains(&r))
+            );
+            if !speed || unwind_uses_result {
+                return Some(Err(InlineDecline::ExceptionalControlFlow));
+            }
+        }
+        if !self.call_semantic_allowed(cx.func, cx.caller_metadata, semantic, args)
+            || host.is_some()
+        {
+            return Some(Err(InlineDecline::SemanticBoundary));
+        }
+        let name = cx.caller_metadata.interns.str(*link_name)?;
+        if self
+            .config
+            .call_retargets
+            .and_then(|map| map.get(name))
+            .is_some_and(|retargets| !retargets.is_empty())
+        {
+            return Some(Err(InlineDecline::ReprRetarget));
+        }
+        if name == cx.caller.as_str() {
+            return Some(Err(InlineDecline::RecursiveBudget));
+        }
+        let callee = JsName::new(name.to_owned());
+        if self.config.graph.recursive(&callee)
+            && !self.can_inline_recursive_callee(cx, &callee, name)
+        {
+            return Some(Err(InlineDecline::RecursiveBudget));
+        }
+        // An item with recorded zombies owes the link step its compile-time diagnostic chain;
+        // splicing its body would drop the item and silence the errors.
+        if !(self.config.zombie_free)(&callee) {
+            return Some(Err(InlineDecline::Zombie));
+        }
+        let Some(callee_metadata) = cx.lookup.metadata.get(&callee) else {
+            return Some(Err(InlineDecline::MetadataUnavailable));
+        };
+        if !cx.caller_metadata.compatible(callee_metadata) {
+            return Some(Err(InlineDecline::ObjectIncompatible));
+        }
+        let Some(Ok(callee_func)) = cx.lookup.funcs.get(&callee) else {
+            return Some(Err(InlineDecline::BodyUnavailable));
+        };
+        if is_invoke && !callee_invoke_safe(callee_func, &callee_metadata.interns) {
+            return Some(Err(InlineDecline::ExceptionalControlFlow));
+        }
+        if cx
+            .caller_retargets
+            .is_some_and(|retargets| callee_retargets_collide(callee_func, retargets))
+        {
+            return Some(Err(InlineDecline::ReprRetarget));
+        }
+        if callee_func.sig.abi.inline_never {
+            return Some(Err(InlineDecline::Never));
+        }
+        if self.is_protected_callee(&callee, callee_func, callee_metadata) {
+            return Some(Err(InlineDecline::SemanticBoundary));
+        }
+        let is_sole_caller = (self.config.sole_referrer)(&callee, cx.caller);
+        let allow_host_boundary = is_sole_caller
+            && count_item_refs(cx.func, &cx.caller_metadata.interns, callee.as_str()) == 1;
+        let site_abi = CallSiteAbi {
+            args_len: args.len(),
+            caller_caller_location: cx.func.sig.abi.caller_location,
+            track_caller: *track_caller,
+        };
+        if let Some(reason) = Self::body_decline(
+            &self.config,
+            speed,
+            callee_func,
+            &callee_metadata.interns,
+            &cx.caller_metadata.interns,
+            site_abi,
+            allow_host_boundary,
+        ) {
+            return Some(Err(reason));
+        }
+        if has_non_baseline_carrier(cx.func, callee_func, args, op.result) {
+            return Some(Err(InlineDecline::CarrierConversionUnsupported));
+        }
+        Some(Ok(Site {
+            block: block_index,
+            op: op_index,
+            callee,
+            has_track_caller: track_caller.is_some()
+                || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
+            host_boundary: callee_has_host_boundary(callee_func, &callee_metadata.interns, speed),
+        }))
+    }
+
+    /// Whether a direct call's [`CallSemantic`] is eligible for inlining in this phase.
+    fn call_semantic_allowed(
+        &self,
+        func: &Func,
+        caller_metadata: &Metadata<'_>,
+        semantic: &CallSemantic,
+        args: &[ValueId],
+    ) -> bool {
+        let speed = self.cost.speed;
+        match semantic {
+            CallSemantic::Ordinary => true,
+            CallSemantic::RawParts if self.config.allow_std_post_repr && speed => true,
+            // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells it as
+            // the string operation it is, which inlining its body would take away.
+            CallSemantic::Standard(std_op)
+                if std_op.is_str()
+                    || std_op.is_typed_heap()
+                    || std_op.is_native_string()
+                    || std_op.is_native_vec()
+                    || std_op.is_fast_str_op() =>
+            {
+                false
+            }
+            CallSemantic::Standard(std_op) if self.config.allow_std_post_repr => {
+                !crate::lower::semantic_ops::fmt_kernel::is_format_machinery(*std_op)
+                    && !matches!(
+                        std_op,
+                        crate::jir::semantic::StandardOperation::F64FromStr
+                            | crate::jir::semantic::StandardOperation::F32FromStr
+                            | crate::jir::semantic::StandardOperation::SliceSort
+                            | crate::jir::semantic::StandardOperation::SliceSortCmp
+                    )
+                    && !(crate::lower::bstr::enabled()
+                        && matches!(
+                            std_op,
+                            crate::jir::semantic::StandardOperation::StringAsStr
+                                | crate::jir::semantic::StandardOperation::StrToLowercase
+                                | crate::jir::semantic::StandardOperation::StrToUppercase
+                        ))
+                    && !(speed
+                        && *std_op == crate::jir::semantic::StandardOperation::VecResize
+                        && args.first().is_some_and(|&recv| {
+                            is_ta_vec_resize_receiver(
+                                &caller_metadata.interns.types,
+                                func.values[recv.0 as usize].ty,
+                            )
+                        }))
+            }
+            _ => false,
         }
     }
-    stats
+
+    /// Under `ReleaseSpeed`, allows inlining a single-callsite sole-caller mutually recursive
+    /// helper when `callee` is not directly self-recursive. Splicing eliminates `callee`, converts
+    /// its back-edge into direct self-recursion on `caller`, and prevents downstream minifiers
+    /// from turning `callee` into a hot closure IIFE.
+    fn can_inline_recursive_callee(
+        &self,
+        cx: &CollectSiteCx<'_, '_>,
+        callee: &JsName,
+        name: &str,
+    ) -> bool {
+        self.cost.speed
+            && (self.config.sole_referrer)(callee, cx.caller)
+            && !self.inlined_mutual_callees.contains(callee)
+            && cx.direct_site_counts.get(name).copied().unwrap_or(0) == 1
+            && cx
+                .lookup
+                .funcs
+                .get(callee)
+                .and_then(|r| r.as_ref().ok())
+                .is_some_and(|cf| {
+                    cx.lookup
+                        .metadata
+                        .get(callee)
+                        .is_some_and(|cm| !directly_calls_self(cf, &cm.interns, callee))
+                })
+    }
+
+    /// Whether `callee` is a protected container drop glue or standard operation whose identity
+    /// must remain intact as a direct call boundary.
+    fn is_protected_callee(
+        &self,
+        callee: &JsName,
+        callee_func: &Func,
+        callee_metadata: &Metadata<'_>,
+    ) -> bool {
+        let speed = self.cost.speed;
+        let is_nonempty_drop_glue = speed
+            && callee.as_str().starts_with("core$ptr$drop_glue$")
+            && callee_func.sig.arguments.len() == 1
+            && !(callee_func.blocks.len() == 1
+                && callee_func.blocks[0].ops.is_empty()
+                && matches!(
+                    callee_func.blocks[0].term,
+                    rcgjs_object::jir::repr::RTerm::Return(None)
+                ));
+        let is_protected_drop_glue = is_nonempty_drop_glue
+            && callee_func
+                .sig
+                .arguments
+                .first()
+                .and_then(|&arg_ty| callee_metadata.interns.types.pointee(arg_ty))
+                .and_then(|pt| callee_metadata.interns.types.get(pt))
+                .is_some_and(|d| {
+                    (crate::lower::bstr::enabled()
+                        && d.meta.candidate
+                            == rcgjs_object::jir::types::RepresentationCandidate::String)
+                        || (d.meta.candidate
+                            == rcgjs_object::jir::types::RepresentationCandidate::Vec
+                            && d.meta.allocator
+                                == rcgjs_object::jir::types::AllocatorIdentity::Global)
+                });
+        is_protected_drop_glue
+            || self
+                .config
+                .items
+                .get(&callee_func.item)
+                .and_then(|entry| entry.standard)
+                .is_some_and(|op| {
+                    crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
+                        || crate::lower::semantic_ops::num::is_float_from_str(op)
+                        || matches!(
+                            op,
+                            crate::jir::semantic::StandardOperation::SliceSort
+                                | crate::jir::semantic::StandardOperation::SliceSortCmp
+                        )
+                        || op.is_typed_heap()
+                        || op.is_native_string()
+                        || op.is_native_vec()
+                        || op.is_fast_str_op()
+                        || (crate::lower::bstr::enabled()
+                            && matches!(
+                                op,
+                                crate::jir::semantic::StandardOperation::StrToLowercase
+                                    | crate::jir::semantic::StandardOperation::StrToUppercase
+                            ))
+                        || (speed
+                            && op == crate::jir::semantic::StandardOperation::VecResize
+                            && callee_func.sig.arguments.first().is_some_and(|&arg_ty| {
+                                is_ta_vec_resize_receiver(&callee_metadata.interns.types, arg_ty)
+                            }))
+                })
+    }
+
+    /// The semantic boundary preventing a callee body from being spliced at this site.
+    fn body_decline(
+        config: &InlineConfig<'_>,
+        speed: bool,
+        callee: &Func,
+        interns: &Interns,
+        caller_interns: &Interns,
+        site_abi: CallSiteAbi,
+        allow_host_boundary: bool,
+    ) -> Option<InlineDecline> {
+        let items = config.items;
+        let args = site_abi.args_len;
+        let caller_caller_location = site_abi.caller_caller_location;
+        let site_track_caller = site_abi.track_caller;
+
+        if callee.has_invoke() && !(speed && callee_has_only_noop_invokes(callee)) {
+            return Some(InlineDecline::ExceptionalControlFlow);
+        }
+        let expected_params = if callee.sig.abi.caller_location {
+            let can_bind_used_loc = site_track_caller.is_some_and(|fact| {
+                caller_interns.source_fact(fact).is_some()
+                    && callee
+                        .params
+                        .last()
+                        .and_then(|p| {
+                            location_param_fields(&interns.types, callee.values[p.0 as usize].ty)
+                        })
+                        .is_some()
+            });
+            if callee.params.len() == args + 1
+                && (unused_caller_location(callee) || can_bind_used_loc)
+            {
+                args + 1
+            } else {
+                return Some(InlineDecline::TrackCallerUnavailable);
+            }
+        } else if site_track_caller.is_some() {
+            return Some(InlineDecline::TrackCallerUnavailable);
+        } else {
+            args
+        };
+        if (!speed && callee.sig.abi.spread.is_some())
+            || callee.params.len() != expected_params
+            || callee
+                .blocks
+                .first()
+                .is_none_or(|block| block.params != callee.params)
+        {
+            return Some(InlineDecline::AbiUnsupported);
+        }
+        let forwards_caller_location = caller_caller_location && site_track_caller.is_none();
+        callee
+            .blocks
+            .iter()
+            .flat_map(|block| &block.ops)
+            .find_map(|op| match &op.kind {
+                // Resume assertions identify coroutine bodies until JIR-R carries a dedicated flag.
+                OpKind::Assert {
+                    msg:
+                        RAssertMessage::ResumedAfterReturn(_)
+                        | RAssertMessage::ResumedAfterPanic(_)
+                        | RAssertMessage::ResumedAfterDrop(_),
+                    ..
+                } => Some(InlineDecline::CoroutineUnsupported),
+                OpKind::Assert { .. }
+                    if callee.sig.abi.caller_location
+                        && !forwards_caller_location
+                        && site_track_caller.is_none() =>
+                {
+                    Some(InlineDecline::TrackCallerUnavailable)
+                }
+                // The original item owes the linker its compile-time required-by diagnostic.
+                OpKind::Zombie(_) => Some(InlineDecline::Zombie),
+                OpKind::Intrinsic {
+                    name,
+                    track_caller: inner_tc,
+                    ..
+                } if interns.str(*name) == Some("caller_location") => {
+                    let ok = speed
+                        && (inner_tc.is_some()
+                            || (callee.sig.abi.caller_location
+                                && (site_track_caller.is_some() || caller_caller_location)));
+                    (!ok).then_some(InlineDecline::TrackCallerUnavailable)
+                }
+                // Host and template lowering may own item-local bindings and observable ordering.
+                _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns, speed) => {
+                    Some(InlineDecline::HostBoundary)
+                }
+                // Do not inline bodies that call the raw global allocator directly: splicing a
+                // stdlib allocator call into a non-stdlib user function triggers `byte_views`'s
+                // conservative `direct_alloc` fallback and forces the ES6 Proxy byte-view shim
+                // across the whole program.
+                OpKind::Call {
+                    callee: inner_callee,
+                    ..
+                } if is_direct_alloc_call(inner_callee, interns) => {
+                    Some(InlineDecline::SemanticBoundary)
+                }
+                OpKind::Call {
+                    callee: inner_callee,
+                    args: inner_args,
+                    track_caller: None,
+                    ..
+                } if callee.sig.abi.caller_location => match inner_callee {
+                    Callee::Direct { item, .. } => {
+                        let Some(entry) = items.get(item) else {
+                            return Some(InlineDecline::TrackCallerUnavailable);
+                        };
+                        if !entry.abi_known
+                            || entry.params != inner_args.len() + usize::from(entry.caller_location)
+                            || (entry.caller_location
+                                && site_track_caller.is_none()
+                                && !caller_caller_location)
+                        {
+                            Some(InlineDecline::TrackCallerUnavailable)
+                        } else {
+                            None
+                        }
+                    }
+                    Callee::Foreign { .. } | Callee::Runtime { .. } | Callee::Indirect { .. } => {
+                        None
+                    }
+                    _ => Some(InlineDecline::TrackCallerUnavailable),
+                },
+                _ => None,
+            })
+    }
+}
+
+/// Shared caller-level inputs for [`InlineCx::collect_sites`] and its helper checks.
+struct CollectSiteCx<'a, 'm> {
+    caller: &'a JsName,
+    func: &'a Func,
+    caller_metadata: &'a Metadata<'m>,
+    lookup: SiteLookup<'a, 'm>,
+    caller_retargets: Option<&'a crate::lower::CallRetargets>,
+    direct_site_counts: BTreeMap<&'a str, usize>,
+}
+
+/// Counts direct non-host call sites per callee link name inside `func`.
+fn count_direct_sites<'a>(func: &Func, interns: &'a Interns) -> BTreeMap<&'a str, usize> {
+    let mut counts: BTreeMap<&'a str, usize> = BTreeMap::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            if let OpKind::Call {
+                callee: Callee::Direct { link_name, .. },
+                function: None,
+                host: None,
+                ..
+            } = &op.kind
+            {
+                if let Some(name) = interns.str(*link_name) {
+                    *counts.entry(name).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Whether `callee_func` directly invokes or drops any item retargeted by its caller.
+fn callee_retargets_collide(
+    callee_func: &Func,
+    caller_retargets: &crate::lower::CallRetargets,
+) -> bool {
+    callee_func.blocks.iter().any(|b| {
+        b.ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                callee: Callee::Direct { item, .. },
+                host: None,
+                ..
+            }
+            | OpKind::Drop {
+                glue: DropGlue::Direct { item, .. },
+                ..
+            } => caller_retargets.contains_key(item),
+            _ => false,
+        })
+    })
+}
+
+/// Whether the callee body or call-site arguments/result cross a committed non-baseline carrier.
+fn has_non_baseline_carrier(
+    func: &Func,
+    callee_func: &Func,
+    args: &[ValueId],
+    result: Option<ValueId>,
+) -> bool {
+    let baseline = crate::jir::repr::Carrier::Baseline;
+    callee_func.values.iter().any(|def| def.carrier != baseline)
+        || args
+            .iter()
+            .copied()
+            .chain(result)
+            .any(|v| func.values[v.0 as usize].carrier != baseline)
 }
 
 /// Whether a callee is the narrow iterator step whose inlining exposes scalar pointer state.
@@ -875,63 +1661,11 @@ fn try_import_assert_panic_dep(
     }
 }
 
-/// Prepares an imported callee for splicing at a call site, resolving any `#[track_caller]`
-/// location substitution, importing panic lang-item dependencies for non-optional `Assert` ops
-/// into the caller's summary when unambiguous, and tagging any still-unresolved callee `Assert`
-/// ops with a sentinel origin so any assert surviving DCE rejects inlining.
-#[allow(clippy::too_many_arguments)]
-fn prepare_callee_for_site<'a>(
-    current_metadata: &Metadata<'a>,
-    provider: &Metadata<'a>,
-    callee_func: &Func,
-    origin: OriginId,
-    site_args_len: usize,
-    _caller_caller_location: bool,
-    site_track_caller: Option<SourceFactId>,
-    items: &ItemIndex,
-) -> Result<(Func, Metadata<'a>, Option<OriginId>), &'static str> {
-    let (mut callee_func, mut imported) = current_metadata.import(provider, callee_func, origin)?;
-    let mut sentinel_assert_origin = None;
-    if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1 {
-        for block in &mut callee_func.blocks {
-            for op in &mut block.ops {
-                if let OpKind::Assert { msg, .. } = &op.kind {
-                    if is_optional_assert(&op.kind) {
-                        continue;
-                    }
-                    if !try_import_assert_panic_dep(&mut imported, provider, msg) {
-                        op.origin = SENTINEL_ASSERT_ORIGIN;
-                        sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
-                    }
-                }
-            }
-        }
-        if let Some(site_fact) = site_track_caller {
-            rewrite_forwarded_track_caller(&mut callee_func, site_fact, items, &imported.interns);
-            if !unused_caller_location(&callee_func) {
-                bind_caller_location_param(&mut callee_func, site_fact, &imported.interns, origin)?;
-            }
-        }
-        strip_unused_last_param(&mut callee_func);
-    } else {
-        for block in &callee_func.blocks {
-            for op in &block.ops {
-                if let OpKind::Assert { msg, .. } = &op.kind {
-                    if !is_optional_assert(&op.kind) {
-                        let _ = try_import_assert_panic_dep(&mut imported, provider, msg);
-                    }
-                }
-            }
-        }
-    }
-    Ok((callee_func, imported, sentinel_assert_origin))
-}
-
 fn clean_candidate(
     candidate: &mut Func,
     table: &TypeTable,
     sentinel_assert_origin: Option<OriginId>,
-) -> Result<(), &'static str> {
+) -> Result<(), InlineDecline> {
     collapse_forwarders(candidate);
     fuse_straight_lines(candidate);
     super::partial_escape::promote_cell_borrows(candidate, table);
@@ -956,12 +1690,12 @@ fn clean_candidate(
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::Assert { .. }) && op.origin == sentinel)
         }) {
-            return Err("inline.track-caller-unavailable");
+            return Err(InlineDecline::TrackCallerUnavailable);
         }
     }
     candidate
         .verify_carriers(table, observed_carriers(candidate))
-        .map_err(|_| "inline.cleanup-invalid")
+        .map_err(|_| InlineDecline::CleanupInvalid)
 }
 
 /// Whether a `StandardOperation` is lowered inline at the call site without emitting a JS call.
@@ -1084,7 +1818,7 @@ fn location_param_fields(table: &TypeTable, ty: TypeId) -> Option<usize> {
     if variant.fields.len() < 3 {
         return None;
     }
-    let file_pointee = crate::lower::js::value::pointee_of(table, variant.fields[0].ty)?;
+    let file_pointee = table.pointee(variant.fields[0].ty)?;
     if !matches!(table.get(table.peeled(file_pointee))?.kind, TypeKind::Str) {
         return None;
     }
@@ -1106,16 +1840,16 @@ fn bind_caller_location_param(
     site_fact: SourceFactId,
     interns: &Interns,
     origin: OriginId,
-) -> Result<(), &'static str> {
+) -> Result<(), InlineDecline> {
     let Some(&last_param) = callee.params.last() else {
-        return Err("inline.track-caller-unavailable");
+        return Err(InlineDecline::TrackCallerUnavailable);
     };
     let last_def = callee.values[last_param.0 as usize];
     let Some(field_count) = location_param_fields(&interns.types, last_def.ty) else {
-        return Err("inline.track-caller-unavailable");
+        return Err(InlineDecline::TrackCallerUnavailable);
     };
     let Some(fact) = interns.source_fact(site_fact) else {
-        return Err("inline.track-caller-unavailable");
+        return Err(InlineDecline::TrackCallerUnavailable);
     };
     let mut fields = Vec::with_capacity(field_count);
     fields.push(ConstTree::Str(fact.file));
@@ -1129,14 +1863,20 @@ fn bind_caller_location_param(
     });
     fields.resize_with(field_count, || ConstTree::Unit);
     let tree = ConstTree::Reference(Box::new(ConstTree::Aggregate(fields)));
-    let const_val = ValueId(callee.values.len() as u32);
-    callee.values.push(last_def);
-    let replace = |v: ValueId| if v == last_param { const_val } else { v };
+    let const_val = callee.push_value(last_def.ty, last_def.carrier, last_def.origin);
     for block in &mut callee.blocks {
         for op in &mut block.ops {
-            map_op(&mut op.kind, &replace, &|c| c);
+            op.kind.visit_values_mut(|v| {
+                if *v == last_param {
+                    *v = const_val;
+                }
+            });
         }
-        block.term = map_term(&block.term, &replace, &|b| b);
+        block.term.visit_values_mut(|v| {
+            if *v == last_param {
+                *v = const_val;
+            }
+        });
     }
     if let Some(entry) = callee.blocks.first_mut() {
         entry.ops.insert(
@@ -1159,90 +1899,6 @@ enum Criterion {
     SoleCaller,
     LoopVirtualizable,
     InlineHint,
-}
-
-/// The criterion one located site meets, if any (the checks that need the graph and interns
-/// were made when the site was collected). The loop shape is checked first: it is the one that
-/// may grow, so a site meeting it and a size criterion keeps the wider allowance.
-#[allow(clippy::too_many_arguments)] // One call site; the arguments are the criteria's inputs.
-fn qualifies(
-    caller: &JsName,
-    callee: &JsName,
-    func: &Func,
-    site: &Site,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    sizes: &BTreeMap<JsName, u64>,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    table: &crate::jir::TypeTable,
-    looping: &BTreeSet<u32>,
-    speed: bool,
-) -> Option<Criterion> {
-    if site.host_boundary {
-        return sole_referrer(callee, caller).then_some(Criterion::SoleCaller);
-    }
-    let callee_bytes = sizes.get(callee).copied().unwrap_or(u64::MAX);
-    if speed {
-        // Check loop sites BEFORE `#[inline]` hints so hot-loop helpers (e.g. `Ord::min`,
-        // `Vec::len`, `Vec::index`, `Range::into_iter`, `compare$closure_1`) receive the wider
-        // `LoopVirtualizable` budget and slack instead of being shadowed by `InlineHint`.
-        if looping.contains(&(site.block as u32)) && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
-            return Some(Criterion::LoopVirtualizable);
-        }
-        if let Some(Ok(callee_func)) = funcs.get(callee) {
-            if (callee_func.sig.abi.inline_always && callee_bytes <= SPEED_INLINE_ALWAYS_FOOTPRINT)
-                || (callee_func.sig.abi.inline_hint && callee_bytes <= SPEED_INLINE_HINT_FOOTPRINT)
-            {
-                return Some(Criterion::InlineHint);
-            }
-        }
-    }
-    let loop_shape = || -> bool {
-        if !looping.contains(&(site.block as u32)) {
-            return false;
-        }
-        let ty_of = |v: ValueId| func.values[v.0 as usize].ty;
-        let Some(op) = func
-            .blocks
-            .get(site.block)
-            .and_then(|block| block.ops.get(site.op))
-        else {
-            return false;
-        };
-        let OpKind::Call { args, .. } = &op.kind else {
-            return false;
-        };
-        args.iter()
-            .map(|arg| ty_of(*arg))
-            .chain(op.result.map(ty_of))
-            .any(|ty| virtualizable(table, ty))
-    };
-    if loop_shape() {
-        return Some(Criterion::LoopVirtualizable);
-    }
-    if sole_referrer(callee, caller) {
-        return Some(Criterion::SoleCaller);
-    }
-    // A small callee at a shared site duplicates its body per site. The raw bytes can still
-    // shrink, but the *compressed* program grows: N identical call sites are nearly free under
-    // brotli, N copies of a body are not — measured on the idiomatic FingerprintJS bundle,
-    // where accepting these sites cost ~500 brotli bytes while the minified count fell. So the
-    // small-callee criterion only stands where the duplication is degenerate: a body at or
-    // under the call's own post-minify footprint, or a trivial 1..=3 op pure scalar wrapper.
-    let footprint_limit = match (speed, site.has_track_caller) {
-        (true, true) => SPEED_TRACK_CALLER_SHARED_FOOTPRINT,
-        (true, false) => SPEED_SHARED_CALLEE_FOOTPRINT,
-        (false, true) => TRACK_CALLER_SHARED_FOOTPRINT,
-        (false, false) => SHARED_CALLEE_FOOTPRINT,
-    };
-    if callee_bytes <= footprint_limit
-        || funcs
-            .get(callee)
-            .and_then(|res| res.as_ref().ok())
-            .is_some_and(trivial_pure_leaf)
-    {
-        return Some(Criterion::SmallCallee);
-    }
-    None
 }
 
 fn is_noop_rethrow_block(callee: &Func, mut blk_id: RBlockId) -> bool {
@@ -1390,327 +2046,29 @@ fn directly_calls_self(func: &Func, interns: &Interns, self_name: &JsName) -> bo
     })
 }
 
-/// The candidate call sites of one caller, in block-and-op order.
-#[allow(clippy::too_many_arguments)] // One call site; the arguments are the refusal oracles.
-fn collect_sites(
-    caller: &JsName,
-    func: &Func,
-    caller_metadata: &Metadata<'_>,
-    metadata: &BTreeMap<JsName, Metadata<'_>>,
-    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
-    graph: &Callgraph,
-    items: &ItemIndex,
-    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
-    zombie_free: &dyn Fn(&JsName) -> bool,
-    allow_std_post_repr: bool,
-    speed: bool,
-    call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
-    inlined_mutual_callees: &BTreeSet<JsName>,
-    stats: &mut InlineStats,
-) -> Vec<Site> {
-    let caller_retargets = call_retargets.and_then(|map| map.get(caller));
-    let mut direct_site_counts: BTreeMap<JsName, usize> = BTreeMap::new();
-    if speed {
-        for block in &func.blocks {
-            for op in &block.ops {
-                if let OpKind::Call {
-                    callee: Callee::Direct { link_name, .. },
-                    function: None,
-                    host: None,
-                    ..
-                } = &op.kind
-                {
-                    if let Some(name) = caller_metadata.interns.str(*link_name) {
-                        *direct_site_counts
-                            .entry(JsName::new(name.to_owned()))
-                            .or_default() += 1;
-                    }
-                }
-            }
-        }
-    }
-    let mut sites = Vec::new();
-    for (block_index, block) in func.blocks.iter().enumerate() {
-        for (op_index, op) in block.ops.iter().enumerate() {
-            let OpKind::Call {
-                callee: Callee::Direct { item, link_name },
-                function: None,
-                args,
-                track_caller,
-                semantic,
-                host,
-            } = &op.kind
-            else {
-                continue;
-            };
-            if caller_retargets.is_some_and(|retargets| retargets.contains_key(item)) {
-                stats.decline("inline.repr-retarget");
-                continue;
-            }
-            let is_invoke =
-                matches!(block.term, RTerm::Invoke { .. }) && op_index + 1 == block.ops.len();
-            if is_invoke {
-                let unwind_uses_result = matches!(
-                    &block.term,
-                    RTerm::Invoke { unwind, .. }
-                        if op.result.is_some_and(|r| unwind.1.contains(&r))
-                );
-                if !speed || unwind_uses_result {
-                    stats.decline("inline.exceptional-control-flow");
-                    continue;
-                }
-            }
-            let semantic_ok = match semantic {
-                CallSemantic::Ordinary => true,
-                CallSemantic::RawParts if allow_std_post_repr && speed => true,
-                // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
-                // it as the string operation it is, which inlining its body would take away.
-                CallSemantic::Standard(std_op)
-                    if std_op.is_str()
-                        || std_op.is_typed_heap()
-                        || std_op.is_native_string()
-                        || std_op.is_native_vec()
-                        || std_op.is_fast_str_op() =>
-                {
-                    false
-                }
-                CallSemantic::Standard(std_op) if allow_std_post_repr => {
-                    !crate::lower::semantic_ops::fmt_kernel::is_format_machinery(*std_op)
-                        && !matches!(
-                            std_op,
-                            crate::jir::semantic::StandardOperation::F64FromStr
-                                | crate::jir::semantic::StandardOperation::F32FromStr
-                                | crate::jir::semantic::StandardOperation::SliceSort
-                                | crate::jir::semantic::StandardOperation::SliceSortCmp
-                        )
-                        && !(crate::lower::bstr::enabled()
-                            && matches!(
-                                std_op,
-                                crate::jir::semantic::StandardOperation::StringAsStr
-                                    | crate::jir::semantic::StandardOperation::StrToLowercase
-                                    | crate::jir::semantic::StandardOperation::StrToUppercase
-                            ))
-                        && !(speed
-                            && *std_op == crate::jir::semantic::StandardOperation::VecResize
-                            && args.first().is_some_and(|&recv| {
-                                is_ta_vec_resize_receiver(
-                                    &caller_metadata.interns.types,
-                                    func.values[recv.0 as usize].ty,
-                                )
-                            }))
-                }
-                _ => false,
-            };
-            if !semantic_ok || host.is_some() {
-                stats.decline("inline.semantic-boundary");
-                continue;
-            }
-            let Some(name) = caller_metadata.interns.str(*link_name) else {
-                continue;
-            };
-            let callee = JsName::new(name.to_owned());
-            if call_retargets
-                .and_then(|map| map.get(&callee))
-                .is_some_and(|retargets| !retargets.is_empty())
-            {
-                stats.decline("inline.repr-retarget");
-                continue;
-            }
-            if &callee == caller {
-                stats.decline("inline.recursive-budget");
-                continue;
-            }
-            if graph.recursive(&callee) {
-                // Under ReleaseSpeed, allow inlining a single-callsite sole-caller mutually
-                // recursive helper (e.g. `eval <-> comparator` / `eval <-> filter_projection`)
-                // when `callee` is not directly self-recursive. Splicing eliminates `callee`
-                // completely, converts its back-edge into direct self-recursion on `caller`, and
-                // prevents downstream minifiers from turning `callee` into a hot closure IIFE.
-                let allow_mutual_sole = speed
-                    && sole_referrer(&callee, caller)
-                    && !inlined_mutual_callees.contains(&callee)
-                    && direct_site_counts.get(&callee).copied().unwrap_or(0) == 1
-                    && funcs
-                        .get(&callee)
-                        .and_then(|r| r.as_ref().ok())
-                        .is_some_and(|cf| {
-                            metadata
-                                .get(&callee)
-                                .is_some_and(|cm| !directly_calls_self(cf, &cm.interns, &callee))
-                        });
-                if !allow_mutual_sole {
-                    stats.decline("inline.recursive-budget");
-                    continue;
-                }
-            }
-            // An item with recorded zombies owes the link step its compile-time diagnostic
-            // chain; splicing its body would drop the item and silence the errors.
-            if !zombie_free(&callee) {
-                stats.decline("inline.zombie");
-                continue;
-            }
-            let Some(callee_metadata) = metadata.get(&callee) else {
-                stats.decline("inline.metadata-unavailable");
-                continue;
-            };
-            if !caller_metadata.compatible(callee_metadata) {
-                stats.decline("inline.object-incompatible");
-                continue;
-            }
-            let Some(Ok(callee_func)) = funcs.get(&callee) else {
-                stats.decline("inline.body-unavailable");
-                continue;
-            };
-            if is_invoke && !callee_invoke_safe(callee_func, &callee_metadata.interns) {
-                stats.decline("inline.exceptional-control-flow");
-                continue;
-            }
-            if let Some(retargets) = caller_retargets {
-                let collides = callee_func.blocks.iter().any(|b| {
-                    b.ops.iter().any(|op| match &op.kind {
-                        OpKind::Call {
-                            callee: Callee::Direct { item, .. },
-                            host: None,
-                            ..
-                        }
-                        | OpKind::Drop {
-                            glue: DropGlue::Direct { item, .. },
-                            ..
-                        } => retargets.contains_key(item),
-                        _ => false,
-                    })
-                });
-                if collides {
-                    stats.decline("inline.repr-retarget");
-                    continue;
-                }
-            }
-            if callee_func.sig.abi.inline_never {
-                stats.decline("inline.never");
-                continue;
-            }
-            let is_nonempty_drop_glue = speed
-                && callee.as_str().starts_with("core$ptr$drop_glue$")
-                && callee_func.sig.arguments.len() == 1
-                && !(callee_func.blocks.len() == 1
-                    && callee_func.blocks[0].ops.is_empty()
-                    && matches!(
-                        callee_func.blocks[0].term,
-                        rcgjs_object::jir::repr::RTerm::Return(None)
-                    ));
-            let is_protected_drop_glue = is_nonempty_drop_glue
-                && callee_func
-                    .sig
-                    .arguments
-                    .first()
-                    .and_then(|&arg_ty| {
-                        crate::lower::js::value::pointee_of(&callee_metadata.interns.types, arg_ty)
-                    })
-                    .and_then(|pt| callee_metadata.interns.types.get(pt))
-                    .is_some_and(|d| {
-                        (crate::lower::bstr::enabled()
-                            && d.meta.candidate
-                                == rcgjs_object::jir::types::RepresentationCandidate::String)
-                            || (d.meta.candidate
-                                == rcgjs_object::jir::types::RepresentationCandidate::Vec
-                                && d.meta.allocator
-                                    == rcgjs_object::jir::types::AllocatorIdentity::Global)
-                    });
-            if is_protected_drop_glue
-                || items
-                    .get(&callee_func.item)
-                    .and_then(|entry| entry.standard)
-                    .is_some_and(|op| {
-                        crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
-                            || crate::lower::semantic_ops::num::is_float_from_str(op)
-                            || matches!(
-                                op,
-                                crate::jir::semantic::StandardOperation::SliceSort
-                                    | crate::jir::semantic::StandardOperation::SliceSortCmp
-                            )
-                            || op.is_typed_heap()
-                            || op.is_native_string()
-                            || op.is_native_vec()
-                            || op.is_fast_str_op()
-                            || (crate::lower::bstr::enabled()
-                                && matches!(
-                                    op,
-                                    crate::jir::semantic::StandardOperation::StrToLowercase
-                                        | crate::jir::semantic::StandardOperation::StrToUppercase
-                                ))
-                            || (speed
-                                && op == crate::jir::semantic::StandardOperation::VecResize
-                                && callee_func.sig.arguments.first().is_some_and(|&arg_ty| {
-                                    is_ta_vec_resize_receiver(
-                                        &callee_metadata.interns.types,
-                                        arg_ty,
-                                    )
-                                }))
-                    })
-            {
-                stats.decline("inline.semantic-boundary");
-                continue;
-            }
-            let is_sole_caller = sole_referrer(&callee, caller);
-            let allow_host_boundary = is_sole_caller
-                && count_item_refs(func, &caller_metadata.interns, callee.as_str()) == 1;
-            if let Some(reason) = body_decline(
-                callee_func,
-                &callee_metadata.interns,
-                &caller_metadata.interns,
-                args.len(),
-                func.sig.abi.caller_location,
-                *track_caller,
-                items,
-                allow_host_boundary,
-                speed,
-            ) {
-                stats.decline(reason);
-                continue;
-            }
-            // A committed-carrier boundary: labels agree only when both sides are baseline.
-            let baseline = crate::jir::repr::Carrier::Baseline;
-            if callee_func.values.iter().any(|def| def.carrier != baseline) {
-                stats.decline("inline.carrier-conversion-unsupported");
-                continue;
-            }
-            let boundary = args
-                .iter()
-                .copied()
-                .chain(op.result)
-                .any(|v| func.values[v.0 as usize].carrier != baseline);
-            if boundary {
-                stats.decline("inline.carrier-conversion-unsupported");
-                continue;
-            }
-            sites.push(Site {
-                block: block_index,
-                op: op_index,
-                callee,
-                has_track_caller: track_caller.is_some()
-                    || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
-                host_boundary: callee_has_host_boundary(
-                    callee_func,
-                    &callee_metadata.interns,
-                    speed,
-                ),
-            });
-        }
-    }
-    sites
-}
-
 /// Whether `callee`'s implicit trailing `Location` parameter has zero uses in its body.
 fn unused_caller_location(callee: &Func) -> bool {
     let Some(&last_param) = callee.params.last() else {
         return false;
     };
     !callee.blocks.iter().any(|block| {
-        block
-            .ops
-            .iter()
-            .any(|op| op.kind.uses().contains(&last_param))
-            || block.term.uses().contains(&last_param)
+        let mut used = false;
+        for op in &block.ops {
+            op.kind.for_each_use(|v| {
+                if v == last_param {
+                    used = true;
+                }
+            });
+            if used {
+                return true;
+            }
+        }
+        block.term.for_each_use(|v| {
+            if v == last_param {
+                used = true;
+            }
+        });
+        used
     })
 }
 
@@ -1743,16 +2101,16 @@ fn strip_unused_last_param(callee: &mut Func) {
             if let Some(res) = &mut op.result {
                 *res = remap_val(*res);
             }
-            map_op(&mut op.kind, &remap_val, &|c| c);
+            op.kind.visit_values_mut(|v| *v = remap_val(*v));
         }
-        block.term = map_term(&block.term, &remap_val, &|b| b);
+        block.term.visit_values_mut(|v| *v = remap_val(*v));
     }
 }
 
 /// Whether `recv_ty` (`&mut Vec<T, Global>`) is a `TypedArray`-eligible numeric/scalar vector
 /// whose `Vec::resize` is intercepted directly by `call.rs` (Phase 1B `TypedArray.fill`).
 fn is_ta_vec_resize_receiver(table: &TypeTable, recv_ty: TypeId) -> bool {
-    let Some(vec_ty) = crate::lower::js::value::pointee_of(table, recv_ty) else {
+    let Some(vec_ty) = table.pointee(recv_ty) else {
         return false;
     };
     let Some(elem_ty) = crate::analysis::heap::global_vec_elem_ty(table, vec_ty) else {
@@ -1893,133 +2251,6 @@ fn callee_has_host_boundary(callee: &Func, interns: &Interns, speed: bool) -> bo
         .any(|op| is_host_boundary_op(&op.kind, interns, speed))
 }
 
-/// The semantic boundary preventing a callee body from being spliced at this site.
-#[allow(clippy::too_many_arguments)]
-fn body_decline(
-    callee: &Func,
-    interns: &Interns,
-    caller_interns: &Interns,
-    args: usize,
-    caller_caller_location: bool,
-    site_track_caller: Option<SourceFactId>,
-    items: &ItemIndex,
-    allow_host_boundary: bool,
-    speed: bool,
-) -> Option<&'static str> {
-    if callee.has_invoke() && !(speed && callee_has_only_noop_invokes(callee)) {
-        return Some("inline.exceptional-control-flow");
-    }
-    let expected_params = if callee.sig.abi.caller_location {
-        let can_bind_used_loc = site_track_caller.is_some_and(|fact| {
-            caller_interns.source_fact(fact).is_some()
-                && callee
-                    .params
-                    .last()
-                    .and_then(|p| {
-                        location_param_fields(&interns.types, callee.values[p.0 as usize].ty)
-                    })
-                    .is_some()
-        });
-        if callee.params.len() == args + 1 && (unused_caller_location(callee) || can_bind_used_loc)
-        {
-            args + 1
-        } else {
-            return Some("inline.track-caller-unavailable");
-        }
-    } else if site_track_caller.is_some() {
-        return Some("inline.track-caller-unavailable");
-    } else {
-        args
-    };
-    if (!speed && callee.sig.abi.spread.is_some())
-        || callee.params.len() != expected_params
-        || callee
-            .blocks
-            .first()
-            .is_none_or(|block| block.params != callee.params)
-    {
-        return Some("inline.abi-unsupported");
-    }
-    let forwards_caller_location = caller_caller_location && site_track_caller.is_none();
-    callee
-        .blocks
-        .iter()
-        .flat_map(|block| &block.ops)
-        .find_map(|op| {
-            match &op.kind {
-                // Resume assertions identify coroutine bodies until JIR-R carries a dedicated flag.
-                OpKind::Assert {
-                    msg:
-                        RAssertMessage::ResumedAfterReturn(_)
-                        | RAssertMessage::ResumedAfterPanic(_)
-                        | RAssertMessage::ResumedAfterDrop(_),
-                    ..
-                } => Some("inline.coroutine-unsupported"),
-                OpKind::Assert { .. }
-                    if callee.sig.abi.caller_location
-                        && !forwards_caller_location
-                        && site_track_caller.is_none() =>
-                {
-                    Some("inline.track-caller-unavailable")
-                }
-                // The original item owes the linker its compile-time required-by diagnostic.
-                OpKind::Zombie(_) => Some("inline.zombie"),
-                OpKind::Intrinsic {
-                    name,
-                    track_caller: inner_tc,
-                    ..
-                } if interns.str(*name) == Some("caller_location") => {
-                    let ok = speed
-                        && (inner_tc.is_some()
-                            || (callee.sig.abi.caller_location
-                                && (site_track_caller.is_some() || caller_caller_location)));
-                    (!ok).then_some("inline.track-caller-unavailable")
-                }
-                // Host and template lowering may own item-local bindings and observable ordering.
-                _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns, speed) => {
-                    Some("inline.host-boundary")
-                }
-                // Do not inline bodies that call the raw global allocator directly: splicing a
-                // stdlib allocator call into a non-stdlib user function triggers `byte_views`'s
-                // conservative `direct_alloc` fallback and forces the ES6 Proxy byte-view shim
-                // across the whole program.
-                OpKind::Call {
-                    callee: inner_callee,
-                    ..
-                } if is_direct_alloc_call(inner_callee, interns) => {
-                    Some("inline.semantic-boundary")
-                }
-                OpKind::Call {
-                    callee: inner_callee,
-                    args: inner_args,
-                    track_caller: None,
-                    ..
-                } if callee.sig.abi.caller_location => match inner_callee {
-                    Callee::Direct { item, .. } => {
-                        let Some(entry) = items.get(item) else {
-                            return Some("inline.track-caller-unavailable");
-                        };
-                        if !entry.abi_known
-                            || entry.params != inner_args.len() + usize::from(entry.caller_location)
-                            || (entry.caller_location
-                                && site_track_caller.is_none()
-                                && !caller_caller_location)
-                        {
-                            Some("inline.track-caller-unavailable")
-                        } else {
-                            None
-                        }
-                    }
-                    Callee::Foreign { .. } | Callee::Runtime { .. } | Callee::Indirect { .. } => {
-                        None
-                    }
-                    _ => Some("inline.track-caller-unavailable"),
-                },
-                _ => None,
-            }
-        })
-}
-
 /// Whether `callee` invokes the raw allocator directly (`__rust_alloc`/`__rust_realloc`,
 /// `__rt.{alloc,alloc_zeroed,realloc}`, or `alloc::alloc::{alloc,alloc_zeroed,realloc,Global::*}`).
 fn is_direct_alloc_call(callee: &Callee, interns: &Interns) -> bool {
@@ -2124,33 +2355,6 @@ fn virtualizable(table: &crate::jir::TypeTable, ty: crate::jir::semantic::TypeId
     false
 }
 
-/// The blocks that sit on a cycle of the CFG: reachable from themselves.
-///
-/// ponytail: O(blocks²) DFS; fine at JIR function sizes, replace with one Tarjan pass if a
-/// profile ever names it.
-fn looping_blocks(func: &Func) -> BTreeSet<u32> {
-    let successors: Vec<Vec<u32>> = func
-        .blocks
-        .iter()
-        .map(|block| block.term.successors().iter().map(|b| b.0).collect())
-        .collect();
-    let mut looping = BTreeSet::new();
-    for start in 0..successors.len() as u32 {
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<u32> = successors[start as usize].clone();
-        while let Some(next) = stack.pop() {
-            if next == start {
-                looping.insert(start);
-                break;
-            }
-            if seen.insert(next) {
-                stack.extend(successors[next as usize].iter().copied());
-            }
-        }
-    }
-    looping
-}
-
 /// Splices `callee`'s body over the call at `func.blocks[block].ops[at]`.
 ///
 /// The call's block keeps the ops before the call and jumps into the mapped callee entry with
@@ -2186,7 +2390,8 @@ fn splice(func: &mut Func, block: usize, at: usize, callee: &Func) {
         let mut ops: Vec<Op> = Vec::with_capacity(source.ops.len());
         for op in &source.ops {
             let mut kind = op.kind.clone();
-            map_op(&mut kind, &map_value, &map_cell);
+            kind.visit_values_mut(|v| *v = map_value(*v));
+            kind.visit_cells_mut(|c| *c = map_cell(*c));
             ops.push(Op {
                 result: op.result.map(map_value),
                 origin: op.origin,
@@ -2202,7 +2407,12 @@ fn splice(func: &mut Func, block: usize, at: usize, callee: &Func) {
                 };
                 RTerm::Goto(continuation, args)
             }
-            other => map_term(other, &map_value, &map_block),
+            other => {
+                let mut term = other.clone();
+                term.visit_values_mut(|v| *v = map_value(*v));
+                term.targets_mut(|b| *b = map_block(*b));
+                term
+            }
         };
         func.blocks.push(RBlock {
             id: map_block(source.id),
@@ -2422,153 +2632,12 @@ fn fuse_straight_lines(func: &mut Func) {
     }
 }
 
-/// Remaps a terminator's values and successors. `Return` is the caller's own and never remapped
-/// here — the callee's returns were rewritten before this runs.
-fn map_term(
-    term: &RTerm,
-    value: &dyn Fn(ValueId) -> ValueId,
-    block: &dyn Fn(RBlockId) -> RBlockId,
-) -> RTerm {
-    let map_args = |args: &[ValueId]| args.iter().copied().map(value).collect::<Vec<_>>();
-    match term {
-        RTerm::Goto(target, args) => RTerm::Goto(block(*target), map_args(args)),
-        RTerm::Switch {
-            scrut,
-            scrut_ty,
-            cases,
-            default,
-        } => RTerm::Switch {
-            scrut: value(*scrut),
-            scrut_ty: *scrut_ty,
-            cases: cases
-                .iter()
-                .map(|(bits, target, args)| (*bits, block(*target), map_args(args)))
-                .collect(),
-            default: (block(default.0), map_args(&default.1)),
-        },
-        RTerm::Return(v) => RTerm::Return(v.map(value)),
-        RTerm::Unreachable => RTerm::Unreachable,
-        RTerm::Throw(v) => RTerm::Throw(v.map(value)),
-        RTerm::Invoke { normal, unwind } => RTerm::Invoke {
-            normal: (block(normal.0), map_args(&normal.1)),
-            unwind: (block(unwind.0), map_args(&unwind.1)),
-        },
-    }
-}
-
-/// Remaps every value and cell an op names. Mirrors [`OpKind::for_each_use`], plus the cell
-/// operands and the assert message.
-fn map_op(kind: &mut OpKind, value: &dyn Fn(ValueId) -> ValueId, cell: &dyn Fn(CellId) -> CellId) {
-    let mut map = |v: &mut ValueId| *v = value(*v);
-    let path = |path: &mut Vec<Proj>, f: &mut dyn FnMut(&mut ValueId)| {
-        for proj in path {
-            if let Proj::Index(v) = proj {
-                f(v);
-            }
-        }
-    };
-    let root = |root: &mut Root, f: &mut dyn FnMut(&mut ValueId)| match root {
-        Root::Value(v) => f(v),
-        Root::Cell(c) => *c = cell(*c),
-    };
-    match kind {
-        OpKind::Const(_) | OpKind::Zombie(_) | OpKind::SpillRead(_) => {}
-        OpKind::CellAlloc(c) | OpKind::CellLoad(c) => *c = cell(*c),
-        OpKind::CellStore { cell: c, v } => {
-            *c = cell(*c);
-            map(v);
-        }
-        OpKind::Copy(v)
-        | OpKind::Move(v)
-        | OpKind::Repeat { v, .. }
-        | OpKind::Field { base: v, .. }
-        | OpKind::Discriminant(v)
-        | OpKind::SetDiscriminant { base: v, .. }
-        | OpKind::SpillWrite { v, .. }
-        | OpKind::Deref(v)
-        | OpKind::Unary { v, .. }
-        | OpKind::Cast { v, .. }
-        | OpKind::Materialize(v)
-        | OpKind::Convert { v, .. } => map(v),
-        OpKind::Aggregate { fields, .. } => fields.iter_mut().for_each(&mut map),
-        OpKind::SetField { base, v, .. } => {
-            map(base);
-            map(v);
-        }
-        OpKind::BorrowView {
-            root: r, path: p, ..
-        }
-        | OpKind::RawView {
-            root: r, path: p, ..
-        }
-        | OpKind::Drop {
-            root: r, path: p, ..
-        } => {
-            root(r, &mut map);
-            path(p, &mut map);
-        }
-        OpKind::SliceView { ptr, len } => {
-            map(ptr);
-            map(len);
-        }
-        OpKind::StoreThrough { ptr, v } => {
-            map(ptr);
-            map(v);
-        }
-        OpKind::Binary { l, r, .. } => {
-            map(l);
-            map(r);
-        }
-        OpKind::Call { function, args, .. } => {
-            if let Some(function) = function {
-                map(function);
-            }
-            args.iter_mut().for_each(&mut map);
-        }
-        OpKind::Intrinsic { args, .. } | OpKind::Host { args, .. } => {
-            args.iter_mut().for_each(&mut map)
-        }
-        OpKind::Assert { cond, msg, .. } => {
-            map(cond);
-            map_message(msg, &mut map);
-        }
-    }
-}
-
-fn map_message(msg: &mut RAssertMessage, f: &mut dyn FnMut(&mut ValueId)) {
-    match msg {
-        RAssertMessage::BoundsCheck {
-            length: a,
-            index: b,
-        }
-        | RAssertMessage::Overflow {
-            left: a, right: b, ..
-        }
-        | RAssertMessage::MisalignedPointer {
-            required: a,
-            found: b,
-        } => {
-            f(a);
-            f(b);
-        }
-        RAssertMessage::OverflowNeg(v)
-        | RAssertMessage::DivisionByZero(v)
-        | RAssertMessage::RemainderByZero(v)
-        | RAssertMessage::InvalidEnum(v) => f(v),
-        RAssertMessage::ResumedAfterReturn(_)
-        | RAssertMessage::ResumedAfterPanic(_)
-        | RAssertMessage::ResumedAfterDrop(_)
-        | RAssertMessage::NullPointer
-        | RAssertMessage::NullReference => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::callgraph;
     use crate::jir::interns::StrId;
-    use crate::jir::repr::{Carrier, FuncBuilder};
+    use crate::jir::repr::{Carrier, FuncBuilder, Root};
     use crate::jir::semantic::{
         AbiSignature, BinaryOp, ConstTree, DefinitionId, ItemId, Signature, TypeId,
     };
@@ -2702,17 +2771,21 @@ mod tests {
                     );
                 }
             }
-            run_with_mode(
+            run_with_config(
                 funcs,
                 &mut metadata,
-                &graph,
-                &items,
-                &measure,
-                &sole_referrer,
-                &|_: &JsName| true,
-                program_bytes,
-                &sizes,
-                false,
+                InlineConfig {
+                    graph: &graph,
+                    items: &items,
+                    measure: &measure,
+                    sole_referrer: &sole_referrer,
+                    zombie_free: &|_: &JsName| true,
+                    program_bytes,
+                    sizes: &sizes,
+                    allow_std_post_repr: false,
+                    profile: None,
+                    call_retargets: None,
+                },
             )
         }
 
@@ -3185,15 +3258,21 @@ mod tests {
                     refs,
                 ))
             };
-            let stats = run(
+            let stats = run_with_config(
                 &mut funcs,
                 &mut metadata,
-                &graph,
-                &measure,
-                &|_, _| true,
-                &|_| true,
-                100000,
-                &sizes,
+                InlineConfig {
+                    graph: &graph,
+                    items: &ItemIndex::new(),
+                    measure: &measure,
+                    sole_referrer: &|_, _| true,
+                    zombie_free: &|_| true,
+                    program_bytes: 100000,
+                    sizes: &sizes,
+                    allow_std_post_repr: false,
+                    profile: None,
+                    call_retargets: None,
+                },
             );
             assert_eq!(funcs[&g_name].as_ref().unwrap(), &g);
             assert!(matches!(metadata[&g_name].interns, Cow::Borrowed(_)));
@@ -3407,15 +3486,21 @@ mod tests {
             (g_name.clone(), measured(&g)),
         ]);
         let measure = |_: &JsName, func: &Func, meta: &Metadata<'_>| Some(measurement(func, meta));
-        let stats = run(
+        let stats = run_with_config(
             &mut funcs,
             &mut metadata,
-            &graph,
-            &measure,
-            &|_, _| true,
-            &|_| true,
-            100_000,
-            &sizes,
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &measure,
+                sole_referrer: &|_, _| true,
+                zombie_free: &|_| true,
+                program_bytes: 100_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
+            },
         );
         assert_eq!(
             stats.applied, 1,
@@ -3821,34 +3906,38 @@ mod tests {
         // yet sole-caller removal shrinks total program (120 - 40 - 200 = -120 <= 0).
         sizes.insert(f_name.clone(), 40);
         sizes.insert(g_name.clone(), 200);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &items,
-            &|_name, func, _meta| {
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if let OpKind::Call {
-                        callee: Callee::Direct { .. },
-                        ..
-                    } = &op.kind
-                    {
-                        refs.insert(g_name.clone());
+            InlineConfig {
+                graph: &graph,
+                items: &items,
+                measure: &|_name, func, _meta| {
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if let OpKind::Call {
+                            callee: Callee::Direct { .. },
+                            ..
+                        } = &op.kind
+                        {
+                            refs.insert(g_name.clone());
+                        }
                     }
-                }
-                let bytes = if func.item == item(1) && refs.is_empty() {
-                    120
-                } else {
-                    40
-                };
-                Some((bytes, refs))
+                    let bytes = if func.item == item(1) && refs.is_empty() {
+                        120
+                    } else {
+                        40
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|callee, caller| callee == &g_name && caller == &f_name,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|callee, caller| callee == &g_name && caller == &f_name,
-            &|_| true,
-            10_000,
-            &sizes,
-            false,
         );
         assert_eq!(stats.applied, 1, "sole-caller net <= 0 lifts 2x entry cap");
         assert_eq!(prog.calls_in("f"), 0);
@@ -4116,34 +4205,38 @@ mod tests {
         // `entry_bytes = 50` (2x limit = 100) and `after = 150` (> 100), while `g` is 200 B so
         // sole-referrer removal yields `net = 100 - 200 = -100 <= 0` and lifts `size_limit`.
         let sizes = BTreeMap::from([(f_name.clone(), 50), (g_name.clone(), 200)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &items,
-            &|_name, func, _meta| {
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if let OpKind::Call {
-                        callee: Callee::Direct { .. },
-                        ..
-                    } = &op.kind
-                    {
-                        refs.insert(g_name.clone());
+            InlineConfig {
+                graph: &graph,
+                items: &items,
+                measure: &|_name, func, _meta| {
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if let OpKind::Call {
+                            callee: Callee::Direct { .. },
+                            ..
+                        } = &op.kind
+                        {
+                            refs.insert(g_name.clone());
+                        }
                     }
-                }
-                let bytes = if func.item == item(1) && refs.is_empty() {
-                    150
-                } else {
-                    50
-                };
-                Some((bytes, refs))
+                    let bytes = if func.item == item(1) && refs.is_empty() {
+                        150
+                    } else {
+                        50
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|callee, caller| callee == &g_name && caller == &f_name,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|callee, caller| callee == &g_name && caller == &f_name,
-            &|_| true,
-            10_000,
-            &sizes,
-            false,
         );
         assert_eq!(
             stats.applied, 1,
@@ -4372,36 +4465,40 @@ mod tests {
             .collect();
         let items = ItemIndex::new();
         let sizes = BTreeMap::from([(f_name.clone(), 1_000), (g_name.clone(), 455)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &items,
-            &|_name, func, _meta| {
-                let calls = func
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.ops)
-                    .filter(|op| matches!(op.kind, OpKind::Call { .. }))
-                    .count() as u64;
-                let refs = if calls > 0 {
-                    BTreeSet::from([g_name.clone()])
-                } else {
-                    BTreeSet::new()
-                };
-                // 2 calls -> 1000 B; 1 call -> 1300 B (+300); 0 calls -> 1600 B (+300).
-                let bytes = if func.item == item(1) {
-                    1_000 + (2 - calls) * 300
-                } else {
-                    455
-                };
-                Some((bytes, refs))
+            InlineConfig {
+                graph: &graph,
+                items: &items,
+                measure: &|_name, func, _meta| {
+                    let calls = func
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.ops)
+                        .filter(|op| matches!(op.kind, OpKind::Call { .. }))
+                        .count() as u64;
+                    let refs = if calls > 0 {
+                        BTreeSet::from([g_name.clone()])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    // 2 calls -> 1000 B; 1 call -> 1300 B (+300); 0 calls -> 1600 B (+300).
+                    let bytes = if func.item == item(1) {
+                        1_000 + (2 - calls) * 300
+                    } else {
+                        455
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|_, _| false,
+                zombie_free: &|_| true,
+                program_bytes: 1_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|_, _| false,
-            &|_| true,
-            1_000,
-            &sizes,
-            false,
         );
         assert_eq!(
             stats.applied, 2,
@@ -4479,32 +4576,36 @@ mod tests {
         let items = ItemIndex::new();
         // Shared callee at 88 B (in 65..=96): admitted when caller shrinks (`120 -> 116`).
         let sizes = BTreeMap::from([(f_name.clone(), 120), (g_name.clone(), 88)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &items,
-            &|_name, func, _meta| {
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if matches!(op.kind, OpKind::Call { .. }) {
-                        refs.insert(g_name.clone());
+            InlineConfig {
+                graph: &graph,
+                items: &items,
+                measure: &|_name, func, _meta| {
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if matches!(op.kind, OpKind::Call { .. }) {
+                            refs.insert(g_name.clone());
+                        }
                     }
-                }
-                let bytes = if func.item == item(1) && refs.is_empty() {
-                    116
-                } else if func.item == item(1) {
-                    120
-                } else {
-                    88
-                };
-                Some((bytes, refs))
+                    let bytes = if func.item == item(1) && refs.is_empty() {
+                        116
+                    } else if func.item == item(1) {
+                        120
+                    } else {
+                        88
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|_, _| false,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|_, _| false,
-            &|_| true,
-            10_000,
-            &sizes,
-            false,
         );
         assert_eq!(stats.applied, 1);
     }
@@ -4943,17 +5044,23 @@ mod tests {
                 ),
             ]);
             let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
-            let stats = run_with_mode(
+            let stats = run_with_config(
                 funcs,
                 &mut metadata,
-                &graph,
-                &ItemIndex::new(),
-                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
-                &|_, _| true,
-                &|_| true,
-                100_000,
-                &sizes,
-                false,
+                InlineConfig {
+                    graph: &graph,
+                    items: &ItemIndex::new(),
+                    measure: &|_, func, _| {
+                        Some(measurement(func, &metadata_dummy_refs(func, interns)))
+                    },
+                    sole_referrer: &|_, _| true,
+                    zombie_free: &|_| true,
+                    program_bytes: 100_000,
+                    sizes: &sizes,
+                    allow_std_post_repr: false,
+                    profile: None,
+                    call_retargets: None,
+                },
             );
             assert_eq!(
                 stats.applied, 0,
@@ -5040,17 +5147,23 @@ mod tests {
                 ),
             ]);
             let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
-            let stats = run_with_mode(
+            let stats = run_with_config(
                 funcs,
                 &mut metadata,
-                &graph,
-                &ItemIndex::new(),
-                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
-                &|_, _| true,
-                &|_| true,
-                100_000,
-                &sizes,
-                false,
+                InlineConfig {
+                    graph: &graph,
+                    items: &ItemIndex::new(),
+                    measure: &|_, func, _| {
+                        Some(measurement(func, &metadata_dummy_refs(func, interns)))
+                    },
+                    sole_referrer: &|_, _| true,
+                    zombie_free: &|_| true,
+                    program_bytes: 100_000,
+                    sizes: &sizes,
+                    allow_std_post_repr: false,
+                    profile: None,
+                    call_retargets: None,
+                },
             );
             assert_eq!(
                 stats.applied, 1,
@@ -5105,32 +5218,36 @@ mod tests {
         // Shared callee (`sole_referrer = false`) priced at 120 bytes (> 96B SHARED_CALLEE_FOOTPRINT),
         // with +12B temporary caller growth (within <=16B trivial leaf slack) and 0 budget charge.
         let sizes = BTreeMap::from([(f_name.clone(), 100), (g_name.clone(), 120)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|_, func, _| {
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if matches!(op.kind, OpKind::Call { .. }) {
-                        refs.insert(g_name.clone());
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &|_, func, _| {
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if matches!(op.kind, OpKind::Call { .. }) {
+                            refs.insert(g_name.clone());
+                        }
                     }
-                }
-                let bytes = if func.item == item(1) && refs.is_empty() {
-                    112
-                } else if func.item == item(1) {
-                    100
-                } else {
-                    120
-                };
-                Some((bytes, refs))
+                    let bytes = if func.item == item(1) && refs.is_empty() {
+                        112
+                    } else if func.item == item(1) {
+                        100
+                    } else {
+                        120
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|_, _| false,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|_, _| false,
-            &|_| true,
-            10_000,
-            &sizes,
-            false,
         );
         assert_eq!(
             stats.applied, 1,
@@ -5196,37 +5313,41 @@ mod tests {
         // Make each intermediate site grow by +25B (>16B slack so single-site rejects when refs still contain g),
         // while batching all 3 sites yields 150 -> 180 (+30B) - 80B removed = -50B net!
         let sizes = BTreeMap::from([(f_name.clone(), 150), (g_name.clone(), 80)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|_, func, _| {
-                let mut call_count = 0u64;
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if matches!(op.kind, OpKind::Call { .. }) {
-                        call_count += 1;
-                        refs.insert(g_name.clone());
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &|_, func, _| {
+                    let mut call_count = 0u64;
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if matches!(op.kind, OpKind::Call { .. }) {
+                            call_count += 1;
+                            refs.insert(g_name.clone());
+                        }
                     }
-                }
-                let bytes = if func.item == item(1) {
-                    match call_count {
-                        3 => 150,
-                        2 => 175,
-                        1 => 178,
-                        _ => 180,
-                    }
-                } else {
-                    80
-                };
-                Some((bytes, refs))
+                    let bytes = if func.item == item(1) {
+                        match call_count {
+                            3 => 150,
+                            2 => 175,
+                            1 => 178,
+                            _ => 180,
+                        }
+                    } else {
+                        80
+                    };
+                    Some((bytes, refs))
+                },
+                sole_referrer: &|_, _| true,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
             },
-            &|_, _| true,
-            &|_| true,
-            10_000,
-            &sizes,
-            false,
         );
         assert_eq!(
             stats.applied, 3,
@@ -5390,17 +5511,21 @@ mod tests {
             ),
         ]);
         let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
-        let stats = run_with_mode(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
-            &|_, _| true,
-            &|_| true,
-            100_000,
-            &sizes,
-            false,
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+                sole_referrer: &|_, _| true,
+                zombie_free: &|_| true,
+                program_bytes: 100_000,
+                sizes: &sizes,
+                allow_std_post_repr: false,
+                profile: None,
+                call_retargets: None,
+            },
         );
         assert_eq!(
             stats.applied, 1,
@@ -5663,38 +5788,41 @@ mod tests {
             (min_name.clone(), 35),
             (len_name.clone(), 27),
         ]);
-        let stats = run_with_profile(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|name, func, _| {
-                if name != &f_name {
-                    return Some((sizes[name], BTreeSet::new()));
-                }
-                let mut remaining = 0u64;
-                let mut refs = BTreeSet::new();
-                for op in func.blocks.iter().flat_map(|b| &b.ops) {
-                    if let OpKind::Call {
-                        callee: Callee::Direct { link_name, .. },
-                        ..
-                    } = &op.kind
-                    {
-                        remaining += 1;
-                        if let Some(s) = interns.str(*link_name) {
-                            refs.insert(JsName::new(s.to_owned()));
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &|name, func, _| {
+                    if name != &f_name {
+                        return Some((sizes[name], BTreeSet::new()));
+                    }
+                    let mut remaining = 0u64;
+                    let mut refs = BTreeSet::new();
+                    for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                        if let OpKind::Call {
+                            callee: Callee::Direct { link_name, .. },
+                            ..
+                        } = &op.kind
+                        {
+                            remaining += 1;
+                            if let Some(s) = interns.str(*link_name) {
+                                refs.insert(JsName::new(s.to_owned()));
+                            }
                         }
                     }
-                }
-                let inlined = 3u64.saturating_sub(remaining);
-                Some((40_000 + inlined * 45, refs))
+                    let inlined = 3u64.saturating_sub(remaining);
+                    Some((40_000 + inlined * 45, refs))
+                },
+                sole_referrer: &|_, _| false,
+                zombie_free: &|_| true,
+                program_bytes: 50_000,
+                sizes: &sizes,
+                allow_std_post_repr: true,
+                profile: Some(crate::opts::Profile::ReleaseSpeed),
+                call_retargets: None,
             },
-            &|_, _| false,
-            &|_| true,
-            50_000,
-            &sizes,
-            true,
-            Some(crate::opts::Profile::ReleaseSpeed),
         );
         assert_eq!(
             stats.applied, 3,
@@ -6213,33 +6341,36 @@ mod tests {
             (idx_name.clone(), 90),
             (res_name.clone(), 50),
         ]);
-        let stats = run_with_profile(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &items,
-            &|name, func, _| {
-                if name != &f_name {
-                    return Some((sizes[name], BTreeSet::new()));
-                }
-                let has_idx = func.blocks.iter().flat_map(|b| &b.ops).any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            callee: Callee::Direct { item: id, .. },
-                            ..
-                        } if *id == item(2)
-                    )
-                });
-                let bytes = if has_idx { 400 } else { 440 };
-                Some((bytes, BTreeSet::new()))
+            InlineConfig {
+                graph: &graph,
+                items: &items,
+                measure: &|name, func, _| {
+                    if name != &f_name {
+                        return Some((sizes[name], BTreeSet::new()));
+                    }
+                    let has_idx = func.blocks.iter().flat_map(|b| &b.ops).any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                callee: Callee::Direct { item: id, .. },
+                                ..
+                            } if *id == item(2)
+                        )
+                    });
+                    let bytes = if has_idx { 400 } else { 440 };
+                    Some((bytes, BTreeSet::new()))
+                },
+                sole_referrer: &|_, _| false,
+                zombie_free: &|_| true,
+                program_bytes: 10_000,
+                sizes: &sizes,
+                allow_std_post_repr: true,
+                profile: Some(crate::opts::Profile::ReleaseSpeed),
+                call_retargets: None,
             },
-            &|_, _| false,
-            &|_| true,
-            10_000,
-            &sizes,
-            true,
-            Some(crate::opts::Profile::ReleaseSpeed),
         );
         assert_eq!(
             stats.applied, 1,
@@ -6378,42 +6509,45 @@ mod tests {
             })
             .collect();
         let sizes = BTreeMap::from([(f_name.clone(), 1_200), (c_name.clone(), 750)]);
-        let stats = run_with_profile(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|name, func, _| {
-                if name != &f_name {
-                    return Some((750, BTreeSet::new()));
-                }
-                let remaining = func
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.ops)
-                    .filter(|op| {
-                        matches!(
-                            &op.kind,
-                            OpKind::Call {
-                                callee: Callee::Direct { item: id, .. },
-                                ..
-                            } if *id == item(2)
-                        )
-                    })
-                    .count() as u64;
-                let mut refs = BTreeSet::new();
-                if remaining > 0 {
-                    refs.insert(c_name.clone());
-                }
-                let inlined = 2u64.saturating_sub(remaining);
-                Some((1_200 + inlined * 700, refs))
+            InlineConfig {
+                graph: &graph,
+                items: &ItemIndex::new(),
+                measure: &|name, func, _| {
+                    if name != &f_name {
+                        return Some((750, BTreeSet::new()));
+                    }
+                    let remaining = func
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.ops)
+                        .filter(|op| {
+                            matches!(
+                                &op.kind,
+                                OpKind::Call {
+                                    callee: Callee::Direct { item: id, .. },
+                                    ..
+                                } if *id == item(2)
+                            )
+                        })
+                        .count() as u64;
+                    let mut refs = BTreeSet::new();
+                    if remaining > 0 {
+                        refs.insert(c_name.clone());
+                    }
+                    let inlined = 2u64.saturating_sub(remaining);
+                    Some((1_200 + inlined * 700, refs))
+                },
+                sole_referrer: &|callee, caller| callee == &c_name && caller == &f_name,
+                zombie_free: &|_| true,
+                program_bytes: 50_000,
+                sizes: &sizes,
+                allow_std_post_repr: true,
+                profile: Some(crate::opts::Profile::ReleaseSpeed),
+                call_retargets: None,
             },
-            &|callee, caller| callee == &c_name && caller == &f_name,
-            &|_| true,
-            50_000,
-            &sizes,
-            true,
-            Some(crate::opts::Profile::ReleaseSpeed),
         );
         assert_eq!(
             stats.applied, 2,
@@ -6522,12 +6656,13 @@ mod tests {
             .collect();
         assert!(graph.recursive(&e_name) && graph.recursive(&h_name));
         let sizes = BTreeMap::from([(e_name.clone(), 1_600), (h_name.clone(), 1_400)]);
-        let stats = run_with_profile(
+        let stats = run_with_config(
             funcs,
             &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|name, func, _| {
+            InlineConfig {
+        graph: &graph,
+        items: &ItemIndex::new(),
+        measure: &|name, func, _| {
                 if name != &e_name {
                     return Some((1_400, BTreeSet::new()));
                 }
@@ -6546,13 +6681,15 @@ mod tests {
                 }
                 Some((if calls_helper { 1_600 } else { 2_900 }, refs))
             },
-            // Only `helper` has sole referrer `eval`; `eval` is an external entry point.
+        sole_referrer: // Only `helper` has sole referrer `eval`; `eval` is an external entry point.
             &|callee, caller| callee == &h_name && caller == &e_name,
-            &|_| true,
-            50_000,
-            &sizes,
-            true,
-            Some(crate::opts::Profile::ReleaseSpeed),
+        zombie_free: &|_| true,
+        program_bytes: 50_000,
+        sizes: &sizes,
+        allow_std_post_repr: true,
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        call_retargets: None,
+    },
         );
         assert_eq!(
             stats.applied, 1,

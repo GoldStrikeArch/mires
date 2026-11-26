@@ -97,12 +97,54 @@ pub enum OptimizerMode {
 }
 
 impl OptimizerMode {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Report => "report",
             Self::On => "on",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "report" => Some(Self::Report),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+
+/// How aggressively emitted JavaScript is minified (`js-minify`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MinifyMode {
+    /// Readable output with original local and item names.
+    #[default]
+    Off,
+    /// Compact printing and shortened local names; top-level item names are preserved so a
+    /// profile or grep still names Rust items.
+    Locals,
+    /// Compact printing, shortened local names, and link-time item renaming.
+    All,
+}
+
+impl MinifyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Locals => "locals",
+            Self::All => "on",
+        }
+    }
+
+    /// Whether compact printing and local minification are active.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether link-time item renaming is also active.
+    pub const fn renames_items(self) -> bool {
+        matches!(self, Self::All)
     }
 }
 
@@ -192,7 +234,17 @@ impl Profile {
         }
     }
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    pub const fn backend_arg(self) -> &'static str {
+        match self {
+            Self::Dev => "js-profile=dev",
+            Self::Report => "js-profile=report",
+            Self::ReleaseSize => "js-profile=release-size",
+            Self::ReleaseBalanced => "js-profile=release-balanced",
+            Self::ReleaseSpeed => "js-profile=release-speed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "dev" => Some(Self::Dev),
             "report" => Some(Self::Report),
@@ -206,8 +258,8 @@ impl Profile {
     /// The emit-affecting half of this alias, in application order.
     ///
     /// Keep this in lockstep with `scripts/sysroot-cache.sh`'s
-    /// `jsc_profile_emit_args` and mires-build's `Profile::emit_args`.
-    pub(crate) const fn emit_args(self) -> &'static [&'static str] {
+    /// `jsc_profile_emit_args`.
+    pub const fn emit_args(self) -> &'static [&'static str] {
         match self {
             Self::Dev => &["js-opt=off"],
             Self::Report => &["js-opt=report"],
@@ -244,8 +296,7 @@ impl Profile {
                 opts.cleanup = true;
                 opts.ecma_target = EcmaTarget::Es2018;
                 opts.lane = Lane::Jir;
-                opts.minify = true;
-                opts.minify_items = true;
+                opts.minify = MinifyMode::All;
                 opts.optimizer = OptimizerMode::On;
                 opts.str_repr = StrRepr::Bytes;
             }
@@ -253,8 +304,7 @@ impl Profile {
                 opts.cleanup = true;
                 opts.ecma_target = EcmaTarget::Es2018;
                 opts.lane = Lane::Jir;
-                opts.minify = true;
-                opts.minify_items = false;
+                opts.minify = MinifyMode::Locals;
                 opts.optimizer = OptimizerMode::On;
                 opts.str_repr = StrRepr::Bytes;
             }
@@ -291,6 +341,17 @@ impl OptimizerPass {
         }
     }
 
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sroa" => Some(Self::Sroa),
+            "ast-dce" => Some(Self::AstDce),
+            "future-poller" => Some(Self::FuturePoller),
+            "native-representations" => Some(Self::NativeRepresentations),
+            "link-dedup" => Some(Self::LinkDedup),
+            _ => None,
+        }
+    }
+
     const fn bit(self) -> u8 {
         match self {
             Self::Sroa => 1 << 0,
@@ -307,7 +368,9 @@ impl OptimizerPass {
 pub struct OptimizerPassMask(u8);
 
 impl OptimizerPassMask {
-    const ALL: Self = Self(
+    pub const NONE: Self = Self(0);
+
+    pub const ALL: Self = Self(
         OptimizerPass::Sroa.bit()
             | OptimizerPass::AstDce.bit()
             | OptimizerPass::FuturePoller.bit()
@@ -325,28 +388,44 @@ impl OptimizerPassMask {
             .filter(move |pass| self.contains(*pass))
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "all" => return Some(Self::ALL),
-            "none" => return Some(Self(0)),
+            "none" => return Some(Self::NONE),
             "" => return None,
             _ => {}
         }
 
-        let mut mask = Self(0);
+        let mut mask = Self::NONE;
         for name in value.split(',') {
-            let pass = match name {
-                "sroa" => OptimizerPass::Sroa,
-                "ast-dce" => OptimizerPass::AstDce,
-                "future-poller" => OptimizerPass::FuturePoller,
-                "native-representations" => OptimizerPass::NativeRepresentations,
-                "link-dedup" => OptimizerPass::LinkDedup,
-                _ => return None,
-            };
+            let pass = OptimizerPass::parse(name)?;
             mask.0 |= pass.bit();
         }
         Some(mask)
     }
+}
+
+/// Normalizes a `js-opt-passes=` value into canonical compiler execution order.
+///
+/// Unknown pass names are returned unchanged so invalid inputs stay distinct in sysroot cache keys.
+/// Matches `scripts/sysroot-cache.sh`'s `jsc_normalize_opt_passes`.
+pub fn normalize_optimizer_passes(value: &str) -> String {
+    if matches!(value, "all" | "none") {
+        return value.to_owned();
+    }
+    let Some(mask) = OptimizerPassMask::parse(value) else {
+        return value.to_owned();
+    };
+    if mask == OptimizerPassMask::NONE {
+        return "none".to_owned();
+    }
+    if mask == OptimizerPassMask::ALL {
+        return "all".to_owned();
+    }
+    mask.ordered()
+        .map(OptimizerPass::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl Default for OptimizerPassMask {
@@ -404,15 +483,6 @@ pub enum Modules {
     Script,
 }
 
-/// How a `SwitchInt` is spelled.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum SwitchStyle {
-    /// A decision tree over the case values (stage 2).
-    DTree,
-    /// One flat JS `switch` with a case per value.
-    Flat,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Opts {
     pub names: NameStyle,
@@ -420,34 +490,20 @@ pub struct Opts {
     pub roots: Vec<String>,
     pub structure: Structure,
     pub queue: bool,
-    pub switch: SwitchStyle,
     /// Whether each item is preceded by a `// <def path>` comment.
     pub comments: bool,
-    pub line_comments: bool,
     /// Whether the finished program gets a `.map` and a `sourceMappingURL` comment.
     pub source_map: bool,
     /// Def path prefixes whose items are left out of `--emit`ted JS fixtures.
     pub emit_skip: Vec<String>,
-    pub scoped_lets: bool,
-    /// Whether names are shortened and the program printed without the whitespace. See
-    /// `minify.rs`.
-    pub minify: bool,
-    /// Whether minification also renames *item* names at link time.
-    ///
-    /// `js-minify=locals` leaves them alone, which keeps a minified program readable enough to
-    /// grep for a def path and is how the two halves of the win were measured apart. Meaningless
-    /// unless [`Opts::minify`] is on.
-    pub minify_items: bool,
+    /// Minification level: off, locals-only, or locals + link-time item renaming. See `minify.rs`.
+    pub minify: MinifyMode,
     /// The syntax ceiling the item printer must satisfy.
     ///
     /// **Emit-affecting**: BigInt constants and logical assignments have different spellings, so
     /// every object in a program, including the sysroot, must agree on this value.
     #[serde(default)]
     pub ecma_target: EcmaTarget,
-    /// Whether repeated constants — `#[track_caller]` locations, long string literals — are
-    /// emitted once as a module level `const` instead of being written out at every use. See
-    /// the codegen unit's constant pool.
-    pub hoist_consts: bool,
     /// Whether the program is an ES module or a plain script. See [`Modules`].
     pub modules: Modules,
     /// The module the runtime shim's `__rt` namespace is imported from, in ES module output.
@@ -456,8 +512,6 @@ pub struct Opts {
     pub entry_role: crate::artifact::EntryRole,
     /// Explicit deployment roles for named chunks; unspecified chunks are main entries.
     pub chunk_roles: Vec<(String, crate::artifact::EntryRole)>,
-    /// The module the DOM runtime's bindings are imported from, in ES module output.
-    pub dom_module: String,
     /// The chunks to split the program into, as `(name, entry)` pairs in request order.
     ///
     /// Empty means one file, which is every compilation that does not ask to be split. See
@@ -567,25 +621,15 @@ impl Default for Opts {
             roots: Vec::new(),
             structure: Structure::Regions,
             queue: true,
-            switch: SwitchStyle::Flat,
             comments: true,
-            line_comments: false,
             source_map: false,
             emit_skip: Vec::new(),
-            scoped_lets: false,
-            minify: false,
-            minify_items: true,
+            minify: MinifyMode::Off,
             ecma_target: EcmaTarget::Latest,
-            // Off by default on measured evidence (see CONTRACT.md "Hoisted constants"): the
-            // 16-hex hash names are incompressible, so hoisting loses 1-5% gzipped even where
-            // it wins raw minified bytes. The mechanism stays for a future per-item reuse-count
-            // gate; `--remap-path-prefix` (the actual win) is unconditional in the scripts.
-            hoist_consts: false,
             modules: Modules::Script,
             shim_module: "./shim.js".to_owned(),
             entry_role: crate::artifact::EntryRole::Main,
             chunk_roles: Vec::new(),
-            dom_module: "topcoat-dom".to_owned(),
             chunks: Vec::new(),
             dts: false,
             shared_chunk: "shared".to_owned(),
@@ -665,7 +709,6 @@ pub fn get() -> &'static Opts {
 }
 
 /// Whether a rendered source file is inside the configured workspace.
-#[allow(dead_code)]
 pub fn is_workspace_source(file: &str) -> bool {
     let Some(root) = &get().workspace_root else {
         return false;
@@ -723,20 +766,33 @@ pub trait Diagnostics {
 
 pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
     let mut opts = Opts::default();
-
-    // The alias layer, resolved first so that an explicitly spelled option overrides whatever the
-    // profile asked for regardless of which side of it the option was written on. A profile is a
-    // starting point, and a command line reads as one thing whichever order it was assembled in.
+    apply_profiles(args, &mut opts, dcx);
     for arg in args {
-        let (key, value) = match arg.split_once('=') {
-            Some((key, value)) => (key, Some(value)),
-            None => (arg.as_str(), None),
-        };
+        parse_flag(arg, &mut opts, dcx);
+    }
+    validate_opts(&mut opts, dcx);
+    opts
+}
+
+fn split_arg(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (arg, None),
+    }
+}
+
+/// Resolves the `js-profile` alias layer ahead of explicit flags.
+///
+/// Running profiles first ensures that an explicitly spelled option overrides whatever the
+/// profile asked for regardless of which side of it the option was written on.
+fn apply_profiles(args: &[String], opts: &mut Opts, dcx: &dyn Diagnostics) {
+    for arg in args {
+        let (key, value) = split_arg(arg);
         if key != "js-profile" {
             continue;
         }
         match value.and_then(Profile::parse) {
-            Some(profile) => profile.apply(&mut opts),
+            Some(profile) => profile.apply(opts),
             None => bad_value(
                 dcx,
                 key,
@@ -745,249 +801,184 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
             ),
         }
     }
+}
 
-    for arg in args {
-        let (key, value) = match arg.split_once('=') {
-            Some((key, value)) => (key, Some(value)),
-            None => (arg.as_str(), None),
-        };
-
-        // A typo here silently changes what the backend emits, so every unknown key and every
-        // unusable value gets a diagnostic rather than being ignored.
-        match key {
-            // Validated against the actual binary by the producer. Rustc tracks this argument;
-            // it does not select a linker policy or belong in normalized emit options.
-            "js-producer" => match value {
-                Some(value)
-                    if value.len() == 64
-                        && value
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {
-                }
-                other => bad_value(dcx, key, other, "a lowercase SHA-256 digest"),
-            },
-            "js-names" => match value {
-                Some("readable") => opts.names = NameStyle::Readable,
-                Some("mangled") => opts.names = NameStyle::Mangled,
-                other => bad_value(dcx, key, other, "readable`, `mangled"),
-            },
-            "js-root" => match value {
-                Some(name) if !name.is_empty() => opts.roots.push(name.to_owned()),
-                other => bad_value(dcx, key, other, "a JavaScript identifier"),
-            },
-            "js-structure" => match value {
-                Some("regions") => opts.structure = Structure::Regions,
-                Some("trampoline") => opts.structure = Structure::Trampoline,
-                other => bad_value(dcx, key, other, "regions`, `trampoline"),
-            },
-            "js-queue" => match on_off(value) {
-                Some(on) => opts.queue = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-switch" => match value {
-                Some("dtree") => opts.switch = SwitchStyle::DTree,
-                Some("flat") => opts.switch = SwitchStyle::Flat,
-                other => bad_value(dcx, key, other, "dtree`, `flat"),
-            },
-            "js-comments" => match on_off(value) {
-                Some(on) => opts.comments = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-line-comments" => match on_off_flag(value) {
-                Some(on) => opts.line_comments = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-source-map" => match on_off_flag(value) {
-                Some(on) => opts.source_map = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-emit-skip" => match value {
-                Some(prefix) if !prefix.is_empty() => opts.emit_skip.push(prefix.to_owned()),
-                other => bad_value(dcx, key, other, "a def path prefix"),
-            },
-            "js-scoped-lets" => match on_off_flag(value) {
-                Some(on) => opts.scoped_lets = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-minify" => match value {
-                // Everything but the link-time item rename, so that the two halves of the win can
-                // be told apart and a minified program can still be grepped for a def path.
-                Some("locals") => {
-                    opts.minify = true;
-                    opts.minify_items = false;
-                }
-                other => match on_off_flag(other) {
-                    Some(on) => opts.minify = on,
-                    None => bad_value(dcx, key, other, "on`, `locals`, `off"),
-                },
-            },
-            "js-ecma-target" => match value {
-                Some("2018") => opts.ecma_target = EcmaTarget::Es2018,
-                Some("latest") => opts.ecma_target = EcmaTarget::Latest,
-                other => bad_value(dcx, key, other, "2018`, `latest"),
-            },
-            "js-dts" => match on_off(value) {
-                Some(on) => opts.dts = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-hoist-consts" => match on_off(value) {
-                Some(on) => opts.hoist_consts = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-modules" => match value {
-                Some("esm") => opts.modules = Modules::Esm,
-                Some("script") => opts.modules = Modules::Script,
-                other => bad_value(dcx, key, other, "esm`, `script"),
-            },
-            "js-shim-module" => match value {
-                Some(spec) if !spec.is_empty() => opts.shim_module = spec.to_owned(),
-                other => bad_value(dcx, key, other, "a module specifier"),
-            },
-            "js-entry-role" => match value.and_then(crate::artifact::EntryRole::parse) {
-                Some(role) => opts.entry_role = role,
-                None => bad_value(
-                    dcx,
-                    key,
-                    value,
-                    "main`, `worker`, `island`, `procedure`, `shared",
-                ),
-            },
-            "js-chunk-role" => match value.and_then(|value| value.split_once(':')) {
-                Some((name, role)) if is_chunk_name(name) => {
-                    match crate::artifact::EntryRole::parse(role) {
-                        Some(role) => opts.chunk_roles.push((name.to_owned(), role)),
-                        None => bad_value(
-                            dcx,
-                            key,
-                            value,
-                            "<chunk name>:<main|worker|island|procedure|shared>",
-                        ),
-                    }
-                }
-                _ => bad_value(
-                    dcx,
-                    key,
-                    value,
-                    "<chunk name>:<main|worker|island|procedure|shared>",
-                ),
-            },
-            "js-dom-module" => match value {
-                Some(spec) if !spec.is_empty() => opts.dom_module = spec.to_owned(),
-                other => bad_value(dcx, key, other, "a module specifier"),
-            },
-            "js-chunk" => match value.and_then(|value| value.split_once(':')) {
-                Some((name, entry)) if is_chunk_name(name) && !entry.is_empty() => {
-                    opts.chunks.push((name.to_owned(), entry.to_owned()));
-                }
-                _ => bad_value(dcx, key, value, "<chunk name>:<entry point>"),
-            },
-            "js-chunk-shared" => match value {
-                Some(name) if is_chunk_name(name) => opts.shared_chunk = name.to_owned(),
-                other => bad_value(dcx, key, other, "a chunk name"),
-            },
-            "js-chunk-registry" => match on_off(value) {
-                Some(on) => opts.chunk_registry = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-opt" => match value {
-                Some("off") => opts.optimizer = OptimizerMode::Off,
-                Some("report") => opts.optimizer = OptimizerMode::Report,
-                Some("on") => opts.optimizer = OptimizerMode::On,
-                other => bad_value(dcx, key, other, "off`, `report`, `on"),
-            },
-            "js-opt-passes" => match value.and_then(OptimizerPassMask::parse) {
-                Some(passes) => opts.optimizer_passes = passes,
-                None => bad_value(
-                    dcx,
-                    key,
-                    value,
-                    "all`, `none`, or a comma list of `sroa`, `ast-dce`, `future-poller`, \
-                     `native-representations`, and `link-dedup`",
-                ),
-            },
-            "js-opt-warnings" => match on_off(value) {
-                Some(on) => opts.optimization_warnings = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-opt-report" => match value {
-                Some(path) if !path.is_empty() => opts.optimization_report = Some(path.to_owned()),
-                other => bad_value(dcx, key, other, "a file path"),
-            },
-            "js-workspace-root" => match value {
-                Some(path) if !path.is_empty() => opts.workspace_root = Some(PathBuf::from(path)),
-                other => bad_value(dcx, key, other, "a directory path"),
-            },
-            "js-cleanup" => match on_off(value) {
-                Some(on) => opts.cleanup = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-jir" => match on_off(value) {
-                Some(true) => opts.jir = true,
-                _ => bad_value(dcx, key, value, "on"),
-            },
-            "js-lane" => match value {
-                Some("jir") => opts.lane = Lane::Jir,
-                other => bad_value(dcx, key, other, "jir"),
-            },
-            "js-lane-report" => match value {
-                Some(path) if !path.is_empty() => opts.lane_report = Some(path.to_owned()),
-                other => bad_value(dcx, key, other, "a file path"),
-            },
-            "js-lane-classes" => match value.and_then(ItemClass::parse) {
-                Some(classes) => opts.lane_classes = classes,
-                None => bad_value(
-                    dcx,
-                    key,
-                    value,
-                    "all`, `none`, or a comma list of `scalar-leaf`, `aggregate`, `refs`, \
-                     `pointers`, `drops`, `unwind`, `host`, `coroutine`, `static`, `vtable",
-                ),
-            },
-            "js-jir-flat-abi" => match on_off(value) {
-                Some(on) => opts.flat_abi = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-jir-ready-futures" => match on_off(value) {
-                Some(on) => opts.ready_futures = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-jir-typed-storage" => match on_off(value) {
-                Some(on) => opts.typed_storage = on,
-                None => bad_value(dcx, key, value, "on`, `off"),
-            },
-            "js-opt-weight-alloc" => match value.and_then(|value| value.parse().ok()) {
-                Some(weight) => opts.weight_alloc = weight,
-                None => bad_value(dcx, key, value, "a non-negative integer"),
-            },
-            "js-lane-only" => match value {
-                Some(names) if !names.is_empty() => {
-                    for name in names.split(',').filter(|name| !name.is_empty()) {
-                        opts.lane_only.push(name.to_owned());
-                    }
-                    opts.lane_only.sort();
-                    opts.lane_only.dedup();
-                }
-                other => bad_value(dcx, key, other, "a comma list of emitted item names"),
-            },
-            "js-jir-dump-conflicts" => match value {
-                Some(path) if !path.is_empty() => opts.jir_dump_conflicts = Some(path.to_owned()),
-                other => bad_value(dcx, key, other, "a file path"),
-            },
-            "js-str" => match value {
-                Some("utf16") => opts.str_repr = StrRepr::Utf16,
-                Some("bytes") => opts.str_repr = StrRepr::Bytes,
-                other => bad_value(dcx, key, other, "utf16`, `bytes"),
-            },
-            // Already resolved, ahead of this loop, so that an explicit option wins.
-            "js-profile" => {}
-            _ => {
-                dcx.warn(&format!(
-                    "`-Cllvm-args={arg}` is not understood by rustc_codegen_js"
-                ));
+/// Parses and applies one `-Cllvm-args` item.
+///
+/// A typo silently changes what the backend emits, so every unknown key and every unusable
+/// value gets a diagnostic rather than being ignored.
+fn parse_flag(arg: &str, opts: &mut Opts, dcx: &dyn Diagnostics) {
+    let (key, value) = split_arg(arg);
+    match key {
+        // Validated against the actual binary by the producer. Rustc tracks this argument;
+        // it does not select a linker policy or belong in normalized emit options.
+        "js-producer" => match value {
+            Some(value) if is_sha256_hex(value) => {}
+            other => bad_value(dcx, key, other, "a lowercase SHA-256 digest"),
+        },
+        "js-names" => match value {
+            Some("readable") => opts.names = NameStyle::Readable,
+            Some("mangled") => opts.names = NameStyle::Mangled,
+            other => bad_value(dcx, key, other, "readable`, `mangled"),
+        },
+        "js-root" => match value {
+            Some(name) if !name.is_empty() => opts.roots.push(name.to_owned()),
+            other => bad_value(dcx, key, other, "a JavaScript identifier"),
+        },
+        "js-structure" => match value {
+            Some("regions") => opts.structure = Structure::Regions,
+            Some("trampoline") => opts.structure = Structure::Trampoline,
+            other => bad_value(dcx, key, other, "regions`, `trampoline"),
+        },
+        "js-queue" => set_on_off(dcx, key, value, &mut opts.queue),
+        "js-switch" => match value {
+            Some("dtree" | "flat") => {}
+            other => bad_value(dcx, key, other, "dtree`, `flat"),
+        },
+        "js-comments" => set_on_off(dcx, key, value, &mut opts.comments),
+        "js-line-comments" | "js-scoped-lets" => {
+            if on_off_flag(value).is_none() {
+                bad_value(dcx, key, value, "on`, `off");
             }
         }
+        "js-source-map" => match on_off_flag(value) {
+            Some(on) => opts.source_map = on,
+            None => bad_value(dcx, key, value, "on`, `off"),
+        },
+        "js-emit-skip" => match value {
+            Some(prefix) if !prefix.is_empty() => opts.emit_skip.push(prefix.to_owned()),
+            other => bad_value(dcx, key, other, "a def path prefix"),
+        },
+        "js-minify" => match value {
+            // Everything but the link-time item rename, so that the two halves of the win can
+            // be told apart and a minified program can still be grepped for a def path.
+            Some("locals") => opts.minify = MinifyMode::Locals,
+            other => match on_off_flag(other) {
+                Some(true) => opts.minify = MinifyMode::All,
+                Some(false) => opts.minify = MinifyMode::Off,
+                None => bad_value(dcx, key, other, "on`, `locals`, `off"),
+            },
+        },
+        "js-ecma-target" => match value {
+            Some("2018") => opts.ecma_target = EcmaTarget::Es2018,
+            Some("latest") => opts.ecma_target = EcmaTarget::Latest,
+            other => bad_value(dcx, key, other, "2018`, `latest"),
+        },
+        "js-dts" => set_on_off(dcx, key, value, &mut opts.dts),
+        "js-hoist-consts" => {
+            if on_off(value).is_none() {
+                bad_value(dcx, key, value, "on`, `off");
+            }
+        }
+        "js-modules" => match value {
+            Some("esm") => opts.modules = Modules::Esm,
+            Some("script") => opts.modules = Modules::Script,
+            other => bad_value(dcx, key, other, "esm`, `script"),
+        },
+        "js-shim-module" => match value {
+            Some(spec) if !spec.is_empty() => opts.shim_module = spec.to_owned(),
+            other => bad_value(dcx, key, other, "a module specifier"),
+        },
+        "js-entry-role" => match value.and_then(crate::artifact::EntryRole::parse) {
+            Some(role) => opts.entry_role = role,
+            None => bad_value(
+                dcx,
+                key,
+                value,
+                "main`, `worker`, `island`, `procedure`, `shared",
+            ),
+        },
+        "js-chunk-role" => parse_chunk_role(dcx, key, value, opts),
+        "js-dom-module" => match value {
+            Some(spec) if !spec.is_empty() => {}
+            other => bad_value(dcx, key, other, "a module specifier"),
+        },
+        "js-chunk" => match value.and_then(|value| value.split_once(':')) {
+            Some((name, entry)) if is_chunk_name(name) && !entry.is_empty() => {
+                opts.chunks.push((name.to_owned(), entry.to_owned()));
+            }
+            _ => bad_value(dcx, key, value, "<chunk name>:<entry point>"),
+        },
+        "js-chunk-shared" => match value {
+            Some(name) if is_chunk_name(name) => opts.shared_chunk = name.to_owned(),
+            other => bad_value(dcx, key, other, "a chunk name"),
+        },
+        "js-chunk-registry" => set_on_off(dcx, key, value, &mut opts.chunk_registry),
+        "js-opt" => match value.and_then(OptimizerMode::parse) {
+            Some(mode) => opts.optimizer = mode,
+            None => bad_value(dcx, key, value, "off`, `report`, `on"),
+        },
+        "js-opt-passes" => match value.and_then(OptimizerPassMask::parse) {
+            Some(passes) => opts.optimizer_passes = passes,
+            None => bad_value(
+                dcx,
+                key,
+                value,
+                "all`, `none`, or a comma list of `sroa`, `ast-dce`, `future-poller`, \
+                 `native-representations`, and `link-dedup`",
+            ),
+        },
+        "js-opt-warnings" => set_on_off(dcx, key, value, &mut opts.optimization_warnings),
+        "js-opt-report" => set_file_path(dcx, key, value, &mut opts.optimization_report),
+        "js-workspace-root" => match value {
+            Some(path) if !path.is_empty() => opts.workspace_root = Some(PathBuf::from(path)),
+            other => bad_value(dcx, key, other, "a directory path"),
+        },
+        "js-cleanup" => set_on_off(dcx, key, value, &mut opts.cleanup),
+        "js-jir" => match on_off(value) {
+            Some(true) => opts.jir = true,
+            _ => bad_value(dcx, key, value, "on"),
+        },
+        "js-lane" => match value {
+            Some("jir") => opts.lane = Lane::Jir,
+            other => bad_value(dcx, key, other, "jir"),
+        },
+        "js-lane-report" => set_file_path(dcx, key, value, &mut opts.lane_report),
+        "js-lane-classes" => match value.and_then(ItemClass::parse) {
+            Some(classes) => opts.lane_classes = classes,
+            None => bad_value(
+                dcx,
+                key,
+                value,
+                "all`, `none`, or a comma list of `scalar-leaf`, `aggregate`, `refs`, \
+                 `pointers`, `drops`, `unwind`, `host`, `coroutine`, `static`, `vtable",
+            ),
+        },
+        "js-jir-flat-abi" => set_on_off(dcx, key, value, &mut opts.flat_abi),
+        "js-jir-ready-futures" => set_on_off(dcx, key, value, &mut opts.ready_futures),
+        "js-jir-typed-storage" => set_on_off(dcx, key, value, &mut opts.typed_storage),
+        "js-opt-weight-alloc" => match value.and_then(|value| value.parse().ok()) {
+            Some(weight) => opts.weight_alloc = weight,
+            None => bad_value(dcx, key, value, "a non-negative integer"),
+        },
+        "js-lane-only" => match value {
+            Some(names) if !names.is_empty() => {
+                for name in names.split(',').filter(|name| !name.is_empty()) {
+                    opts.lane_only.push(name.to_owned());
+                }
+                opts.lane_only.sort();
+                opts.lane_only.dedup();
+            }
+            other => bad_value(dcx, key, other, "a comma list of emitted item names"),
+        },
+        "js-jir-dump-conflicts" => set_file_path(dcx, key, value, &mut opts.jir_dump_conflicts),
+        "js-str" => match value {
+            Some("utf16") => opts.str_repr = StrRepr::Utf16,
+            Some("bytes") => opts.str_repr = StrRepr::Bytes,
+            other => bad_value(dcx, key, other, "utf16`, `bytes"),
+        },
+        // Already resolved ahead of this loop so that an explicit option wins.
+        "js-profile" => {}
+        _ => {
+            dcx.warn(&format!(
+                "`-Cllvm-args={arg}` is not understood by rustc_codegen_js"
+            ));
+        }
     }
+}
 
+/// Validates cross-option invariants and applies post-parse defaults.
+fn validate_opts(opts: &mut Opts, dcx: &dyn Diagnostics) {
     // A split program's pieces reach each other by `import`, so there is no split without modules,
     // and a name collision between two chunks would have them overwrite each other's file.
     if !opts.chunks.is_empty() {
@@ -1027,11 +1018,48 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
         }
     }
 
-    if opts.minify {
+    if opts.minify.is_enabled() {
         opts.comments = false;
     }
+}
 
-    opts
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn set_on_off(dcx: &dyn Diagnostics, key: &str, value: Option<&str>, target: &mut bool) {
+    match on_off(value) {
+        Some(on) => *target = on,
+        None => bad_value(dcx, key, value, "on`, `off"),
+    }
+}
+
+fn set_file_path(
+    dcx: &dyn Diagnostics,
+    key: &str,
+    value: Option<&str>,
+    target: &mut Option<String>,
+) {
+    match value {
+        Some(path) if !path.is_empty() => *target = Some(path.to_owned()),
+        other => bad_value(dcx, key, other, "a file path"),
+    }
+}
+
+fn parse_chunk_role(dcx: &dyn Diagnostics, key: &str, value: Option<&str>, opts: &mut Opts) {
+    const EXPECTED: &str = "<chunk name>:<main|worker|island|procedure|shared>";
+    match value.and_then(|value| value.split_once(':')) {
+        Some((name, role)) if is_chunk_name(name) => {
+            match crate::artifact::EntryRole::parse(role) {
+                Some(role) => opts.chunk_roles.push((name.to_owned(), role)),
+                None => bad_value(dcx, key, value, EXPECTED),
+            }
+        }
+        _ => bad_value(dcx, key, value, EXPECTED),
+    }
 }
 
 /// Whether `name` can be both a chunk's file name and part of a module specifier.
@@ -1231,7 +1259,7 @@ mod tests {
         assert_eq!(dev.optimizer, OptimizerMode::Off);
         assert_eq!(dev.lane, Lane::Jir);
         assert_eq!(dev.str_repr, StrRepr::Utf16);
-        assert!(!dev.minify);
+        assert_eq!(dev.minify, MinifyMode::Off);
 
         let report = opts_of("js-profile=report");
         assert_eq!(report.optimizer, OptimizerMode::Report);
@@ -1243,8 +1271,9 @@ mod tests {
             assert_eq!(opts.ecma_target, EcmaTarget::Es2018, "{name}");
             assert_eq!(opts.lane, Lane::Jir, "{name}");
             assert_eq!(opts.str_repr, StrRepr::Bytes, "{name}");
-            assert!(opts.minify, "{name}");
-            assert!(opts.minify_items, "{name}");
+            assert_eq!(opts.minify, MinifyMode::All, "{name}");
+            assert!(opts.minify.is_enabled(), "{name}");
+            assert!(opts.minify.renames_items(), "{name}");
             assert_eq!(opts.optimizer, OptimizerMode::On, "{name}");
             // Minification decides the header comments, and it does so after the profile.
             assert!(!opts.comments, "{name}");
@@ -1254,8 +1283,9 @@ mod tests {
         assert_eq!(speed.ecma_target, EcmaTarget::Es2018);
         assert_eq!(speed.lane, Lane::Jir);
         assert_eq!(speed.str_repr, StrRepr::Bytes);
-        assert!(speed.minify);
-        assert!(!speed.minify_items);
+        assert_eq!(speed.minify, MinifyMode::Locals);
+        assert!(speed.minify.is_enabled());
+        assert!(!speed.minify.renames_items());
         assert_eq!(speed.optimizer, OptimizerMode::On);
 
         let (_, collected) = parse_line("js-profile=release");
@@ -1303,10 +1333,32 @@ mod tests {
     fn minification_preserves_source_maps() {
         let (opts, collected) = parse_line("js-minify=on js-source-map=on");
 
-        assert!(opts.minify);
+        assert_eq!(opts.minify, MinifyMode::All);
         assert!(opts.source_map);
         assert!(collected.errors.borrow().is_empty());
         assert!(collected.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn minify_on_overrides_release_speed_locals_mode() {
+        for line in [
+            "js-profile=release-speed js-minify=on",
+            "js-minify=on js-profile=release-speed",
+            "js-profile=release-speed js-minify",
+        ] {
+            let opts = opts_of(line);
+            assert_eq!(opts.minify, MinifyMode::All, "{line}");
+            assert!(opts.minify.is_enabled(), "{line}");
+            assert!(opts.minify.renames_items(), "{line}");
+        }
+        assert_eq!(
+            opts_of("js-profile=release-size js-minify=locals").minify,
+            MinifyMode::Locals
+        );
+        assert_eq!(
+            opts_of("js-profile=release-size js-minify=off").minify,
+            MinifyMode::Off
+        );
     }
 
     #[test]
@@ -1317,7 +1369,7 @@ mod tests {
         ] {
             let opts = opts_of(line);
             assert_eq!(opts.profile, Some(Profile::ReleaseSize), "{line}");
-            assert!(!opts.minify, "{line}");
+            assert_eq!(opts.minify, MinifyMode::Off, "{line}");
             assert_eq!(opts.ecma_target, EcmaTarget::Latest, "{line}");
             assert_eq!(opts.lane, Lane::Jir, "{line}");
             // Nothing the profile decided and the command line did not is disturbed.
@@ -1335,7 +1387,7 @@ mod tests {
         assert_eq!(opts.optimizer, OptimizerMode::Report);
         let opts = opts_of("js-profile=release-size js-profile=report");
         assert_eq!(opts.optimizer, OptimizerMode::Report);
-        assert!(opts.minify);
+        assert_eq!(opts.minify, MinifyMode::All);
     }
 
     #[test]
@@ -1496,8 +1548,23 @@ mod tests {
             ]
         );
         assert_eq!(OptimizerPassMask::parse("all"), Some(mask));
-        assert_eq!(OptimizerPassMask::parse("none"), Some(OptimizerPassMask(0)));
+        assert_eq!(
+            OptimizerPassMask::parse("none"),
+            Some(OptimizerPassMask::NONE)
+        );
         assert_eq!(OptimizerPassMask::parse("unknown"), None);
+        assert_eq!(
+            normalize_optimizer_passes("link-dedup,sroa,sroa"),
+            "sroa,link-dedup"
+        );
+        assert_eq!(
+            normalize_optimizer_passes(
+                "link-dedup,native-representations,future-poller,ast-dce,sroa"
+            ),
+            "all"
+        );
+        assert_eq!(normalize_optimizer_passes("none"), "none");
+        assert_eq!(normalize_optimizer_passes("unknown"), "unknown");
     }
 
     #[test]

@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rcgjs_object::jir::conflict::{self, Cause};
+use rcgjs_object::jir::conflict::{self, DiffCause};
 use rcgjs_object::jir::origin::OriginTable;
 use rcgjs_object::jir::semantic::Body;
 use rcgjs_object::jir::summary::{merge_headers, ItemSummary, NormalizedBody};
@@ -113,7 +113,9 @@ fn main() {
         duplicate_items += 1;
         let group = judge(&objects, group);
         if group.verdict == "different" {
-            *drift.entry(group.cause.as_str()).or_default() += 1;
+            *drift
+                .entry(group.cause.map_or("-", DiffCause::as_str))
+                .or_default() += 1;
         }
         verdicts.entry(group.verdict).or_default().push(group);
     }
@@ -203,7 +205,7 @@ struct Group {
     entries: Vec<Entry>,
     verdict: &'static str,
     /// For `different`: `inlined`, `shape`, or `content`.
-    cause: Cause,
+    cause: Option<DiffCause>,
     /// The first field the two representative normal forms disagree about.
     difference: Option<String>,
     blob_hashes: Vec<Hash128>,
@@ -231,7 +233,7 @@ fn group(objects: &[(String, Object)]) -> Vec<Group> {
             name: name.to_owned(),
             entries,
             verdict: "identical",
-            cause: Cause::None,
+            cause: None,
             difference: None,
             blob_hashes: Vec::new(),
             normalized_hashes: Vec::new(),
@@ -292,7 +294,7 @@ fn judge(objects: &[(String, Object)], mut group: Group) -> Group {
             Ok(None) => {}
             Err(err) => {
                 group.verdict = "different";
-                group.cause = Cause::Undecodable;
+                group.cause = Some(DiffCause::Undecodable);
                 group.difference = Some(format!("body does not decode: {err}"));
                 return group;
             }
@@ -346,11 +348,11 @@ fn judge(objects: &[(String, Object)], mut group: Group) -> Group {
         conflict::first_difference(&normalized[keep], &normalized[other])
             .unwrap_or_else(|| "nothing (the walk found no difference)".to_owned()),
     );
-    group.cause = conflict::cause(
+    group.cause = Some(conflict::cause(
         &normalized[keep],
         &normalized[other],
         Some((&bodies[keep].2, &bodies[other].2)),
-    );
+    ));
     group
 }
 
@@ -388,7 +390,10 @@ fn print_group(objects: &[(String, Object)], group: &Group) {
         println!("    blob {blob}  normalized {normalized}  {path}");
     }
     if let Some(difference) = &group.difference {
-        println!("    cause {}: {difference}", group.cause.as_str());
+        println!(
+            "    cause {}: {difference}",
+            group.cause.map_or("-", DiffCause::as_str)
+        );
     }
 }
 
@@ -406,7 +411,7 @@ fn report_expected(
             return;
         }
     };
-    let mut where_is: BTreeMap<&str, (&'static str, Cause)> = BTreeMap::new();
+    let mut where_is: BTreeMap<&str, (&'static str, Option<DiffCause>)> = BTreeMap::new();
     for (verdict, groups) in verdicts {
         for group in groups {
             where_is.insert(group.name.as_str(), (verdict, group.cause));
@@ -424,12 +429,15 @@ fn report_expected(
         // conflict cannot have come from a cross-object duplicate — or not in it at all.
         let (verdict, cause) = where_is.get(name).copied().unwrap_or_else(|| {
             match present.get(name).copied().unwrap_or(0) {
-                0 => ("absent", Cause::None),
-                _ => ("single", Cause::None),
+                0 => ("absent", None),
+                _ => ("single", None),
             }
         });
         *counts.entry(verdict).or_default() += 1;
-        println!("  {name}\t{verdict}\t{}", cause.as_str());
+        println!(
+            "  {name}\t{verdict}\t{}",
+            cause.map_or("-", DiffCause::as_str)
+        );
     }
     for (verdict, count) in counts {
         println!("expected.{verdict}\t{count}");

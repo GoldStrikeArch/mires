@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use crate::{js_bindings, HostValue, JsValue};
+use crate::{js_bindings, HostHandle, HostValue, JsValue};
 
 /// A JavaScript string.
 ///
@@ -12,7 +12,7 @@ use crate::{js_bindings, HostValue, JsValue};
 #[derive(Clone, Copy)]
 pub struct JsString {
     #[allow(dead_code)]
-    handle: u32,
+    handle: HostHandle,
 }
 
 impl crate::host::sealed::Sealed for JsString {}
@@ -82,10 +82,7 @@ impl TryFrom<JsValue> for JsString {
     type Error = JsValue;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        match value.is_string() {
-            true => Ok(value.read()),
-            false => Err(value),
-        }
+        value.try_read()
     }
 }
 
@@ -96,8 +93,8 @@ impl TryFrom<JsValue> for JsString {
 #[repr(transparent)]
 pub struct JsArray<T> {
     #[allow(dead_code)]
-    handle: u32,
-    marker: PhantomData<fn() -> T>,
+    handle: HostHandle,
+    marker: PhantomData<fn(T) -> T>,
 }
 
 impl<T> Clone for JsArray<T> {
@@ -178,10 +175,7 @@ impl TryFrom<JsValue> for JsArray<JsValue> {
     type Error = JsValue;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        match array_is_array(value) {
-            true => Ok(value.read()),
-            false => Err(value),
-        }
+        value.try_read()
     }
 }
 

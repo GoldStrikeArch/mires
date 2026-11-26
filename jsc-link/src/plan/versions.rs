@@ -10,8 +10,10 @@
 //! instead target one private clone; [`budget`] enforces the cap and [`allocate_version_name`]
 //! owns its collision-proof name.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 use crate::item::JsName;
 use crate::jir::decline::{Decline, VersionDecline};
 
@@ -38,15 +40,13 @@ pub fn budget(requested: u32) -> Result<(), Decline> {
 /// name (the `$rN` lesson).
 ///
 /// Owned-set form used while allocating several clones and adding each selected name to `taken`.
+#[cfg(test)]
 pub fn allocate_version_name_owned(
     base: &str,
     taken: &BTreeSet<String>,
 ) -> Result<JsName, Decline> {
     let preferred = format!("{base}$n{MAX_NATIVE_VERSIONS}");
-    std::iter::once(preferred.clone())
-        .chain((1..64).map(|suffix| format!("{preferred}${suffix}")))
-        .find(|name| !taken.contains(name))
-        .map(JsName::new)
+    super::names::find_suffixed(&preferred, taken)
         .ok_or(Decline::Version(VersionDecline::NativeCloneCollision))
 }
 

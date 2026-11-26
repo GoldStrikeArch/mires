@@ -702,41 +702,15 @@ fn path_expr(path: &FixedPath) -> Expr {
 
 struct AliasRewriter<'a>(&'a BTreeMap<String, FixedPath>);
 
-impl AliasRewriter<'_> {
-    fn rewrite_block(&mut self, stmts: &mut Vec<Stmt>) {
+impl VisitMut for AliasRewriter<'_> {
+    fn visit_block_mut(&mut self, stmts: &mut Vec<Stmt>) {
         self.visit_stmts_mut(stmts);
         stmts.retain(|stmt| !matches!(stmt, Stmt::ExprStmt(Expr::Undefined)));
     }
-}
 
-impl VisitMut for AliasRewriter<'_> {
     fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
-        match stmt {
-            Stmt::TryCatch { .. } => {}
-            Stmt::If(test, then, otherwise) => {
-                self.visit_expr_mut(test);
-                self.rewrite_block(then);
-                if let Some(body) = otherwise {
-                    self.rewrite_block(body);
-                }
-            }
-            Stmt::Switch(disc, cases) => {
-                self.visit_expr_mut(disc);
-                for case in cases {
-                    for test in &mut case.tests {
-                        self.visit_expr_mut(test);
-                    }
-                    self.rewrite_block(&mut case.body);
-                }
-            }
-            Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
-                self.rewrite_block(body);
-            }
-            Stmt::While(test, body) => {
-                self.visit_expr_mut(test);
-                self.rewrite_block(body);
-            }
-            _ => walk_stmt_mut(self, stmt),
+        if !matches!(stmt, Stmt::TryCatch { .. }) {
+            walk_stmt_mut(self, stmt);
         }
     }
 
@@ -751,7 +725,6 @@ impl VisitMut for AliasRewriter<'_> {
             {
                 *expr = Expr::Undefined;
             }
-            Expr::Arrow(_, ArrowBody::Block(body)) => self.rewrite_block(body),
             Expr::Seq(items) => {
                 for item in items.iter_mut() {
                     self.visit_expr_mut(item);
@@ -769,7 +742,7 @@ impl VisitMut for AliasRewriter<'_> {
 }
 
 fn rewrite_alias_stmts(mut stmts: Vec<Stmt>, aliases: &BTreeMap<String, FixedPath>) -> Vec<Stmt> {
-    AliasRewriter(aliases).rewrite_block(&mut stmts);
+    AliasRewriter(aliases).visit_block_mut(&mut stmts);
     stmts
 }
 
@@ -2192,7 +2165,11 @@ mod tests {
         for (store, spelled) in [
             (jsast::assign(field(), jsast::id("v")), "s.f = v;"),
             (
-                Expr::CompoundAssign(BinOp::Add, Box::new(field()), Box::new(jsast::id("v"))),
+                Expr::CompoundAssign(
+                    jsast::CompoundOp::Add,
+                    Box::new(field()),
+                    Box::new(jsast::id("v")),
+                ),
                 "s.f += v;",
             ),
         ] {

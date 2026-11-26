@@ -51,21 +51,36 @@ pub(crate) fn warn_misses(dcx: &Sink, table: &BTreeMap<JsName, LinkItem>, reacha
     }
 }
 
+/// Immutable inputs for writing a whole-program optimization report.
+pub(crate) struct ReportInput<'a> {
+    pub(crate) dcx: &'a Sink,
+    pub(crate) path: &'a Path,
+    pub(crate) label: &'a str,
+    pub(crate) program_bytes: usize,
+    pub(crate) item_bytes: &'a BTreeMap<JsName, usize>,
+    pub(crate) synthesized_bytes: usize,
+    pub(crate) table: &'a BTreeMap<JsName, LinkItem>,
+    pub(crate) reachable: &'a [JsName],
+    pub(crate) parents: &'a HashMap<JsName, JsName>,
+    pub(crate) dedup: &'a crate::link_dedup::DedupSummary,
+    pub(crate) lane: Option<&'a crate::link::lane::LaneRun>,
+}
+
 /// Writes the requested whole-program report.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write(
-    dcx: &Sink,
-    path: &Path,
-    label: &str,
-    program_bytes: usize,
-    item_bytes: &BTreeMap<JsName, usize>,
-    synthesized_bytes: usize,
-    table: &BTreeMap<JsName, LinkItem>,
-    reachable: &[JsName],
-    parents: &HashMap<JsName, JsName>,
-    dedup: &crate::link_dedup::DedupSummary,
-    lane: Option<&crate::link::lane::LaneRun>,
-) {
+pub(crate) fn write(input: &ReportInput<'_>) {
+    let ReportInput {
+        dcx,
+        path,
+        label,
+        program_bytes,
+        item_bytes,
+        synthesized_bytes,
+        table,
+        reachable,
+        parents,
+        dedup,
+        lane,
+    } = *input;
     let mut names: Vec<&JsName> = reachable.iter().collect();
     names.sort();
 

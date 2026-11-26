@@ -564,6 +564,16 @@ impl Body {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct LocalId(pub u32);
 
+impl crate::index_vec::Idx for LocalId {
+    fn new(idx: usize) -> Self {
+        Self(u32::try_from(idx).expect("LocalId overflows u32"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Local {
     pub id: LocalId,
@@ -581,6 +591,16 @@ pub enum LocalRole {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
+
+impl crate::index_vec::Idx for BlockId {
+    fn new(idx: usize) -> Self {
+        Self(u32::try_from(idx).expect("BlockId overflows u32"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BasicBlock {

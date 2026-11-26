@@ -21,24 +21,86 @@
 //! # What is not free
 //!
 //! * a reserved word, and the four host names in [`HOST_NAMES`];
+//! * a contextual keyword (`of` in `for (... of ...)`, `async` before `function` or arrow params,
+//!   `get`/`set`/`async` in object-literal method/accessor positions) — anywhere else those four
+//!   names are ordinary identifiers and can capture Rust locals of the same name;
 //! * an identifier after `.` or `?.`, which is a property and a different namespace;
 //! * an object literal key: `{ method: "POST" }` binds nothing, while the shorthand `{ body }` is a
 //!   reference and so is a capture, rewritten to `{ body: <slot> }`;
 //! * a name the block itself binds, in the region that binds it. The binding forms are `let`,
 //!   `const`, `var`, function parameters, arrow parameters, a function's own name, and `catch`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 
-use crate::block;
+use mires_marker_abi::block;
 
 /// What lexing a block found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Analysis {
     /// The free identifiers, in first occurrence order. Capture `i` fills slot `i`.
     pub free: Vec<String>,
+    /// Character offset of the first free occurrence of each identifier in [`Analysis::free`].
+    pub free_offsets: Vec<usize>,
     /// The block, with every free occurrence replaced by its slot name.
     pub text: String,
 }
+
+/// Error returned by [`analyze`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LexError {
+    /// An opening `(`, `[`, or `{` reached EOF without its matching closer.
+    UnclosedBracket(char),
+    /// A closing `)`, `]`, or `}` appeared with no open bracket.
+    UnopenedBracket(char),
+    /// A closing bracket did not match the innermost open bracket.
+    MismatchedBracket { open: char, close: char },
+    /// A template literal reached EOF without a closing `` ` ``.
+    UnterminatedTemplate,
+    /// A `/*` block comment reached EOF without `*/`.
+    UnterminatedBlockComment,
+    /// A single- or double-quoted string literal reached EOF without its closing quote.
+    UnterminatedString(char),
+    /// A regular expression literal hit a newline or EOF before its closing `/`.
+    UnterminatedRegex,
+    /// The source mentioned a reserved capture slot name such as `_$js0`.
+    ReservedSlotName(String),
+    /// A statement-opening keyword appeared at top level.
+    StatementKeyword(String),
+    /// A `;` appeared at top level.
+    TopLevelSemicolon,
+}
+
+impl fmt::Display for LexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnclosedBracket(open) => write!(f, "`{open}` is never closed"),
+            Self::UnopenedBracket(close) => {
+                write!(f, "`{close}` closes a bracket that was never opened")
+            }
+            Self::MismatchedBracket { open, close } => {
+                write!(f, "`{open}` is closed by `{close}`")
+            }
+            Self::UnterminatedTemplate => f.write_str("a template literal is never closed"),
+            Self::UnterminatedBlockComment => f.write_str("a block comment is never closed"),
+            Self::UnterminatedString(quote) => write!(f, "a {quote} string is never closed"),
+            Self::UnterminatedRegex => f.write_str("a regular expression is never closed"),
+            Self::ReservedSlotName(word) => write!(
+                f,
+                "`{word}` is what a capture is emitted as, so a block cannot spell it"
+            ),
+            Self::StatementKeyword(word) => write!(
+                f,
+                "`{word}` opens a statement and a `js!{{}}` block is one expression"
+            ),
+            Self::TopLevelSemicolon => {
+                f.write_str("a `js!{}` block is one expression, and `;` ends a statement")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LexError {}
 
 /// The names the analysis treats as always bound, on top of the reserved words.
 ///
@@ -49,9 +111,11 @@ pub struct Analysis {
 /// depends on greppable, which is what keeps the rule "a free identifier is a Rust binding" total.
 pub const HOST_NAMES: [&str; 4] = ["globalThis", "undefined", "NaN", "Infinity"];
 
-/// The reserved words, which are never identifiers.
-const RESERVED: [&str; 42] = [
-    "async",
+/// The unconditionally reserved words, which are never captured as identifiers.
+///
+/// Contextual keywords (`async`, `get`, `of`, `set`) are intentionally excluded here and handled
+/// positionally so Rust locals with those names can still be captured in ordinary expressions.
+const RESERVED: [&str; 38] = [
     "await",
     "break",
     "case",
@@ -71,7 +135,6 @@ const RESERVED: [&str; 42] = [
     "finally",
     "for",
     "function",
-    "get",
     "if",
     "implements",
     "import",
@@ -81,13 +144,11 @@ const RESERVED: [&str; 42] = [
     "let",
     "new",
     "null",
-    "of",
     "package",
     "private",
     "protected",
     "public",
     "return",
-    "set",
     "static",
     "super",
     "switch",
@@ -110,7 +171,7 @@ const STATEMENT_WORDS: [&str; 13] = [
     "throw", "var", "while",
 ];
 
-/// Whether `word` is a name a block never captures.
+/// Whether `word` is an unconditionally reserved name a block never captures.
 #[must_use]
 pub fn is_reserved(word: &str) -> bool {
     RESERVED.contains(&word) || RESERVED_REST.contains(&word) || HOST_NAMES.contains(&word)
@@ -126,15 +187,15 @@ fn is_ident_continue(character: char) -> bool {
     character == '_' || character == '$' || character.is_alphanumeric()
 }
 
-/// The multi character operators, longest first so a munch is greedy. `/` and `/=` are absent
+/// The multi-character operators, longest first so a munch is greedy. `/` and `/=` are absent
 /// because a leading `/` is decided by [`Scan::regex_follows`] before it reaches here.
 const OPERATORS: [&str; 25] = [
     ">>>=", "...", "===", "!==", "**=", "<<=", ">>=", ">>>", "&&=", "||=", "??=", "=>", "==", "!=",
     "<=", ">=", "&&", "||", "??", "?.", "++", "--", "+=", "-=", "*=",
 ];
 
-/// The rest of them. Split only to keep each array a readable width.
-const OPERATORS_REST: [&str; 8] = ["%=", "&=", "|=", "^=", "**", "<<", ">>", "="];
+/// The rest of the multi-character operators. Split only to keep each array a readable width.
+const OPERATORS_REST: [&str; 7] = ["%=", "&=", "|=", "^=", "**", "<<", ">>"];
 
 /// The last significant thing the scan read, which is what several decisions turn on.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,8 +212,10 @@ enum Prev {
     Open(char),
     /// A closing bracket.
     Close(char),
-    /// Anything else, as the operator it munched to. `${` is spelled as one.
-    Op(String),
+    /// A multi-character operator (or `${`).
+    Op(&'static str),
+    /// A single punctuation character.
+    Punct(char),
 }
 
 impl Prev {
@@ -161,8 +224,54 @@ impl Prev {
         match self {
             Prev::Word(word) => !is_reserved(word) || VALUE_WORDS.contains(&word.as_str()),
             Prev::Literal | Prev::Regex | Prev::Close(_) => true,
-            Prev::Op(op) => op == "++" || op == "--",
-            Prev::Start | Prev::Open(_) => false,
+            Prev::Op("++" | "--") => true,
+            Prev::Start | Prev::Open(_) | Prev::Op(_) | Prev::Punct(_) => false,
+        }
+    }
+}
+
+/// Which kind of `{ ... }` construct a brace frame represents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BraceKind {
+    Block,
+    Object,
+    TemplateSubstitution,
+}
+
+/// Which bracket construct a [`Frame`] represents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameKind {
+    /// The top-level expression itself.
+    Root,
+    /// A `(...)` group: possibly a parameter list, a `for (...)` head still on its LHS, or
+    /// immediately preceded by a free `async` token that becomes contextual if `=>` follows `)`.
+    Paren {
+        params: bool,
+        for_head: bool,
+        async_prefix: Option<usize>,
+    },
+    /// A `[...]` group, possibly a computed property key inside an object literal.
+    Bracket { computed_key: bool },
+    /// A `{...}` group.
+    Brace(BraceKind),
+}
+
+impl FrameKind {
+    const fn open_char(self) -> Option<char> {
+        match self {
+            Self::Root => None,
+            Self::Paren { .. } => Some('('),
+            Self::Bracket { .. } => Some('['),
+            Self::Brace(_) => Some('{'),
+        }
+    }
+
+    const fn close_char(self) -> Option<char> {
+        match self {
+            Self::Root => None,
+            Self::Paren { .. } => Some(')'),
+            Self::Bracket { .. } => Some(']'),
+            Self::Brace(_) => Some('}'),
         }
     }
 }
@@ -173,12 +282,7 @@ impl Prev {
 /// every bracket are tracked the same way as ones written inside.
 #[derive(Debug)]
 struct Frame {
-    /// `(`, `[`, `{`, or `\0` for the root.
-    open: char,
-    /// Whether a `{` is an object literal rather than a block.
-    object: bool,
-    /// Whether a `{` opened a template literal's `${`, so its `}` resumes the template.
-    substitution: bool,
+    kind: FrameKind,
     /// Open `?`s waiting for their `:` at this depth, so a ternary's `:` is not read as a key's.
     ternary: usize,
     /// Where this frame's occurrences begin, for the retroactive pass that turns `(a, b) =>` into
@@ -187,22 +291,20 @@ struct Frame {
     /// Whether a bare `=` has been written at this frame's own depth since the last `,`. A
     /// parameter list's default value is a reference and must survive that pass.
     default: bool,
-    /// Whether the frame is a parameter list already, which `function`, `catch` and a method
-    /// shorthand say at the `(` and an arrow only says at the `)`.
-    params: bool,
 }
 
 impl Frame {
     /// The frame the block itself is written in.
     fn root() -> Self {
+        Self::new(FrameKind::Root, 0)
+    }
+
+    fn new(kind: FrameKind, occurrences: usize) -> Self {
         Self {
-            open: '\0',
-            object: false,
-            substitution: false,
+            kind,
             ternary: 0,
-            occurrences: 0,
+            occurrences,
             default: false,
-            params: false,
         }
     }
 }
@@ -223,42 +325,69 @@ struct Occurrence {
     shorthand: bool,
 }
 
+/// How far a [`Scope`] reaches before it is popped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeExtent {
+    /// The scope has collected its parameters and is waiting to learn whether its body is a block
+    /// or an expression.
+    Pending,
+    /// A block-bodied scope valid while `depth >= depth`.
+    Block { depth: usize },
+    /// An expression-bodied scope valid while `depth >= depth`, also ended by `,`, `;`, or a
+    /// non-ternary `:` at `depth`.
+    Expression { depth: usize },
+}
+
 /// A region of the block over which some names are bound.
 #[derive(Debug)]
 struct Scope {
     names: BTreeSet<String>,
-    /// The bracket depth this scope needs the scan to stay at or below. It ends when the depth
-    /// drops under it. [`PENDING`] while the scope is waiting to learn where its body is.
-    depth: usize,
-    /// Whether the body is an expression rather than a block, so a `,`, a `;` or a non ternary `:`
-    /// at [`Scope::depth`] ends it too.
-    expression: bool,
+    extent: ScopeExtent,
 }
 
-/// A scope that has its parameters and not yet its body.
-const PENDING: usize = usize::MAX;
+impl Scope {
+    fn insert_name(&mut self, name: &str) {
+        self.names.insert(name.to_owned());
+    }
+}
+
+/// Which mode the scanner is currently in inside a template literal stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemplateMode {
+    /// Raw template text between `` ` `` / `}` and `${` / `` ` ``.
+    Text,
+    /// JavaScript code inside a `${ ... }` substitution.
+    Substitution,
+}
 
 /// Reads a block, one character at a time.
 struct Scan<'a> {
     chars: &'a [char],
     at: usize,
-    /// One entry per template literal nesting level. The top says which of the two modes the scan
-    /// is in: `true` inside the literal's text, `false` inside a `${}` substitution.
-    templates: Vec<bool>,
+    /// One entry per template literal nesting level.
+    templates: Vec<TemplateMode>,
     frames: Vec<Frame>,
     scopes: Vec<Scope>,
     occurrences: Vec<Occurrence>,
     prev: Prev,
     /// The scope whose body extent is not known yet.
     pending: Option<usize>,
-    /// The next `(` opens a parameter list, said by `function`, `catch` or a method shorthand.
+    /// The next `(` opens a parameter list, said by `function`, `catch`, or a method shorthand.
     expect_params: bool,
     /// The next identifier is a function's own name.
     expect_name: bool,
-    /// The frame depth a `let`, `const` or `var` was written at, while it is still in effect.
+    /// The next `(` opens a `for (...)` header.
+    expect_for_head: bool,
+    /// A contextual object-literal entry modifier (`get`, `set`, `async`, or `*`) was just read,
+    /// so the following token is still in property/method-name position.
+    entry_modifier: bool,
+    /// If the previous token was a potentially-free `async` followed on the same line by `(`, its
+    /// index in `occurrences` so closing `)` followed by `=>` can clear its `free` flag.
+    pending_async_occ: Option<usize>,
+    /// The frame depth a `let`, `const`, or `var` was written at, while it is still in effect.
     declaring: Option<usize>,
-    /// The depth of the `=` whose right hand side the scan is in, so an initializer reads as
-    /// references rather than as bindings.
+    /// The depth of the `=` (or `of`/`in`) whose right hand side the scan is in, so an
+    /// initializer reads as references rather than as bindings.
     initializing: Option<usize>,
 }
 
@@ -271,14 +400,16 @@ impl<'a> Scan<'a> {
             frames: vec![Frame::root()],
             scopes: vec![Scope {
                 names: BTreeSet::new(),
-                depth: 0,
-                expression: false,
+                extent: ScopeExtent::Block { depth: 0 },
             }],
             occurrences: Vec::new(),
             prev: Prev::Start,
             pending: None,
             expect_params: false,
             expect_name: false,
+            expect_for_head: false,
+            entry_modifier: false,
+            pending_async_occ: None,
             declaring: None,
             initializing: None,
         }
@@ -286,6 +417,18 @@ impl<'a> Scan<'a> {
 
     fn peek(&self, ahead: usize) -> Option<char> {
         self.chars.get(self.at + ahead).copied()
+    }
+
+    /// Advances past a `\` and the escaped character without overshooting `self.chars.len()`.
+    fn advance_escape(&mut self) {
+        self.at = (self.at + 2).min(self.chars.len());
+    }
+
+    /// Whether the remaining characters at `self.at` start with `needle`.
+    fn starts_with(&self, needle: &str) -> bool {
+        (self.at..)
+            .zip(needle.chars())
+            .all(|(index, expected)| self.chars.get(index) == Some(&expected))
     }
 
     /// The frame the scan is in, which is never absent: the root is one.
@@ -322,6 +465,39 @@ impl<'a> Scan<'a> {
             if character == '/' && self.chars.get(at + 1) == Some(&'*') {
                 at += 2;
                 while at < self.chars.len() {
+                    if self.chars[at] == '*' && self.chars.get(at + 1) == Some(&'/') {
+                        at += 2;
+                        break;
+                    }
+                    at += 1;
+                }
+                continue;
+            }
+            return Some((at, character));
+        }
+    }
+
+    /// Like [`Scan::significant`], but stops and returns `None` if a line terminator intervenes
+    /// (JavaScript's `[no LineTerminator here]` restriction for contextual `async`).
+    fn same_line_significant(&self, mut at: usize) -> Option<(usize, char)> {
+        loop {
+            let character = *self.chars.get(at)?;
+            if character == '\n' || character == '\r' {
+                return None;
+            }
+            if character.is_whitespace() {
+                at += 1;
+                continue;
+            }
+            if character == '/' && self.chars.get(at + 1) == Some(&'/') {
+                return None;
+            }
+            if character == '/' && self.chars.get(at + 1) == Some(&'*') {
+                at += 2;
+                while at < self.chars.len() {
+                    if matches!(self.chars[at], '\n' | '\r') {
+                        return None;
+                    }
                     if self.chars[at] == '*' && self.chars.get(at + 1) == Some(&'/') {
                         at += 2;
                         break;
@@ -386,7 +562,13 @@ impl<'a> Scan<'a> {
         let depth = self.depth();
         while self.scopes.len() > 1 {
             let scope = self.scopes.last().expect("the root scope is never dropped");
-            if scope.depth == PENDING || depth >= scope.depth {
+            let keep = match scope.extent {
+                ScopeExtent::Pending => true,
+                ScopeExtent::Block { depth: d } | ScopeExtent::Expression { depth: d } => {
+                    depth >= d
+                }
+            };
+            if keep {
                 break;
             }
             self.scopes.pop();
@@ -398,7 +580,7 @@ impl<'a> Scan<'a> {
         let depth = self.depth();
         while self.scopes.len() > 1 {
             let scope = self.scopes.last().expect("the root scope is never dropped");
-            if scope.depth != depth || !scope.expression {
+            if scope.extent != (ScopeExtent::Expression { depth }) {
                 break;
             }
             self.scopes.pop();
@@ -416,8 +598,7 @@ impl<'a> Scan<'a> {
         }
         self.scopes.push(Scope {
             names,
-            depth: PENDING,
-            expression: false,
+            extent: ScopeExtent::Pending,
         });
         self.pending = Some(self.scopes.len() - 1);
     }
@@ -433,15 +614,594 @@ impl<'a> Scan<'a> {
             return;
         }
         let depth = self.depth();
-        self.scopes[index].depth = depth;
-        self.scopes[index].expression = true;
+        self.scopes[index].extent = ScopeExtent::Expression { depth };
         self.pending = None;
     }
-}
 
-impl Scope {
-    fn insert_name(&mut self, name: &str) {
-        self.names.insert(name.to_owned());
+    /// Marks the current `for (...)` header frame as past its binding LHS (after `=`, `;`, `in`,
+    /// or `of`).
+    fn leave_for_head_lhs(&mut self) {
+        if let FrameKind::Paren { for_head, .. } = &mut self.frame_mut().kind {
+            *for_head = false;
+        }
+    }
+
+    /// One step of the scan, outside a template literal.
+    fn code(&mut self) -> Result<(), LexError> {
+        let character = self.chars[self.at];
+
+        if character.is_whitespace() {
+            self.at += 1;
+            return Ok(());
+        }
+        if character == '/' && self.peek(1) == Some('/') {
+            while self.peek(0).is_some_and(|c| c != '\n') {
+                self.at += 1;
+            }
+            return Ok(());
+        }
+        if character == '/' && self.peek(1) == Some('*') {
+            self.at += 2;
+            loop {
+                match self.peek(0) {
+                    None => return Err(LexError::UnterminatedBlockComment),
+                    Some('*') if self.peek(1) == Some('/') => {
+                        self.at += 2;
+                        return Ok(());
+                    }
+                    Some(_) => self.at += 1,
+                }
+            }
+        }
+        if character == '/' && self.regex_follows() {
+            return self.regex();
+        }
+        if character == '"' || character == '\'' {
+            return self.string(character);
+        }
+        if character == '`' {
+            self.entry_modifier = false;
+            self.pending_async_occ = None;
+            self.at += 1;
+            self.templates.push(TemplateMode::Text);
+            return Ok(());
+        }
+        if character.is_ascii_digit()
+            || (character == '.' && self.peek(1).is_some_and(|c| c.is_ascii_digit()))
+        {
+            self.number();
+            return Ok(());
+        }
+        if is_ident_start(character) {
+            return self.identifier();
+        }
+        self.punctuation()
+    }
+
+    /// One step of the scan, inside a template literal's text segment.
+    fn template(&mut self) {
+        match self.chars[self.at] {
+            '\\' => self.advance_escape(),
+            '`' => {
+                self.at += 1;
+                self.templates.pop();
+                self.prev = Prev::Literal;
+            }
+            '$' if self.peek(1) == Some('{') => {
+                self.at += 2;
+                // The substitution is code again, and its `}` puts the scan back in the template.
+                self.templates.push(TemplateMode::Substitution);
+                let occurrences = self.occurrences.len();
+                self.frames.push(Frame::new(
+                    FrameKind::Brace(BraceKind::TemplateSubstitution),
+                    occurrences,
+                ));
+                self.prev = Prev::Op("${");
+            }
+            _ => self.at += 1,
+        }
+    }
+
+    /// A string literal, skipped whole.
+    fn string(&mut self, quote: char) -> Result<(), LexError> {
+        let was_entry = self.entry_position();
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+        self.at += 1;
+        loop {
+            match self.peek(0) {
+                None => return Err(LexError::UnterminatedString(quote)),
+                Some('\\') => self.advance_escape(),
+                Some(character) if character == quote => {
+                    self.at += 1;
+                    self.prev = Prev::Literal;
+                    if was_entry && matches!(self.significant(self.at), Some((_, '('))) {
+                        self.expect_params = true;
+                    }
+                    return Ok(());
+                }
+                Some(_) => self.at += 1,
+            }
+        }
+    }
+
+    /// A regular expression literal, skipped whole. A `[..]` class may hold an unescaped `/`.
+    fn regex(&mut self) -> Result<(), LexError> {
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+        self.at += 1;
+        let mut in_class = false;
+        loop {
+            match self.peek(0) {
+                None | Some('\n') => return Err(LexError::UnterminatedRegex),
+                Some('\\') => {
+                    if self.peek(1) == Some('\n') {
+                        return Err(LexError::UnterminatedRegex);
+                    }
+                    self.advance_escape();
+                }
+                Some('[') => {
+                    in_class = true;
+                    self.at += 1;
+                }
+                Some(']') => {
+                    in_class = false;
+                    self.at += 1;
+                }
+                Some('/') if !in_class => {
+                    self.at += 1;
+                    while self.peek(0).is_some_and(is_ident_continue) {
+                        self.at += 1;
+                    }
+                    self.prev = Prev::Regex;
+                    return Ok(());
+                }
+                Some(_) => self.at += 1,
+            }
+        }
+    }
+
+    /// A number literal, skipped whole so that `0x1f` is not read as an identifier `x1f`.
+    fn number(&mut self) {
+        let was_entry = self.entry_position();
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+        let mut seen_point = false;
+        while let Some(character) = self.peek(0) {
+            if character == '.' && !seen_point {
+                seen_point = true;
+                self.at += 1;
+                continue;
+            }
+            if matches!(character, 'e' | 'E' | 'p' | 'P') && matches!(self.peek(1), Some('+' | '-'))
+            {
+                self.at += 2;
+                continue;
+            }
+            if character.is_alphanumeric() || character == '_' {
+                self.at += 1;
+                continue;
+            }
+            break;
+        }
+        self.prev = Prev::Literal;
+        if was_entry && matches!(self.significant(self.at), Some((_, '('))) {
+            self.expect_params = true;
+        }
+    }
+
+    /// An identifier, classified where it stands.
+    fn identifier(&mut self) -> Result<(), LexError> {
+        let start = self.at;
+        while self.peek(0).is_some_and(is_ident_continue) {
+            self.at += 1;
+        }
+        let end = self.at;
+        let word: String = self.chars[start..end].iter().collect();
+
+        if block::is_slot_name(&word) {
+            return Err(LexError::ReservedSlotName(word));
+        }
+
+        let after_dot = matches!(self.prev, Prev::Punct('.') | Prev::Op("?."));
+        let next = self.significant(end).map(|(_, character)| character);
+
+        if STATEMENT_WORDS.contains(&word.as_str()) && self.depth() == 0 && !after_dot {
+            return Err(LexError::StatementKeyword(word));
+        }
+
+        let was_entry = self.entry_position();
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+
+        let mut free = false;
+        let mut shorthand = false;
+        if after_dot {
+            // A property, which is a namespace of its own.
+        } else if is_reserved(&word) {
+            self.keyword(&word);
+        } else if word == "of" && self.is_contextual_of() {
+            self.leave_for_head_lhs();
+            if self.declaring.is_some() {
+                self.initializing = Some(self.depth());
+            }
+        } else if was_entry && matches!(next, Some(':' | '(')) {
+            // An object literal key binds nothing and is not a reference. A method shorthand's
+            // parameters are a parameter list, which its `(` has to be told about.
+            if next == Some('(') {
+                self.expect_params = true;
+            }
+        } else if was_entry && self.is_object_modifier(&word, end, next) {
+            self.entry_modifier = true;
+        } else if self.expect_name {
+            self.expect_name = false;
+            self.bind(&word);
+        } else if self.binding() {
+            self.bind(&word);
+        } else if word == "async" && self.is_contextual_async_keyword(end) {
+            // `async function ...` or `async ident => ...`
+        } else if !self.bound(&word) {
+            free = true;
+            shorthand = was_entry && matches!(next, Some(',' | '}'));
+            if word == "async" && matches!(self.same_line_significant(end), Some((_, '('))) {
+                self.pending_async_occ = Some(self.occurrences.len());
+            }
+        }
+
+        let default = self.frame().default;
+        self.occurrences.push(Occurrence {
+            start,
+            end,
+            name: word.clone(),
+            free,
+            default,
+            shorthand,
+        });
+        self.prev = Prev::Word(word);
+        Ok(())
+    }
+
+    /// Whether an identifier here opens an entry of an object literal, which is what makes it
+    /// either a key (`{ method: .. }`), an accessor/method modifier (`{ get x() {} }`), or a
+    /// shorthand (`{ body }`) rather than an ordinary reference.
+    ///
+    /// Three things have to hold at once, and each rules out a case that would otherwise be a
+    /// silent miss. The enclosing bracket must be a `{` that is an object literal, so a `case x:`
+    /// inside a block is not a key. What came before must be that `{`, a `,`, or an entry modifier
+    /// (`get`/`set`/`async`/`*`), so `a ? b : c` is not one either. And the frame must have no
+    /// open `?`, for the same reason one step further out.
+    fn entry_position(&self) -> bool {
+        let frame = self.frame();
+        if frame.kind != FrameKind::Brace(BraceKind::Object) || frame.ternary > 0 {
+            return false;
+        }
+        self.entry_modifier || matches!(self.prev, Prev::Open('{') | Prev::Punct(','))
+    }
+
+    /// Whether `of` at the current cursor is the `for (... of ...)` contextual keyword rather than
+    /// a variable name.
+    fn is_contextual_of(&self) -> bool {
+        if !matches!(self.frame().kind, FrameKind::Paren { for_head: true, .. }) {
+            return false;
+        }
+        match &self.prev {
+            Prev::Word(word) => !matches!(word.as_str(), "let" | "const" | "var"),
+            Prev::Close(']' | '}' | ')') => true,
+            _ => false,
+        }
+    }
+
+    /// Whether `word` (`get`, `set`, or `async`) at an object literal entry starts a getter,
+    /// setter, or async method rather than naming a property or shorthand capture.
+    fn is_object_modifier(&self, word: &str, end: usize, next: Option<char>) -> bool {
+        let is_prop_start =
+            |ch: char| is_ident_start(ch) || ch.is_ascii_digit() || matches!(ch, '[' | '"' | '\'');
+        match word {
+            "get" | "set" => next.is_some_and(is_prop_start),
+            "async" => self
+                .same_line_significant(end)
+                .is_some_and(|(_, ch)| is_prop_start(ch) || ch == '*'),
+            _ => false,
+        }
+    }
+
+    /// Whether `async` followed by what starts at `end` introduces an async function expression
+    /// (`async function ...`) or a single-parameter async arrow (`async x => ...`).
+    ///
+    /// Parenthesized async arrows (`async (...) => ...`) are resolved retroactively at `)` via
+    /// `pending_async_occ`, so calling a Rust local named `async(x)` remains a capture.
+    fn is_contextual_async_keyword(&self, end: usize) -> bool {
+        let Some((start, first)) = self.same_line_significant(end) else {
+            return false;
+        };
+        if !is_ident_start(first) {
+            return false;
+        }
+        let mut after = start;
+        while self
+            .chars
+            .get(after)
+            .copied()
+            .is_some_and(is_ident_continue)
+        {
+            after += 1;
+        }
+        if self.chars[start..after] == ['f', 'u', 'n', 'c', 't', 'i', 'o', 'n'] {
+            return true;
+        }
+        matches!(
+            self.significant(after),
+            Some((at, '=')) if self.chars.get(at + 1) == Some(&'>')
+        )
+    }
+
+    /// What an unconditionally reserved word does to the scan's state.
+    fn keyword(&mut self, word: &str) {
+        match word {
+            "let" | "const" | "var" => {
+                self.declaring = Some(self.depth());
+                self.initializing = None;
+            }
+            // A `for (const k in o)` head binds `k` and references `o`.
+            "in" => {
+                self.leave_for_head_lhs();
+                self.initializing = Some(self.depth());
+            }
+            "for" => self.expect_for_head = true,
+            "function" => {
+                self.expect_params = true;
+                self.expect_name = true;
+            }
+            "catch" => self.expect_params = true,
+            _ => {}
+        }
+    }
+
+    /// Everything that is not a word, a literal or a comment.
+    fn punctuation(&mut self) -> Result<(), LexError> {
+        match self.chars[self.at] {
+            character @ ('(' | '[' | '{') => {
+                self.open(character);
+                Ok(())
+            }
+            character @ (')' | ']' | '}') => self.close(character),
+            ';' => self.semicolon(),
+            ',' => {
+                self.entry_modifier = false;
+                self.pending_async_occ = None;
+                if self.initializing == Some(self.depth()) {
+                    self.initializing = None;
+                }
+                self.frame_mut().default = false;
+                self.at += 1;
+                self.prev = Prev::Punct(',');
+                self.close_expression_scopes();
+                Ok(())
+            }
+            ':' => {
+                self.entry_modifier = false;
+                self.pending_async_occ = None;
+                let ternary = self.frame().ternary > 0;
+                if ternary {
+                    self.frame_mut().ternary -= 1;
+                }
+                self.at += 1;
+                self.prev = Prev::Punct(':');
+                if !ternary {
+                    self.close_expression_scopes();
+                }
+                Ok(())
+            }
+            '?' if !matches!(self.peek(1), Some('.' | '?')) => {
+                self.entry_modifier = false;
+                self.pending_async_occ = None;
+                self.frame_mut().ternary += 1;
+                self.at += 1;
+                self.prev = Prev::Punct('?');
+                Ok(())
+            }
+            _ => {
+                self.operator();
+                Ok(())
+            }
+        }
+    }
+
+    /// An opening bracket.
+    fn open(&mut self, character: char) {
+        let was_entry = self.entry_position();
+        self.entry_modifier = false;
+        let async_prefix = if character == '(' {
+            self.pending_async_occ.take()
+        } else {
+            self.pending_async_occ = None;
+            None
+        };
+
+        let kind = match character {
+            '(' => FrameKind::Paren {
+                params: self.expect_params,
+                for_head: self.expect_for_head,
+                async_prefix,
+            },
+            '[' => FrameKind::Bracket {
+                computed_key: was_entry,
+            },
+            '{' => FrameKind::Brace(if self.opens_an_object() {
+                BraceKind::Object
+            } else {
+                BraceKind::Block
+            }),
+            _ => unreachable!("open is only called on opening brackets"),
+        };
+
+        self.expect_params = false;
+        self.expect_name = false;
+        self.expect_for_head = false;
+        let occurrences = self.occurrences.len();
+        self.frames.push(Frame::new(kind, occurrences));
+
+        // A scope waiting on its body gets it here: a `{` block after a parameter list is that
+        // body.
+        if kind == FrameKind::Brace(BraceKind::Block) {
+            if let Some(index) = self.pending.take() {
+                self.scopes[index].extent = ScopeExtent::Block {
+                    depth: self.depth(),
+                };
+            }
+        }
+        self.at += 1;
+        self.prev = Prev::Open(character);
+    }
+
+    /// A closing bracket, and everything that closing one settles.
+    fn close(&mut self, character: char) -> Result<(), LexError> {
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+        if self.frames.len() == 1 {
+            return Err(LexError::UnopenedBracket(character));
+        }
+        let frame = self.frames.pop().expect("the length was checked");
+        let expected = frame
+            .kind
+            .close_char()
+            .expect("non-root frame has a closing bracket");
+        if character != expected {
+            let open = frame
+                .kind
+                .open_char()
+                .expect("non-root frame has an opening bracket");
+            return Err(LexError::MismatchedBracket {
+                open,
+                close: character,
+            });
+        }
+        self.at += 1;
+
+        if frame.kind == FrameKind::Brace(BraceKind::TemplateSubstitution) {
+            // Back into the template literal the `${` interrupted.
+            self.templates.pop();
+            self.prev = Prev::Literal;
+            return Ok(());
+        }
+        self.prev = Prev::Close(character);
+
+        if self.declaring.is_some_and(|root| self.depth() < root) {
+            self.declaring = None;
+            self.initializing = None;
+        }
+        if self.initializing.is_some_and(|depth| self.depth() < depth) {
+            self.initializing = None;
+        }
+        self.close_scopes();
+
+        match frame.kind {
+            FrameKind::Bracket { computed_key: true } => {
+                if matches!(self.significant(self.at), Some((_, '('))) {
+                    self.expect_params = true;
+                }
+            }
+            FrameKind::Paren {
+                params,
+                async_prefix,
+                ..
+            } => match (self.arrow_ahead(), params) {
+                (Some(body), _) => {
+                    if let Some(async_idx) = async_prefix {
+                        self.occurrences[async_idx].free = false;
+                    }
+                    self.take_parameters(frame.occurrences);
+                    self.at = body;
+                    self.prev = Prev::Op("=>");
+                    self.settle_pending();
+                }
+                (None, true) => {
+                    self.take_parameters(frame.occurrences);
+                    self.settle_pending();
+                }
+                (None, false) => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A `;`, which at the outermost depth is what says a body is statements.
+    fn semicolon(&mut self) -> Result<(), LexError> {
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+        if self.depth() == 0 {
+            return Err(LexError::TopLevelSemicolon);
+        }
+        self.leave_for_head_lhs();
+        if self.declaring == Some(self.depth()) {
+            self.declaring = None;
+            self.initializing = None;
+        }
+        self.at += 1;
+        self.prev = Prev::Punct(';');
+        self.close_expression_scopes();
+        Ok(())
+    }
+
+    /// Everything else, as the longest operator that starts here.
+    fn operator(&mut self) {
+        let was_entry = self.entry_position();
+        self.entry_modifier = false;
+        self.pending_async_occ = None;
+
+        let (prev, len) = self.munch();
+        self.at += len;
+
+        if prev == Prev::Punct('*') && was_entry {
+            self.entry_modifier = true;
+        }
+        if prev == Prev::Punct('=') {
+            self.leave_for_head_lhs();
+            if self.declaring.is_some() {
+                self.initializing = Some(self.depth());
+            }
+            self.frame_mut().default = true;
+        }
+        if prev == Prev::Op("=>") {
+            // `a => ..`: the bare single parameter, whose `(..)` counterpart is settled at its `)`.
+            let from = match (&self.prev, self.occurrences.last()) {
+                (Prev::Word(word), Some(last)) if *word == last.name => self.occurrences.len() - 1,
+                _ => self.occurrences.len(),
+            };
+            self.take_parameters(from);
+            self.prev = prev;
+            self.settle_pending();
+            return;
+        }
+
+        self.prev = prev;
+    }
+
+    /// Whether a `{` here opens an object literal rather than a block.
+    ///
+    /// Everything is an object literal except after the tokens that can only be followed by a
+    /// block. A `js!{}` block is an expression, so the literal is the common direction; the
+    /// exceptions are an arrow's block body, a `)` that closed a head or a parameter list, and the
+    /// keywords that take a block on their own.
+    fn opens_an_object(&self) -> bool {
+        match &self.prev {
+            Prev::Close(')' | '}') | Prev::Open('{') => false,
+            Prev::Op("=>") | Prev::Punct(';') => false,
+            Prev::Word(word) => !matches!(word.as_str(), "else" | "do" | "try" | "finally"),
+            _ => true,
+        }
+    }
+
+    /// The longest multi-character operator that starts at the cursor, or the single punctuation
+    /// character written there, together with its length in characters.
+    fn munch(&self) -> (Prev, usize) {
+        for &operator in OPERATORS.iter().chain(OPERATORS_REST.iter()) {
+            if self.starts_with(operator) {
+                return (Prev::Op(operator), operator.len());
+            }
+        }
+        (Prev::Punct(self.chars[self.at]), 1)
     }
 }
 
@@ -452,22 +1212,22 @@ impl Scope {
 /// Returns why the block is not one this macro takes: an unterminated string, template, comment or
 /// regular expression, unbalanced brackets, a name that collides with an emitted slot, or a body
 /// that is a sequence of statements rather than an expression.
-pub fn analyze(source: &str) -> Result<Analysis, String> {
+pub fn analyze(source: &str) -> Result<Analysis, LexError> {
     let chars: Vec<char> = source.chars().collect();
     let mut scan = Scan::new(&chars);
 
     while scan.at < chars.len() {
         match scan.templates.last() {
-            Some(true) => template(&mut scan)?,
-            _ => code(&mut scan)?,
+            Some(TemplateMode::Text) => scan.template(),
+            Some(TemplateMode::Substitution) | None => scan.code()?,
         }
     }
 
-    if scan.frames.len() > 1 {
-        return Err(format!("`{}` is never closed", scan.frame().open));
+    if let Some(open) = scan.frame().kind.open_char() {
+        return Err(LexError::UnclosedBracket(open));
     }
-    if scan.templates.last() == Some(&true) {
-        return Err("a template literal is never closed".to_owned());
+    if scan.templates.last() == Some(&TemplateMode::Text) {
+        return Err(LexError::UnterminatedTemplate);
     }
 
     Ok(splice(&chars, &scan.occurrences))
@@ -476,16 +1236,17 @@ pub fn analyze(source: &str) -> Result<Analysis, String> {
 /// The block with every free occurrence replaced by the slot that fills it.
 fn splice(chars: &[char], occurrences: &[Occurrence]) -> Analysis {
     let mut free: Vec<String> = Vec::new();
+    let mut free_offsets: Vec<usize> = Vec::new();
+    let mut indices: HashMap<&str, usize> = HashMap::new();
     let mut text = String::with_capacity(chars.len());
     let mut cursor = 0;
     for occurrence in occurrences.iter().filter(|occurrence| occurrence.free) {
-        let slot = match free.iter().position(|name| *name == occurrence.name) {
-            Some(index) => index,
-            None => {
-                free.push(occurrence.name.clone());
-                free.len() - 1
-            }
-        };
+        let slot = *indices.entry(occurrence.name.as_str()).or_insert_with(|| {
+            let index = free.len();
+            free.push(occurrence.name.clone());
+            free_offsets.push(occurrence.start);
+            index
+        });
         text.extend(&chars[cursor..occurrence.start]);
         // A shorthand entry names its key with the same token it reads, so replacing the token
         // would rename the key. Writing the entry out in full keeps the object the one the block
@@ -498,430 +1259,11 @@ fn splice(chars: &[char], occurrences: &[Occurrence]) -> Analysis {
         cursor = occurrence.end;
     }
     text.extend(&chars[cursor..]);
-    Analysis { free, text }
-}
-
-/// One step of the scan, outside a template literal.
-fn code(scan: &mut Scan<'_>) -> Result<(), String> {
-    let character = scan.chars[scan.at];
-
-    if character.is_whitespace() {
-        scan.at += 1;
-        return Ok(());
-    }
-    if character == '/' && scan.peek(1) == Some('/') {
-        while scan.peek(0).is_some_and(|c| c != '\n') {
-            scan.at += 1;
-        }
-        return Ok(());
-    }
-    if character == '/' && scan.peek(1) == Some('*') {
-        scan.at += 2;
-        loop {
-            match scan.peek(0) {
-                None => return Err("a block comment is never closed".to_owned()),
-                Some('*') if scan.peek(1) == Some('/') => {
-                    scan.at += 2;
-                    return Ok(());
-                }
-                Some(_) => scan.at += 1,
-            }
-        }
-    }
-    if character == '/' && scan.regex_follows() {
-        return regex(scan);
-    }
-    if character == '"' || character == '\'' {
-        return string(scan, character);
-    }
-    if character == '`' {
-        scan.at += 1;
-        scan.templates.push(true);
-        return Ok(());
-    }
-    if character.is_ascii_digit()
-        || (character == '.' && scan.peek(1).is_some_and(|c| c.is_ascii_digit()))
-    {
-        return number(scan);
-    }
-    if is_ident_start(character) {
-        return identifier(scan);
-    }
-    punctuation(scan)
-}
-
-/// One step of the scan, inside a template literal.
-fn template(scan: &mut Scan<'_>) -> Result<(), String> {
-    match scan.chars[scan.at] {
-        '\\' => scan.at += 2,
-        '`' => {
-            scan.at += 1;
-            scan.templates.pop();
-            scan.prev = Prev::Literal;
-        }
-        '$' if scan.peek(1) == Some('{') => {
-            scan.at += 2;
-            // The substitution is code again, and its `}` puts the scan back in the template.
-            scan.templates.push(false);
-            let occurrences = scan.occurrences.len();
-            scan.frames.push(Frame {
-                open: '{',
-                substitution: true,
-                occurrences,
-                ..Frame::root()
-            });
-            scan.prev = Prev::Op("${".to_owned());
-        }
-        _ => scan.at += 1,
-    }
-    Ok(())
-}
-
-/// A string literal, skipped whole.
-fn string(scan: &mut Scan<'_>, quote: char) -> Result<(), String> {
-    scan.at += 1;
-    loop {
-        match scan.peek(0) {
-            None => return Err(format!("a {quote} string is never closed")),
-            Some('\\') => scan.at += 2,
-            Some(character) if character == quote => {
-                scan.at += 1;
-                scan.prev = Prev::Literal;
-                return Ok(());
-            }
-            Some(_) => scan.at += 1,
-        }
-    }
-}
-
-/// A regular expression literal, skipped whole. A `[..]` class may hold an unescaped `/`.
-fn regex(scan: &mut Scan<'_>) -> Result<(), String> {
-    scan.at += 1;
-    let mut in_class = false;
-    loop {
-        match scan.peek(0) {
-            None | Some('\n') => return Err("a regular expression is never closed".to_owned()),
-            Some('\\') => scan.at += 2,
-            Some('[') => {
-                in_class = true;
-                scan.at += 1;
-            }
-            Some(']') => {
-                in_class = false;
-                scan.at += 1;
-            }
-            Some('/') if !in_class => {
-                scan.at += 1;
-                while scan.peek(0).is_some_and(is_ident_continue) {
-                    scan.at += 1;
-                }
-                scan.prev = Prev::Regex;
-                return Ok(());
-            }
-            Some(_) => scan.at += 1,
-        }
-    }
-}
-
-/// A number literal, skipped whole so that `0x1f` is not read as an identifier `x1f`.
-fn number(scan: &mut Scan<'_>) -> Result<(), String> {
-    let mut seen_point = false;
-    while let Some(character) = scan.peek(0) {
-        if character == '.' && !seen_point {
-            seen_point = true;
-            scan.at += 1;
-            continue;
-        }
-        if matches!(character, 'e' | 'E' | 'p' | 'P') && matches!(scan.peek(1), Some('+' | '-')) {
-            scan.at += 2;
-            continue;
-        }
-        if character.is_alphanumeric() || character == '_' {
-            scan.at += 1;
-            continue;
-        }
-        break;
-    }
-    scan.prev = Prev::Literal;
-    Ok(())
-}
-
-/// An identifier, classified where it stands.
-fn identifier(scan: &mut Scan<'_>) -> Result<(), String> {
-    let start = scan.at;
-    while scan.peek(0).is_some_and(is_ident_continue) {
-        scan.at += 1;
-    }
-    let end = scan.at;
-    let word: String = scan.chars[start..end].iter().collect();
-
-    if block::is_slot_name(&word) {
-        return Err(format!(
-            "`{word}` is what a capture is emitted as, so a block cannot spell it"
-        ));
-    }
-
-    let after_dot = matches!(&scan.prev, Prev::Op(op) if op == "." || op == "?.");
-    let next = scan.significant(end).map(|(_, character)| character);
-
-    if STATEMENT_WORDS.contains(&word.as_str()) && scan.depth() == 0 && !after_dot {
-        return Err(format!(
-            "`{word}` opens a statement and a `js!{{}}` block is one expression"
-        ));
-    }
-
-    let mut free = false;
-    let mut shorthand = false;
-    if after_dot {
-        // A property, which is a namespace of its own.
-    } else if is_reserved(&word) {
-        keyword(scan, &word);
-    } else if entry_position(scan) && matches!(next, Some(':' | '(')) {
-        // An object literal key binds nothing and is not a reference. A method shorthand's
-        // parameters are a parameter list, which its `(` has to be told about.
-        if next == Some('(') {
-            scan.expect_params = true;
-        }
-    } else if scan.expect_name {
-        scan.expect_name = false;
-        scan.bind(&word);
-    } else if scan.binding() {
-        scan.bind(&word);
-    } else if !scan.bound(&word) {
-        free = true;
-        shorthand = entry_position(scan) && matches!(next, Some(',' | '}'));
-    }
-
-    let default = scan.frame().default;
-    scan.occurrences.push(Occurrence {
-        start,
-        end,
-        name: word.clone(),
+    Analysis {
         free,
-        default,
-        shorthand,
-    });
-    scan.prev = Prev::Word(word);
-    Ok(())
-}
-
-/// Whether an identifier here opens an entry of an object literal, which is what makes it either a
-/// key (`{ method: .. }`) or a shorthand (`{ body }`) rather than an ordinary reference.
-///
-/// Three things have to hold at once, and each rules out a case that would otherwise be a silent
-/// miss. The enclosing bracket must be a `{` that is an object literal, so a `case x:` inside a
-/// block is not a key. What came before must be that `{` or a `,`, so `a ? b : c` is not one
-/// either. And the frame must have no open `?`, for the same reason one step further out.
-fn entry_position(scan: &Scan<'_>) -> bool {
-    let frame = scan.frame();
-    if frame.open != '{' || !frame.object || frame.ternary > 0 {
-        return false;
+        free_offsets,
+        text,
     }
-    matches!(&scan.prev, Prev::Open('{')) || matches!(&scan.prev, Prev::Op(op) if op == ",")
-}
-
-/// What a reserved word does to the scan's state.
-fn keyword(scan: &mut Scan<'_>, word: &str) {
-    match word {
-        "let" | "const" | "var" => {
-            scan.declaring = Some(scan.depth());
-            scan.initializing = None;
-        }
-        // A `for (const x of xs)` head binds `x` and references `xs`.
-        "of" | "in" => scan.initializing = Some(scan.depth()),
-        "function" => {
-            scan.expect_params = true;
-            scan.expect_name = true;
-        }
-        "catch" => scan.expect_params = true,
-        _ => {}
-    }
-}
-
-/// Everything that is not a word, a literal or a comment.
-fn punctuation(scan: &mut Scan<'_>) -> Result<(), String> {
-    match scan.chars[scan.at] {
-        character @ ('(' | '[' | '{') => open(scan, character),
-        character @ (')' | ']' | '}') => close(scan, character),
-        ';' => semicolon(scan),
-        ',' => {
-            if scan.initializing == Some(scan.depth()) {
-                scan.initializing = None;
-            }
-            scan.frame_mut().default = false;
-            scan.at += 1;
-            scan.prev = Prev::Op(",".to_owned());
-            scan.close_expression_scopes();
-            Ok(())
-        }
-        ':' => {
-            let ternary = scan.frame().ternary > 0;
-            if ternary {
-                scan.frame_mut().ternary -= 1;
-            }
-            scan.at += 1;
-            scan.prev = Prev::Op(":".to_owned());
-            if !ternary {
-                scan.close_expression_scopes();
-            }
-            Ok(())
-        }
-        '?' if !matches!(scan.peek(1), Some('.' | '?')) => {
-            scan.frame_mut().ternary += 1;
-            scan.at += 1;
-            scan.prev = Prev::Op("?".to_owned());
-            Ok(())
-        }
-        _ => operator(scan),
-    }
-}
-
-/// An opening bracket.
-fn open(scan: &mut Scan<'_>, character: char) -> Result<(), String> {
-    let object = character == '{' && opens_an_object(scan);
-    let params = character == '(' && scan.expect_params;
-    scan.expect_params = false;
-    scan.expect_name = false;
-    let occurrences = scan.occurrences.len();
-    scan.frames.push(Frame {
-        open: character,
-        object,
-        occurrences,
-        params,
-        ..Frame::root()
-    });
-    // A scope waiting on its body gets it here: a `{` after a parameter list is that body.
-    if character == '{' && !object {
-        if let Some(index) = scan.pending.take() {
-            scan.scopes[index].depth = scan.depth();
-            scan.scopes[index].expression = false;
-        }
-    }
-    scan.at += 1;
-    scan.prev = Prev::Open(character);
-    Ok(())
-}
-
-/// A closing bracket, and everything that closing one settles.
-fn close(scan: &mut Scan<'_>, character: char) -> Result<(), String> {
-    if scan.frames.len() == 1 {
-        return Err(format!(
-            "`{character}` closes a bracket that was never opened"
-        ));
-    }
-    let frame = scan.frames.pop().expect("the length was checked");
-    let expected = match frame.open {
-        '(' => ')',
-        '[' => ']',
-        _ => '}',
-    };
-    if character != expected {
-        return Err(format!("`{}` is closed by `{character}`", frame.open));
-    }
-    scan.at += 1;
-
-    if frame.substitution {
-        // Back into the template literal the `${` interrupted.
-        scan.templates.pop();
-        scan.prev = Prev::Literal;
-        return Ok(());
-    }
-    scan.prev = Prev::Close(character);
-
-    if scan.declaring.is_some_and(|root| scan.depth() < root) {
-        scan.declaring = None;
-        scan.initializing = None;
-    }
-    if scan.initializing.is_some_and(|depth| scan.depth() < depth) {
-        scan.initializing = None;
-    }
-    scan.close_scopes();
-
-    if character != ')' {
-        return Ok(());
-    }
-    match (scan.arrow_ahead(), frame.params) {
-        (Some(body), _) => {
-            scan.take_parameters(frame.occurrences);
-            scan.at = body;
-            scan.prev = Prev::Op("=>".to_owned());
-            scan.settle_pending();
-        }
-        (None, true) => {
-            scan.take_parameters(frame.occurrences);
-            scan.settle_pending();
-        }
-        (None, false) => {}
-    }
-    Ok(())
-}
-
-/// A `;`, which at the outermost depth is what says a body is statements.
-fn semicolon(scan: &mut Scan<'_>) -> Result<(), String> {
-    if scan.depth() == 0 {
-        return Err("a `js!{}` block is one expression, and `;` ends a statement".to_owned());
-    }
-    if scan.declaring == Some(scan.depth()) {
-        scan.declaring = None;
-        scan.initializing = None;
-    }
-    scan.at += 1;
-    scan.prev = Prev::Op(";".to_owned());
-    scan.close_expression_scopes();
-    Ok(())
-}
-
-/// Everything else, as the longest operator that starts here.
-fn operator(scan: &mut Scan<'_>) -> Result<(), String> {
-    let operator = munch(scan);
-    scan.at += operator.chars().count();
-
-    if operator == "=" {
-        if scan.declaring.is_some() {
-            scan.initializing = Some(scan.depth());
-        }
-        scan.frame_mut().default = true;
-    }
-    if operator == "=>" {
-        // `a => ..`: the bare single parameter, whose `(..)` counterpart is settled at its `)`.
-        let from = match (&scan.prev, scan.occurrences.last()) {
-            (Prev::Word(word), Some(last)) if *word == last.name => scan.occurrences.len() - 1,
-            _ => scan.occurrences.len(),
-        };
-        scan.take_parameters(from);
-        scan.prev = Prev::Op(operator);
-        scan.settle_pending();
-        return Ok(());
-    }
-
-    scan.prev = Prev::Op(operator);
-    Ok(())
-}
-
-/// Whether a `{` here opens an object literal rather than a block.
-///
-/// Everything is an object literal except after the tokens that can only be followed by a block. A
-/// `js!{}` block is an expression, so the literal is the common direction; the exceptions are an
-/// arrow's block body, a `)` that closed a head or a parameter list, and the keywords that take a
-/// block on their own.
-fn opens_an_object(scan: &Scan<'_>) -> bool {
-    match &scan.prev {
-        Prev::Close(')' | '}') | Prev::Open('{') => false,
-        Prev::Op(op) => op != "=>" && op != ";",
-        Prev::Word(word) => !matches!(word.as_str(), "else" | "do" | "try" | "finally"),
-        _ => true,
-    }
-}
-
-/// The longest operator that starts at the cursor, or the single character written there.
-fn munch(scan: &Scan<'_>) -> String {
-    let rest: String = scan.chars[scan.at..].iter().take(4).collect();
-    for operator in OPERATORS.iter().chain(OPERATORS_REST.iter()) {
-        if rest.starts_with(operator) {
-            return (*operator).to_owned();
-        }
-    }
-    scan.chars[scan.at].to_string()
 }
 
 #[cfg(test)]
@@ -939,7 +1281,7 @@ mod tests {
     }
 
     fn error(source: &str) -> String {
-        analyze(source).expect_err("it is refused")
+        analyze(source).expect_err("it is refused").to_string()
     }
 
     /// `Vec::new()` needs the annotation at every use, and there are many.
@@ -967,6 +1309,107 @@ mod tests {
         assert_eq!(free("null ?? undefined ?? NaN ?? Infinity"), none());
         // The one door to the host: `fetch` is reached through it and only `url` is captured.
         assert_eq!(free("globalThis.fetch(url)"), ["url"]);
+    }
+
+    #[test]
+    fn contextual_keywords_capture_as_rust_locals_in_expression_positions() {
+        assert_eq!(
+            free("f(get, set, of, async)"),
+            ["f", "get", "set", "of", "async"]
+        );
+        assert_eq!(
+            free("get + set + of + async"),
+            ["get", "set", "of", "async"]
+        );
+        assert_eq!(free("async(a, b)"), ["async", "a", "b"]);
+        assert_eq!(free("get / 2 + set / 3"), ["get", "set"]);
+        // Shorthand object properties with contextual names still capture and keep their key.
+        assert_eq!(
+            free("({ get, set, of, async })"),
+            ["get", "set", "of", "async"]
+        );
+        assert_eq!(
+            text("({ get, set, of, async })"),
+            "({ get: _$js0, set: _$js1, of: _$js2, async: _$js3 })"
+        );
+        // Inside `for` loops, `of` is contextual only as the loop connector.
+        assert_eq!(
+            free("(() => { for (const x of arr) { f(x, of); } })"),
+            ["arr", "f", "of"]
+        );
+        assert_eq!(
+            free("(() => { for (const x of of) { f(x); } })"),
+            ["of", "f"]
+        );
+        assert_eq!(
+            free("(() => { for (let i = 0; i < of; i++) { f(i); } })"),
+            ["of", "f"]
+        );
+    }
+
+    #[test]
+    fn contextual_keywords_still_work_in_their_javascript_syntax_positions() {
+        // `for (... of ...)` and `for await (... of ...)`
+        assert_eq!(
+            free("(() => { for (const x of arr) { f(x); } })"),
+            ["arr", "f"]
+        );
+        assert_eq!(
+            free("(() => { for (const { a, b } of arr) { f(a, b); } })"),
+            ["arr", "f"]
+        );
+        assert_eq!(
+            free("(() => { for (const { a = d } of arr) { f(a); } })"),
+            ["d", "arr", "f"]
+        );
+        assert_eq!(
+            free("(() => { for (const of of arr) { f(of); } })"),
+            ["arr", "f"]
+        );
+        assert_eq!(
+            free("(() => { for (x of arr) { f(x); } })"),
+            ["x", "arr", "f"]
+        );
+        assert_eq!(
+            free("(async () => { for await (const x of arr) { f(x); } })"),
+            ["arr", "f"]
+        );
+        // Object literal getters, setters, and async / generator methods.
+        assert_eq!(
+            free("({ get x() { return 1; }, set x(v) { f(v); } })"),
+            ["f"]
+        );
+        assert_eq!(
+            free("({ get x() { return get; }, set x(v) { set(v); } })"),
+            ["get", "set"]
+        );
+        assert_eq!(
+            free("({ get [k]() { return 1; }, set [k](v) { f(v); } })"),
+            ["k", "f"]
+        );
+        assert_eq!(free("({ get: a, set: b, async: c })"), ["a", "b", "c"]);
+        assert_eq!(
+            free("({ get(x) { return x; }, set(x) { return x; }, async(x) { return x; } })"),
+            none()
+        );
+        assert_eq!(free("({ async m(a) { return a; } })"), none());
+        assert_eq!(free("({ async *m(a) { yield a; } })"), none());
+        assert_eq!(free("({ async m(a) { return a + async; } })"), ["async"]);
+        // Async arrows and async functions.
+        assert_eq!(free("async () => {}"), none());
+        assert_eq!(free("async (a, b) => a + b"), none());
+        assert_eq!(free("async (a = async) => a"), ["async"]);
+        assert_eq!(free("async r => r.json()"), none());
+        assert_eq!(free("async async => async"), none());
+        assert_eq!(free("async r => async(r)"), ["async"]);
+        assert_eq!(free("(async function f(a) { return f(a); })"), none());
+        assert_eq!(free("(async function (a) { return a + b; })"), ["b"]);
+        assert_eq!(free("(async function* gen(a) { yield a; })"), none());
+        // Local bindings with contextual names.
+        assert_eq!(
+            free("(() => { const get = 1, set = 2, of = 3, async = 4; return get + set + of + async; })"),
+            none()
+        );
     }
 
     #[test]
@@ -1160,7 +1603,9 @@ mod tests {
 
     #[test]
     fn a_slot_name_inside_a_block_is_refused() {
-        let message = error("_$js0 + a");
+        let err = analyze("_$js0 + a").unwrap_err();
+        assert_eq!(err, LexError::ReservedSlotName("_$js0".to_owned()));
+        let message = err.to_string();
         assert!(message.contains("_$js0"), "{message}");
         assert!(message.contains("capture"), "{message}");
         assert!(error("(_$js1) => 1").contains("_$js1"));
@@ -1188,19 +1633,41 @@ mod tests {
 
     #[test]
     fn an_unterminated_anything_is_refused() {
-        for (source, why) in [
-            ("\"a", "never closed"),
-            ("'a", "never closed"),
-            ("`a", "never closed"),
-            ("/* a", "never closed"),
-            ("f(a", "never closed"),
-            ("f(a]", "closed by"),
-            ("a)", "never opened"),
-            ("x ? /a", "never closed"),
+        for (source, why, expected) in [
+            ("\"a", "never closed", LexError::UnterminatedString('"')),
+            ("'a", "never closed", LexError::UnterminatedString('\'')),
+            ("\"a\\", "never closed", LexError::UnterminatedString('"')),
+            ("'a\\", "never closed", LexError::UnterminatedString('\'')),
+            ("`a", "never closed", LexError::UnterminatedTemplate),
+            ("`a\\", "never closed", LexError::UnterminatedTemplate),
+            ("/* a", "never closed", LexError::UnterminatedBlockComment),
+            ("f(a", "never closed", LexError::UnclosedBracket('(')),
+            (
+                "f(a]",
+                "closed by",
+                LexError::MismatchedBracket {
+                    open: '(',
+                    close: ']',
+                },
+            ),
+            ("a)", "never opened", LexError::UnopenedBracket(')')),
+            ("x ? /a", "never closed", LexError::UnterminatedRegex),
+            ("x ? /a\\", "never closed", LexError::UnterminatedRegex),
+            ("x ? /a\\\nb/", "never closed", LexError::UnterminatedRegex),
         ] {
-            let message = error(source);
+            let err = analyze(source).expect_err("it is refused");
+            assert_eq!(err, expected, "`{source}`");
+            let message = err.to_string();
             assert!(message.contains(why), "`{source}` reported `{message}`");
         }
+    }
+
+    #[test]
+    fn free_offsets_point_at_the_first_free_site_not_a_prior_property() {
+        let analysis = analyze("a.foo + foo").expect("it analyzes");
+        assert_eq!(analysis.free, ["a", "foo"]);
+        // `a` is at 0, `.foo` is at 2 (not free), free `foo` is at 8.
+        assert_eq!(analysis.free_offsets, [0, 8]);
     }
 
     #[test]

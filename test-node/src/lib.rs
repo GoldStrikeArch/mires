@@ -18,6 +18,7 @@
 //! dylib's SHA-256 keys every sysroot.
 
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -32,8 +33,21 @@ const WORKER: &str = include_str!("worker.js");
 /// unless the program's thread does not stop.
 const GRACE: Duration = Duration::from_secs(5);
 
+/// The largest timeout Node's `setTimeout` accepts: delays above `i32::MAX` milliseconds overflow
+/// its signed 32-bit timer and are clamped to 1 ms.
+const MAX_TIMEOUT_MS: u32 = i32::MAX as u32;
+
+/// Default upper bound on concurrent workers in the shared pool.
+const MAX_POOL_SIZE: NonZeroUsize = NonZeroUsize::new(4).expect("non-zero");
+
+/// How long to wait for a worker's stderr reader to reach EOF after the worker exits.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum size of a single stdout or stderr block accepted from a worker reply (64 MiB).
+const MAX_BLOCK_BYTES: u32 = 64 * 1024 * 1024;
+
 /// One node command line a test runs, with its program.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Node<'a> {
     /// `node -`, the program written to its stdin.
     Stdin(&'a str),
@@ -62,7 +76,7 @@ impl Status {
 }
 
 /// What the node process would have produced.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
     pub status: Status,
     pub stdout: Vec<u8>,
@@ -76,7 +90,7 @@ pub struct Output {
 /// Only where node cannot be started, as when it is not installed. A test that is skipped
 /// without node is skipped on this error, and a test that requires node panics on it.
 pub fn run(invocation: Node<'_>) -> io::Result<Output> {
-    if std::env::var_os("RCGJS_TEST_NODE").is_some_and(|mode| mode == "spawn") {
+    if spawn_mode() {
         return spawn(invocation);
     }
     match Request::new(invocation, timeout()) {
@@ -84,6 +98,12 @@ pub fn run(invocation: Node<'_>) -> io::Result<Output> {
         // A program of 4 GiB or more cannot be told to the worker, but node can still be given it.
         None => spawn(invocation),
     }
+}
+
+/// Whether `RCGJS_TEST_NODE=spawn` was requested, bypassing the worker pool.
+fn spawn_mode() -> bool {
+    static SPAWN: OnceLock<bool> = OnceLock::new();
+    *SPAWN.get_or_init(|| std::env::var_os("RCGJS_TEST_NODE").is_some_and(|mode| mode == "spawn"))
 }
 
 /// One node process for `invocation`, spawned as the tests spawned it before the pool.
@@ -141,16 +161,19 @@ impl Request {
             Node::Stdin(program) => (b's', program),
             Node::StdinCommonJs(program) => (b'c', program),
         };
-        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let millis = u32::try_from(timeout.as_millis())
+            .unwrap_or(MAX_TIMEOUT_MS)
+            .min(MAX_TIMEOUT_MS);
         let length = u32::try_from(payload.len()).ok()?;
         let mut bytes = Vec::with_capacity(9 + payload.len());
         bytes.push(mode);
         bytes.extend_from_slice(&millis.to_be_bytes());
         bytes.extend_from_slice(&length.to_be_bytes());
         bytes.extend_from_slice(payload.as_bytes());
+        let clamped = timeout.min(Duration::from_millis(u64::from(MAX_TIMEOUT_MS)));
         Some(Self {
             bytes,
-            deadline: timeout + timeout.min(GRACE),
+            deadline: clamped.saturating_add(clamped.min(GRACE)),
         })
     }
 }
@@ -163,7 +186,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Pool {
     state: Mutex<PoolState>,
     freed: Condvar,
-    size: usize,
+    size: NonZeroUsize,
 }
 
 struct PoolState {
@@ -173,11 +196,15 @@ struct PoolState {
 
 fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new(thread::available_parallelism().map_or(1, |n| n.get().min(4))))
+    POOL.get_or_init(|| {
+        let size =
+            thread::available_parallelism().map_or(NonZeroUsize::MIN, |n| n.min(MAX_POOL_SIZE));
+        Pool::new(size)
+    })
 }
 
 impl Pool {
-    fn new(size: usize) -> Self {
+    fn new(size: NonZeroUsize) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
@@ -203,11 +230,11 @@ impl Pool {
         // A program that answered, failed or not, has left nothing behind: its thread is gone. A
         // worker that did not answer is replaced.
         match lease.worker().receive(request.deadline) {
-            Ok(output) => {
+            WorkerReply::Reusable(output) => {
                 lease.keep();
                 Ok(output)
             }
-            Err(output) => Ok(output),
+            WorkerReply::Retired(output) => Ok(output),
         }
     }
 
@@ -220,7 +247,7 @@ impl Pool {
                     worker: Some(worker),
                 });
             }
-            if state.live < self.size {
+            if state.live < self.size.get() {
                 state.live += 1;
                 drop(state);
                 return match Worker::spawn() {
@@ -279,14 +306,95 @@ impl Drop for Lease<'_> {
     }
 }
 
+/// Outcome of reading a worker's reply: either the worker answered cleanly and may return to the
+/// pool, or it failed / timed out and must be retired.
+enum WorkerReply {
+    Reusable(Output),
+    Retired(Output),
+}
+
+struct StderrState {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+struct WorkerStderr {
+    state: Mutex<StderrState>,
+    eof: Condvar,
+}
+
+struct StderrEofGuard<'a>(&'a WorkerStderr);
+
+impl Drop for StderrEofGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.state).eof = true;
+        self.0.eof.notify_all();
+    }
+}
+
+/// Drains a worker's stderr on a background thread and wakes waiters once the pipe hits EOF.
+struct StderrCollector {
+    shared: Arc<WorkerStderr>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl StderrCollector {
+    fn spawn(mut pipe: impl Read + Send + 'static) -> Self {
+        let shared = Arc::new(WorkerStderr {
+            state: Mutex::new(StderrState {
+                bytes: Vec::new(),
+                eof: false,
+            }),
+            eof: Condvar::new(),
+        });
+        let log = Arc::clone(&shared);
+        let reader = thread::spawn(move || {
+            let _notify_eof = StderrEofGuard(&log);
+            let mut buffer = [0; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => lock(&log.state).bytes.extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            shared,
+            reader: Some(reader),
+        }
+    }
+
+    /// Waits up to `timeout` for the reader thread to reach EOF and joins it if it did.
+    fn finish(&mut self, timeout: Duration) {
+        let Some(handle) = self.reader.take() else {
+            return;
+        };
+        let (state, _) = self
+            .shared
+            .eof
+            .wait_timeout_while(lock(&self.shared.state), timeout, |state| !state.eof)
+            .unwrap_or_else(PoisonError::into_inner);
+        let eof = state.eof;
+        drop(state);
+        if eof {
+            let _ = handle.join();
+        }
+    }
+
+    fn read_lossy(&self) -> String {
+        String::from_utf8_lossy(&lock(&self.shared.state).bytes).into_owned()
+    }
+}
+
 /// One node process running `worker.js`. Its replies are read on a thread of their own, so a
 /// program that never finishes is noticed and the worker killed.
 struct Worker {
     child: Child,
     stdin: ChildStdin,
     replies: Receiver<io::Result<Output>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    stderr_reader: JoinHandle<()>,
+    stderr: StderrCollector,
 }
 
 impl Worker {
@@ -297,7 +405,7 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let (Some(stdin), Some(mut stdout), Some(mut stderr_pipe)) =
+        let (Some(stdin), Some(mut stdout), Some(stderr_pipe)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
             let _ = child.kill();
@@ -313,20 +421,12 @@ impl Worker {
             }
         });
         // What the worker itself says goes into the message when it dies.
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&stderr);
-        let stderr_reader = thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            while let Ok(read @ 1..) = stderr_pipe.read(&mut buffer) {
-                lock(&log).extend_from_slice(&buffer[..read]);
-            }
-        });
+        let stderr = StderrCollector::spawn(stderr_pipe);
         Ok(Self {
             child,
             stdin,
             replies,
             stderr,
-            stderr_reader,
         })
     }
 
@@ -336,12 +436,16 @@ impl Worker {
     }
 
     /// The worker's answer, or the failure of a worker that gave none.
-    fn receive(&mut self, deadline: Duration) -> Result<Output, Output> {
+    fn receive(&mut self, deadline: Duration) -> WorkerReply {
         match self.replies.recv_timeout(deadline) {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(error)) => Err(self.died(&format!("stopped answering: {error}"))),
-            Err(RecvTimeoutError::Disconnected) => Err(self.died("stopped answering")),
-            Err(RecvTimeoutError::Timeout) => Err(failure(format!(
+            Ok(Ok(output)) => WorkerReply::Reusable(output),
+            Ok(Err(error)) => {
+                WorkerReply::Retired(self.died(&format!("stopped answering: {error}")))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                WorkerReply::Retired(self.died("stopped answering"))
+            }
+            Err(RecvTimeoutError::Timeout) => WorkerReply::Retired(failure(format!(
                 "test-node: the program did not finish within {deadline:?}, so its worker was \
                  killed\n"
             ))),
@@ -352,14 +456,9 @@ impl Worker {
     fn died(&mut self, what: &str) -> Output {
         let _ = self.child.kill();
         let status = self.child.wait();
-        // The last of what it said is still in the pipe; give the reader a moment for it.
-        for _ in 0..100 {
-            if self.stderr_reader.is_finished() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let said = String::from_utf8_lossy(&lock(&self.stderr)).into_owned();
+        // The last of what it said is still in the pipe; wait for the reader to reach EOF.
+        self.stderr.finish(STDERR_DRAIN_TIMEOUT);
+        let said = self.stderr.read_lossy();
         failure(format!("test-node: the worker {what} ({status:?})\n{said}"))
     }
 }
@@ -368,6 +467,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.stderr.finish(STDERR_DRAIN_TIMEOUT);
     }
 }
 
@@ -407,8 +507,47 @@ fn read_reply(from: &mut impl Read) -> io::Result<Output> {
 }
 
 fn read_block(from: &mut impl Read, length: u32) -> io::Result<Vec<u8>> {
-    let mut block = vec![0; length as usize];
-    from.read_exact(&mut block)?;
+    if length > MAX_BLOCK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("reply block length {length} exceeds limit of {MAX_BLOCK_BYTES} bytes"),
+        ));
+    }
+    let expected = usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("reply block length {length} does not fit in usize"),
+        )
+    })?;
+    let mut block = Vec::new();
+    let mut remaining = expected;
+    let mut chunk = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len());
+        match from.read(&mut chunk[..to_read]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "reply block truncated: expected {expected} bytes, got {}",
+                        block.len()
+                    ),
+                ));
+            }
+            Ok(read) => {
+                block.try_reserve(read).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "could not allocate buffer for reply block",
+                    )
+                })?;
+                block.extend_from_slice(&chunk[..read]);
+                remaining -= read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(block)
 }
 
@@ -614,7 +753,7 @@ console.log([1, 'two', { three: [3n] }], new Map([[1, 2]]));
 
     #[test]
     fn nothing_of_one_program_reaches_the_next_on_its_worker() {
-        let pool = Pool::new(1);
+        let pool = Pool::new(NonZeroUsize::MIN);
         let pid = "require('node:process').pid";
         let first = pooled(
             &pool,
@@ -644,7 +783,7 @@ console.log([1, 'two', { three: [3n] }], new Map([[1, 2]]));
 
     #[test]
     fn a_runaway_program_times_out_and_its_worker_goes_on() {
-        let pool = Pool::new(1);
+        let pool = Pool::new(NonZeroUsize::MIN);
         let pid = "console.log(require('node:process').pid);";
         for program in [
             "for (;;) {}",
@@ -667,5 +806,160 @@ console.log([1, 'two', { three: [3n] }], new Map([[1, 2]]));
             // The program's thread was stopped and the same worker ran the next one.
             assert_eq!(next.stdout, output.stdout, "{program}");
         }
+    }
+
+    #[test]
+    fn large_timeouts_clamp_to_signed_32_bit_millis() {
+        let encoded_millis = |duration: Duration| {
+            let request = Request::new(Node::Stdin(""), duration).expect("empty program fits");
+            u32::from_be_bytes(request.bytes[1..5].try_into().expect("4-byte timeout"))
+        };
+
+        assert_eq!(encoded_millis(Duration::from_secs(60)), 60_000);
+        assert_eq!(
+            encoded_millis(Duration::from_millis(u64::from(MAX_TIMEOUT_MS))),
+            MAX_TIMEOUT_MS
+        );
+        assert_eq!(
+            encoded_millis(Duration::from_millis(u64::from(MAX_TIMEOUT_MS) + 1)),
+            MAX_TIMEOUT_MS
+        );
+        assert_eq!(
+            encoded_millis(Duration::from_millis(u64::from(u32::MAX))),
+            MAX_TIMEOUT_MS
+        );
+        assert_eq!(encoded_millis(Duration::MAX), MAX_TIMEOUT_MS);
+
+        // Node clamps delays above `i32::MAX` ms to 1 ms; verify large timeouts do not trigger a
+        // spurious 1 ms timeout in the worker.
+        let pool = Pool::new(NonZeroUsize::MIN);
+        for duration in [Duration::from_millis(u64::from(u32::MAX)), Duration::MAX] {
+            let output = pooled(
+                &pool,
+                Node::Stdin("setTimeout(() => console.log('ok'), 25);"),
+                duration,
+            );
+            assert!(output.status.success(), "{}", lossy(&output.stderr));
+            assert_eq!(lossy(&output.stdout), "ok\n");
+        }
+    }
+
+    #[test]
+    fn read_block_guards_against_oversized_and_truncated_lengths() {
+        let mut empty: &[u8] = &[];
+        assert_eq!(read_block(&mut empty, 0).expect("empty block"), b"");
+
+        for bad_length in [MAX_BLOCK_BYTES + 1, u32::MAX] {
+            let mut empty: &[u8] = &[];
+            let error = read_block(&mut empty, bad_length).expect_err("length exceeds limit");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // A corrupt length within the cap must fail on EOF without allocating the claimed size.
+        let mut short: &[u8] = b"short";
+        let error = read_block(&mut short, MAX_BLOCK_BYTES).expect_err("truncated stream");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Exact block reads stop at the boundary and leave trailing bytes intact.
+        let mut payload = vec![b'x'; 20_000];
+        payload.extend_from_slice(b"tail");
+        let mut reader = payload.as_slice();
+        let block = read_block(&mut reader, 20_000).expect("multi-chunk block");
+        assert_eq!(block.len(), 20_000);
+        assert_eq!(reader, b"tail");
+
+        // `read_reply` rejects an oversized length header without attempting a 4 GiB allocation.
+        let mut corrupt_reply = Vec::new();
+        corrupt_reply.extend_from_slice(b"TNOD");
+        corrupt_reply.push(0);
+        corrupt_reply.extend_from_slice(&0i32.to_be_bytes());
+        corrupt_reply.extend_from_slice(&u32::MAX.to_be_bytes());
+        let error = read_reply(&mut corrupt_reply.as_slice()).expect_err("corrupt stdout length");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn stderr_collector_wakes_on_eof_and_bounds_open_pipes() {
+        struct ChannelReader {
+            chunks: Receiver<Vec<u8>>,
+            on_read: Option<mpsc::Sender<()>>,
+        }
+
+        impl Read for ChannelReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if let Some(notify) = &self.on_read {
+                    let _ = notify.send(());
+                }
+                match self.chunks.recv() {
+                    Ok(chunk) => {
+                        let len = chunk.len().min(buf.len());
+                        buf[..len].copy_from_slice(&chunk[..len]);
+                        Ok(len)
+                    }
+                    Err(_) => Ok(0),
+                }
+            }
+        }
+
+        // Immediate EOF wakes `finish` and joins the reader thread.
+        let (tx, rx) = mpsc::channel();
+        let mut collector = StderrCollector::spawn(ChannelReader {
+            chunks: rx,
+            on_read: None,
+        });
+        tx.send(b"worker ".to_vec()).expect("reader alive");
+        tx.send(b"failed\n".to_vec()).expect("reader alive");
+        drop(tx);
+        collector.finish(Duration::from_secs(30));
+        assert!(collector.reader.is_none());
+        assert!(lock(&collector.shared.state).eof);
+        assert_eq!(collector.read_lossy(), "worker failed\n");
+
+        // A pipe held open past the drain timeout does not hang `finish` and keeps partial output.
+        let (tx, rx) = mpsc::channel();
+        let (read_tx, read_rx) = mpsc::channel();
+        let mut collector = StderrCollector::spawn(ChannelReader {
+            chunks: rx,
+            on_read: Some(read_tx),
+        });
+        tx.send(b"partial\n".to_vec()).expect("reader alive");
+        // First notification: reader entered first `read()`. Second: first chunk is stored and
+        // reader is now blocked waiting for the next chunk.
+        read_rx.recv().expect("first read");
+        read_rx.recv().expect("second read");
+        collector.finish(Duration::from_millis(20));
+        assert!(collector.reader.is_none());
+        assert!(!lock(&collector.shared.state).eof);
+        assert_eq!(collector.read_lossy(), "partial\n");
+        // Release the reader thread so it exits cleanly before the test finishes.
+        drop(tx);
+        let shared = Arc::clone(&collector.shared);
+        let (state, _) = shared
+            .eof
+            .wait_timeout_while(lock(&shared.state), Duration::from_secs(5), |state| {
+                !state.eof
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(state.eof);
+    }
+
+    #[test]
+    fn node_and_output_derive_equality() {
+        assert_eq!(Node::Stdin("1"), Node::Stdin("1"));
+        assert_ne!(Node::Stdin("1"), Node::StdinCommonJs("1"));
+        assert_ne!(Node::Stdin("1"), Node::Stdin("2"));
+
+        let ok = Output {
+            status: Status { code: Some(0) },
+            stdout: b"hi\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let same_ok = ok.clone();
+        let diff_ok = Output {
+            stdout: b"bye\n".to_vec(),
+            ..ok.clone()
+        };
+        assert_eq!(ok, same_ok);
+        assert_ne!(ok, diff_ok);
     }
 }

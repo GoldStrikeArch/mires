@@ -4,24 +4,60 @@
 
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::types::{
-    EnumRepr, FieldKey, NominalForm, RepresentationCandidate, TypeId, TypeKind,
+    EnumRepr, FieldKey, NominalForm, RepresentationCandidate, TypeId, TypeKind, TypeTable,
 };
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 use rcgjs_object::ptr::{self, BUF, LEN, META, OFF, PTR};
 
+use super::ast_util::{is_one_num, is_zero_num, rt_member};
 use super::value::{self, is_slot_pointee, size_of, CLONE_PARAM};
 use super::{decline, JsCx, Res};
 
 /// The depth at which a cast stops peeling and reports (`ptr.rs::CAST_DEPTH`).
 const CAST_DEPTH: u32 = 16;
 
-/// Representation and mutability flags for [`JsCx::cast_str_as`].
-#[derive(Clone, Copy)]
-struct StrCastMode {
-    from_fat: bool,
-    from_mut: bool,
-    to_fat: bool,
-    to_mut: bool,
+/// Arguments to [`JsCx::cast_pointer_sized`].
+struct PointerCast {
+    from_pointee: TypeId,
+    to_pointee: TypeId,
+    from: TypeId,
+    to: TypeId,
+    value: Expr,
+    depth: u32,
+}
+
+/// Representation and mutability of one side of a `str`-involving pointer cast.
+///
+/// Mutable pointers (`&mut T`, `*mut T`) are always fat slices for `str`, so an immutable-style
+/// non-fat mutable representation is unrepresentable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrPtrRepr {
+    /// Immutable non-raw reference (`&str` as JS string, or `&[u8]` / `&u8`).
+    RefConst,
+    /// Immutable raw/fat pointer (`*const str` / `NonNull<str>` / `Box<str>`, or `*const [u8]`).
+    FatConst,
+    /// Mutable reference or raw pointer (`&mut str` / `*mut str`, or `&mut [u8]` / `*mut [u8]`).
+    FatMut,
+}
+
+impl StrPtrRepr {
+    fn from_ptr_ty(table: &TypeTable, ty: TypeId) -> Self {
+        if value::is_mutable_ptr(table, ty) {
+            Self::FatMut
+        } else if value::is_raw(table, ty) {
+            Self::FatConst
+        } else {
+            Self::RefConst
+        }
+    }
+
+    const fn is_fat(self) -> bool {
+        matches!(self, Self::FatConst | Self::FatMut)
+    }
+
+    const fn is_mut(self) -> bool {
+        matches!(self, Self::FatMut)
+    }
 }
 
 // The read/write/offset/copy helpers below are the seams W8's intrinsics (`read_via_copy`,
@@ -225,29 +261,7 @@ impl<'a> JsCx<'a> {
         let Some(desc) = table.get(peeled) else {
             return Err((target, value));
         };
-        let is_simple_atom = |e: &Expr| {
-            matches!(
-                e,
-                Expr::Ident(_)
-                    | Expr::Num(_)
-                    | Expr::RawNum(_)
-                    | Expr::Bool(_)
-                    | Expr::Str(_)
-                    | Expr::Undefined
-                    | Expr::Null
-                    | Expr::BigInt(_)
-            )
-        };
         let mut stmts = Vec::new();
-        let bind_target = |target: Expr, stmts: &mut Vec<Stmt>| -> Expr {
-            if matches!(target, Expr::Ident(_)) {
-                target
-            } else {
-                let (bind, id) = self.temp(target);
-                stmts.push(bind);
-                id
-            }
-        };
         match &desc.kind {
             TypeKind::Adt {
                 form: NominalForm::Struct,
@@ -276,16 +290,10 @@ impl<'a> JsCx<'a> {
                             let Expr::Object(entries) = value else {
                                 unreachable!()
                             };
-                            let t = bind_target(target, &mut stmts);
+                            let t = self.bind_temp_if_needed(target, &mut stmts);
                             let mut evaluated = Vec::with_capacity(entries.len());
                             for (k, v) in entries {
-                                let val = if is_simple_atom(&v) {
-                                    v
-                                } else {
-                                    let (bind, id) = self.temp(v);
-                                    stmts.push(bind);
-                                    id
-                                };
+                                let val = self.bind_atom(v, &mut stmts);
                                 evaluated.push((k, val));
                             }
                             for (k, v) in evaluated {
@@ -294,14 +302,8 @@ impl<'a> JsCx<'a> {
                             return Ok(stmts);
                         }
                     }
-                    let t = bind_target(target, &mut stmts);
-                    let v = if matches!(value, Expr::Ident(_)) {
-                        value
-                    } else {
-                        let (bind, id) = self.temp(value);
-                        stmts.push(bind);
-                        id
-                    };
+                    let t = self.bind_temp_if_needed(target, &mut stmts);
+                    let v = self.bind_temp_if_needed(value, &mut stmts);
                     for k in keys {
                         stmts.push(jsast::assign_stmt(
                             jsast::member(t.clone(), k.clone()),
@@ -342,16 +344,10 @@ impl<'a> JsCx<'a> {
                         let Expr::Object(entries) = value else {
                             unreachable!()
                         };
-                        let t = bind_target(target, &mut stmts);
+                        let t = self.bind_temp_if_needed(target, &mut stmts);
                         let mut evaluated = Vec::with_capacity(entries.len());
                         for (k, v) in entries {
-                            let val = if is_simple_atom(&v) {
-                                v
-                            } else {
-                                let (bind, id) = self.temp(v);
-                                stmts.push(bind);
-                                id
-                            };
+                            let val = self.bind_atom(v, &mut stmts);
                             evaluated.push((k, val));
                         }
                         for (k, v) in evaluated {
@@ -360,14 +356,8 @@ impl<'a> JsCx<'a> {
                         return Ok(stmts);
                     }
                 }
-                let t = bind_target(target, &mut stmts);
-                let v = if matches!(value, Expr::Ident(_)) {
-                    value
-                } else {
-                    let (bind, id) = self.temp(value);
-                    stmts.push(bind);
-                    id
-                };
+                let t = self.bind_temp_if_needed(target, &mut stmts);
+                let v = self.bind_temp_if_needed(value, &mut stmts);
                 for k in keys {
                     stmts.push(jsast::assign_stmt(
                         jsast::member(t.clone(), k.clone()),
@@ -408,16 +398,10 @@ impl<'a> JsCx<'a> {
                         let Expr::Object(entries) = value else {
                             unreachable!()
                         };
-                        let t = bind_target(target, &mut stmts);
+                        let t = self.bind_temp_if_needed(target, &mut stmts);
                         let mut by_key = std::collections::HashMap::with_capacity(entries.len());
                         for (k, v) in entries {
-                            let val = if is_simple_atom(&v) {
-                                v
-                            } else {
-                                let (bind, id) = self.temp(v);
-                                stmts.push(bind);
-                                id
-                            };
+                            let val = self.bind_atom(v, &mut stmts);
                             by_key.insert(k, val);
                         }
                         for k in keys {
@@ -427,14 +411,8 @@ impl<'a> JsCx<'a> {
                         return Ok(stmts);
                     }
                 }
-                let t = bind_target(target, &mut stmts);
-                let v = if matches!(value, Expr::Ident(_)) {
-                    value
-                } else {
-                    let (bind, id) = self.temp(value);
-                    stmts.push(bind);
-                    id
-                };
+                let t = self.bind_temp_if_needed(target, &mut stmts);
+                let v = self.bind_temp_if_needed(value, &mut stmts);
                 for k in keys {
                     stmts.push(jsast::assign_stmt(
                         jsast::member(t.clone(), k.clone()),
@@ -450,16 +428,10 @@ impl<'a> JsCx<'a> {
                         let Expr::Array(items) = value else {
                             unreachable!()
                         };
-                        let t = bind_target(target, &mut stmts);
+                        let t = self.bind_temp_if_needed(target, &mut stmts);
                         let mut evaluated = Vec::with_capacity(len);
                         for item in items {
-                            let val = if is_simple_atom(&item) {
-                                item
-                            } else {
-                                let (bind, id) = self.temp(item);
-                                stmts.push(bind);
-                                id
-                            };
+                            let val = self.bind_atom(item, &mut stmts);
                             evaluated.push(val);
                         }
                         for (i, val) in evaluated.into_iter().enumerate() {
@@ -471,14 +443,8 @@ impl<'a> JsCx<'a> {
                         return Ok(stmts);
                     }
                 }
-                let t = bind_target(target, &mut stmts);
-                let v = if matches!(value, Expr::Ident(_)) {
-                    value
-                } else {
-                    let (bind, id) = self.temp(value);
-                    stmts.push(bind);
-                    id
-                };
+                let t = self.bind_temp_if_needed(target, &mut stmts);
+                let v = self.bind_temp_if_needed(value, &mut stmts);
                 for i in 0..len {
                     let idx = jsast::num(i as f64);
                     stmts.push(jsast::assign_stmt(
@@ -1202,7 +1168,7 @@ impl<'a> JsCx<'a> {
         let (pre, tail) = peel_seq(slice);
         if !self.byte_views.raw_byte_derefs {
             if let Expr::Call(ref callee, ref args) = tail {
-                if (is_rt_call(callee, "sfp") || is_rt_call(callee, "slice_from_parts"))
+                if matches!(rt_member(callee), Some("sfp" | "slice_from_parts"))
                     && (args.len() == 2 || args.len() == 3)
                     && jsast::is_droppable(&args[0])
                     && args.get(2).is_none_or(jsast::is_droppable)
@@ -1233,19 +1199,14 @@ impl<'a> JsCx<'a> {
             from_pointee,
             to_pointee,
             value,
-            StrCastMode {
-                from_fat: false,
-                from_mut: false,
-                to_fat: false,
-                to_mut: false,
-            },
+            (StrPtrRepr::RefConst, StrPtrRepr::RefConst),
         )
     }
 
     /// [`Self::cast_str`], told the representation and mutability of both pointer types:
-    /// - `&str` (`from_fat = false`) is a JavaScript string;
+    /// - `&str` (`RefConst`) is a JavaScript string;
     /// - `&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`
-    ///   (`from_fat = true`) are live `{ buf, off, len }` UTF-8 byte slices.
+    ///   (`FatConst` / `FatMut`) are live `{ buf, off, len }` UTF-8 byte slices.
     ///
     /// Crossing from an immutable `FatSlice` (`*const str` / `NonNull<str>` / `Box<str>`) to a
     /// mutable target (`*mut str` / `&mut str` / `*mut [u8]` / `&mut [u8]` / `*mut u8`) routes
@@ -1257,14 +1218,8 @@ impl<'a> JsCx<'a> {
         from_pointee: TypeId,
         to_pointee: TypeId,
         value: Expr,
-        mode: StrCastMode,
+        (from_repr, to_repr): (StrPtrRepr, StrPtrRepr),
     ) -> Option<Res<Expr>> {
-        let StrCastMode {
-            from_fat,
-            from_mut,
-            to_fat,
-            to_mut,
-        } = mode;
         let table = self.table;
         let (from_str, to_str) = (
             value::is_str(table, from_pointee),
@@ -1274,7 +1229,7 @@ impl<'a> JsCx<'a> {
             return None;
         }
         let detach_if_const_to_mut = |v: Expr| {
-            if !from_mut && to_mut {
+            if !from_repr.is_mut() && to_repr.is_mut() {
                 jsast::rt_call("detach_str_memo", vec![v])
             } else {
                 v
@@ -1289,19 +1244,22 @@ impl<'a> JsCx<'a> {
             )))
         };
         Some(match (from_str, to_str) {
-            (true, true) => Ok(match (from_fat, to_fat) {
-                (false, false) => value,
-                (true, true) => detach_if_const_to_mut(value),
-                (true, false) => self.bytes_to_str(value),
-                (false, true) => {
-                    if to_mut {
-                        self.str_to_bytes_mut(value)
-                    } else {
-                        self.str_to_bytes(value)
-                    }
+            (true, true) => Ok(match (from_repr, to_repr) {
+                (StrPtrRepr::RefConst, StrPtrRepr::RefConst) => value,
+                (StrPtrRepr::FatConst, StrPtrRepr::FatMut) => {
+                    jsast::rt_call("detach_str_memo", vec![value])
                 }
+                (
+                    StrPtrRepr::FatConst | StrPtrRepr::FatMut,
+                    StrPtrRepr::FatConst | StrPtrRepr::FatMut,
+                ) => value,
+                (StrPtrRepr::FatConst | StrPtrRepr::FatMut, StrPtrRepr::RefConst) => {
+                    self.bytes_to_str(value)
+                }
+                (StrPtrRepr::RefConst, StrPtrRepr::FatMut) => self.str_to_bytes_mut(value),
+                (StrPtrRepr::RefConst, StrPtrRepr::FatConst) => self.str_to_bytes(value),
             }),
-            (true, false) if from_fat => match value::kind(table, to_pointee) {
+            (true, false) if from_repr.is_fat() => match value::kind(table, to_pointee) {
                 Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
                     Ok(detach_if_const_to_mut(value))
                 }
@@ -1315,12 +1273,14 @@ impl<'a> JsCx<'a> {
                 _ => unsupported(),
             },
             (true, false) => match value::kind(table, to_pointee) {
-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if to_mut {
-                    self.str_to_bytes_mut(value)
-                } else {
-                    self.str_to_bytes(value)
-                }),
-                _ if value::is_u8(table, to_pointee) => Ok(if to_mut {
+                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
+                    Ok(if to_repr.is_mut() {
+                        self.str_to_bytes_mut(value)
+                    } else {
+                        self.str_to_bytes(value)
+                    })
+                }
+                _ if value::is_u8(table, to_pointee) => Ok(if to_repr.is_mut() {
                     let bytes = self.str_to_bytes_mut(value);
                     let (setup, sb) = self.reread(bytes, &[BUF, OFF]);
                     sequenced(
@@ -1333,11 +1293,13 @@ impl<'a> JsCx<'a> {
                 _ => unsupported(),
             },
             (false, true) => match value::kind(table, from_pointee) {
-                Some(TypeKind::Slice(element)) if table.byte_element(*element) => Ok(if to_fat {
-                    detach_if_const_to_mut(value)
-                } else {
-                    self.bytes_to_str(value)
-                }),
+                Some(TypeKind::Slice(element)) if table.byte_element(*element) => {
+                    Ok(if to_repr.is_fat() {
+                        detach_if_const_to_mut(value)
+                    } else {
+                        self.bytes_to_str(value)
+                    })
+                }
                 _ => unsupported(),
             },
             (false, false) => Ok(value),
@@ -1348,21 +1310,9 @@ impl<'a> JsCx<'a> {
     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
         let from_pointee = value::pointee_of(self.table, from_ty)?;
         let to_pointee = value::pointee_of(self.table, to_ty)?;
-        let from_mut = value::is_mutable_ptr(self.table, from_ty);
-        let to_mut = value::is_mutable_ptr(self.table, to_ty);
-        let from_fat = value::is_raw(self.table, from_ty) || from_mut;
-        let to_fat = value::is_raw(self.table, to_ty) || to_mut;
-        self.cast_str_as(
-            from_pointee,
-            to_pointee,
-            value,
-            StrCastMode {
-                from_fat,
-                from_mut,
-                to_fat,
-                to_mut,
-            },
-        )
+        let from_repr = StrPtrRepr::from_ptr_ty(self.table, from_ty);
+        let to_repr = StrPtrRepr::from_ptr_ty(self.table, to_ty);
+        self.cast_str_as(from_pointee, to_pointee, value, (from_repr, to_repr))
     }
 
     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).
@@ -1461,19 +1411,25 @@ impl<'a> JsCx<'a> {
                 None => self.ref_to_raw(to, value),
             });
         }
-        self.cast_pointer_sized(from_pointee, to_pointee, from, to, value, depth)
+        self.cast_pointer_sized(PointerCast {
+            from_pointee,
+            to_pointee,
+            from,
+            to,
+            value,
+            depth,
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn cast_pointer_sized(
-        &self,
-        from_pointee: TypeId,
-        to_pointee: TypeId,
-        from: TypeId,
-        to: TypeId,
-        value: Expr,
-        depth: u32,
-    ) -> Res<Expr> {
+    fn cast_pointer_sized(&self, cast: PointerCast) -> Res<Expr> {
+        let PointerCast {
+            from_pointee,
+            to_pointee,
+            from,
+            to,
+            value,
+            depth,
+        } = cast;
         let table = self.table;
         let unsupported = || {
             Ok(self.zombie(format!(
@@ -1906,7 +1862,7 @@ pub(super) fn unwrap_offset_cond(expr: Expr) -> Expr {
 fn unwrap_rt_box(expr: Expr) -> Result<(Vec<Expr>, Expr), Expr> {
     let (prefix, tail) = peel_seq(expr);
     match tail {
-        Expr::Call(callee, mut args) if args.len() == 1 && is_rt_call(&callee, "box") => {
+        Expr::Call(callee, mut args) if args.len() == 1 && rt_member(&callee) == Some("box") => {
             Ok((prefix, args.pop().expect("1 arg")))
         }
         other => Err(sequenced_vec(prefix, other)),
@@ -1977,32 +1933,18 @@ fn sequenced_vec(mut pre: Vec<Expr>, tail: Expr) -> Expr {
     }
 }
 
-fn is_rt_call(callee: &Expr, method: &str) -> bool {
-    matches!(
-        callee,
-        Expr::Member(object, name)
-            if name == method && matches!(object.as_ref(), Expr::Ident(rt) if rt == "__rt")
-    )
-}
-
 /// If `expr` is `__rt.bytes_str(b, o, l)`, returns `Ok((b, o, l))`.
 pub(super) fn bytes_str_args(expr: Expr) -> Result<(Expr, Expr, Expr), Expr> {
     match expr {
-        Expr::Call(callee, mut args) if args.len() == 3 && is_rt_call(&callee, "bytes_str") => {
+        Expr::Call(callee, mut args)
+            if args.len() == 3 && rt_member(&callee) == Some("bytes_str") =>
+        {
             let len = args.pop().expect("3 args");
             let off = args.pop().expect("3 args");
             let buf = args.pop().expect("3 args");
             Ok((buf, off, len))
         }
         other => Err(other),
-    }
-}
-
-fn is_zero_num(expr: &Expr) -> bool {
-    match expr {
-        Expr::Num(n) => *n == 0.0,
-        Expr::RawNum(s) => s == "0",
-        _ => false,
     }
 }
 
@@ -2014,18 +1956,10 @@ fn unwrap_addr_ptr(expr: &Expr) -> Option<(Expr, Expr)> {
     let Expr::Call(callee, args) = inner else {
         return None;
     };
-    if args.len() == 2 && is_rt_call(callee, "addr") && jsast::is_droppable(&args[1]) {
+    if args.len() == 2 && rt_member(callee) == Some("addr") && jsast::is_droppable(&args[1]) {
         Some((args[0].clone(), args[1].clone()))
     } else {
         None
-    }
-}
-
-fn is_one_num(expr: &Expr) -> bool {
-    match expr {
-        Expr::Num(n) => *n == 1.0,
-        Expr::RawNum(s) => s == "1",
-        _ => false,
     }
 }
 
@@ -2075,9 +2009,7 @@ pub fn meta(pointer: Expr) -> Expr {
 fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
     match expr {
         Expr::Call(callee, mut args)
-            if args.len() == 1
-                && matches!(&*callee, Expr::Member(object, name)
-                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
+            if args.len() == 1 && rt_member(&callee) == Some("str_bytes") =>
         {
             Ok(args.pop().expect("one argument"))
         }

@@ -1153,7 +1153,7 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             if pieces.len() != texts.len() + 1 {
                 return Err(kernel_decline("marked format template arity"));
             }
-            let byte_strings = cx.heap().native_string_enabled || crate::lower::bstr::enabled();
+            let byte_strings = cx.heap().native_string_enabled || cx.bstr_enabled();
             Ok(Some(Lowered::value(concat_format_pieces_with_bytes(
                 &pieces,
                 &texts,
@@ -1201,7 +1201,7 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             }
             let text = cx.expr_of(*arguments)?;
             let stmts = vec![jsast::expr_stmt(jsast::compound_assign(
-                BinOp::Add,
+                jsast::CompoundOp::Add,
                 jsast::member(recv, "s"),
                 text,
             ))];
@@ -1303,7 +1303,7 @@ fn format_text(
 ) -> Res<(Vec<Stmt>, Expr)> {
     let walk = cx.walk_place(&root, path)?;
     let loaded = cx.read_place(&walk.place);
-    let byte_strings = cx.heap().native_string_enabled || crate::lower::bstr::enabled();
+    let byte_strings = cx.heap().native_string_enabled || cx.bstr_enabled();
     let mut setup = Vec::new();
     let expr = match (format, kind) {
         (ArgFormat::Display, DisplayKind::Integer { .. }) => {

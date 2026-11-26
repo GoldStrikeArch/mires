@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rcgjs_object::item::AllocatorProvider;
 use rcgjs_object::jir::decline::Decline;
 use rcgjs_object::jir::interns::Interns;
-use rcgjs_object::jir::repr::{Carrier, Func, OpKind, Proj, Root};
+use rcgjs_object::jir::repr::{Carrier, Func, OpKind, Proj};
 use rcgjs_object::jir::semantic::{
     BodySemantic, CallSemantic, Callee, ConstTree, StandardOperation,
 };
@@ -334,51 +334,20 @@ fn collect_contained_candidates(
     ty: TypeId,
     target: RepresentationCandidate,
     out: &mut BTreeSet<TypeId>,
-    visited: &mut BTreeSet<TypeId>,
 ) {
-    let ty = table.peeled(ty);
-    if !visited.insert(ty) {
-        return;
-    }
-    let Some(desc) = table.get(ty) else {
-        return;
-    };
-    if desc.meta.candidate == target {
-        out.insert(ty);
-    }
-    match &desc.kind {
-        TypeKind::Reference { pointee, .. }
-        | TypeKind::RawPointer { pointee, .. }
-        | TypeKind::Array {
-            element: pointee, ..
-        }
-        | TypeKind::Slice(pointee) => {
-            collect_contained_candidates(table, *pointee, target, out, visited);
-        }
-        TypeKind::Tuple(elems) => {
-            for elem in elems {
-                collect_contained_candidates(table, *elem, target, out, visited);
+    table.visit_types(
+        ty,
+        rcgjs_object::jir::types::TypeWalk::WithAdtArgs,
+        &mut |current| {
+            let peeled = table.peeled(current);
+            if table
+                .get(peeled)
+                .is_some_and(|desc| desc.meta.candidate == target)
+            {
+                out.insert(peeled);
             }
-        }
-        TypeKind::Adt { variants, args, .. } => {
-            for arg in args {
-                collect_contained_candidates(table, *arg, target, out, visited);
-            }
-            for variant in variants {
-                for field in &variant.fields {
-                    collect_contained_candidates(table, field.ty, target, out, visited);
-                }
-            }
-        }
-        TypeKind::Closure { upvars, .. }
-        | TypeKind::Coroutine { upvars, .. }
-        | TypeKind::CoroutineClosure { upvars, .. } => {
-            for upvar in upvars {
-                collect_contained_candidates(table, *upvar, target, out, visited);
-            }
-        }
-        _ => {}
-    }
+        },
+    );
 }
 
 fn is_box_raw_provenance_item(item: &LinkItem, interns: &Interns) -> bool {
@@ -492,9 +461,10 @@ fn user_reachable_excluding_maps(
                         _ => None,
                     };
                     if let Some(target_str) = direct_name {
-                        let target = JsName::new(target_str.to_owned());
-                        if live.contains(&target) && seen.insert(target.clone()) {
-                            queue.push_back(target);
+                        if let Some(target) = live.get(target_str) {
+                            if seen.insert(target.clone()) {
+                                queue.push_back(target.clone());
+                            }
                         }
                     }
                 }
@@ -531,13 +501,11 @@ fn audit_reachable_items(
                     .iter()
                     .chain(std::iter::once(&body.signature.result))
                 {
-                    let mut visited = BTreeSet::new();
                     collect_contained_candidates(
                         types,
                         ty,
                         RepresentationCandidate::BTreeMap,
                         &mut audit.disqualified_maps,
-                        &mut visited,
                     );
                 }
             }
@@ -552,13 +520,11 @@ fn audit_reachable_items(
                     .iter()
                     .chain(std::iter::once(&body.signature.result))
                 {
-                    let mut visited = BTreeSet::new();
                     collect_contained_candidates(
                         types,
                         ty,
                         RepresentationCandidate::Box,
                         &mut audit.disqualified_boxes,
-                        &mut visited,
                     );
                 }
             }
@@ -584,13 +550,11 @@ fn audit_reachable_items(
                         .chain(std::iter::once(&body.signature.result))
                         .chain(body.locals.iter().map(|l| &l.ty))
                     {
-                        let mut visited = BTreeSet::new();
                         collect_contained_candidates(
                             types,
                             ty,
                             RepresentationCandidate::BTreeMap,
                             &mut audit.disqualified_maps,
-                            &mut visited,
                         );
                     }
                 }
@@ -613,36 +577,30 @@ fn audit_func(
     audit: &mut TypeAudit,
 ) {
     let val_ty = |v: rcgjs_object::jir::repr::ValueId| func.values.get(v.0 as usize).map(|d| d.ty);
-    let root_ty = |root: &Root| match root {
-        Root::Cell(c) => func.cells.get(c.0 as usize).map(|d| d.ty),
-        Root::Value(v) => val_ty(*v),
-    };
-    let mut def_map: BTreeMap<rcgjs_object::jir::repr::ValueId, &OpKind> = BTreeMap::new();
+    let mut def_map: Vec<Option<&OpKind>> = vec![None; func.values.len()];
     for block in &func.blocks {
         for op in &block.ops {
             if let Some(res) = op.result {
-                def_map.insert(res, &op.kind);
+                if let Some(slot) = def_map.get_mut(res.0 as usize) {
+                    *slot = Some(&op.kind);
+                }
             }
         }
     }
     let disqualify_all_maps = |ty: TypeId, audit: &mut TypeAudit| {
-        let mut visited = BTreeSet::new();
         collect_contained_candidates(
             types,
             ty,
             RepresentationCandidate::BTreeMap,
             &mut audit.disqualified_maps,
-            &mut visited,
         );
     };
     let disqualify_all_boxes = |ty: TypeId, audit: &mut TypeAudit| {
-        let mut visited = BTreeSet::new();
         collect_contained_candidates(
             types,
             ty,
             RepresentationCandidate::Box,
             &mut audit.disqualified_boxes,
-            &mut visited,
         );
     };
 
@@ -679,7 +637,7 @@ fn audit_func(
                     }
                 }
                 OpKind::BorrowView { root, path, .. } | OpKind::Drop { root, path, .. } => {
-                    if let Some(r_ty) = root_ty(root) {
+                    if let Some(r_ty) = func.root_ty(*root) {
                         check_path_field_into_map(types, r_ty, path, &mut audit.disqualified_maps);
                     }
                 }
@@ -692,7 +650,7 @@ fn audit_func(
                             candidate_of(types, v_ty)
                         {
                             let is_member_store = matches!(
-                                def_map.get(ptr),
+                                def_map.get(ptr.0 as usize).copied().flatten(),
                                 Some(OpKind::BorrowView { path, .. })
                                     if matches!(
                                         path.last(),
@@ -706,7 +664,7 @@ fn audit_func(
                     }
                 }
                 OpKind::RawView { root, path, .. } => {
-                    if let Some(r_ty) = root_ty(root) {
+                    if let Some(r_ty) = func.root_ty(*root) {
                         disqualify_all_maps(r_ty, audit);
                         if !box_internal {
                             disqualify_all_boxes(r_ty, audit);

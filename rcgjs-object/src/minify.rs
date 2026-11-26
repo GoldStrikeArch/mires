@@ -78,7 +78,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{ItemMap, JsItem, LinkItem};
-use crate::jsast::{self, ArrowBody, Expr, Stmt};
+use crate::jsast::{self, Expr, Stmt};
 
 /// Globals the emitted JavaScript reads. A generated name is never one of these.
 ///
@@ -213,7 +213,7 @@ impl<'a> Names<'a> {
 
 /// Renames the locals of every item in a codegen unit. A no-op unless `js-minify` is on.
 pub fn shorten_locals(items: &mut [JsItem]) {
-    if !crate::opts::get().minify {
+    if !crate::opts::get().minify.is_enabled() {
         return;
     }
     for item in items {
@@ -449,151 +449,91 @@ impl Visit for Apply<'_> {
     }
 }
 
-fn walk_stmts<V: Visit>(stmts: &mut [Stmt], v: &mut V) {
-    for stmt in stmts {
-        walk_stmt(stmt, v);
+struct NameWalker<'a, V>(&'a mut V);
+
+impl<V: Visit> jsast::VisitMut for NameWalker<'_, V> {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::Let(name, init) => {
+                self.0.declared(name);
+                if let Some(init) = init {
+                    self.visit_expr_mut(init);
+                }
+            }
+            Stmt::Lets(decls) => {
+                for (name, init) in decls {
+                    self.0.declared(name);
+                    if let Some(init) = init {
+                        self.visit_expr_mut(init);
+                    }
+                }
+            }
+            Stmt::Const(name, init) => {
+                self.0.declared(name);
+                self.visit_expr_mut(init);
+            }
+            Stmt::Labeled(label, inner) => {
+                self.0.label_declared(label);
+                self.visit_stmt_mut(inner);
+            }
+            Stmt::LoopForever(label, body) => {
+                if let Some(label) = label {
+                    self.0.label_declared(label);
+                }
+                self.visit_stmts_mut(body);
+            }
+            Stmt::Continue(label) | Stmt::Break(label) => {
+                if let Some(label) = label {
+                    self.0.label_used(label);
+                }
+            }
+            // Never emitted inside a body today; treated as a nested binding rather than assumed away.
+            Stmt::FunctionDecl { name, params, body } => {
+                self.0.declared(name);
+                for param in params {
+                    self.0.param(param);
+                }
+                self.visit_stmts_mut(body);
+            }
+            Stmt::TryCatch {
+                body,
+                binding,
+                handler,
+            } => {
+                self.visit_stmts_mut(body);
+                self.0.catch_binding(binding);
+                self.visit_stmts_mut(handler);
+            }
+            Stmt::Raw(_) => self.0.raw(),
+            // An import declares names the whole program shares, and `link.rs` keeps them exactly as
+            // they are spelled: renaming one here would rewrite the binding inside the `import` and
+            // leave every use of it looking for something the module does not export.
+            Stmt::Import { .. } => {}
+            _ => jsast::walk_stmt_mut(self, stmt),
+        }
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Ident(name) => self.0.used(name),
+            Expr::Arrow(params, _) => {
+                for param in params {
+                    self.0.param(param);
+                }
+                jsast::walk_expr_mut(self, expr);
+            }
+            Expr::Raw(_) => self.0.raw(),
+            _ => jsast::walk_expr_mut(self, expr),
+        }
     }
 }
 
-fn walk_stmt<V: Visit>(stmt: &mut Stmt, v: &mut V) {
-    match stmt {
-        Stmt::ExprStmt(expr) | Stmt::Throw(expr) => walk_expr(expr, v),
-        Stmt::Let(name, init) => {
-            v.declared(name);
-            if let Some(init) = init {
-                walk_expr(init, v);
-            }
-        }
-        Stmt::Lets(decls) => {
-            for (name, init) in decls {
-                v.declared(name);
-                if let Some(init) = init {
-                    walk_expr(init, v);
-                }
-            }
-        }
-        Stmt::Const(name, init) => {
-            v.declared(name);
-            walk_expr(init, v);
-        }
-        Stmt::Return(value) => {
-            if let Some(value) = value {
-                walk_expr(value, v);
-            }
-        }
-        Stmt::If(test, then, els) => {
-            walk_expr(test, v);
-            walk_stmts(then, v);
-            if let Some(els) = els {
-                walk_stmts(els, v);
-            }
-        }
-        Stmt::Switch(disc, cases) => {
-            walk_expr(disc, v);
-            for case in cases {
-                for test in &mut case.tests {
-                    walk_expr(test, v);
-                }
-                walk_stmts(&mut case.body, v);
-            }
-        }
-        Stmt::Labeled(label, inner) => {
-            v.label_declared(label);
-            walk_stmt(inner, v);
-        }
-        Stmt::LoopForever(label, body) => {
-            if let Some(label) = label {
-                v.label_declared(label);
-            }
-            walk_stmts(body, v);
-        }
-        Stmt::While(test, body) => {
-            walk_expr(test, v);
-            walk_stmts(body, v);
-        }
-        Stmt::Continue(label) | Stmt::Break(label) => {
-            if let Some(label) = label {
-                v.label_used(label);
-            }
-        }
-        // Never emitted inside a body today; treated as a nested binding rather than assumed away.
-        Stmt::FunctionDecl { name, params, body } => {
-            v.declared(name);
-            for param in params {
-                v.param(param);
-            }
-            walk_stmts(body, v);
-        }
-        Stmt::TryCatch {
-            body,
-            binding,
-            handler,
-        } => {
-            walk_stmts(body, v);
-            v.catch_binding(binding);
-            walk_stmts(handler, v);
-        }
-        Stmt::Block(body) => walk_stmts(body, v),
-        Stmt::Raw(_) => v.raw(),
-        // An import declares names the whole program shares, and `link.rs` keeps them exactly as
-        // they are spelled: renaming one here would rewrite the binding inside the `import` and
-        // leave every use of it looking for something the module does not export.
-        Stmt::Import { .. } | Stmt::Comment(_) | Stmt::Loc(_) => {}
-    }
+fn walk_stmts<V: Visit>(stmts: &mut [Stmt], v: &mut V) {
+    jsast::VisitMut::visit_stmts_mut(&mut NameWalker(v), stmts);
 }
 
 fn walk_expr<V: Visit>(expr: &mut Expr, v: &mut V) {
-    match expr {
-        Expr::Ident(name) => v.used(name),
-        Expr::Member(obj, _) => walk_expr(obj, v),
-        Expr::Index(obj, index) => {
-            walk_expr(obj, v);
-            walk_expr(index, v);
-        }
-        Expr::Call(callee, args) | Expr::New(callee, args) => {
-            walk_expr(callee, v);
-            for arg in args {
-                walk_expr(arg, v);
-            }
-        }
-        Expr::Unary(_, operand) => walk_expr(operand, v),
-        Expr::Binary(_, lhs, rhs) | Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
-            walk_expr(lhs, v);
-            walk_expr(rhs, v);
-        }
-        Expr::Cond(test, consequent, alternate) => {
-            walk_expr(test, v);
-            walk_expr(consequent, v);
-            walk_expr(alternate, v);
-        }
-        Expr::Object(entries) => {
-            for (_, value) in entries {
-                walk_expr(value, v);
-            }
-        }
-        Expr::Array(items) | Expr::Seq(items) => {
-            for item in items {
-                walk_expr(item, v);
-            }
-        }
-        Expr::Arrow(params, body) => {
-            for param in params {
-                v.param(param);
-            }
-            match body {
-                ArrowBody::Expr(body) => walk_expr(body, v),
-                ArrowBody::Block(body) => walk_stmts(body, v),
-            }
-        }
-        Expr::Raw(_) => v.raw(),
-        Expr::Num(_)
-        | Expr::RawNum(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Undefined
-        | Expr::Null => {}
-    }
+    jsast::VisitMut::visit_expr_mut(&mut NameWalker(v), expr);
 }
 
 // -------------------------------------------------------------------------------------------

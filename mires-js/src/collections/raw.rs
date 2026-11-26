@@ -1,34 +1,27 @@
-//! The host `Map`, and the calls that reach it.
+//! The host `Map`, and the marker calls that reach it.
 //!
-//! Two mechanisms, and which one an operation uses is decided by one thing: whether it is generic.
+//! Every operation here is a marker function: an ordinary Rust `fn` with an unreachable body,
+//! recognized by its `rcgjs.map.*` `link_section` and lowered directly to JavaScript `Map`
+//! operations by `jsc-link/src/lower/js/host.rs`.
 //!
-//! * A **monomorphic** operation is an ordinary `extern "C-unwind"` declaration (a host exception
-//!   keeps its cleanup edge in the unwind build mode). A foreign call with a C ABI lowers to
-//!   `__rt.<symbol>(...)` already (`CONTRACT.md`, "Calls to foreign items"): it costs nothing.
-//! * A **generic** operation cannot be a foreign declaration, because rustc has no such thing. It
-//!   is a marker function instead: an ordinary Rust `fn` with an unreachable body, recognized by
-//!   the `link_section` it carries, exactly as `view-abi`'s markers are (`CONTRACT.md`,
-//!   "Templates"). The prefix is `rcgjs.map.` and `backend/src/map.rs` is the lowering.
+//! # Storage model
 //!
-//! # The value a map stores is an `Option`
+//! This module is value-agnostic; the collection types above it pick what each host `Map` entry
+//! stores:
 //!
-//! Nothing here hands the host a bare `V`. A map holds `Option<V>` and the host stores the object
-//! that is (`CONTRACT.md`, "Enums"), which buys three things at the cost of one object per entry:
-//!
-//! * the host never has to know what a Rust value looks like, so the shim stays four lines of `Map`
-//!   calls;
-//! * `&Option<V>` is always an object rather than sometimes a `{ buf, off }` slot, so the marker
-//!   lowering is a plain call with no case analysis on `V`;
-//! * moving the old value out on `insert` and `remove` is `Option::replace` and `Option::take`,
-//!   which are safe code writing through an ordinary `&mut`, rather than a `ptr::read` that the
-//!   caller has to promise is a move.
+//! * [`super::HashMap`] stores a non-transparent `MapEntry<V>` wrapper around `Option<V>` so
+//!   `&MapEntry<V>` and `&mut MapEntry<V>` always stay indirect even when `Option<V>` uses
+//!   null-niche lowering, and moving old values out on `insert` and `remove` is safe
+//!   `Option::replace` / `Option::take`.
+//! * [`super::HashSet`] stores `bool` values directly to avoid wrapper allocations.
+
+use crate::HostHandle;
 
 /// A host `Map`, as the value model sees it: the `Map` object itself.
 ///
-/// One machine word and `repr(transparent)`, for the reasons `view_abi::Node` gives. A zero sized
-/// value is folded away by MIR, and a value copied out of an ordinary one field struct is rebuilt
-/// field by field, so a map passed by value through either shape would come back as
-/// `{ handle: undefined }`.
+/// One transparent machine word ([`HostHandle`]): a zero-sized value is folded away by MIR, and a
+/// value copied out of an ordinary one-field struct is rebuilt field by field, so a map passed by
+/// value through either shape would lose its host object identity.
 ///
 /// `Copy` because the handle is a reference to the host object rather than an owner of it: a
 /// collection type above this one decides what owning means. Nothing frees a `Map`; the engine's
@@ -38,7 +31,7 @@
 pub(crate) struct RawMap {
     /// Never read by Rust code; see the type docs.
     #[allow(dead_code)]
-    handle: u32,
+    handle: HostHandle,
 }
 
 /// `new Map()`.
@@ -94,6 +87,13 @@ pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
 }
 
 /// `map.get(key)`, as a shared reference to the stored value, or `None` if absent.
+///
+/// # Safety
+///
+/// * Every entry stored in `map` under a key of `Q`'s class must have been stored as `V`.
+/// * No mutable reference to the returned entry may exist, and `map` must not mutate or remove
+///   that entry, for the lifetime `'a`.
+#[allow(unsafe_code)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_get")]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a V> {
@@ -102,6 +102,14 @@ pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Opti
 }
 
 /// `map.get(key)`, as a mutable reference to the stored value, or `None` if absent.
+///
+/// # Safety
+///
+/// * Every entry stored in `map` under a key of `Q`'s class must have been stored as `V`.
+/// * The caller must hold exclusive access to `map` for the lifetime `'a` so no other reference to
+///   the returned entry exists, and the entry must not be removed or overwritten while the
+///   returned reference is live.
+#[allow(unsafe_code)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_getmut")]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a mut V> {
@@ -115,14 +123,28 @@ pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> 
 /// noticing. `S` is [`crate::collections::MapKey::Snapshot`], which is the key class for a key that
 /// is a value and `&'static str` for the string class, so the array's elements are exactly what the
 /// host stored.
+///
+/// # Safety
+///
+/// * Every key stored in `map` must have the host snapshot representation `S`.
+/// * `'a` must be bounded by the caller's borrow of the map owning `map` (and any lifetime carried
+///   by `S`).
+#[allow(unsafe_code)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.keys")]
 #[inline(never)]
-pub(crate) fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
+pub(crate) unsafe fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
     let _ = map;
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `[...map.values()]`, the stored entry references in the exact insertion order of [`map_keys`].
+///
+/// # Safety
+///
+/// * Every value stored in `map` must have been stored as `V`.
+/// * No mutable reference to any entry in `map` may exist, and `map` must not be mutated for the
+///   lifetime `'a`.
+#[allow(unsafe_code)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.values")]
 #[inline(never)]
 pub(crate) unsafe fn map_values<'a, V>(map: RawMap) -> &'a [&'a V] {

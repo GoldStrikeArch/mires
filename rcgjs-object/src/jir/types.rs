@@ -11,7 +11,7 @@
 //! resolve in the table; [`TypeTable::verify`] checks the table's own references and
 //! `Body::verify` the body's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -622,6 +622,17 @@ impl From<TypeTable> for Vec<TypeDescriptor> {
     }
 }
 
+/// How deeply [`TypeTable::visit_types`] descends through a type graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypeWalk {
+    /// Structural by-value containment only (stops at references/raw pointers and skips `Adt::args`).
+    ByValue,
+    /// Descends through references and raw pointers, but skips unstored `Adt::args`.
+    ThroughPointers,
+    /// Descends through references, raw pointers, and `Adt::args` (e.g. `PhantomData<T>`).
+    WithAdtArgs,
+}
+
 impl TypeTable {
     pub fn new() -> Self {
         Self::default()
@@ -808,6 +819,101 @@ impl TypeTable {
     pub fn pointer_form(&self, id: TypeId) -> Option<PointerForm> {
         self.get(id)
             .and_then(|descriptor| descriptor.js.pointer_form)
+    }
+
+    /// For a reference or raw pointer type (after peeling transparent wrappers), returns
+    /// `(pointee, mutable, is_raw)`.
+    pub fn ptr_info(&self, ty: TypeId) -> Option<(TypeId, bool, bool)> {
+        let peeled = self.peeled(ty);
+        match self.get(peeled)?.kind {
+            TypeKind::Reference { pointee, mutable } => Some((pointee, mutable, false)),
+            TypeKind::RawPointer { pointee, mutable } => Some((pointee, mutable, true)),
+            _ => None,
+        }
+    }
+
+    /// The pointee type of a reference or raw pointer type, after peeling transparent wrappers.
+    pub fn pointee(&self, ty: TypeId) -> Option<TypeId> {
+        self.ptr_info(ty).map(|(pointee, _, _)| pointee)
+    }
+
+    /// Visits `ty` and every transitively reachable type in DFS pre-order according to `walk`,
+    /// guarding against recursive type cycles.
+    pub fn visit_types(&self, ty: TypeId, walk: TypeWalk, f: &mut impl FnMut(TypeId)) {
+        let follow_ptrs = matches!(walk, TypeWalk::ThroughPointers | TypeWalk::WithAdtArgs);
+        let follow_adt_args = matches!(walk, TypeWalk::WithAdtArgs);
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![ty];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            f(current);
+            let Some(descriptor) = self.get(current) else {
+                continue;
+            };
+            match &descriptor.kind {
+                TypeKind::Tuple(elements) => {
+                    for &elem in elements.iter().rev() {
+                        stack.push(elem);
+                    }
+                }
+                TypeKind::Array { element, .. }
+                | TypeKind::Slice(element)
+                | TypeKind::Pattern(element) => stack.push(*element),
+                TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                    if follow_ptrs {
+                        stack.push(*pointee);
+                    }
+                }
+                TypeKind::Adt { args, variants, .. } => {
+                    for variant in variants.iter().rev() {
+                        for field in variant.fields.iter().rev() {
+                            stack.push(field.ty);
+                        }
+                    }
+                    if follow_adt_args {
+                        for &arg in args.iter().rev() {
+                            stack.push(arg);
+                        }
+                    }
+                }
+                TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
+                    for &upvar in upvars.iter().rev() {
+                        stack.push(upvar);
+                    }
+                }
+                TypeKind::Coroutine {
+                    upvars,
+                    saved_locals,
+                    variants,
+                    ..
+                } => {
+                    for variant in variants.iter().rev() {
+                        for field in variant.fields.iter().rev() {
+                            stack.push(field.ty);
+                        }
+                    }
+                    for &(_, saved) in saved_locals.iter().rev() {
+                        stack.push(saved);
+                    }
+                    for &upvar in upvars.iter().rev() {
+                        stack.push(upvar);
+                    }
+                }
+                TypeKind::Bool
+                | TypeKind::Char
+                | TypeKind::Integer { .. }
+                | TypeKind::Float { .. }
+                | TypeKind::Str
+                | TypeKind::Never
+                | TypeKind::Opaque
+                | TypeKind::FnDef { .. }
+                | TypeKind::FnPtr { .. }
+                | TypeKind::Dynamic { .. }
+                | TypeKind::Foreign(_) => {}
+            }
+        }
     }
 
     /// The variants of an ADT or the states of a coroutine; empty for anything else.
@@ -1102,5 +1208,183 @@ impl TypeTable {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jir::interns::StrId;
+
+    fn descriptor(id: u128, kind: TypeKind, peeled: u128) -> TypeDescriptor {
+        TypeDescriptor {
+            id: TypeId(id),
+            name: None,
+            kind,
+            layout: LayoutFacts::default(),
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: TypeId(peeled),
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn ptr_info_pointee_and_visit_types_handle_wrappers_and_cycles() {
+        let mut table = TypeTable::new();
+        // TypeId(1): i32
+        table.insert(descriptor(
+            1,
+            TypeKind::Integer {
+                signed: true,
+                bits: 32,
+            },
+            1,
+        ));
+        // TypeId(2): &mut i32
+        table.insert(descriptor(
+            2,
+            TypeKind::Reference {
+                pointee: TypeId(1),
+                mutable: true,
+            },
+            2,
+        ));
+        // TypeId(3): transparent wrapper peeling to *const Node (TypeId(4))
+        table.insert(descriptor(
+            3,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 1,
+                },
+                args: vec![TypeId(5)],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: StrId(0),
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Transparent,
+                        ty: TypeId(4),
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            4,
+        ));
+        // TypeId(4): *const Node (TypeId(5))
+        table.insert(descriptor(
+            4,
+            TypeKind::RawPointer {
+                pointee: TypeId(5),
+                mutable: false,
+            },
+            4,
+        ));
+        // TypeId(5): recursive struct Node { val: i32, next: *const Node }
+        table.insert(descriptor(
+            5,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 2,
+                },
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: StrId(1),
+                    fields: vec![
+                        FieldDescriptor {
+                            key: FieldKey::Name(StrId(2)),
+                            ty: TypeId(1),
+                            offset: 0,
+                        },
+                        FieldDescriptor {
+                            key: FieldKey::Name(StrId(3)),
+                            ty: TypeId(4),
+                            offset: 4,
+                        },
+                    ],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            5,
+        ));
+
+        assert_eq!(table.ptr_info(TypeId(1)), None);
+        assert_eq!(table.ptr_info(TypeId(2)), Some((TypeId(1), true, false)));
+        assert_eq!(table.pointee(TypeId(2)), Some(TypeId(1)));
+        assert_eq!(table.ptr_info(TypeId(3)), Some((TypeId(5), false, true)));
+        assert_eq!(table.pointee(TypeId(3)), Some(TypeId(5)));
+
+        let mut without_ptrs = Vec::new();
+        table.visit_types(TypeId(5), TypeWalk::ByValue, &mut |id| {
+            without_ptrs.push(id)
+        });
+        assert_eq!(without_ptrs, vec![TypeId(5), TypeId(1), TypeId(4)]);
+
+        let mut through_ptrs = Vec::new();
+        table.visit_types(TypeId(3), TypeWalk::ThroughPointers, &mut |id| {
+            through_ptrs.push(id)
+        });
+        assert_eq!(
+            through_ptrs,
+            vec![TypeId(3), TypeId(4), TypeId(5), TypeId(1)]
+        );
+
+        let mut with_args_3 = Vec::new();
+        table.visit_types(TypeId(3), TypeWalk::WithAdtArgs, &mut |id| {
+            with_args_3.push(id)
+        });
+        assert_eq!(
+            with_args_3,
+            vec![TypeId(3), TypeId(5), TypeId(1), TypeId(4)]
+        );
+
+        // An ADT with an unstored generic argument: `ThroughPointers` skips `args`, `WithAdtArgs` visits it.
+        table.insert(descriptor(
+            6,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 6,
+                },
+                form: NominalForm::Struct,
+                args: vec![TypeId(2)],
+                variants: Vec::new(),
+                niche: None,
+            },
+            6,
+        ));
+        let mut skip_args = Vec::new();
+        table.visit_types(TypeId(6), TypeWalk::ThroughPointers, &mut |id| {
+            skip_args.push(id)
+        });
+        assert_eq!(skip_args, vec![TypeId(6)]);
+
+        let mut with_args = Vec::new();
+        table.visit_types(TypeId(6), TypeWalk::WithAdtArgs, &mut |id| {
+            with_args.push(id)
+        });
+        assert_eq!(with_args, vec![TypeId(6), TypeId(2), TypeId(1)]);
     }
 }

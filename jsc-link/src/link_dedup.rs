@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{ItemKind, JsName, LinkItem, OptimizationMiss};
-use crate::jir::conflict::{self, ConflictRecord};
+use crate::jir::conflict::{self, ConflictRecord, ConflictRelation};
 use crate::jir::summary::{merge_aliases, MergeDecision, Side};
 use crate::opts::OptimizerPass;
 
@@ -344,16 +344,15 @@ fn alias_conflict(winner: &LinkItem, duplicate: &LinkItem) -> ConflictRecord {
                 .origins
                 .as_ref()
                 .zip(duplicate.jir.origins.as_ref());
-            ConflictRecord::of(&name, "alias", &left, &right, origins).with_entries(entries)
+            ConflictRecord::of(&name, ConflictRelation::Alias, &left, &right, origins)
+                .with_entries(entries)
         }
-        _ => ConflictRecord {
+        _ => ConflictRecord::undecodable(
             name,
-            relation: "alias",
-            verdict: conflict::Verdict::Different,
-            cause: conflict::Cause::Undecodable,
-            difference: Some("a body was not decoded".to_owned()),
+            ConflictRelation::Alias,
+            "a body was not decoded",
             entries,
-        },
+        ),
     }
 }
 

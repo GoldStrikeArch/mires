@@ -46,7 +46,7 @@ use crate::item::{
     prologue, read_object, write_program, ItemKind, ItemMap, JsName, LinkItem, Linkage,
     CLEANUP_LOWERING_REQUIRED, FORMAT_VERSION,
 };
-use crate::jir::conflict::{self, ConflictRecord};
+use crate::jir::conflict::{self, ConflictRecord, ConflictRelation};
 use crate::jir::summary::{MergeDecision, Side};
 use crate::jsast;
 use crate::lane_report::{ItemLane, LaneAvailability, LaneItem};
@@ -172,22 +172,20 @@ impl Read {
             }
         }
         // Once per object, not once per item: the answer is a property of the object pair.
-        if let Some(header) = read.header {
-            match &self.header {
-                None => self.header = Some((label.to_owned(), header)),
-                Some((first_label, first)) => {
-                    if let Err(decline) = crate::jir::summary::merge_headers(first, &header) {
-                        let mut diag = dcx.struct_err(format!(
-                            "rustc_codegen_js: `{label}` cannot be linked with `{first_label}`: \
-                             {decline}"
-                        ));
-                        diag.note(
-                            "every object in a program must be compiled with the same toolchain, \
-                             target and `-Cllvm-args=js-*` options; rebuild the sysroot with the \
-                             ones this crate uses (`JS_EXTRA_ARGS='...' scripts/build_sysroot.sh`)",
-                        );
-                        diag.emit();
-                    }
+        match &self.header {
+            None => self.header = Some((label.to_owned(), read.header)),
+            Some((first_label, first)) => {
+                if let Err(decline) = crate::jir::summary::merge_headers(first, &read.header) {
+                    let mut diag = dcx.struct_err(format!(
+                        "rustc_codegen_js: `{label}` cannot be linked with `{first_label}`: \
+                         {decline}"
+                    ));
+                    diag.note(
+                        "every object in a program must be compiled with the same toolchain, \
+                         target and `-Cllvm-args=js-*` options; rebuild the sysroot with the \
+                         ones this crate uses (`JS_EXTRA_ARGS='...' scripts/build_sysroot.sh`)",
+                    );
+                    diag.emit();
                 }
             }
         }
@@ -288,110 +286,14 @@ fn resolve(
     let mut conflicts: Vec<ConflictRecord> = Vec::new();
     let mut table = dedup(dcx, items, &mut conflicts);
     let split = !opts.chunks.is_empty();
-    if split
-        && path.is_some_and(|path| {
-            let name = path.file_name().and_then(|name| name.to_str());
-            opts.chunks
-                .iter()
-                .any(|(chunk, _)| name == Some(format!("{chunk}.js").as_str()))
-                || name == Some(format!("{}.js", opts.shared_chunk).as_str())
-        })
-    {
-        dcx.err("the unsplit output path collides with an emitted chunk; choose a different output name");
+    if split && !validate_split_output(dcx, opts, path) {
         return String::new();
     }
-    if split && opts.optimization_report.is_some() {
-        dcx.err(
-            "`js-opt-report` cannot be combined with `js-chunk` until reports account for each \
-             emitted chunk",
-        );
-    }
 
-    let (mut reachable, mut parents) = reach(dcx, &table);
-    let initial_count = reachable.len();
-    decode_reachable_bodies(dcx, &mut table, &mut reachable, true);
-    let mut lane_run = lane::run(dcx, &mut table, &reachable);
-    if table.values().any(|item| {
-        item.jir
-            .body
-            .as_ref()
-            .is_some_and(|body| body.blocks.iter().any(|block| block.cleanup))
-    }) {
-        let (live, _) = reach(dcx, &table);
-        reject_cleanup_fallbacks(dcx, &table, &live, Some(&lane_run));
-    }
-    let (mut dedup, references_changed) = if crate::lower::bstr::enabled() {
-        let pre_changed = initial_count != reachable.len()
-            || lane_run.added_items()
-            || lane_run.references_changed();
-        if pre_changed {
-            (reachable, parents) = reach(dcx, &table);
-        }
-        let facades = byte_string_facades(dcx, &mut table, &mut reachable);
-        for (name, body) in &facades {
-            lane_run.rename(name, body);
-        }
-        let pre_synth = reachable.len();
-        let native_vec_enabled = lane_run.native_vec_enabled();
-        crate::lower::bstr::synthesize_converters(&mut table, &mut reachable, native_vec_enabled);
-        let added_bstr = !facades.is_empty() || reachable.len() != pre_synth;
-        let dedup = crate::profile::time("link.dedup", || {
-            crate::link_dedup::merge_duplicates(
-                &mut table,
-                &reachable,
-                &BTreeSet::new(),
-                &mut conflicts,
-            )
-        });
-        let references_changed = added_bstr || dedup.references_changed();
-        (dedup, references_changed)
-    } else {
-        let pre_changed = initial_count != reachable.len()
-            || lane_run.added_items()
-            || lane_run.references_changed();
-        if pre_changed {
-            (reachable, parents) = reach(dcx, &table);
-        }
-        let facades = track_caller_location_facades(&mut table, &mut reachable);
-        for (name, body) in &facades {
-            lane_run.rename(name, body);
-        }
-        let dedup = crate::profile::time("link.dedup", || {
-            crate::link_dedup::merge_duplicates(
-                &mut table,
-                &reachable,
-                &BTreeSet::new(),
-                &mut conflicts,
-            )
-        });
-        let references_changed = pre_changed || !facades.is_empty() || dedup.references_changed();
-        (dedup, references_changed)
-    };
-    if references_changed {
-        (reachable, parents) = reach(dcx, &table);
-    }
-    if crate::lower::bstr::enabled() {
-        refuse_hybrid_strings(dcx, &table, &reachable);
-    }
-    dedup.retain_reachable(&reachable);
-    lane_run.retain_reachable(&reachable);
-    crate::report::warn_misses(dcx, &table, &reachable);
-    // With chunks the same zombie would otherwise be reported twice, once here and once for the
-    // chunk that reaches it. The per-chunk report is the more useful of the two: its chain names
-    // the entry point that pulled the item in.
-    if !split {
-        report_zombies(
-            dcx,
-            &table,
-            &reachable,
-            &parents,
-            None,
-            &mut BTreeSet::new(),
-        );
-    }
+    let analysis = analyze_reachable_graph(dcx, &mut table, conflicts, split);
 
-    let stubs = stub_missing(&table, &reachable);
-    let placed = layout(&table, &reachable);
+    let stubs = stub_missing(&table, &analysis.reachable);
+    let placed = layout(&table, &analysis.reachable);
     let cycles = statics::initialize_cycles(dcx, &placed);
     let mut ordered = statics::print_order(&placed, &cycles);
     ordered.extend(stubs.iter());
@@ -402,10 +304,140 @@ fn resolve(
         exports: BTreeSet::new(),
         entry: None,
     };
-    let wide_byte_views = lane_run.wide_byte_views();
+    let wide_byte_views = analysis.lane_run.wide_byte_views();
     let mut printed = crate::profile::time("link.print", || {
         print_units(dcx, sources, std::slice::from_ref(&unit), wide_byte_views)
     });
+    let mut deployment = build_deployment_manifest(opts, &unit, &printed, label, path, split);
+
+    write_reports_and_sidecars(dcx, label, path, &table, &analysis, printed.first());
+
+    if split {
+        match path {
+            Some(path) => {
+                write_chunks(dcx, sources, &table, path, &mut deployment, wide_byte_views)
+            }
+            None => {
+                dcx.err(
+                    "`-Cllvm-args=js-chunk` needs an output path to write the chunk files beside",
+                );
+            }
+        }
+    }
+
+    if let Some(path) = path.filter(|_| dcx.errors() == 0) {
+        finalize_deployment_manifest(dcx, path, &mut deployment);
+    }
+
+    printed
+        .pop()
+        .map(|program| program.text)
+        .unwrap_or_default()
+}
+
+struct LinkAnalysis {
+    reachable: Vec<JsName>,
+    parents: HashMap<JsName, JsName>,
+    dedup: crate::link_dedup::DedupSummary,
+    lane_run: lane::LaneRun,
+    conflicts: Vec<ConflictRecord>,
+}
+
+fn validate_split_output(dcx: &Sink, opts: &crate::opts::Opts, path: Option<&Path>) -> bool {
+    if path.is_some_and(|path| {
+        let name = path.file_name().and_then(|name| name.to_str());
+        opts.chunks
+            .iter()
+            .any(|(chunk, _)| name == Some(format!("{chunk}.js").as_str()))
+            || name == Some(format!("{}.js", opts.shared_chunk).as_str())
+    }) {
+        dcx.err("the unsplit output path collides with an emitted chunk; choose a different output name");
+        return false;
+    }
+    if opts.optimization_report.is_some() {
+        dcx.err(
+            "`js-opt-report` cannot be combined with `js-chunk` until reports account for each \
+             emitted chunk",
+        );
+    }
+    true
+}
+
+fn analyze_reachable_graph(
+    dcx: &Sink,
+    table: &mut BTreeMap<JsName, LinkItem>,
+    mut conflicts: Vec<ConflictRecord>,
+    split: bool,
+) -> LinkAnalysis {
+    let (mut reachable, mut parents) = reach(dcx, table);
+    let initial_count = reachable.len();
+    decode_reachable_bodies(dcx, table, &mut reachable, true);
+    let mut lane_run = lane::run(dcx, table, &reachable);
+    if table.values().any(|item| {
+        item.jir
+            .body
+            .as_ref()
+            .is_some_and(|body| body.blocks.iter().any(|block| block.cleanup))
+    }) {
+        let (live, _) = reach(dcx, table);
+        reject_cleanup_fallbacks(dcx, table, &live, Some(&lane_run));
+    }
+    let pre_changed =
+        initial_count != reachable.len() || lane_run.added_items() || lane_run.references_changed();
+    if pre_changed {
+        (reachable, parents) = reach(dcx, table);
+    }
+    let facades_changed = if crate::lower::bstr::enabled() {
+        let facades = byte_string_facades(dcx, table, &mut reachable);
+        for (name, body) in &facades {
+            lane_run.rename(name, body);
+        }
+        let pre_synth = reachable.len();
+        let native_vec_enabled = lane_run.native_vec_enabled();
+        crate::lower::bstr::synthesize_converters(table, &mut reachable, native_vec_enabled);
+        !facades.is_empty() || reachable.len() != pre_synth
+    } else {
+        let facades = track_caller_location_facades(table, &mut reachable);
+        for (name, body) in &facades {
+            lane_run.rename(name, body);
+        }
+        pre_changed || !facades.is_empty()
+    };
+    let mut dedup = crate::profile::time("link.dedup", || {
+        crate::link_dedup::merge_duplicates(table, &reachable, &BTreeSet::new(), &mut conflicts)
+    });
+    if facades_changed || dedup.references_changed() {
+        (reachable, parents) = reach(dcx, table);
+    }
+    if crate::lower::bstr::enabled() {
+        refuse_hybrid_strings(dcx, table, &reachable);
+    }
+    dedup.retain_reachable(&reachable);
+    lane_run.retain_reachable(&reachable);
+    crate::report::warn_misses(dcx, table, &reachable);
+    // With chunks the same zombie would otherwise be reported twice, once here and once for the
+    // chunk that reaches it. The per-chunk report is the more useful of the two: its chain names
+    // the entry point that pulled the item in.
+    if !split {
+        report_zombies(dcx, table, &reachable, &parents, None, &mut BTreeSet::new());
+    }
+    LinkAnalysis {
+        reachable,
+        parents,
+        dedup,
+        lane_run,
+        conflicts,
+    }
+}
+
+fn build_deployment_manifest(
+    opts: &crate::opts::Opts,
+    unit: &Unit<'_>,
+    printed: &[PrintedUnit],
+    label: &str,
+    path: Option<&Path>,
+    split: bool,
+) -> ArtifactManifest {
     let mut deployment = ArtifactManifest {
         schema: ARTIFACT_SCHEMA,
         object_format: FORMAT_VERSION,
@@ -445,22 +477,34 @@ fn resolve(
             }
         }
     }
+    deployment
+}
 
+fn write_reports_and_sidecars(
+    dcx: &Sink,
+    label: &str,
+    path: Option<&Path>,
+    table: &BTreeMap<JsName, LinkItem>,
+    analysis: &LinkAnalysis,
+    program: Option<&PrintedUnit>,
+) {
+    let opts = crate::opts::get();
+    let split = !opts.chunks.is_empty();
     if !split {
-        if let (Some(report_path), Some(program)) = (&opts.optimization_report, printed.first()) {
-            crate::report::write(
+        if let (Some(report_path), Some(program)) = (&opts.optimization_report, program) {
+            crate::report::write(&crate::report::ReportInput {
                 dcx,
-                Path::new(report_path),
+                path: Path::new(report_path),
                 label,
-                program.text.len(),
-                &program.item_bytes,
-                program.synthesized_bytes,
-                &table,
-                &reachable,
-                &parents,
-                &dedup,
-                Some(&lane_run),
-            );
+                program_bytes: program.text.len(),
+                item_bytes: &program.item_bytes,
+                synthesized_bytes: program.synthesized_bytes,
+                table,
+                reachable: &analysis.reachable,
+                parents: &analysis.parents,
+                dedup: &analysis.dedup,
+                lane: Some(&analysis.lane_run),
+            });
         }
     }
 
@@ -468,62 +512,44 @@ fn resolve(
         write_lane_report(
             dcx,
             Path::new(report_path),
-            &table,
-            &reachable,
-            Some(&lane_run),
+            table,
+            &analysis.reachable,
+            Some(&analysis.lane_run),
         );
     }
     if let Some(sidecar) = path {
-        lane::write_sidecar(dcx, sidecar, &lane_run, opts.lane);
+        lane::write_sidecar(dcx, sidecar, &analysis.lane_run, opts.lane);
     }
     if let Some(dump_path) = &opts.jir_dump_conflicts {
-        if let Err(err) = crate::jir::conflict::write(Path::new(dump_path), &conflicts) {
+        if let Err(err) = crate::jir::conflict::write(Path::new(dump_path), &analysis.conflicts) {
             dcx.err(format!("error writing `{dump_path}`: {err}"));
         }
     }
+}
 
-    if split {
-        match path {
-            Some(path) => {
-                write_chunks(dcx, sources, &table, path, &mut deployment, wide_byte_views)
-            }
-            None => {
-                dcx.err(
-                    "`-Cllvm-args=js-chunk` needs an output path to write the chunk files beside",
-                );
+fn finalize_deployment_manifest(dcx: &Sink, path: &Path, deployment: &mut ArtifactManifest) {
+    let names = deployment
+        .artifacts
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for artifact in deployment.artifacts.values_mut() {
+        for (specifier, target) in &mut artifact.imports {
+            if let Some(local) = specifier
+                .strip_prefix("./")
+                .filter(|local| names.contains(*local))
+            {
+                *target = Some(local.to_owned());
             }
         }
     }
-
-    if let Some(path) = path.filter(|_| dcx.errors() == 0) {
-        let names = deployment
-            .artifacts
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for artifact in deployment.artifacts.values_mut() {
-            for (specifier, target) in &mut artifact.imports {
-                if let Some(local) = specifier
-                    .strip_prefix("./")
-                    .filter(|local| names.contains(*local))
-                {
-                    *target = Some(local.to_owned());
-                }
-            }
-        }
-        let manifest_path = rcgjs_object::artifact::manifest_path(path);
-        if let Err(error) = deployment.write(&manifest_path) {
-            dcx.err(format!(
-                "error writing `{}`: {error}",
-                manifest_path.display()
-            ));
-        }
+    let manifest_path = rcgjs_object::artifact::manifest_path(path);
+    if let Err(error) = deployment.write(&manifest_path) {
+        dcx.err(format!(
+            "error writing `{}`: {error}",
+            manifest_path.display()
+        ));
     }
-
-    printed
-        .pop()
-        .map(|program| program.text)
-        .unwrap_or_default()
 }
 
 // -------------------------------------------------------------------------------------------
@@ -959,7 +985,7 @@ fn install_export_facades(
             })
             .collect();
     }
-    let style = match crate::opts::get().minify {
+    let style = match crate::opts::get().minify.is_enabled() {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
@@ -1035,7 +1061,7 @@ fn print_units(
 
     // The whole-program half of minification: an item name can only be shortened once every
     // reference to it is in one place, which is here and nowhere earlier. See `minify.rs`.
-    let renames = match opts.minify && opts.minify_items {
+    let renames = match opts.minify.renames_items() {
         false => BTreeMap::new(),
         true => {
             let items: Vec<&LinkItem> = units
@@ -1222,7 +1248,7 @@ fn artifact_records(
 fn shim_import() -> LinkItem {
     let source = crate::opts::get().shim_module.clone();
     let decl = jsast::import_namespace(SHIM_NAMESPACE, source.clone());
-    let style = match crate::opts::get().minify {
+    let style = match crate::opts::get().minify.is_enabled() {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
@@ -1280,7 +1306,7 @@ fn export_clause(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> String 
         .into_iter()
         .map(|name| renames.get(name).map_or(name, String::as_str))
         .collect();
-    match opts.minify {
+    match opts.minify.is_enabled() {
         true => format!("export{{{}}};\n", names.join(",")),
         false => format!("export {{ {} }};\n", names.join(", ")),
     }
@@ -1305,7 +1331,7 @@ fn chunk_registration(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> St
         jsast::member(registry, "set"),
         vec![jsast::string(&unit.label), jsast::id(entry)],
     );
-    let style = match crate::opts::get().minify {
+    let style = match crate::opts::get().minify.is_enabled() {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
@@ -1560,13 +1586,13 @@ fn reject_cleanup_fallbacks(
             continue;
         }
         let outcome = run.and_then(|run| run.outcome(name));
-        if outcome.is_some_and(|outcome| outcome.lane == crate::lane_report::ItemLane::Jir) {
+        if outcome.is_some_and(lane::LaneOutcome::is_jir) {
             continue;
         }
         let mut diagnostic = dcx.struct_err(format!(
             "rustc_codegen_js: `{name}` {CLEANUP_LOWERING_REQUIRED}"
         ));
-        if let Some(decline) = outcome.and_then(|outcome| outcome.decline.as_ref()) {
+        if let Some(decline) = outcome.and_then(lane::LaneOutcome::decline) {
             diagnostic.note(format!("JIR lowering declined: {decline}"));
         }
         diagnostic.emit();
@@ -1616,15 +1642,15 @@ fn write_lane_report(
         // What the lane did with the item, when a lane ran. An item the driver never offered to
         // the lowerer keeps the row the summary produced: `semantic`, printed from the baseline.
         if let Some(outcome) = lane_run.and_then(|run| run.outcome(name)) {
-            row.lane = outcome.lane;
-            match outcome.lane {
-                ItemLane::Jir => {
+            row.lane = outcome.lane();
+            match outcome.decline() {
+                None => {
                     row.availability = LaneAvailability::Available;
                     row.decline = None;
                 }
-                ItemLane::Fallback | ItemLane::Baseline => {
+                Some(decline) => {
                     row.availability = LaneAvailability::Semantic;
-                    row.decline = outcome.decline.clone();
+                    row.decline = Some(decline.clone());
                 }
             }
         }
@@ -1797,16 +1823,15 @@ fn duplicate_conflict(existing: &LinkItem, item: &LinkItem) -> ConflictRecord {
     match (normalized(existing), normalized(item)) {
         (Some((left, left_origins)), Some((right, right_origins))) => {
             let origins = left_origins.as_ref().zip(right_origins.as_ref());
-            ConflictRecord::of(&name, "duplicate", &left, &right, origins).with_entries(entries)
+            ConflictRecord::of(&name, ConflictRelation::Duplicate, &left, &right, origins)
+                .with_entries(entries)
         }
-        _ => ConflictRecord {
+        _ => ConflictRecord::undecodable(
             name,
-            relation: "duplicate",
-            verdict: conflict::Verdict::Different,
-            cause: conflict::Cause::Undecodable,
-            difference: Some("a body did not decode".to_owned()),
+            ConflictRelation::Duplicate,
+            "a body did not decode",
             entries,
-        },
+        ),
     }
 }
 
@@ -1834,7 +1859,7 @@ fn report_collision(dcx: &Sink, existing: &LinkItem, item: &LinkItem) {
 fn reach(dcx: &Sink, table: &BTreeMap<JsName, LinkItem>) -> (Vec<JsName>, HashMap<JsName, JsName>) {
     let extra_roots = &crate::opts::get().roots;
     for root in extra_roots {
-        if !table.contains_key(&JsName::new(root.clone())) {
+        if !table.contains_key(root.as_str()) {
             dcx.warn(format!(
                 "`-Cllvm-args=js-root={root}` names no item in this program"
             ));
@@ -2135,8 +2160,7 @@ fn write_chunks(
 /// An exported item's JavaScript name *is* its symbol name (see `naming.rs`), so the usual case is
 /// a direct hit. The fallback covers an item whose emitted name and fixed name differ.
 fn entry_item<'a>(table: &'a BTreeMap<JsName, LinkItem>, entry: &str) -> Option<&'a JsName> {
-    let name = JsName::new(entry.to_owned());
-    if let Some((name, _)) = table.get_key_value(&name) {
+    if let Some((name, _)) = table.get_key_value(entry) {
         return Some(name);
     }
     table
@@ -2161,7 +2185,7 @@ fn cross_chunk_import(chunk: &str, names: &BTreeSet<&str>) -> LinkItem {
         .map(|name| ((*name).to_owned(), (*name).to_owned()))
         .collect();
     let decl = jsast::import_named(named, source.clone());
-    let style = match crate::opts::get().minify {
+    let style = match crate::opts::get().minify.is_enabled() {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
@@ -2390,7 +2414,7 @@ mod tests {
 
     #[test]
     fn semantic_preparation_follows_lazy_objects_without_retaining_unused_edges() {
-        use crate::item::{JirItem, JsItem, ObjectIdentity};
+        use crate::item::{JirItem, JsItem, JsItemJir, ObjectIdentity};
         use crate::jir::interns::Interns;
         use crate::jir::origin::OriginTable;
         use crate::jir::semantic::*;
@@ -2481,7 +2505,7 @@ mod tests {
                 Linkage::internal(),
                 name.to_owned(),
             )
-            .with_jir(Some(JirItem { body, origins }), None);
+            .with_jir(JsItemJir::from(JirItem { body, origins }));
             let bytes = crate::item::write_object(
                 "",
                 &[item],
@@ -2691,7 +2715,7 @@ mod tests {
                 .expect("a body survived");
             assert_eq!(kept, Hash128 { lo: 4, hi: 0 });
             assert_eq!(conflicts.len(), 1);
-            assert_eq!(conflicts[0].relation, "duplicate");
+            assert_eq!(conflicts[0].relation, ConflictRelation::Duplicate);
         }
     }
 

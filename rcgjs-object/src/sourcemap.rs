@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 
 use crate::item::LinkItem;
+use crate::lane_report::push_string;
 
 /// The stand-in source for generated glue: mapped so that no line is unattributed, and named in
 /// `ignoreList` so that a debugger steps over it.
@@ -106,13 +107,13 @@ pub fn build(
 
     let mut json = String::with_capacity(mappings.len() + 4096);
     json.push_str("{\"version\":3,\"file\":");
-    write_json_string(&mut json, file);
+    push_string(&mut json, file);
     json.push_str(",\"sources\":[");
     for (i, source) in sources.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
-        write_json_string(&mut json, source);
+        push_string(&mut json, source);
     }
     json.push_str("],\"sourcesContent\":[");
     for (i, content) in contents.iter().enumerate() {
@@ -120,7 +121,7 @@ pub fn build(
             json.push(',');
         }
         match content {
-            Some(text) => write_json_string(&mut json, text),
+            Some(text) => push_string(&mut json, text),
             None => json.push_str("null"),
         }
     }
@@ -129,11 +130,11 @@ pub fn build(
         if i > 0 {
             json.push(',');
         }
-        write_json_string(&mut json, name);
+        push_string(&mut json, name);
     }
     // The generated source is always index 0, and always the one to step over.
     json.push_str("],\"ignoreList\":[0],\"mappings\":");
-    write_json_string(&mut json, &mappings);
+    push_string(&mut json, &mappings);
     json.push_str("}\n");
     json
 }
@@ -184,11 +185,7 @@ fn encode(program: &str, segments: &[Segment], starts: &[u32]) -> String {
 
     let mut out = String::new();
     let mut next = 0usize;
-    // The deltas of every field but the column carry across lines.
-    let mut prev_source = 0i64;
-    let mut prev_src_line = 0i64;
-    let mut prev_src_col = 0i64;
-    let mut prev_name = 0i64;
+    let mut cursor = VlqCursor::default();
     // The mapping in effect at the end of the line before: what a line with nothing of its own
     // repeats, which is the Firefox workaround and the blackboxing rule in one.
     let mut carry = generated;
@@ -209,7 +206,7 @@ fn encode(program: &str, segments: &[Segment], starts: &[u32]) -> String {
         }
         let on_line = &segments[first..next];
 
-        let mut prev_col = 0i64;
+        cursor.reset_col();
         let mut wrote = false;
         // A line with nothing of its own repeats what was in effect, at column 0. A line that has
         // a mapping needs no filler: everything before its first column already resolves to the
@@ -220,30 +217,14 @@ fn encode(program: &str, segments: &[Segment], starts: &[u32]) -> String {
                 col: 0,
                 ..carry
             };
-            write_segment(
-                &mut out,
-                &filler,
-                &mut prev_col,
-                &mut prev_source,
-                &mut prev_src_line,
-                &mut prev_src_col,
-                &mut prev_name,
-            );
+            cursor.write_segment(&mut out, &filler);
             wrote = true;
         }
         for segment in on_line {
             if wrote {
                 out.push(',');
             }
-            write_segment(
-                &mut out,
-                segment,
-                &mut prev_col,
-                &mut prev_source,
-                &mut prev_src_line,
-                &mut prev_src_col,
-                &mut prev_name,
-            );
+            cursor.write_segment(&mut out, segment);
             wrote = true;
         }
         if let Some(last) = on_line.last() {
@@ -254,32 +235,39 @@ fn encode(program: &str, segments: &[Segment], starts: &[u32]) -> String {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_segment(
-    out: &mut String,
-    segment: &Segment,
-    prev_col: &mut i64,
-    prev_source: &mut i64,
-    prev_src_line: &mut i64,
-    prev_src_col: &mut i64,
-    prev_name: &mut i64,
-) {
-    let col = segment.col as i64;
-    let source = segment.source as i64;
-    let src_line = segment.src_line as i64;
-    let src_col = segment.src_col as i64;
-    vlq(out, col - *prev_col);
-    vlq(out, source - *prev_source);
-    vlq(out, src_line - *prev_src_line);
-    vlq(out, src_col - *prev_src_col);
-    *prev_col = col;
-    *prev_source = source;
-    *prev_src_line = src_line;
-    *prev_src_col = src_col;
-    if segment.name >= 0 {
-        let name = segment.name as i64;
-        vlq(out, name - *prev_name);
-        *prev_name = name;
+/// Running VLQ delta state across encoded source-map segments.
+#[derive(Default)]
+struct VlqCursor {
+    col: i64,
+    source: i64,
+    src_line: i64,
+    src_col: i64,
+    name: i64,
+}
+
+impl VlqCursor {
+    fn reset_col(&mut self) {
+        self.col = 0;
+    }
+
+    fn write_segment(&mut self, out: &mut String, segment: &Segment) {
+        let col = i64::from(segment.col);
+        let source = i64::from(segment.source);
+        let src_line = i64::from(segment.src_line);
+        let src_col = i64::from(segment.src_col);
+        vlq(out, col - self.col);
+        vlq(out, source - self.source);
+        vlq(out, src_line - self.src_line);
+        vlq(out, src_col - self.src_col);
+        self.col = col;
+        self.source = source;
+        self.src_line = src_line;
+        self.src_col = src_col;
+        if segment.name >= 0 {
+            let name = i64::from(segment.name);
+            vlq(out, name - self.name);
+            self.name = name;
+        }
     }
 }
 
@@ -313,27 +301,6 @@ fn line_count(program: &str) -> u32 {
     } else {
         newlines + 1
     }
-}
-
-/// Writes a JSON string literal. Everything below a space is escaped, as JSON requires.
-fn write_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 #[cfg(test)]
@@ -434,7 +401,7 @@ mod tests {
     #[test]
     fn json_strings_escape_what_json_requires() {
         let mut out = String::new();
-        write_json_string(&mut out, "a\"b\\c\nd\u{1}e");
+        push_string(&mut out, "a\"b\\c\nd\u{1}e");
         assert_eq!(out, "\"a\\\"b\\\\c\\nd\\u0001e\"");
     }
 

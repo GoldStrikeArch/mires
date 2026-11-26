@@ -382,12 +382,16 @@ impl<'a> Planner<'a> {
                 if !is_slice(*param) {
                     continue;
                 }
-                let carried = self.func.blocks.iter().any(|pred| {
-                    doms.dominates(block.id, pred.id)
-                        && pred.term.edges().into_iter().any(|(target, args)| {
-                            target == block.id
-                                && args.get(position).is_some_and(|arg| *arg != *param)
-                        })
+                let carried = self.preds[block.id.0 as usize].iter().any(|&pred_id| {
+                    doms.dominates(block.id, pred_id)
+                        && self.func.blocks[pred_id.0 as usize]
+                            .term
+                            .edges()
+                            .into_iter()
+                            .any(|(target, args)| {
+                                target == block.id
+                                    && args.get(position).is_some_and(|arg| *arg != *param)
+                            })
                 });
                 if carried && candidates.insert(*param) {
                     headers.insert(block.id);
@@ -395,18 +399,12 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        let mut predecessors: Vec<Vec<RBlockId>> = vec![Vec::new(); self.func.blocks.len()];
-        for block in &self.func.blocks {
-            for successor in block.term.successors() {
-                predecessors[successor.0 as usize].push(block.id);
-            }
-        }
         let mut loop_blocks = headers.clone();
         let mut loop_work = Vec::new();
-        for block in &self.func.blocks {
-            for successor in block.term.successors() {
-                if headers.contains(&successor) && doms.dominates(successor, block.id) {
-                    loop_work.push((successor, block.id));
+        for &header in &headers {
+            for &pred in &self.preds[header.0 as usize] {
+                if doms.dominates(header, pred) {
+                    loop_work.push((header, pred));
                 }
             }
         }
@@ -417,7 +415,7 @@ impl<'a> Planner<'a> {
             }
             loop_blocks.insert(block);
             loop_work.extend(
-                predecessors[block.0 as usize]
+                self.preds[block.0 as usize]
                     .iter()
                     .copied()
                     .map(|pred| (header, pred)),
@@ -452,53 +450,71 @@ impl<'a> Planner<'a> {
         }
         // Follow only the loop-local physical chain: copies/moves and sub-slices derived from a
         // carried value. The preheader's initial value is decomposed once on its incoming edge.
+        let related_source = |kind: &OpKind| match kind {
+            OpKind::Copy(source) | OpKind::Move(source) | OpKind::Deref(source) => Some(*source),
+            OpKind::SliceView { ptr, .. } if is_slice(*ptr) => Some(*ptr),
+            _ => None,
+        };
         while let Some(value) = work.pop() {
-            for block in &self.func.blocks {
-                if !loop_blocks.contains(&block.id) {
-                    continue;
-                }
-                for op in &block.ops {
-                    let Some(result) = op.result.filter(|result| is_slice(*result)) else {
-                        continue;
-                    };
-                    let related = match &op.kind {
-                        OpKind::Copy(source) | OpKind::Move(source) | OpKind::Deref(source) => {
-                            Some(*source)
+            for use_ in &self.uses[value.0 as usize] {
+                let block = &self.func.blocks[use_.block.0 as usize];
+                if let Some(target) = use_.edge {
+                    for (edge_target, args) in block.term.edges() {
+                        if edge_target != target {
+                            continue;
                         }
-                        OpKind::SliceView { ptr, .. } if is_slice(*ptr) => Some(*ptr),
-                        _ => None,
-                    };
-                    if let Some(source) = related {
-                        for related in [
-                            (source == value).then_some(result),
-                            (result == value).then_some(source),
-                        ]
-                        .into_iter()
-                        .flatten()
+                        for (param, arg) in
+                            self.func.blocks[target.0 as usize].params.iter().zip(args)
                         {
-                            if candidates.insert(related) {
-                                work.push(related);
+                            if *arg == value && is_slice(*param) && candidates.insert(*param) {
+                                work.push(*param);
+                            }
+                        }
+                    }
+                } else if loop_blocks.contains(&use_.block) {
+                    if let Some(op) = block.ops.get(use_.position) {
+                        if let Some(result) = op.result.filter(|result| is_slice(*result)) {
+                            if related_source(&op.kind) == Some(value) && candidates.insert(result)
+                            {
+                                work.push(result);
                             }
                         }
                     }
                 }
             }
-            for block in &self.func.blocks {
-                for (target, args) in block.term.edges() {
-                    for (param, arg) in self.func.blocks[target.0 as usize].params.iter().zip(args)
-                    {
-                        if *arg == value && is_slice(*param) && candidates.insert(*param) {
-                            work.push(*param);
-                        }
-                        if *param == value
-                            && doms.dominates(target, block.id)
-                            && is_slice(*arg)
-                            && candidates.insert(*arg)
-                        {
-                            work.push(*arg);
+            match self.defs[value.0 as usize] {
+                Some(Def::Op(def_block, def_index)) if loop_blocks.contains(&def_block) => {
+                    let op = &self.func.blocks[def_block.0 as usize].ops[def_index];
+                    if is_slice(value) {
+                        if let Some(source) = related_source(&op.kind) {
+                            if candidates.insert(source) {
+                                work.push(source);
+                            }
                         }
                     }
                 }
+                Some(Def::Param(target)) => {
+                    let params = &self.func.blocks[target.0 as usize].params;
+                    if let Some(position) = params.iter().position(|param| *param == value) {
+                        for &pred_id in &self.preds[target.0 as usize] {
+                            if !doms.dominates(target, pred_id) {
+                                continue;
+                            }
+                            for (edge_target, args) in
+                                self.func.blocks[pred_id.0 as usize].term.edges()
+                            {
+                                if edge_target == target {
+                                    if let Some(&arg) = args.get(position) {
+                                        if is_slice(arg) && candidates.insert(arg) {
+                                            work.push(arg);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -569,26 +585,14 @@ impl<'a> Planner<'a> {
                 {
                     continue;
                 }
-                let legal_ops = self.func.blocks.iter().all(|user_block| {
-                    user_block.ops.iter().all(|user| {
-                        !user.kind.uses().contains(&result) || slot_use_allowed(&user.kind, result)
-                    })
+                let legal_uses = self.uses[result.0 as usize].iter().all(|use_| {
+                    use_.edge.is_none()
+                        && self.func.blocks[use_.block.0 as usize]
+                            .ops
+                            .get(use_.position)
+                            .is_some_and(|user| slot_use_allowed(&user.kind, result))
                 });
-                let used_on_edge = self.func.blocks.iter().any(|user_block| {
-                    user_block
-                        .term
-                        .edges()
-                        .into_iter()
-                        .any(|(_, args)| args.contains(&result))
-                        || matches!(
-                            user_block.term,
-                            RTerm::Switch { scrut, .. }
-                                | RTerm::Return(Some(scrut))
-                                | RTerm::Throw(Some(scrut))
-                                if scrut == result
-                        )
-                });
-                if legal_ops && !used_on_edge {
+                if legal_uses {
                     slots.insert(result);
                 }
             }

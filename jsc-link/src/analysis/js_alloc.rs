@@ -5,8 +5,10 @@
 //! object literals, array literals, arrow closures, and `new`. Unlike JIR allocation accounting,
 //! it sees record-shaped pointer views and multi-result arrays introduced by lowering itself.
 
-use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 
 use crate::jir::repr::{Func, OpKind, RTerm, ValueId};
 use crate::jir::semantic::CastKind;
@@ -101,7 +103,7 @@ impl JsAllocSites {
         Walker {
             sites: &mut sites,
             depth: 0,
-            origins: &[],
+            origins: OriginIndex::empty(),
         }
         .stmt(stmt);
         sites
@@ -113,7 +115,7 @@ impl JsAllocSites {
         Walker {
             sites: &mut sites,
             depth: 0,
-            origins,
+            origins: OriginIndex::new(origins),
         }
         .stmt(stmt);
         sites
@@ -231,19 +233,139 @@ impl JsAllocSites {
     }
 }
 
+/// Hash-bucketed lookup table over `origins` preserving exact first-match `PartialEq` semantics
+/// without scanning the entire slice on every allocation expression.
+struct OriginIndex<'a> {
+    origins: &'a [Origin],
+    buckets: HashMap<u64, Vec<usize>>,
+}
+
+impl<'a> OriginIndex<'a> {
+    fn empty() -> Self {
+        Self {
+            origins: &[],
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn new(origins: &'a [Origin]) -> Self {
+        if origins.is_empty() {
+            return Self::empty();
+        }
+        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(origins.len());
+        for (idx, origin) in origins.iter().enumerate() {
+            buckets
+                .entry(expr_fingerprint(&origin.expression))
+                .or_default()
+                .push(idx);
+        }
+        Self { origins, buckets }
+    }
+
+    fn find(&self, expression: &Expr) -> Option<&'a Origin> {
+        let indices = self.buckets.get(&expr_fingerprint(expression))?;
+        indices
+            .iter()
+            .copied()
+            .map(|idx| &self.origins[idx])
+            .find(|origin| origin.expression == *expression)
+    }
+}
+
+fn expr_fingerprint(expr: &Expr) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_expr(expr, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
+    std::mem::discriminant(expr).hash(state);
+    match expr {
+        Expr::Num(n) => {
+            // `-0.0 == 0.0` under `PartialEq`, so normalize signed zeros to the same bits.
+            let bits = if *n == 0.0 {
+                0.0f64.to_bits()
+            } else {
+                n.to_bits()
+            };
+            bits.hash(state);
+        }
+        Expr::RawNum(s) | Expr::BigInt(s) | Expr::Str(s) | Expr::Ident(s) | Expr::Raw(s) => {
+            s.hash(state);
+        }
+        Expr::Bool(b) => b.hash(state),
+        Expr::Undefined | Expr::Null => {}
+        Expr::Member(obj, prop) => {
+            hash_expr(obj, state);
+            prop.hash(state);
+        }
+        Expr::Index(obj, idx) | Expr::Assign(obj, idx) => {
+            hash_expr(obj, state);
+            hash_expr(idx, state);
+        }
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            hash_expr(callee, state);
+            args.len().hash(state);
+            for arg in args {
+                hash_expr(arg, state);
+            }
+        }
+        Expr::Unary(op, operand) => {
+            std::mem::discriminant(op).hash(state);
+            hash_expr(operand, state);
+        }
+        Expr::Binary(op, left, right) => {
+            std::mem::discriminant(op).hash(state);
+            hash_expr(left, state);
+            hash_expr(right, state);
+        }
+        Expr::CompoundAssign(op, left, right) => {
+            std::mem::discriminant(op).hash(state);
+            hash_expr(left, state);
+            hash_expr(right, state);
+        }
+        Expr::Cond(test, consequent, alternate) => {
+            hash_expr(test, state);
+            hash_expr(consequent, state);
+            hash_expr(alternate, state);
+        }
+        Expr::Object(entries) => {
+            entries.len().hash(state);
+            for (key, value) in entries {
+                key.hash(state);
+                hash_expr(value, state);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            items.len().hash(state);
+            for item in items {
+                hash_expr(item, state);
+            }
+        }
+        Expr::Arrow(params, body) => {
+            params.hash(state);
+            std::mem::discriminant(body).hash(state);
+            match body {
+                ArrowBody::Expr(expr) => hash_expr(expr, state),
+                ArrowBody::Block(stmts) => stmts.len().hash(state),
+            }
+        }
+    }
+}
+
 struct Walker<'a> {
     sites: &'a mut JsAllocSites,
     depth: u32,
-    origins: &'a [Origin],
+    origins: OriginIndex<'a>,
 }
 
 impl Walker<'_> {
     fn record(&mut self, kind: Kind, expression: &Expr) {
-        let origin = self
-            .origins
-            .iter()
-            .find(|origin| origin.expression == *expression)
-            .cloned();
+        let origin = if self.depth > 0 {
+            self.origins.find(expression).cloned()
+        } else {
+            None
+        };
         self.sites.record(kind, self.depth, origin);
     }
 

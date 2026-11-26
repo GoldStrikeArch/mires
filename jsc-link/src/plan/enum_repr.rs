@@ -31,19 +31,22 @@ use std::sync::Arc;
 
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::semantic::{
-    BlockId, Body, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, DropGlue,
-    GlobalReference, HostPayload, ItemId, LocalId, Operand, OperandKind, Place, Projection, Rvalue,
-    StatementKind, Terminator, TypeId, Unwind,
+    BlockId, Body, BodySemantic, Call, CallSemantic, Callee, ConstTree, Constant, DropGlue,
+    GlobalReference, HostPayload, ItemId, LocalId, Operand, OperandKind, Projection, Rvalue,
+    Statement, StatementKind, Terminator, TypeId, Unwind,
 };
 use rcgjs_object::jir::types::{
-    EnumRepr, FieldKey, NominalAbi, NominalForm, PinnedBoundary, PointerForm,
-    RepresentationCandidate, TypeDescriptor, TypeKind, TypeTable,
+    EnumRepr, FieldDescriptor, NominalAbi, NominalForm, PinnedBoundary, PointerForm,
+    TypeDescriptor, TypeKind, TypeTable,
 };
 use rcgjs_object::object::ItemKind;
 
 use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
 use crate::opts::{OptimizerMode, OptimizerPass, Opts, Profile};
+
+use super::names::{synthesized_static_item, NamePool};
+use super::smi_fields::SmiScanState;
 
 /// Whether `callee` is a pure representation-opaque sysroot runtime helper (memory/pointer/alloc/
 /// string/byte/NativeVec primitive) that never inspects `.TAG` or struct field names and never
@@ -301,22 +304,12 @@ impl EnumReprPlan {
         let Some(name) = self.sentinel_none.clone() else {
             return Vec::new();
         };
-        vec![LinkItem {
-            js: format!("\nconst {} = {{}};\n", name.as_str()),
+        let js = format!("\nconst {} = {{}};\n", name.as_str());
+        vec![synthesized_static_item(
             name,
-            kind: ItemKind::Static,
-            refs: Default::default(),
-            zombies: Vec::new(),
-            linkage: crate::item::Linkage::internal(),
-            debug_path: "enum SentinelNiche none sentinel".to_owned(),
-            crate_name: "generated".to_owned(),
-            order: None,
-            map: crate::item::ItemMap::default(),
-            dts: None,
-            optimization: Default::default(),
-            allocator_provider: Default::default(),
-            jir: Default::default(),
-        }]
+            js,
+            "enum SentinelNiche none sentinel",
+        )]
     }
 }
 
@@ -364,644 +357,778 @@ pub fn specialize_table(
         return EnumReprPlan::default();
     }
 
-    let live_set: BTreeSet<&JsName> = reachable.iter().collect();
-    let offered_set: BTreeSet<&JsName> = offered.iter().collect();
-    let items_by_id: BTreeMap<ItemId, JsName> = table
-        .values()
-        .filter_map(|item| {
-            let id = item
-                .jir
-                .summary
-                .as_ref()
-                .and_then(|s| s.key.item)
-                .or_else(|| item.jir.body.as_ref().map(|b| b.item))?;
-            Some((id, item.name.clone()))
-        })
-        .collect();
     let global_types = build_global_type_map(table);
-    let drop_glue_by_ty: BTreeMap<TypeId, JsName> = table
-        .values()
-        .filter_map(|item| {
-            let body = item.jir.body.as_ref()?;
-            let BodySemantic::DropGlue(ty) = body.semantic else {
-                return None;
-            };
-            Some((peel_global(ty, &global_types), item.name.clone()))
-        })
-        .collect();
+    let (excluded_enums, host_boundary_types, smi_u32_fields) = {
+        let mut scanner =
+            EnumBoundaryScanner::new(table, offered, extra_excluded, &global_types, opts);
+        let live_set: BTreeSet<&str> = reachable.iter().map(JsName::as_str).collect();
+        scanner.scan_live_items(&live_set);
+        let smi_u32_fields = scanner.smi.select(&global_types, &scanner.excluded_enums);
+        (
+            scanner.excluded_enums,
+            scanner.host_boundary_types,
+            smi_u32_fields,
+        )
+    };
 
-    let mut excluded_enums: BTreeSet<TypeId> = extra_excluded.clone();
-    let mut host_boundary_types: BTreeSet<TypeId> = BTreeSet::new();
-    let mut smi_bad_structs: BTreeSet<TypeId> = BTreeSet::new();
-    let mut smi_bad_fields: BTreeSet<(TypeId, u32)> = BTreeSet::new();
-    let mut smi_high_bit_structs: BTreeSet<TypeId> = BTreeSet::new();
-    let mut visited_excl = BTreeSet::new();
-    let mut visited_host = BTreeSet::new();
-    let mut visited_smi_bad = BTreeSet::new();
+    let mut plan = select_enum_reprs(
+        table,
+        &global_types,
+        &excluded_enums,
+        &host_boundary_types,
+        opts,
+    );
+    plan.smi_u32_fields = smi_u32_fields;
 
-    // Seed any `extra_excluded` types transitively so nested enum fields stay aligned with v1.
-    for &ty in extra_excluded {
-        walk_type_id_global(ty, &global_types, &mut excluded_enums, &mut visited_excl);
+    if !plan.decisions.is_empty() {
+        rewrite_shared_interns(table, reachable, &plan);
+    }
+    plan
+}
+
+/// Scans every live item's descriptors, signatures, and reachable MIR blocks to record boundary
+/// enum exclusions, host-boundary types, and `smi_u32_fields` disqualifications.
+struct EnumBoundaryScanner<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    offered_set: BTreeSet<&'a str>,
+    items_by_id: BTreeMap<ItemId, &'a str>,
+    drop_glue_by_ty: BTreeMap<TypeId, &'a str>,
+    global_types: &'a BTreeMap<TypeId, TypeDescriptor>,
+    opts: &'a Opts,
+    excluded_enums: BTreeSet<TypeId>,
+    host_boundary_types: BTreeSet<TypeId>,
+    visited_excl: BTreeSet<TypeId>,
+    visited_host: BTreeSet<TypeId>,
+    smi: SmiScanState,
+}
+
+impl<'a> EnumBoundaryScanner<'a> {
+    fn new(
+        table: &'a BTreeMap<JsName, LinkItem>,
+        offered: &'a [JsName],
+        extra_excluded: &BTreeSet<TypeId>,
+        global_types: &'a BTreeMap<TypeId, TypeDescriptor>,
+        opts: &'a Opts,
+    ) -> Self {
+        let offered_set: BTreeSet<&'a str> = offered.iter().map(JsName::as_str).collect();
+        let items_by_id: BTreeMap<ItemId, &'a str> = table
+            .values()
+            .filter_map(|item| {
+                let id = item
+                    .jir
+                    .summary
+                    .as_ref()
+                    .and_then(|s| s.key.item)
+                    .or_else(|| item.jir.body.as_ref().map(|b| b.item))?;
+                Some((id, item.name.as_str()))
+            })
+            .collect();
+        let drop_glue_by_ty: BTreeMap<TypeId, &'a str> = table
+            .values()
+            .filter_map(|item| {
+                let body = item.jir.body.as_ref()?;
+                let BodySemantic::DropGlue(ty) = body.semantic else {
+                    return None;
+                };
+                Some((peel_global(ty, global_types), item.name.as_str()))
+            })
+            .collect();
+
+        let mut excluded_enums = extra_excluded.clone();
+        let mut visited_excl = BTreeSet::new();
+        for &ty in extra_excluded {
+            walk_type_id_global(ty, global_types, &mut excluded_enums, &mut visited_excl);
+        }
+
+        Self {
+            table,
+            offered_set,
+            items_by_id,
+            drop_glue_by_ty,
+            global_types,
+            opts,
+            excluded_enums,
+            host_boundary_types: BTreeSet::new(),
+            visited_excl,
+            visited_host: BTreeSet::new(),
+            smi: SmiScanState::default(),
+        }
     }
 
-    let walk_both = |ty: TypeId,
-                     interns: &Interns,
-                     excluded_enums: &mut BTreeSet<TypeId>,
-                     host_boundary_types: &mut BTreeSet<TypeId>,
-                     visited_excl: &mut BTreeSet<TypeId>,
-                     visited_host: &mut BTreeSet<TypeId>| {
-        walk_type_id(ty, interns, &global_types, excluded_enums, visited_excl);
+    fn walk_excluded(&mut self, ty: TypeId, interns: &Interns) {
         walk_type_id(
             ty,
             interns,
-            &global_types,
-            host_boundary_types,
-            visited_host,
+            self.global_types,
+            &mut self.excluded_enums,
+            &mut self.visited_excl,
         );
-    };
+    }
 
-    for item in table.values() {
-        if !live_set.contains(&item.name) {
-            continue;
+    fn walk_both(&mut self, ty: TypeId, interns: &Interns) {
+        walk_type_id(
+            ty,
+            interns,
+            self.global_types,
+            &mut self.excluded_enums,
+            &mut self.visited_excl,
+        );
+        walk_type_id(
+            ty,
+            interns,
+            self.global_types,
+            &mut self.host_boundary_types,
+            &mut self.visited_host,
+        );
+    }
+
+    fn walk_signature_both(&mut self, body: &Body, interns: &Interns) {
+        for &input in &body.signature.arguments {
+            self.walk_both(input, interns);
         }
+        self.walk_both(body.signature.result, interns);
+    }
+
+    fn walk_signature_excluded(&mut self, body: &Body, interns: &Interns) {
+        for &input in &body.signature.arguments {
+            self.walk_excluded(input, interns);
+        }
+        self.walk_excluded(body.signature.result, interns);
+    }
+
+    fn scan_live_items(&mut self, live_set: &BTreeSet<&str>) {
+        for item in self.table.values() {
+            if !live_set.contains(item.name.as_str()) {
+                continue;
+            }
+            self.scan_item(item);
+        }
+    }
+
+    fn scan_item(&mut self, item: &LinkItem) {
         let Some(interns) = item.jir.interns() else {
-            continue;
+            return;
         };
         let local = &interns.types;
 
-        // 1. Pinned view-abi or C-ABI descriptors walk transitively; `PinnedBoundary::Host`
-        // (`mires_js` crate types like `JsValue`, `HashMap<K, V>`, `MapEntry<V>`) pins only the
+        // 1. Pinned C-ABI descriptors walk transitively; `PinnedBoundary::Host` pins only the
         // host descriptor itself so user types stored inside `mires_js::HashMap` are not
-        // spuriously poisoned (actual host crossings are walked at `Call`/`Export`/`Import`).
+        // spuriously poisoned.
         for desc in local.descriptors() {
             if desc.meta.abi == NominalAbi::C {
-                walk_both(
-                    desc.id,
-                    interns,
-                    &mut excluded_enums,
-                    &mut host_boundary_types,
-                    &mut visited_excl,
-                    &mut visited_host,
-                );
+                self.walk_both(desc.id, interns);
             } else if desc.meta.boundary == PinnedBoundary::Host {
-                excluded_enums.insert(desc.id);
-                host_boundary_types.insert(desc.id);
+                self.excluded_enums.insert(desc.id);
+                self.host_boundary_types.insert(desc.id);
             }
         }
 
         let Some(body) = item.jir.body.as_ref() else {
-            continue;
+            return;
         };
 
         if item.kind == ItemKind::Static {
-            walk_type_id(
-                body.signature.result,
-                interns,
-                &global_types,
-                &mut smi_bad_structs,
-                &mut visited_smi_bad,
-            );
+            self.smi
+                .record_static(body.signature.result, interns, self.global_types);
         }
 
         // 2. Exported / imported / DTS-bearing items cross the JS boundary.
         let is_js_boundary_item =
             item.linkage.exported || item.kind == ItemKind::Import || item.dts.is_some();
+        let item_is_offered = self.offered_set.contains(item.name.as_str());
         if is_js_boundary_item {
-            for &input in &body.signature.arguments {
-                walk_both(
-                    input,
-                    interns,
-                    &mut excluded_enums,
-                    &mut host_boundary_types,
-                    &mut visited_excl,
-                    &mut visited_host,
-                );
-            }
-            walk_both(
-                body.signature.result,
-                interns,
-                &mut excluded_enums,
-                &mut host_boundary_types,
-                &mut visited_excl,
-                &mut visited_host,
-            );
-        } else if !offered_set.contains(&item.name) {
-            // Non-offered item runs v1 JS; keep its signature enums baseline.
-            for &input in &body.signature.arguments {
-                walk_type_id(
-                    input,
-                    interns,
-                    &global_types,
-                    &mut excluded_enums,
-                    &mut visited_excl,
-                );
-            }
-            walk_type_id(
-                body.signature.result,
-                interns,
-                &global_types,
-                &mut excluded_enums,
-                &mut visited_excl,
-            );
+            self.walk_signature_both(body, interns);
+        } else if !item_is_offered {
+            self.walk_signature_excluded(body, interns);
         }
 
-        // 3. Scan reachable MIR blocks for calls, drops, and constant trees crossing boundaries,
-        // non-offered items, or non-offered statics. Dead `FalseEdge`/`FalseUnwind` and folded
-        // `RuntimeCheck` branches (for offered items when `AstDce` applies) are skipped so
-        // unreachable v1-folded calls/drops do not spuriously poison internal enums.
-        let item_is_offered = offered_set.contains(&item.name);
-        let reachable_blocks =
-            reachable_mir_blocks(body, item_is_offered && opts.applies(OptimizerPass::AstDce));
+        // 3. Scan reachable MIR blocks for calls, drops, and constant trees crossing boundaries.
+        let reachable_blocks = reachable_mir_blocks(
+            body,
+            item_is_offered && self.opts.applies(OptimizerPass::AstDce),
+        );
         for block in &body.blocks {
             if !reachable_blocks.contains(&block.id) {
                 continue;
             }
             for stmt in &block.statements {
-                match &stmt.kind {
-                    StatementKind::Assign {
-                        destination: place,
-                        value: rv,
-                    } => match rv {
-                        Rvalue::Cast {
-                            kind,
-                            value: op,
-                            result,
-                        } => {
-                            scan_operand_consts(
-                                op,
-                                local,
-                                interns,
-                                table,
-                                &offered_set,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
-                            let bad_cast = match kind {
-                                CastKind::Transmute => {
-                                    peel_global(op.ty, &global_types)
-                                        != peel_global(*result, &global_types)
-                                        && !is_harmless_ptr_to_ptr(
-                                            op.ty,
-                                            *result,
-                                            local,
-                                            &global_types,
-                                        )
-                                        && !is_ptr_addr_transmute(
-                                            op.ty,
-                                            *result,
-                                            local,
-                                            &global_types,
-                                        )
-                                }
-                                CastKind::PtrToPtr => {
-                                    !is_harmless_ptr_to_ptr(op.ty, *result, local, &global_types)
-                                }
-                                _ => false,
-                            };
-                            if bad_cast {
-                                walk_type_id(
-                                    op.ty,
-                                    interns,
-                                    &global_types,
-                                    &mut smi_bad_structs,
-                                    &mut visited_smi_bad,
-                                );
-                                walk_type_id(
-                                    *result,
-                                    interns,
-                                    &global_types,
-                                    &mut smi_bad_structs,
-                                    &mut visited_smi_bad,
-                                );
-                            }
-                        }
-                        Rvalue::Use(op) => {
-                            scan_operand_consts(
-                                op,
-                                local,
-                                interns,
-                                table,
-                                &offered_set,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
-                            if is_high_bit_u32_const(op, local, &global_types) {
-                                record_place_field_structs(
-                                    place,
-                                    &body.locals,
-                                    local,
-                                    &global_types,
-                                    &mut smi_high_bit_structs,
-                                );
-                            }
-                        }
-                        Rvalue::Repeat { value: op, .. }
-                        | Rvalue::Unary { value: op, .. }
-                        | Rvalue::WrapUnsafeBinder(op) => scan_operand_consts(
-                            op,
-                            local,
-                            interns,
-                            table,
-                            &offered_set,
-                            &global_types,
-                            &mut excluded_enums,
-                            &mut visited_excl,
-                        ),
-                        Rvalue::Binary { left, right, .. } => {
-                            scan_operand_consts(
-                                left,
-                                local,
-                                interns,
-                                table,
-                                &offered_set,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
-                            scan_operand_consts(
-                                right,
-                                local,
-                                interns,
-                                table,
-                                &offered_set,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
-                        }
-                        Rvalue::Aggregate {
-                            result, operands, ..
-                        } => {
-                            for op in operands {
-                                scan_operand_consts(
-                                    op,
-                                    local,
-                                    interns,
-                                    table,
-                                    &offered_set,
-                                    &global_types,
-                                    &mut excluded_enums,
-                                    &mut visited_excl,
-                                );
-                                if is_high_bit_u32_const(op, local, &global_types) {
-                                    smi_high_bit_structs
-                                        .insert(peel_global(*result, &global_types));
-                                }
-                            }
-                        }
-                        Rvalue::Reference { place, .. }
-                        | Rvalue::RawPointer { place, .. }
-                        | Rvalue::Reborrow { place, .. } => {
-                            record_borrowed_struct_fields(
-                                place,
-                                &body.locals,
-                                local,
-                                &global_types,
-                                &mut smi_bad_fields,
-                            );
-                        }
-                        Rvalue::Discriminant(_) | Rvalue::CopyForDeref(_) => {}
+                self.scan_stmt(stmt, body, local, interns);
+            }
+            self.scan_terminator(&block.terminator, item_is_offered, local, interns);
+        }
+    }
+
+    fn scan_stmt(&mut self, stmt: &Statement, body: &Body, local: &TypeTable, interns: &Interns) {
+        match &stmt.kind {
+            StatementKind::Assign {
+                destination: place,
+                value: rv,
+            } => match rv {
+                Rvalue::Cast {
+                    kind,
+                    value: op,
+                    result,
+                } => {
+                    self.scan_operand_consts(op, local, interns);
+                    self.smi
+                        .record_cast(*kind, op, *result, local, interns, self.global_types);
+                }
+                Rvalue::Use(op) => {
+                    self.scan_operand_consts(op, local, interns);
+                    self.smi
+                        .record_use_assign(place, op, &body.locals, local, self.global_types);
+                }
+                Rvalue::Repeat { value: op, .. }
+                | Rvalue::Unary { value: op, .. }
+                | Rvalue::WrapUnsafeBinder(op) => self.scan_operand_consts(op, local, interns),
+                Rvalue::Binary { left, right, .. } => {
+                    self.scan_operand_consts(left, local, interns);
+                    self.scan_operand_consts(right, local, interns);
+                }
+                Rvalue::Aggregate {
+                    result, operands, ..
+                } => {
+                    for op in operands {
+                        self.scan_operand_consts(op, local, interns);
+                        self.smi
+                            .record_aggregate_operand(*result, op, local, self.global_types);
+                    }
+                }
+                Rvalue::Reference { place, .. }
+                | Rvalue::RawPointer { place, .. }
+                | Rvalue::Reborrow { place, .. } => {
+                    self.smi
+                        .record_ref_place(place, &body.locals, local, self.global_types);
+                }
+                Rvalue::Discriminant(_) | Rvalue::CopyForDeref(_) => {}
+            },
+            StatementKind::Assume(op) => self.scan_operand_consts(op, local, interns),
+            StatementKind::CopyNonOverlapping {
+                source,
+                destination,
+                count,
+            } => {
+                for op in [source, destination, count] {
+                    self.scan_operand_consts(op, local, interns);
+                }
+            }
+            StatementKind::SetDiscriminant { .. }
+            | StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Nop => {}
+        }
+    }
+
+    fn scan_terminator(
+        &mut self,
+        term: &Terminator,
+        item_is_offered: bool,
+        local: &TypeTable,
+        interns: &Interns,
+    ) {
+        match term {
+            Terminator::Switch { discriminant, .. } => {
+                self.scan_operand_consts(discriminant, local, interns);
+            }
+            Terminator::Assert { condition, .. } => {
+                self.scan_operand_consts(condition, local, interns);
+            }
+            Terminator::Drop {
+                place,
+                glue:
+                    DropGlue::Direct {
+                        item: tid,
+                        link_name,
                     },
-                    StatementKind::Assume(op) => scan_operand_consts(
-                        op,
-                        local,
-                        interns,
-                        table,
-                        &offered_set,
-                        &global_types,
-                        &mut excluded_enums,
-                        &mut visited_excl,
-                    ),
-                    StatementKind::CopyNonOverlapping {
-                        source,
-                        destination,
-                        count,
-                    } => {
-                        for op in [source, destination, count] {
-                            scan_operand_consts(
-                                op,
-                                local,
-                                interns,
-                                table,
-                                &offered_set,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
+                ..
+            } => {
+                let target_name = self
+                    .items_by_id
+                    .get(tid)
+                    .copied()
+                    .or_else(|| interns.str(*link_name));
+                if !target_name.is_some_and(|n| self.offered_set.contains(n)) {
+                    self.walk_excluded(place.ty, interns);
+                }
+            }
+            Terminator::Call(call) => {
+                self.scan_call(call, item_is_offered, local, interns);
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_call(
+        &mut self,
+        call: &Call,
+        item_is_offered: bool,
+        local: &TypeTable,
+        interns: &Interns,
+    ) {
+        self.scan_operand_consts(&call.function, local, interns);
+        for arg in &call.arguments {
+            self.scan_operand_consts(arg, local, interns);
+        }
+
+        let map_marker = match &call.host {
+            Some(HostPayload::Map { marker }) => interns.str(*marker),
+            Some(HostPayload::Marker { section, .. }) => interns
+                .str(*section)
+                .and_then(|s| s.strip_prefix("rcgjs.map.")),
+            _ => None,
+        };
+        if let Some(marker) = map_marker {
+            let stored_ty = if matches!(marker, "try_get" | "try_getmut") {
+                option_ref_inner_pointee(local, self.global_types, call.destination.ty)
+            } else if marker == "values" {
+                slice_of_ref_pointee(local, self.global_types, call.destination.ty)
+            } else {
+                None
+            };
+            if let Some(stored_ty) = stored_ty {
+                let peeled = peel_global(stored_ty, self.global_types);
+                if self
+                    .global_types
+                    .get(&peeled)
+                    .is_some_and(|d| d.js.enum_repr.is_some())
+                {
+                    self.excluded_enums.insert(peeled);
+                }
+            }
+            return;
+        }
+
+        self.smi
+            .record_call(call, local, interns, self.global_types);
+
+        if item_is_offered {
+            if let Some(HostPayload::Marker { section, .. }) = &call.host {
+                if let Some(marker) = interns
+                    .str(*section)
+                    .and_then(|s| s.strip_prefix("rcgjs.host."))
+                {
+                    if self.handle_opaque_host_marker(marker, call, interns) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let is_internal_foreign = match &call.callee {
+            Callee::Foreign { symbol, .. } => interns.str(*symbol).is_some_and(|sym| {
+                self.table.get(sym).is_some_and(|target| {
+                    target.kind == ItemKind::Alloc
+                        || (target.kind == ItemKind::Fn
+                            && self.offered_set.contains(sym)
+                            && !target.linkage.exported
+                            && target.dts.is_none())
+                })
+            }),
+            _ => false,
+        };
+
+        let is_host_boundary = call.host.is_some()
+            || matches!(
+                call.semantic,
+                CallSemantic::Host | CallSemantic::RawJavaScript
+            )
+            || (matches!(call.callee, Callee::Foreign { .. }) && !is_internal_foreign)
+            || (matches!(call.callee, Callee::Runtime { .. })
+                && !is_representation_opaque_runtime(&call.callee, interns));
+
+        let is_non_offered_direct = match &call.callee {
+            Callee::Direct {
+                item: tid,
+                link_name,
+            } => {
+                let target_name = self
+                    .items_by_id
+                    .get(tid)
+                    .copied()
+                    .or_else(|| interns.str(*link_name));
+                !target_name.is_some_and(|n| {
+                    self.offered_set.contains(n)
+                        || self.table.get(n).is_some_and(|t| t.kind == ItemKind::Alloc)
+                })
+            }
+            _ => false,
+        };
+
+        if is_host_boundary {
+            for arg in &call.arguments {
+                self.walk_both(arg.ty, interns);
+            }
+            self.walk_both(call.destination.ty, interns);
+            if let Some(host) = &call.host {
+                for (_, helper) in host.helpers() {
+                    if let Some(&helper_name) = self.items_by_id.get(&helper.item) {
+                        if let Some(helper_item) = self.table.get(helper_name) {
+                            if let (Some(h_body), Some(h_interns)) =
+                                (&helper_item.jir.body, helper_item.jir.interns())
+                            {
+                                self.walk_signature_both(h_body, h_interns);
+                            }
                         }
                     }
-                    StatementKind::SetDiscriminant { .. }
-                    | StatementKind::StorageLive(_)
-                    | StatementKind::StorageDead(_)
-                    | StatementKind::Nop => {}
+                }
+            }
+        } else if is_non_offered_direct {
+            for arg in &call.arguments {
+                self.walk_excluded(arg.ty, interns);
+            }
+            self.walk_excluded(call.destination.ty, interns);
+        }
+    }
+
+    /// Handles closure-taking and async-driver `rcgjs.host.*` markers whose JS host wrappers store
+    /// a Rust closure environment or coroutine future opaquely without inspecting its captured
+    /// fields or saved locals.
+    fn handle_opaque_host_marker(&mut self, marker: &str, call: &Call, interns: &Interns) -> bool {
+        // 1. Closure-taking markers: JS receives `(...$a) => body(env, ...$a)`.
+        let closure_idx = match marker {
+            "callback0" | "callback1" | "callback2" | "callback3" | "callback4" | "promise"
+            | "localwaker" | "microtask" | "task" | "try"
+                if call.arguments.len() == 1 =>
+            {
+                Some(0usize)
+            }
+            "settled" if call.arguments.len() == 2 => Some(1usize),
+            _ => None,
+        };
+        if let Some(c_idx) = closure_idx {
+            let closure_peeled = peel_global(call.arguments[c_idx].ty, self.global_types);
+            let Some(closure_desc) = self.global_types.get(&closure_peeled) else {
+                return false;
+            };
+            let TypeKind::Closure { def, .. } = closure_desc.kind else {
+                return false;
+            };
+            let closure_item_id = ItemId {
+                definition: def,
+                instantiation: closure_peeled.0,
+            };
+            let Some(&closure_name) = self.items_by_id.get(&closure_item_id) else {
+                return false;
+            };
+            if !self.offered_set.contains(closure_name) {
+                return false;
+            }
+            let Some(closure_item) = self.table.get(closure_name) else {
+                return false;
+            };
+            let (Some(c_body), Some(c_interns)) =
+                (closure_item.jir.body.as_ref(), closure_item.jir.interns())
+            else {
+                return false;
+            };
+            if marker == "try" && closure_desc.layout.needs_drop {
+                let Some(&glue_name) = self.drop_glue_by_ty.get(&closure_peeled) else {
+                    return false;
+                };
+                if !self.offered_set.contains(glue_name) {
+                    return false;
                 }
             }
 
-            match &block.terminator {
-                Terminator::Switch { discriminant, .. } => scan_operand_consts(
-                    discriminant,
-                    local,
-                    interns,
-                    table,
-                    &offered_set,
-                    &global_types,
-                    &mut excluded_enums,
-                    &mut visited_excl,
-                ),
-                Terminator::Assert { condition, .. } => scan_operand_consts(
-                    condition,
-                    local,
-                    interns,
-                    table,
-                    &offered_set,
-                    &global_types,
-                    &mut excluded_enums,
-                    &mut visited_excl,
-                ),
-                Terminator::Drop {
-                    place,
-                    glue:
-                        DropGlue::Direct {
-                            item: tid,
-                            link_name,
-                        },
-                    ..
-                } => {
-                    let target_name = items_by_id
-                        .get(tid)
-                        .cloned()
-                        .or_else(|| interns.str(*link_name).map(|s| JsName::new(s.to_owned())));
-                    if !target_name
-                        .as_ref()
-                        .is_some_and(|n| offered_set.contains(n))
+            for (i, arg) in call.arguments.iter().enumerate() {
+                if i != c_idx {
+                    self.walk_both(arg.ty, interns);
+                }
+            }
+            self.walk_both(call.destination.ty, interns);
+            for &inp in c_body.signature.arguments.iter().skip(1) {
+                self.walk_both(inp, c_interns);
+            }
+            self.walk_both(c_body.signature.result, c_interns);
+            return true;
+        }
+
+        // 2. Async-driver markers: JS stores `state.future` opaquely.
+        let (is_promise, expected_args) = match marker {
+            "futurepromise" | "futurenativepromise" => (true, 1usize),
+            "spawn" => (false, 1usize),
+            "spawnowner" | "spawnowner.v2" => (false, 2usize),
+            _ => return false,
+        };
+        if !self.opts.applies(OptimizerPass::FuturePoller) || call.arguments.len() != expected_args
+        {
+            return false;
+        }
+        let Some(host) = &call.host else {
+            return false;
+        };
+        let helper_key = if is_promise {
+            "poll_result"
+        } else {
+            "poll_once"
+        };
+        let Some(helper_ref) = host.helper(interns, helper_key) else {
+            return false;
+        };
+        let Some(helper_name) = self
+            .items_by_id
+            .get(&helper_ref.item)
+            .copied()
+            .or_else(|| interns.str(helper_ref.link_name))
+        else {
+            return false;
+        };
+        if !self.offered_set.contains(helper_name) {
+            return false;
+        }
+        let Some(helper_item) = self.table.get(helper_name) else {
+            return false;
+        };
+        let (Some(h_body), Some(h_interns)) =
+            (helper_item.jir.body.as_ref(), helper_item.jir.interns())
+        else {
+            return false;
+        };
+        let future_peeled = peel_global(call.arguments[0].ty, self.global_types);
+        let Some(future_desc) = self.global_types.get(&future_peeled) else {
+            return false;
+        };
+        if future_desc.layout.needs_drop {
+            let Some(&glue_name) = self.drop_glue_by_ty.get(&future_peeled) else {
+                return false;
+            };
+            if !self.offered_set.contains(glue_name) {
+                return false;
+            }
+        }
+
+        for arg in call.arguments.iter().skip(1) {
+            self.walk_both(arg.ty, interns);
+        }
+        self.walk_both(call.destination.ty, interns);
+        for &inp in h_body.signature.arguments.iter().skip(1) {
+            self.walk_both(inp, h_interns);
+        }
+        self.walk_both(h_body.signature.result, h_interns);
+        true
+    }
+
+    fn is_offered_internal_static(&self, target: &GlobalReference, interns: &Interns) -> bool {
+        let GlobalReference::Static { link_name, .. } = target else {
+            return false;
+        };
+        let Some(name_str) = interns.str(*link_name) else {
+            return false;
+        };
+        self.offered_set.contains(name_str)
+            && self
+                .table
+                .get(name_str)
+                .is_some_and(|item| !item.linkage.exported && item.dts.is_none())
+    }
+
+    fn scan_operand_consts(&mut self, op: &Operand, local: &TypeTable, interns: &Interns) {
+        let OperandKind::Constant(constant) = &op.kind else {
+            return;
+        };
+        match constant {
+            Constant::Pointer {
+                target: target @ GlobalReference::Static { .. },
+                ..
+            } => {
+                if !self.is_offered_internal_static(target, interns) {
+                    self.walk_excluded(op.ty, interns);
+                }
+            }
+            Constant::Pointer {
+                target: GlobalReference::Function { link_name, .. },
+                ..
+            } => {
+                let offered = interns
+                    .str(*link_name)
+                    .is_some_and(|s| self.offered_set.contains(s));
+                if !offered {
+                    self.walk_excluded(op.ty, interns);
+                }
+            }
+            Constant::Memory(tree) => {
+                self.scan_const_tree(tree, op.ty, local, interns, 0);
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_const_tree(
+        &mut self,
+        tree: &ConstTree,
+        ty: TypeId,
+        local: &TypeTable,
+        interns: &Interns,
+        depth: u32,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        match tree {
+            ConstTree::Global {
+                target: target @ GlobalReference::Static { .. },
+                ..
+            }
+            | ConstTree::StaticField { target, .. }
+            | ConstTree::StaticSlice { target, .. } => {
+                if !self.is_offered_internal_static(target, interns) {
+                    self.walk_excluded(ty, interns);
+                }
+            }
+            ConstTree::Global {
+                target: GlobalReference::Function { link_name, .. },
+                ..
+            } => {
+                let offered = interns
+                    .str(*link_name)
+                    .is_some_and(|s| self.offered_set.contains(s));
+                if !offered {
+                    self.walk_excluded(ty, interns);
+                }
+            }
+            ConstTree::Reference(inner) => {
+                let peeled = peel_global(ty, self.global_types);
+                if let Some(desc) = lookup_desc(peeled, local, self.global_types) {
+                    if let TypeKind::Reference { pointee, .. }
+                    | TypeKind::RawPointer { pointee, .. } = desc.kind
                     {
-                        walk_type_id(
-                            place.ty,
-                            interns,
-                            &global_types,
-                            &mut excluded_enums,
-                            &mut visited_excl,
-                        );
+                        self.scan_const_tree(inner, pointee, local, interns, depth + 1);
                     }
                 }
-                Terminator::Call(call) => {
-                    scan_operand_consts(
-                        &call.function,
-                        local,
-                        interns,
-                        table,
-                        &offered_set,
-                        &global_types,
-                        &mut excluded_enums,
-                        &mut visited_excl,
-                    );
-                    for arg in &call.arguments {
-                        scan_operand_consts(
-                            arg,
+            }
+            ConstTree::Slice(elems) => {
+                let peeled = peel_global(ty, self.global_types);
+                if let Some(desc) = lookup_desc(peeled, local, self.global_types) {
+                    let elem_ty = match desc.kind {
+                        TypeKind::Slice(e) | TypeKind::Array { element: e, .. } => Some(e),
+                        TypeKind::Reference { pointee, .. }
+                        | TypeKind::RawPointer { pointee, .. } => match lookup_desc(
+                            peel_global(pointee, self.global_types),
                             local,
-                            interns,
-                            table,
-                            &offered_set,
-                            &global_types,
-                            &mut excluded_enums,
-                            &mut visited_excl,
-                        );
-                    }
-
-                    let map_marker = match &call.host {
-                        Some(HostPayload::Map { marker }) => interns.str(*marker),
-                        Some(HostPayload::Marker { section, .. }) => interns
-                            .str(*section)
-                            .and_then(|s| s.strip_prefix("rcgjs.map.")),
+                            self.global_types,
+                        )
+                        .map(|d| &d.kind)
+                        {
+                            Some(TypeKind::Slice(e) | TypeKind::Array { element: e, .. }) => {
+                                Some(*e)
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     };
-                    if let Some(marker) = map_marker {
-                        // `rcgjs.map.*` markers lower via `value::enum_value` for their `Option`
-                        // return type, so do NOT exclude the return `Option`. However, if a
-                        // legacy crate stores an enum directly inside the JS `Map` (without
-                        // `MapEntry<V>`), keep that stored enum indirect (`PointerForm::Thin`).
-                        if matches!(marker, "try_get" | "try_getmut") {
-                            if let Some(stored_ty) =
-                                option_ref_inner_pointee(local, &global_types, call.destination.ty)
-                            {
-                                let peeled = peel_global(stored_ty, &global_types);
-                                if global_types
-                                    .get(&peeled)
-                                    .is_some_and(|d| d.js.enum_repr.is_some())
+                    if let Some(e) = elem_ty {
+                        for elem in elems {
+                            self.scan_const_tree(elem, e, local, interns, depth + 1);
+                        }
+                    }
+                }
+            }
+            ConstTree::Aggregate(fields) => {
+                let peeled = peel_global(ty, self.global_types);
+                if let Some(desc) = lookup_desc(peeled, local, self.global_types) {
+                    match &desc.kind {
+                        TypeKind::Array { element, .. } => {
+                            let elem = *element;
+                            for f in fields {
+                                self.scan_const_tree(f, elem, local, interns, depth + 1);
+                            }
+                        }
+                        TypeKind::Tuple(elems) => {
+                            for (f, &e_ty) in fields.iter().zip(elems) {
+                                self.scan_const_tree(f, e_ty, local, interns, depth + 1);
+                            }
+                        }
+                        TypeKind::Adt { variants, .. } => {
+                            if let Some(v) = variants.first() {
+                                for (f, fd) in fields.iter().zip(&v.fields) {
+                                    self.scan_const_tree(f, fd.ty, local, interns, depth + 1);
+                                }
+                            }
+                        }
+                        TypeKind::Closure { upvars, .. }
+                        | TypeKind::CoroutineClosure { upvars, .. } => {
+                            for (f, &u_ty) in fields.iter().zip(upvars) {
+                                self.scan_const_tree(f, u_ty, local, interns, depth + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ConstTree::Variant { variant, fields } => {
+                let peeled = peel_global(ty, self.global_types);
+                if let Some(desc) = lookup_desc(peeled, local, self.global_types) {
+                    if let TypeKind::Adt { variants, .. } = &desc.kind {
+                        if let Some(v) = variants.get(*variant as usize) {
+                            for (f, fd) in fields.iter().zip(&v.fields) {
+                                self.scan_const_tree(f, fd.ty, local, interns, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            ConstTree::Dyn {
+                data,
+                concrete,
+                vtable,
+            } => {
+                self.scan_const_tree(data, *concrete, local, interns, depth + 1);
+                if let Some(vt_name) = interns.str(*vtable) {
+                    if let Some(vt_item) = self.table.get(vt_name) {
+                        for r in &vt_item.refs {
+                            if let Some(ref_item) = self.table.get(r) {
+                                if ref_item.kind == ItemKind::Fn
+                                    && !self.offered_set.contains(r.as_str())
                                 {
-                                    excluded_enums.insert(peeled);
-                                }
-                            }
-                        } else if marker == "values" {
-                            if let Some(stored_ty) =
-                                slice_of_ref_pointee(local, &global_types, call.destination.ty)
-                            {
-                                let peeled = peel_global(stored_ty, &global_types);
-                                if global_types
-                                    .get(&peeled)
-                                    .is_some_and(|d| d.js.enum_repr.is_some())
-                                {
-                                    excluded_enums.insert(peeled);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    let is_smi_raw_call = matches!(
-                        &call.callee,
-                        Callee::Intrinsic { name, .. }
-                            if matches!(
-                                interns.str(*name).unwrap_or(""),
-                                "transmute" | "transmute_unchecked"
-                            )
-                    ) && !(call.arguments.len() == 1
-                        && (peel_global(call.arguments[0].ty, &global_types)
-                            == peel_global(call.destination.ty, &global_types)
-                            || is_harmless_ptr_to_ptr(
-                                call.arguments[0].ty,
-                                call.destination.ty,
-                                local,
-                                &global_types,
-                            )
-                            || is_ptr_addr_transmute(
-                                call.arguments[0].ty,
-                                call.destination.ty,
-                                local,
-                                &global_types,
-                            )));
-                    if is_smi_raw_call {
-                        for arg in &call.arguments {
-                            walk_type_id(
-                                arg.ty,
-                                interns,
-                                &global_types,
-                                &mut smi_bad_structs,
-                                &mut visited_smi_bad,
-                            );
-                        }
-                        walk_type_id(
-                            call.destination.ty,
-                            interns,
-                            &global_types,
-                            &mut smi_bad_structs,
-                            &mut visited_smi_bad,
-                        );
-                    }
-
-                    // Closure-taking and async-driver `rcgjs.host.*` markers wrap an internal
-                    // JIR closure environment or coroutine future in an opaque JS thunk/state;
-                    // the JS host never inspects closure upvars or coroutine saved locals.
-                    // Only the host-visible arguments, return type, and JS-called closure/poller
-                    // parameters & return types cross the boundary.
-                    if item_is_offered {
-                        if let Some(HostPayload::Marker { section, .. }) = &call.host {
-                            if let Some(marker) = interns
-                                .str(*section)
-                                .and_then(|s| s.strip_prefix("rcgjs.host."))
-                            {
-                                if handle_opaque_host_marker(
-                                    marker,
-                                    call,
-                                    interns,
-                                    table,
-                                    &offered_set,
-                                    &items_by_id,
-                                    &drop_glue_by_ty,
-                                    &global_types,
-                                    opts,
-                                    &mut excluded_enums,
-                                    &mut host_boundary_types,
-                                    &mut visited_excl,
-                                    &mut visited_host,
-                                ) {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    let is_internal_foreign = match &call.callee {
-                        Callee::Foreign { symbol, .. } => interns.str(*symbol).is_some_and(|sym| {
-                            let js_name = JsName::new(sym.to_owned());
-                            table.get(&js_name).is_some_and(|target| {
-                                target.kind == ItemKind::Alloc
-                                    || (target.kind == ItemKind::Fn
-                                        && offered_set.contains(&js_name)
-                                        && !target.linkage.exported
-                                        && target.dts.is_none())
-                            })
-                        }),
-                        _ => false,
-                    };
-
-                    let is_host_boundary = call.host.is_some()
-                        || matches!(
-                            call.semantic,
-                            CallSemantic::Host | CallSemantic::RawJavaScript
-                        )
-                        || (matches!(call.callee, Callee::Foreign { .. }) && !is_internal_foreign)
-                        || (matches!(call.callee, Callee::Runtime { .. })
-                            && !is_representation_opaque_runtime(&call.callee, interns));
-
-                    let is_non_offered_direct = match &call.callee {
-                        Callee::Direct {
-                            item: tid,
-                            link_name,
-                        } => {
-                            let target_name = items_by_id.get(tid).cloned().or_else(|| {
-                                interns.str(*link_name).map(|s| JsName::new(s.to_owned()))
-                            });
-                            !target_name.as_ref().is_some_and(|n| {
-                                offered_set.contains(n)
-                                    || table.get(n).is_some_and(|t| t.kind == ItemKind::Alloc)
-                            })
-                        }
-                        _ => false,
-                    };
-
-                    if is_host_boundary {
-                        for arg in &call.arguments {
-                            walk_both(
-                                arg.ty,
-                                interns,
-                                &mut excluded_enums,
-                                &mut host_boundary_types,
-                                &mut visited_excl,
-                                &mut visited_host,
-                            );
-                        }
-                        walk_both(
-                            call.destination.ty,
-                            interns,
-                            &mut excluded_enums,
-                            &mut host_boundary_types,
-                            &mut visited_excl,
-                            &mut visited_host,
-                        );
-                        if let Some(host) = &call.host {
-                            for (_, helper) in host.helpers() {
-                                if let Some(helper_name) = items_by_id.get(&helper.item) {
-                                    if let Some(helper_item) = table.get(helper_name) {
-                                        if let (Some(h_body), Some(h_interns)) =
-                                            (&helper_item.jir.body, helper_item.jir.interns())
-                                        {
-                                            for &inp in &h_body.signature.arguments {
-                                                walk_both(
-                                                    inp,
-                                                    h_interns,
-                                                    &mut excluded_enums,
-                                                    &mut host_boundary_types,
-                                                    &mut visited_excl,
-                                                    &mut visited_host,
-                                                );
-                                            }
-                                            walk_both(
-                                                h_body.signature.result,
-                                                h_interns,
-                                                &mut excluded_enums,
-                                                &mut host_boundary_types,
-                                                &mut visited_excl,
-                                                &mut visited_host,
-                                            );
-                                        }
+                                    self.walk_excluded(*concrete, interns);
+                                    if let (Some(rb), Some(ri)) =
+                                        (&ref_item.jir.body, ref_item.jir.interns())
+                                    {
+                                        self.walk_signature_excluded(rb, ri);
                                     }
                                 }
                             }
                         }
-                    } else if is_non_offered_direct {
-                        for arg in &call.arguments {
-                            walk_type_id(
-                                arg.ty,
-                                interns,
-                                &global_types,
-                                &mut excluded_enums,
-                                &mut visited_excl,
-                            );
-                        }
-                        walk_type_id(
-                            call.destination.ty,
-                            interns,
-                            &global_types,
-                            &mut excluded_enums,
-                            &mut visited_excl,
-                        );
                     }
                 }
-                _ => {}
             }
+            ConstTree::Unit
+            | ConstTree::Scalar { .. }
+            | ConstTree::Str(_)
+            | ConstTree::Address(_)
+            | ConstTree::SliceAddress { .. }
+            | ConstTree::Global {
+                target: GlobalReference::Type(_),
+                ..
+            } => {}
         }
     }
+}
 
-    // 4. Compute canonical bottom-up decisions over all `TypeId`s in `global_types`.
+/// Candidate 2-variant enum eligible for bottom-up `NullNiche` / `SentinelNiche` selection.
+struct NicheCandidate {
+    depth: u32,
+    id: TypeId,
+    none_variant: u32,
+    some_variant: u32,
+    some_field: u32,
+    single_field: bool,
+    payload_ty: TypeId,
+}
+
+/// Computes canonical bottom-up enum representation decisions over `global_types`.
+fn select_enum_reprs(
+    table: &BTreeMap<JsName, LinkItem>,
+    global_types: &BTreeMap<TypeId, TypeDescriptor>,
+    excluded_enums: &BTreeSet<TypeId>,
+    host_boundary_types: &BTreeSet<TypeId>,
+    opts: &Opts,
+) -> EnumReprPlan {
     let mut plan = EnumReprPlan::default();
 
-    // Collect eligible internal `EnumRepr::Tag` enums (excluding untagged single-inhabited enums,
-    // C-ABI, pinned boundary, and any `excluded_enums`).
+    // Collect eligible internal `EnumRepr::Tag` enums.
     let mut candidates: Vec<TypeId> = Vec::new();
-    for (&id, desc) in &global_types {
+    for (&id, desc) in global_types {
         if excluded_enums.contains(&id)
             || desc.meta.abi == NominalAbi::C
             || desc.meta.boundary != PinnedBoundary::None
@@ -1030,7 +1157,7 @@ pub fn specialize_table(
             .filter(|v| {
                 !v.fields
                     .iter()
-                    .any(|f| is_uninhabited_global(f.ty, &global_types))
+                    .any(|f| is_uninhabited_global(f.ty, global_types))
             })
             .count();
         if inhabited_count < 2 {
@@ -1039,9 +1166,9 @@ pub fn specialize_table(
         candidates.push(id);
     }
 
-    // Pass A: All-ZST-field enums (`Option<()>`, `Result<(), fmt::Error>`, etc.) -> `IntTag { fieldless: true }`.
-    // 2-variant enums with one all-ZST variant and one single-non-ZST-field variant go to Pass B.
-    let mut niche_candidates: Vec<(u32, TypeId, u32, u32, u32, bool, TypeId)> = Vec::new();
+    // Pass A: All-ZST-field enums -> `IntTag { fieldless: true }`; 2-variant option-like enums ->
+    // Pass B; everything else -> Pass C.
+    let mut niche_candidates: Vec<NicheCandidate> = Vec::new();
     let mut remaining_tag_enums: Vec<(TypeId, bool)> = Vec::new();
     for id in candidates {
         let desc = &global_types[&id];
@@ -1054,7 +1181,7 @@ pub fn specialize_table(
         if !fieldless
             && variants
                 .iter()
-                .all(|v| v.fields.iter().all(|f| is_zst_global(f.ty, &global_types)))
+                .all(|v| v.fields.iter().all(|f| is_zst_global(f.ty, global_types)))
         {
             plan.decisions
                 .insert(id, EnumRepr::IntTag { fieldless: true });
@@ -1065,52 +1192,43 @@ pub fn specialize_table(
             let v0_zst = variants[0]
                 .fields
                 .iter()
-                .all(|f| is_zst_global(f.ty, &global_types));
+                .all(|f| is_zst_global(f.ty, global_types));
             let v1_zst = variants[1]
                 .fields
                 .iter()
-                .all(|f| is_zst_global(f.ty, &global_types));
-            let pair = if v0_zst {
-                single_non_zst_field(&variants[1].fields, &global_types).map(
-                    |(some_field, payload_ty)| {
-                        (
-                            0u32,
-                            1u32,
-                            some_field,
-                            variants[1].fields.len() == 1,
-                            payload_ty,
-                        )
+                .all(|f| is_zst_global(f.ty, global_types));
+            let niche = if v0_zst {
+                single_non_zst_field(&variants[1].fields, global_types).map(
+                    |(some_field, payload_ty)| NicheCandidate {
+                        depth: transparent_enum_depth(payload_ty, global_types),
+                        id,
+                        none_variant: 0,
+                        some_variant: 1,
+                        some_field,
+                        single_field: variants[1].fields.len() == 1,
+                        payload_ty,
                     },
                 )
             } else if v1_zst {
-                single_non_zst_field(&variants[0].fields, &global_types).map(
-                    |(some_field, payload_ty)| {
-                        (
-                            1u32,
-                            0u32,
-                            some_field,
-                            variants[0].fields.len() == 1,
-                            payload_ty,
-                        )
+                single_non_zst_field(&variants[0].fields, global_types).map(
+                    |(some_field, payload_ty)| NicheCandidate {
+                        depth: transparent_enum_depth(payload_ty, global_types),
+                        id,
+                        none_variant: 1,
+                        some_variant: 0,
+                        some_field,
+                        single_field: variants[0].fields.len() == 1,
+                        payload_ty,
                     },
                 )
             } else {
                 None
             };
-            if let Some((none_v, some_v, some_field, single_field, payload_ty)) = pair {
-                if !is_zst_global(payload_ty, &global_types)
-                    && !is_uninhabited_global(payload_ty, &global_types)
+            if let Some(cand) = niche {
+                if !is_zst_global(cand.payload_ty, global_types)
+                    && !is_uninhabited_global(cand.payload_ty, global_types)
                 {
-                    let depth = transparent_enum_depth(payload_ty, &global_types);
-                    niche_candidates.push((
-                        depth,
-                        id,
-                        none_v,
-                        some_v,
-                        some_field,
-                        single_field,
-                        payload_ty,
-                    ));
+                    niche_candidates.push(cand);
                     continue;
                 }
             }
@@ -1123,43 +1241,41 @@ pub fn specialize_table(
     let sentinel_candidate = opts
         .chunks
         .is_empty()
-        .then(|| allocate_sentinel_name("$sn", table))
+        .then(|| NamePool::from_table(table).alloc_suffixed("$sn"))
         .flatten();
-    niche_candidates.sort_by_key(|&(depth, id, _, _, _, _, _)| (depth, id));
-    for (_, id, none_variant, some_variant, some_field, single_field, payload_ty) in
-        niche_candidates
-    {
-        if single_field
-            && some_field == 0
+    niche_candidates.sort_by_key(|c| (c.depth, c.id));
+    for cand in niche_candidates {
+        if cand.single_field
+            && cand.some_field == 0
             && !may_inhabit_null(
-                payload_ty,
-                &global_types,
-                &host_boundary_types,
+                cand.payload_ty,
+                global_types,
+                host_boundary_types,
                 &plan.decisions,
             )
         {
             plan.decisions.insert(
-                id,
+                cand.id,
                 EnumRepr::NullNiche {
-                    none_variant,
-                    some_variant,
+                    none_variant: cand.none_variant,
+                    some_variant: cand.some_variant,
                 },
             );
             plan.null_niche_count += 1;
         } else if sentinel_candidate.is_some()
-            && !may_inhabit_sentinel_none(payload_ty, &global_types, &plan.decisions)
+            && !may_inhabit_sentinel_none(cand.payload_ty, global_types, &plan.decisions)
         {
             plan.decisions.insert(
-                id,
+                cand.id,
                 EnumRepr::SentinelNiche {
-                    none_variant,
-                    some_variant,
-                    some_field,
+                    none_variant: cand.none_variant,
+                    some_variant: cand.some_variant,
+                    some_field: cand.some_field,
                 },
             );
             plan.sentinel_niche_count += 1;
         } else {
-            remaining_tag_enums.push((id, false));
+            remaining_tag_enums.push((cand.id, false));
         }
     }
     if plan.sentinel_niche_count > 0 {
@@ -1176,65 +1292,20 @@ pub fn specialize_table(
         }
     }
 
-    // Pass D: Identify internal multi-field struct `u32` fields eligible for signed-`Int32` Smi
-    // storage: only structs that actually store a high-bit `u32` constant (`>= 0x8000_0000`, e.g.
-    // `u32::MAX` sentinel indices in `earcut::Node`), so ordinary small-index structs never pay
-    // extra `>>> 0` on ordered comparisons.
-    for (&id, desc) in &global_types {
-        if desc.js.peeled != id
-            || !smi_high_bit_structs.contains(&id)
-            || excluded_enums.contains(&id)
-            || smi_bad_structs.contains(&id)
-            || desc.meta.abi == NominalAbi::C
-            || desc.meta.boundary != PinnedBoundary::None
-            || desc.meta.candidate != RepresentationCandidate::None
-            || desc.js.transparent.is_some()
-            || desc.js.crosses_transparent_union
-            || desc.js.unsized_tail.is_some()
-        {
-            continue;
-        }
-        let TypeKind::Adt {
-            form: NominalForm::Struct,
-            variants,
-            ..
-        } = &desc.kind
-        else {
-            continue;
-        };
-        if variants.len() != 1 || variants[0].fields.len() < 2 {
-            continue;
-        }
-        for (fi, field) in variants[0].fields.iter().enumerate() {
-            if matches!(field.key, FieldKey::Transparent) {
-                continue;
-            }
-            let Some(fdesc) = global_types.get(&field.ty) else {
-                continue;
-            };
-            if matches!(
-                fdesc.kind,
-                TypeKind::Integer {
-                    signed: false,
-                    bits: 32
-                }
-            ) && !smi_bad_fields.contains(&(id, fi as u32))
-            {
-                plan.smi_u32_fields.insert((id, fi as u32));
-            }
-        }
-    }
+    plan
+}
 
-    if plan.decisions.is_empty() {
-        return plan;
-    }
-
-    // 5. Apply `plan.decisions` to every live item's `TypeTable`, deduplicating mutated `Arc<Interns>`
-    // by original pointer identity so items from the same crate share one table.
+/// Applies `plan.decisions` to every live item's `TypeTable`, deduplicating mutated `Arc<Interns>`
+/// by original pointer identity so items from the same crate share one table.
+fn rewrite_shared_interns(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &[JsName],
+    plan: &EnumReprPlan,
+) {
     let mut mutated_interns: BTreeMap<usize, Arc<Interns>> = BTreeMap::new();
-    let item_names: Vec<JsName> = reachable.to_vec();
-    for name in item_names {
-        let Some(item) = table.get_mut(&name) else {
+    let sentinel_str = plan.sentinel_none.as_ref().map(JsName::as_str);
+    for name in reachable {
+        let Some(item) = table.get_mut(name) else {
             continue;
         };
         let Some(orig_interns) = item.jir.interns() else {
@@ -1245,230 +1316,12 @@ pub fn specialize_table(
             cached.clone()
         } else {
             let mut cloned = orig_interns.clone();
-            apply_decisions_to_table(
-                &mut cloned.types,
-                &plan.decisions,
-                plan.sentinel_none.as_ref().map(JsName::as_str),
-            );
+            apply_decisions_to_table(&mut cloned.types, &plan.decisions, sentinel_str);
             let arc = Arc::new(cloned);
             mutated_interns.insert(key, arc.clone());
             arc
         };
         item.jir.use_shared_interns(shared);
-    }
-
-    plan
-}
-
-fn is_ptr_addr_transmute(
-    from_ty: TypeId,
-    to_ty: TypeId,
-    local_table: &TypeTable,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-) -> bool {
-    let is_ptr = |ty: TypeId| -> bool {
-        matches!(
-            lookup_desc(peel_global(ty, global), local_table, global).map(|d| &d.kind),
-            Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. })
-        )
-    };
-    let is_addr_scalar = |ty: TypeId| -> bool {
-        let Some(d) = lookup_desc(peel_global(ty, global), local_table, global) else {
-            return false;
-        };
-        matches!(d.kind, TypeKind::Integer { .. })
-            || matches!(d.js.enum_repr, Some(EnumRepr::Number { .. }))
-    };
-    (is_ptr(from_ty) && is_addr_scalar(to_ty)) || (is_addr_scalar(from_ty) && is_ptr(to_ty))
-}
-
-fn is_harmless_ptr_to_ptr(
-    from_ty: TypeId,
-    to_ty: TypeId,
-    local_table: &TypeTable,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-) -> bool {
-    let pointee = |ty: TypeId| -> Option<TypeId> {
-        let peeled = peel_global(ty, global);
-        match lookup_desc(peeled, local_table, global).map(|d| &d.kind)? {
-            TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                Some(peel_global(*pointee, global))
-            }
-            _ => None,
-        }
-    };
-    let (Some(a), Some(b)) = (pointee(from_ty), pointee(to_ty)) else {
-        return false;
-    };
-    if a == b {
-        return true;
-    }
-    let is_erased_elem = |ty: TypeId| -> bool {
-        match lookup_desc(ty, local_table, global) {
-            Some(d) if d.layout.zst => true,
-            Some(d) => matches!(d.kind, TypeKind::Integer { bits: 8, .. }),
-            None => false,
-        }
-    };
-    let elem_of = |ty: TypeId| -> Option<TypeId> {
-        match lookup_desc(ty, local_table, global).map(|d| &d.kind)? {
-            TypeKind::Slice(e) | TypeKind::Array { element: e, .. } => {
-                Some(peel_global(*e, global))
-            }
-            _ => None,
-        }
-    };
-    let is_erased =
-        |ty: TypeId| -> bool { is_erased_elem(ty) || elem_of(ty).is_some_and(is_erased_elem) };
-    if is_erased(a) || is_erased(b) {
-        return true;
-    }
-    let ea = elem_of(a);
-    let eb = elem_of(b);
-    ea == Some(b) || eb == Some(a) || (ea.is_some() && ea == eb)
-}
-
-fn is_high_bit_u32_const(
-    op: &Operand,
-    local_table: &TypeTable,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-) -> bool {
-    let OperandKind::Constant(rcgjs_object::jir::semantic::Constant::Scalar { bits, .. }) =
-        &op.kind
-    else {
-        return false;
-    };
-    if *bits < 0x8000_0000 || *bits > u128::from(u32::MAX) {
-        return false;
-    }
-    let peeled = peel_global(op.ty, global);
-    matches!(
-        lookup_desc(peeled, local_table, global).map(|d| &d.kind),
-        Some(TypeKind::Integer {
-            signed: false,
-            bits: 32
-        })
-    )
-}
-
-fn record_place_field_structs(
-    place: &Place,
-    locals: &[rcgjs_object::jir::semantic::Local],
-    local_table: &TypeTable,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-    out: &mut BTreeSet<TypeId>,
-) {
-    let Some(mut cur_ty) = locals.get(place.local.0 as usize).map(|l| l.ty) else {
-        return;
-    };
-    let mut downcast = false;
-    for proj in &place.projection {
-        match proj {
-            Projection::Deref => {
-                downcast = false;
-                let peeled = peel_global(cur_ty, global);
-                let Some(desc) = lookup_desc(peeled, local_table, global) else {
-                    return;
-                };
-                match desc.kind {
-                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                        cur_ty = pointee;
-                    }
-                    _ => return,
-                }
-            }
-            Projection::Field { ty, .. } => {
-                if !downcast {
-                    out.insert(peel_global(cur_ty, global));
-                }
-                downcast = false;
-                cur_ty = *ty;
-            }
-            Projection::Index(_) | Projection::ConstantIndex { .. } => {
-                downcast = false;
-                let peeled = peel_global(cur_ty, global);
-                let Some(desc) = lookup_desc(peeled, local_table, global) else {
-                    return;
-                };
-                match desc.kind {
-                    TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-                        cur_ty = element;
-                    }
-                    _ => return,
-                }
-            }
-            Projection::Subslice { .. } => {
-                downcast = false;
-            }
-            Projection::Downcast { .. } => {
-                downcast = true;
-            }
-            Projection::OpaqueCast(ty) | Projection::UnwrapUnsafeBinder(ty) => {
-                downcast = false;
-                cur_ty = *ty;
-            }
-        }
-    }
-}
-
-fn record_borrowed_struct_fields(
-    place: &Place,
-    locals: &[rcgjs_object::jir::semantic::Local],
-    local_table: &TypeTable,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-    bad_fields: &mut BTreeSet<(TypeId, u32)>,
-) {
-    let Some(mut cur_ty) = locals.get(place.local.0 as usize).map(|l| l.ty) else {
-        return;
-    };
-    let mut downcast = false;
-    for proj in &place.projection {
-        match proj {
-            Projection::Deref => {
-                downcast = false;
-                let peeled = peel_global(cur_ty, global);
-                let Some(desc) = lookup_desc(peeled, local_table, global) else {
-                    return;
-                };
-                match desc.kind {
-                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                        cur_ty = pointee;
-                    }
-                    _ => return,
-                }
-            }
-            Projection::Field { field, ty } => {
-                let peeled = peel_global(cur_ty, global);
-                if !downcast {
-                    bad_fields.insert((peeled, *field));
-                }
-                downcast = false;
-                cur_ty = *ty;
-            }
-            Projection::Index(_) | Projection::ConstantIndex { .. } => {
-                downcast = false;
-                let peeled = peel_global(cur_ty, global);
-                let Some(desc) = lookup_desc(peeled, local_table, global) else {
-                    return;
-                };
-                match desc.kind {
-                    TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-                        cur_ty = element;
-                    }
-                    _ => return,
-                }
-            }
-            Projection::Subslice { .. } => {
-                downcast = false;
-            }
-            Projection::Downcast { .. } => {
-                downcast = true;
-            }
-            Projection::OpaqueCast(ty) | Projection::UnwrapUnsafeBinder(ty) => {
-                downcast = false;
-                cur_ty = *ty;
-            }
-        }
     }
 }
 
@@ -1490,7 +1343,7 @@ fn build_global_type_map(table: &BTreeMap<JsName, LinkItem>) -> BTreeMap<TypeId,
     out
 }
 
-fn lookup_desc<'a>(
+pub(crate) fn lookup_desc<'a>(
     ty: TypeId,
     local: &'a TypeTable,
     global: &'a BTreeMap<TypeId, TypeDescriptor>,
@@ -1498,7 +1351,7 @@ fn lookup_desc<'a>(
     local.get(ty).or_else(|| global.get(&ty))
 }
 
-fn peel_global(mut ty: TypeId, global: &BTreeMap<TypeId, TypeDescriptor>) -> TypeId {
+pub(crate) fn peel_global(mut ty: TypeId, global: &BTreeMap<TypeId, TypeDescriptor>) -> TypeId {
     for _ in 0..16 {
         let Some(desc) = global.get(&ty) else {
             break;
@@ -1530,7 +1383,7 @@ fn is_uninhabited_global(ty: TypeId, global: &BTreeMap<TypeId, TypeDescriptor>) 
 }
 
 fn single_non_zst_field(
-    fields: &[rcgjs_object::jir::types::FieldDescriptor],
+    fields: &[FieldDescriptor],
     global: &BTreeMap<TypeId, TypeDescriptor>,
 ) -> Option<(u32, TypeId)> {
     let mut found = None;
@@ -1544,19 +1397,6 @@ fn single_non_zst_field(
         found = Some((idx as u32, field.ty));
     }
     found
-}
-
-fn allocate_sentinel_name(base: &str, table: &BTreeMap<JsName, LinkItem>) -> Option<JsName> {
-    let mut taken: BTreeSet<&str> = table.keys().map(JsName::as_str).collect();
-    taken.extend(
-        table
-            .values()
-            .flat_map(|item| item.refs.iter().map(JsName::as_str)),
-    );
-    std::iter::once(base.to_owned())
-        .chain((1..64).map(|suffix| format!("{base}${suffix}")))
-        .find(|name| !taken.contains(name.as_str()))
-        .map(JsName::new)
 }
 
 /// Counts transparent + single-field-enum nesting depth so `Option<T>` is decided before
@@ -1646,11 +1486,6 @@ fn may_inhabit_null(
 
 /// Whether our private module-scope sentinel (`const $sn = {};`) could ever be a valid runtime
 /// value of `ty`.
-///
-/// Host-boundary types such as `JsValue` cannot inhabit `$sn` because `$sn` is a private object
-/// never exposed across any JS/host/export/static boundary; only types that already use
-/// [`EnumRepr::SentinelNiche`] (directly, via transparent/`Pattern` wrappers, or inside a
-/// `NullNiche` payload) or opaque/foreign/never types return `true`.
 fn may_inhabit_sentinel_none(
     mut ty: TypeId,
     global: &BTreeMap<TypeId, TypeDescriptor>,
@@ -1740,7 +1575,7 @@ fn slice_of_ref_pointee(
     }
 }
 
-fn walk_type_id(
+pub(crate) fn walk_type_id(
     ty: TypeId,
     interns: &Interns,
     global: &BTreeMap<TypeId, TypeDescriptor>,
@@ -1836,25 +1671,6 @@ fn walk_type_id_global(
     walk_type_id(ty, &empty, global, out, visited);
 }
 
-fn is_offered_internal_static(
-    target: &GlobalReference,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    offered_set: &BTreeSet<&JsName>,
-) -> bool {
-    let GlobalReference::Static { link_name, .. } = target else {
-        return false;
-    };
-    let Some(name_str) = interns.str(*link_name) else {
-        return false;
-    };
-    let name = JsName::new(name_str.to_owned());
-    offered_set.contains(&name)
-        && table
-            .get(&name)
-            .is_some_and(|item| !item.linkage.exported && item.dts.is_none())
-}
-
 fn reachable_mir_blocks(body: &Body, fold_runtime_checks: bool) -> BTreeSet<BlockId> {
     let mut visited = BTreeSet::new();
     let Some(entry) = body.blocks.first().map(|b| b.id) else {
@@ -1888,11 +1704,7 @@ fn reachable_mir_blocks(body: &Body, fold_runtime_checks: bool) -> BTreeSet<Bloc
                                     OperandKind::RuntimeCheck(v) => {
                                         const_locals.insert(destination.local, u128::from(*v));
                                     }
-                                    OperandKind::Constant(
-                                        rcgjs_object::jir::semantic::Constant::Scalar {
-                                            bits, ..
-                                        },
-                                    ) => {
+                                    OperandKind::Constant(Constant::Scalar { bits, .. }) => {
                                         const_locals.insert(destination.local, *bits);
                                     }
                                     _ => {
@@ -1939,10 +1751,7 @@ fn reachable_mir_blocks(body: &Body, fold_runtime_checks: bool) -> BTreeSet<Bloc
                 let folded = if fold_runtime_checks {
                     match &discriminant.kind {
                         OperandKind::RuntimeCheck(v) => Some(u128::from(*v)),
-                        OperandKind::Constant(rcgjs_object::jir::semantic::Constant::Scalar {
-                            bits,
-                            ..
-                        }) => Some(*bits),
+                        OperandKind::Constant(Constant::Scalar { bits, .. }) => Some(*bits),
                         OperandKind::Copy(p) | OperandKind::Move(p) if p.projection.is_empty() => {
                             const_locals.get(&p.local).copied()
                         }
@@ -2013,468 +1822,6 @@ fn reachable_mir_blocks(body: &Body, fold_runtime_checks: bool) -> BTreeSet<Bloc
     visited
 }
 
-/// Handles closure-taking and async-driver `rcgjs.host.*` markers whose JS host wrappers store
-/// a Rust closure environment or coroutine future opaquely without inspecting its captured fields
-/// or saved locals. Returns `true` when the call was soundly handled (so the caller skips the
-/// conservative whole-argument `walk_both`), or `false` to fall back to the conservative walk.
-#[allow(clippy::too_many_arguments)]
-fn handle_opaque_host_marker(
-    marker: &str,
-    call: &rcgjs_object::jir::semantic::Call,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    offered_set: &BTreeSet<&JsName>,
-    items_by_id: &BTreeMap<ItemId, JsName>,
-    drop_glue_by_ty: &BTreeMap<TypeId, JsName>,
-    global_types: &BTreeMap<TypeId, TypeDescriptor>,
-    opts: &Opts,
-    excluded_enums: &mut BTreeSet<TypeId>,
-    host_boundary_types: &mut BTreeSet<TypeId>,
-    visited_excl: &mut BTreeSet<TypeId>,
-    visited_host: &mut BTreeSet<TypeId>,
-) -> bool {
-    let mut walk_both = |ty: TypeId, ty_interns: &Interns| {
-        walk_type_id(ty, ty_interns, global_types, excluded_enums, visited_excl);
-        walk_type_id(
-            ty,
-            ty_interns,
-            global_types,
-            host_boundary_types,
-            visited_host,
-        );
-    };
-
-    // 1. Closure-taking markers (`host.rs:245-284`): JS receives `(...$a) => body(env, ...$a)`
-    //    (plus `() => drop_glue(env)` for `try`). `env` never crosses into JS.
-    let closure_idx = match marker {
-        "callback0" | "callback1" | "callback2" | "callback3" | "callback4" | "promise"
-        | "localwaker" | "microtask" | "task" | "try"
-            if call.arguments.len() == 1 =>
-        {
-            Some(0usize)
-        }
-        "settled" if call.arguments.len() == 2 => Some(1usize),
-        _ => None,
-    };
-    if let Some(c_idx) = closure_idx {
-        let closure_peeled = peel_global(call.arguments[c_idx].ty, global_types);
-        let Some(closure_desc) = global_types.get(&closure_peeled) else {
-            return false;
-        };
-        let TypeKind::Closure { def, .. } = closure_desc.kind else {
-            return false;
-        };
-        let closure_item_id = ItemId {
-            definition: def,
-            instantiation: closure_peeled.0,
-        };
-        let Some(closure_name) = items_by_id.get(&closure_item_id) else {
-            return false;
-        };
-        if !offered_set.contains(closure_name) {
-            return false;
-        }
-        let Some(closure_item) = table.get(closure_name) else {
-            return false;
-        };
-        let (Some(c_body), Some(c_interns)) =
-            (closure_item.jir.body.as_ref(), closure_item.jir.interns())
-        else {
-            return false;
-        };
-        if marker == "try" && closure_desc.layout.needs_drop {
-            let Some(glue_name) = drop_glue_by_ty.get(&closure_peeled) else {
-                return false;
-            };
-            if !offered_set.contains(glue_name) {
-                return false;
-            }
-        }
-
-        // Walk all non-closure arguments (e.g. `settled`'s `args[0]`), the call result (e.g.
-        // `try`'s `Result<T, JsValue>`), and the JS-visible parameters/result of the closure body
-        // (skipping `arguments[0]`, the captured environment).
-        for (i, arg) in call.arguments.iter().enumerate() {
-            if i != c_idx {
-                walk_both(arg.ty, interns);
-            }
-        }
-        walk_both(call.destination.ty, interns);
-        for &inp in c_body.signature.arguments.iter().skip(1) {
-            walk_both(inp, c_interns);
-        }
-        walk_both(c_body.signature.result, c_interns);
-        return true;
-    }
-
-    // 2. Async-driver markers (`host.rs:672-765`): JS stores `state.future` opaquely and only
-    //    passes `state` to the offered `poll_once`/`poll_result` helper and offered `drop_glue`.
-    //    `host_future_*` inspects `Poll::Ready` and `Result::Ok`/`Err` on `poll_result`'s return
-    //    value, which we explicitly walk via `h_body.signature.result`.
-    let (is_promise, expected_args) = match marker {
-        "futurepromise" | "futurenativepromise" => (true, 1usize),
-        "spawn" => (false, 1usize),
-        "spawnowner" | "spawnowner.v2" => (false, 2usize),
-        _ => return false,
-    };
-    if !opts.applies(OptimizerPass::FuturePoller) || call.arguments.len() != expected_args {
-        return false;
-    }
-    let Some(host) = &call.host else {
-        return false;
-    };
-    let helper_key = if is_promise {
-        "poll_result"
-    } else {
-        "poll_once"
-    };
-    let Some(helper_ref) = host.helper(interns, helper_key) else {
-        return false;
-    };
-    let helper_name = items_by_id.get(&helper_ref.item).cloned().or_else(|| {
-        interns
-            .str(helper_ref.link_name)
-            .map(|s| JsName::new(s.to_owned()))
-    });
-    let Some(helper_name) = helper_name else {
-        return false;
-    };
-    if !offered_set.contains(&helper_name) {
-        return false;
-    }
-    let Some(helper_item) = table.get(&helper_name) else {
-        return false;
-    };
-    let (Some(h_body), Some(h_interns)) =
-        (helper_item.jir.body.as_ref(), helper_item.jir.interns())
-    else {
-        return false;
-    };
-    let future_peeled = peel_global(call.arguments[0].ty, global_types);
-    let Some(future_desc) = global_types.get(&future_peeled) else {
-        return false;
-    };
-    if future_desc.layout.needs_drop {
-        let Some(glue_name) = drop_glue_by_ty.get(&future_peeled) else {
-            return false;
-        };
-        if !offered_set.contains(glue_name) {
-            return false;
-        }
-    }
-
-    // Walk `call.destination.ty`, any non-future args (`owner`), and the poll helper's non-future
-    // inputs (`Waker`/`Context`) and return type (`Poll<Result<JsValue, JsValue>>` or `bool`),
-    // while keeping `future` (`args[0]`, `h_body.signature.arguments[0]`) opaque.
-    for arg in call.arguments.iter().skip(1) {
-        walk_both(arg.ty, interns);
-    }
-    walk_both(call.destination.ty, interns);
-    for &inp in h_body.signature.arguments.iter().skip(1) {
-        walk_both(inp, h_interns);
-    }
-    walk_both(h_body.signature.result, h_interns);
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_operand_consts(
-    op: &Operand,
-    local: &TypeTable,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    offered_set: &BTreeSet<&JsName>,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-    excluded: &mut BTreeSet<TypeId>,
-    visited: &mut BTreeSet<TypeId>,
-) {
-    if let OperandKind::Constant(constant) = &op.kind {
-        match constant {
-            rcgjs_object::jir::semantic::Constant::Pointer {
-                target: target @ GlobalReference::Static { .. },
-                ..
-            } => {
-                if !is_offered_internal_static(target, interns, table, offered_set) {
-                    walk_type_id(op.ty, interns, global, excluded, visited);
-                }
-            }
-            rcgjs_object::jir::semantic::Constant::Pointer {
-                target: GlobalReference::Function { link_name, .. },
-                ..
-            } => {
-                let offered = interns
-                    .str(*link_name)
-                    .is_some_and(|s| offered_set.contains(&JsName::new(s.to_owned())));
-                if !offered {
-                    walk_type_id(op.ty, interns, global, excluded, visited);
-                }
-            }
-            rcgjs_object::jir::semantic::Constant::Memory(tree) => {
-                scan_const_tree(
-                    tree,
-                    op.ty,
-                    local,
-                    interns,
-                    table,
-                    offered_set,
-                    global,
-                    excluded,
-                    visited,
-                    0,
-                );
-            }
-            _ => {}
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_const_tree(
-    tree: &ConstTree,
-    ty: TypeId,
-    local: &TypeTable,
-    interns: &Interns,
-    table: &BTreeMap<JsName, LinkItem>,
-    offered_set: &BTreeSet<&JsName>,
-    global: &BTreeMap<TypeId, TypeDescriptor>,
-    excluded: &mut BTreeSet<TypeId>,
-    visited: &mut BTreeSet<TypeId>,
-    depth: u32,
-) {
-    if depth > 32 {
-        return;
-    }
-    match tree {
-        ConstTree::Global {
-            target: target @ GlobalReference::Static { .. },
-            ..
-        }
-        | ConstTree::StaticField { target, .. }
-        | ConstTree::StaticSlice { target, .. } => {
-            if !is_offered_internal_static(target, interns, table, offered_set) {
-                walk_type_id(ty, interns, global, excluded, visited);
-            }
-        }
-        ConstTree::Global {
-            target: GlobalReference::Function { link_name, .. },
-            ..
-        } => {
-            let offered = interns
-                .str(*link_name)
-                .is_some_and(|s| offered_set.contains(&JsName::new(s.to_owned())));
-            if !offered {
-                walk_type_id(ty, interns, global, excluded, visited);
-            }
-        }
-        ConstTree::Reference(inner) => {
-            let peeled = peel_global(ty, global);
-            if let Some(desc) = lookup_desc(peeled, local, global) {
-                if let TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } =
-                    desc.kind
-                {
-                    scan_const_tree(
-                        inner,
-                        pointee,
-                        local,
-                        interns,
-                        table,
-                        offered_set,
-                        global,
-                        excluded,
-                        visited,
-                        depth + 1,
-                    );
-                }
-            }
-        }
-        ConstTree::Slice(elems) => {
-            let peeled = peel_global(ty, global);
-            if let Some(desc) = lookup_desc(peeled, local, global) {
-                let elem_ty = match desc.kind {
-                    TypeKind::Slice(e) | TypeKind::Array { element: e, .. } => Some(e),
-                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                        match lookup_desc(peel_global(pointee, global), local, global)
-                            .map(|d| &d.kind)
-                        {
-                            Some(TypeKind::Slice(e) | TypeKind::Array { element: e, .. }) => {
-                                Some(*e)
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(e) = elem_ty {
-                    for elem in elems {
-                        scan_const_tree(
-                            elem,
-                            e,
-                            local,
-                            interns,
-                            table,
-                            offered_set,
-                            global,
-                            excluded,
-                            visited,
-                            depth + 1,
-                        );
-                    }
-                }
-            }
-        }
-        ConstTree::Aggregate(fields) => {
-            let peeled = peel_global(ty, global);
-            if let Some(desc) = lookup_desc(peeled, local, global) {
-                match &desc.kind {
-                    TypeKind::Array { element, .. } => {
-                        for f in fields {
-                            scan_const_tree(
-                                f,
-                                *element,
-                                local,
-                                interns,
-                                table,
-                                offered_set,
-                                global,
-                                excluded,
-                                visited,
-                                depth + 1,
-                            );
-                        }
-                    }
-                    TypeKind::Tuple(elems) => {
-                        for (f, &e_ty) in fields.iter().zip(elems) {
-                            scan_const_tree(
-                                f,
-                                e_ty,
-                                local,
-                                interns,
-                                table,
-                                offered_set,
-                                global,
-                                excluded,
-                                visited,
-                                depth + 1,
-                            );
-                        }
-                    }
-                    TypeKind::Adt { variants, .. } => {
-                        if let Some(v) = variants.first() {
-                            for (f, fd) in fields.iter().zip(&v.fields) {
-                                scan_const_tree(
-                                    f,
-                                    fd.ty,
-                                    local,
-                                    interns,
-                                    table,
-                                    offered_set,
-                                    global,
-                                    excluded,
-                                    visited,
-                                    depth + 1,
-                                );
-                            }
-                        }
-                    }
-                    TypeKind::Closure { upvars, .. }
-                    | TypeKind::CoroutineClosure { upvars, .. } => {
-                        for (f, &u_ty) in fields.iter().zip(upvars) {
-                            scan_const_tree(
-                                f,
-                                u_ty,
-                                local,
-                                interns,
-                                table,
-                                offered_set,
-                                global,
-                                excluded,
-                                visited,
-                                depth + 1,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        ConstTree::Variant { variant, fields } => {
-            let peeled = peel_global(ty, global);
-            if let Some(desc) = lookup_desc(peeled, local, global) {
-                if let TypeKind::Adt { variants, .. } = &desc.kind {
-                    if let Some(v) = variants.get(*variant as usize) {
-                        for (f, fd) in fields.iter().zip(&v.fields) {
-                            scan_const_tree(
-                                f,
-                                fd.ty,
-                                local,
-                                interns,
-                                table,
-                                offered_set,
-                                global,
-                                excluded,
-                                visited,
-                                depth + 1,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        ConstTree::Dyn {
-            data,
-            concrete,
-            vtable,
-        } => {
-            scan_const_tree(
-                data,
-                *concrete,
-                local,
-                interns,
-                table,
-                offered_set,
-                global,
-                excluded,
-                visited,
-                depth + 1,
-            );
-            if let Some(vt_name) = interns.str(*vtable) {
-                if let Some(vt_item) = table.get(&JsName::new(vt_name.to_owned())) {
-                    for r in &vt_item.refs {
-                        if let Some(ref_item) = table.get(r) {
-                            if ref_item.kind == ItemKind::Fn && !offered_set.contains(r) {
-                                walk_type_id(*concrete, interns, global, excluded, visited);
-                                if let (Some(rb), Some(ri)) =
-                                    (&ref_item.jir.body, ref_item.jir.interns())
-                                {
-                                    for &inp in &rb.signature.arguments {
-                                        walk_type_id(inp, ri, global, excluded, visited);
-                                    }
-                                    walk_type_id(
-                                        rb.signature.result,
-                                        ri,
-                                        global,
-                                        excluded,
-                                        visited,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ConstTree::Unit
-        | ConstTree::Scalar { .. }
-        | ConstTree::Str(_)
-        | ConstTree::Address(_)
-        | ConstTree::SliceAddress { .. }
-        | ConstTree::Global {
-            target: GlobalReference::Type(_),
-            ..
-        } => {}
-    }
-}
-
 /// Applies `decisions` to one `TypeTable`, cascading to transparent/pattern wrappers and
 /// references whose pointee transitioned from `is_indirect = true` to `false`.
 fn apply_decisions_to_table(
@@ -2483,7 +1830,7 @@ fn apply_decisions_to_table(
     sentinel_none: Option<&str>,
 ) {
     // Pass 1a: `IntTag { fieldless: true }` first so `needs_clone` is false when `NullNiche` /
-    // `SentinelNiche` queries its payload (e.g. `Option<Option<()>>` or `Result<Option<()>, ()>`).
+    // `SentinelNiche` queries its payload.
     for (&id, &repr) in decisions {
         if let EnumRepr::IntTag { fieldless: true } = repr {
             if let Some(desc) = table.get_mut(id) {
@@ -2590,8 +1937,7 @@ fn apply_decisions_to_table(
     }
 
     // Pass 3: Cascade `PointerForm::Thin -> PointerForm::Slot` on references whose pointee became
-    // direct (`!is_indirect`), then propagate updated `pointer_form` to transparent wrappers like
-    // `Pin<&mut Option<T>>`.
+    // direct (`!is_indirect`), then propagate updated `pointer_form` to transparent wrappers.
     let ref_updates: Vec<TypeId> = table
         .descriptors()
         .iter()
@@ -2652,8 +1998,8 @@ mod tests {
     use crate::item::{ItemMap, LinkJir, Linkage};
     use rcgjs_object::jir::interns::StrId;
     use rcgjs_object::jir::semantic::{
-        AbiSignature, BasicBlock, BlockId, Body, BodyKind, BodySemantic, DefinitionId, Signature,
-        Terminator,
+        AbiSignature, BasicBlock, BlockId, Body, BodyKind, BodySemantic, DefinitionId, Place,
+        Signature, Terminator,
     };
     use rcgjs_object::jir::types::{
         FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, NominalDiscriminant,
