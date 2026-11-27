@@ -87,10 +87,12 @@ FAST_FIXTURES=(
 	310_i64_pair_arith
 	320_r3_loops_bounds
 	330_r3_inline_cells
+	364_multi_wrapping_niche_transmute
 	366_byte_views_wider_scalars
 	402_byte_views_analysis_soundness
 	413_bstr_chars_bytes_cursor
 	419_native_vec_typed_array
+	421_safe_rust_regressions
 	guard_custom_allocator
 	guard_heap_retype
 )

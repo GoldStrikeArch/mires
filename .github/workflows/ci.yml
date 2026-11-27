@@ -36,8 +36,8 @@ jobs:
       - name: Lint shell scripts
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/ergonomics-e2e.sh
-          shellcheck scripts/install.sh scripts/ergonomics-e2e.sh
+          bash -n scripts/ergonomics-e2e.sh scripts/metamorphic-test.sh scripts/fuzz/run.sh
+          shellcheck scripts/install.sh scripts/ergonomics-e2e.sh scripts/metamorphic-test.sh scripts/fuzz/run.sh
 
   deny:
     runs-on: ubuntu-latest
@@ -90,6 +90,22 @@ jobs:
       - run: SKIP_BUILD=1 bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/test.sh --require-core
+      - name: Safe-Rust regression gates (known-gaps, round1-open, round2-open)
+        run: |
+          python3 scripts/check-known-gaps.py
+          python3 scripts/check-round1-open.py
+          python3 scripts/check-round2-open.py --mode both
+      - name: Cross-profile metamorphic oracle (fast)
+        run: bash scripts/metamorphic-test.sh --fast --skip-build -j 4
+      - name: Differential fuzz smoke check
+        run: bash scripts/fuzz/run.sh --ci-smoke -j 4
+      - name: Run cargo mires test differential check on example workspace
+        run: |
+          target/release/cargo-mires mires test --diff \
+            --manifest-path examples/fullstack-workspace/Cargo.toml \
+            -p shared --mires-root "$PWD"
+      - name: Run continuous differential oracle (fast tier)
+        run: node oracle/run-oracle.mjs --tier fast
       - run: bash scripts/ergonomics-e2e.sh
       - run: bash scripts/check.sh
       - run: node scripts/standalone-check.mjs

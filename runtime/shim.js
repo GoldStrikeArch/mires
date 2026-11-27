@@ -3702,7 +3702,7 @@ globalThis.__rt.bstr_cmp_ptr = (s, so, p, n) => {
     }
   }
   const bv = globalThis.__rt.bstr_bytes(s);
-  return globalThis.__rt.compare_bytes({ $b: bv.buf, $o: bv.off + so }, p, n);
+  return globalThis.__rt.compare_bytes({ $b: bv.$b, $o: bv.$o + so }, p, n);
 };
 
 globalThis.__rt.ptr_cmp_bstr = (p, s, so, n) => {
@@ -3723,7 +3723,7 @@ globalThis.__rt.bstr_copy_to = (s, so, dst, n) => {
     }
   }
   const bv = globalThis.__rt.bstr_bytes(s);
-  globalThis.__rt.copy_nonoverlapping(dst, { $b: bv.buf, $o: bv.off + so }, n);
+  globalThis.__rt.copy_nonoverlapping(dst, { $b: bv.$b, $o: bv.$o + so }, n);
 };
 
 // bytes_is_ascii(s): `<[u8]>::is_ascii` on a `{ buf, off, len }` byte slice, one byte at a time

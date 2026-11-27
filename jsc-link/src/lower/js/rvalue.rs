@@ -2497,12 +2497,14 @@ impl<'a> JsCx<'a> {
             _ => false,
         };
         if inhabited.len() <= 1 || untagged {
-            let index = inhabited.first().copied().unwrap_or(0);
+            let index = inhabited.first().copied().unwrap_or(0) as u32;
+            if as_tag {
+                if let Some(tag) = value::variant_tag(table, self.interns, peeled, index) {
+                    return Ok(tag);
+                }
+            }
             return Ok(value::discriminant_literal(
-                table,
-                peeled,
-                index as u32,
-                discr_repr,
+                table, peeled, index, discr_repr,
             ));
         }
         if variants.is_empty() {
