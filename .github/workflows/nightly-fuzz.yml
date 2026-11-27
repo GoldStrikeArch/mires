@@ -1,0 +1,66 @@
+name: Nightly Metamorphic & Differential Fuzz
+
+on:
+  schedule:
+    # Daily at 03:00 UTC.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of differential fuzz seeds to run across all profiles (default: 180)"
+        required: false
+        default: "180"
+        type: string
+
+concurrency:
+  group: mires-nightly-fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RCGJS_WITNESS_CHECK: "1"
+
+jobs:
+  nightly-fuzz:
+    name: metamorphic-and-fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-fuzz
+
+      - name: Print toolchain info
+        run: rustc --version --verbose
+
+      - name: Build compiler
+        run: bash scripts/build.sh --locked
+
+      - name: Run full cross-profile metamorphic suite
+        run: bash scripts/metamorphic-test.sh --full --skip-build -j 4
+
+      - name: Run multi-profile differential fuzzer
+        env:
+          FUZZ_SEEDS: ${{ inputs.seeds || '180' }}
+        run: bash scripts/fuzz/run.sh "$FUZZ_SEEDS" --all-profiles --mir-inline -j 4
+
+      - name: Upload failure logs and shrunk repros
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-fuzz-failures-${{ github.run_id }}
+          path: |
+            build/metamorphic/
+            build/fuzz/
+          if-no-files-found: ignore
+          retention-days: 14
