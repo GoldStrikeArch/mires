@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 //
-// The LLVM side of the fuzzer: runs a `wasm32-unknown-unknown` build of a generated program and
-// prints exactly what runtime/shim.js prints for the rustc_codegen_js build of the same source.
+// The LLVM side of the fuzzer & metamorphic oracle: runs a `wasm32-unknown-unknown` build of a
+// program and prints exactly what runtime/shim.js prints for the rustc_codegen_mires build of the
+// same source.
 //
 //   node scripts/fuzz/shim.mjs <program.wasm>
 //
-// The imports are the `extern "C"` names scripts/fuzz/gen.mjs declares, which are in turn the ones
-// runtime/shim.js installs on `__rt` — that shared vocabulary is what lets one source file be the
-// input to both compilers. `print_*` aliases are installed beside them so a hand-written probe can
-// use either spelling.
+// The imports are the `extern "C"` names scripts/fuzz/gen.mjs and examples/core-tests/prelude.rs
+// declare, which are in turn the ones runtime/shim.js installs on `__rt` — that shared vocabulary
+// is what lets one source file be the input to both compilers. `print_*` aliases are installed
+// beside them so a hand-written probe can use either spelling.
 //
 // PRINTING HAS TO MATCH THE OTHER SIDE EXACTLY
 // --------------------------------------------
@@ -44,11 +45,14 @@ const readString = (...args) => {
   let pointer
   let length
   if (args.length >= 2) {
-    ;[pointer, length] = args
+    pointer = args[0] >>> 0
+    length = args[1] >>> 0
   } else {
-    pointer = view.getUint32(args[0], true)
-    length = view.getUint32(args[0] + 4, true)
+    const slot = args[0] >>> 0
+    pointer = view.getUint32(slot, true)
+    length = view.getUint32(slot + 4, true)
   }
+  if (length === 0) return ''
   return Buffer.from(new Uint8Array(memory.buffer, pointer, length)).toString('utf8')
 }
 
