@@ -1,0 +1,17 @@
+[package]
+name = "cargo-mires"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "cargo-mires"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

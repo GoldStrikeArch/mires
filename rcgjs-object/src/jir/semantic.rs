@@ -145,6 +145,9 @@ pub enum BodySemantic {
     DropGlue(TypeId),
     /// The crate graph's `#[panic_handler]` (`LangItem::PanicImpl`).
     PanicImpl,
+    /// A function exported with `#[js_export]` (`link_section = "rcgjs.export.v1"`), eligible for
+    /// automatic JS↔Rust boundary marshaling.
+    JsExport,
 }
 
 /// Standard-library operation families eligible for native representation analysis.

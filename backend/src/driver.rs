@@ -213,7 +213,8 @@ fn codegen_jir_fn<'tcx>(cx: &CguCx<'tcx>, instance: rustc_middle::ty::Instance<'
     let debug_path = with_no_trimmed_paths!(tcx.def_path_str(instance.def_id()));
     let dts = if linkage.exported {
         let params = crate::jir::encode::dts_params(tcx, instance, mir);
-        crate::dts::signature(tcx, instance, &params)
+        let is_js_export = crate::jir::encode::is_js_export_fn(tcx, instance);
+        crate::dts::signature(tcx, instance, &params, is_js_export)
     } else {
         None
     };

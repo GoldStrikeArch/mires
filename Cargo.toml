@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["experiments", "experiments-pro", "recovery", "legacy"]
+exclude = ["experiments", "experiments-pro", "recovery", "legacy", "mires-std"]
 members = [
     "backend",
     "rcgjs-object",
@@ -9,6 +9,8 @@ members = [
     "mires-marker-abi",
     "structurizer",
     "mires-js",
+    "mires",
+    "cargo-mires",
     "js-extern-macro",
     "js-macro",
     "test-node",

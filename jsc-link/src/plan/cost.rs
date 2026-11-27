@@ -152,7 +152,7 @@ pub fn helper_program(direct: &BTreeSet<String>) -> String {
 }
 
 /// The bundled `runtime/shim.js`, parsed once per process.
-fn shim() -> &'static ShimIndex {
+pub(crate) fn shim() -> &'static ShimIndex {
     static SHIM_INDEX: OnceLock<ShimIndex> = OnceLock::new();
     SHIM_INDEX.get_or_init(|| ShimIndex::of(SHIM))
 }
@@ -160,17 +160,19 @@ fn shim() -> &'static ShimIndex {
 /// One shim source's member statements, and each member's direct dependencies under
 /// `minimal-shim.mjs`'s closure rule. Neither depends on which members a program reaches, so a
 /// closure is a walk over this index rather than a re-parse.
-struct ShimIndex {
-    /// Every member's statement, by name ([`shim_members`]).
-    members: BTreeMap<String, String>,
+pub(crate) struct ShimIndex {
+    /// Member names in original `runtime/shim.js` declaration order.
+    pub(crate) order: Vec<String>,
+    /// Every member's statement, by name ([`shim_members_ordered`]).
+    pub(crate) members: BTreeMap<String, String>,
     /// The members each member's statement reaches directly: the runtime members it references,
     /// and the owner of every lexical helper binding it mentions.
     dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl ShimIndex {
-    fn of(source: &str) -> ShimIndex {
-        let members = shim_members(source);
+    pub(crate) fn of(source: &str) -> ShimIndex {
+        let (order, members) = shim_members_ordered(source);
         // Match minimal-shim's source groups: lexical helper declarations travel
         // with the runtime member preceding them, even when another member calls them.
         let mut bindings = BTreeMap::new();
@@ -206,6 +208,7 @@ impl ShimIndex {
             })
             .collect();
         ShimIndex {
+            order,
             members,
             dependencies,
         }
@@ -213,7 +216,7 @@ impl ShimIndex {
 
     /// `direct` and every member it transitively depends on. A name that is not a member is
     /// kept and has no dependencies.
-    fn closure(&self, direct: &BTreeSet<String>) -> BTreeSet<String> {
+    pub(crate) fn closure(&self, direct: &BTreeSet<String>) -> BTreeSet<String> {
         crate::profile::bump(crate::profile::Counter::ShimClosure);
         let mut needed = direct.clone();
         let mut queue: Vec<&str> = direct.iter().map(String::as_str).collect();
@@ -231,15 +234,17 @@ impl ShimIndex {
     }
 }
 
-/// Every member statement in any shim source. Split out so the parser and closure are testable.
+/// Every member statement in any shim source, alongside original declaration order.
+/// Split out so the parser and closure are testable.
 ///
 /// The shim's rigid shape (its own documented contract, relied on by `minimal-shim.mjs`): one
 /// opening `globalThis.__rt = { name: body, … };` literal, then one top-level
 /// `globalThis.__rt.name = …` assignment per member, each ending immediately before the next
 /// member's leading comments.
-fn shim_members(source: &str) -> BTreeMap<String, String> {
+fn shim_members_ordered(source: &str) -> (Vec<String>, BTreeMap<String, String>) {
     crate::profile::bump(crate::profile::Counter::ShimMembers);
     let lines: Vec<&str> = source.lines().collect();
+    let mut order = Vec::new();
     let mut members = BTreeMap::new();
 
     let open = lines
@@ -255,17 +260,21 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
     // The literal's entries, spelled as the standalone assignment minimal-shim publishes them as.
     let mut entry: Option<(String, Vec<&str>)> = None;
     let flush = |entry: &mut Option<(String, Vec<&str>)>,
+                 order: &mut Vec<String>,
                  members: &mut BTreeMap<String, String>| {
         if let Some((name, body)) = entry.take() {
             let body = body.join("\n");
             let body = body.trim_end().trim_end_matches(',');
             let statement = format!("globalThis.__rt.{name} = {body};");
+            if !members.contains_key(&name) {
+                order.push(name.clone());
+            }
             members.insert(name, statement);
         }
     };
     for line in &lines[open + 1..close] {
         if let Some((name, rest)) = literal_entry(line) {
-            flush(&mut entry, &mut members);
+            flush(&mut entry, &mut order, &mut members);
             entry = Some((name, vec![rest]));
         } else if let Some((_, body)) = entry.as_mut() {
             if !line.trim_start().starts_with("//") {
@@ -273,7 +282,7 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
             }
         }
     }
-    flush(&mut entry, &mut members);
+    flush(&mut entry, &mut order, &mut members);
 
     // The later members: assignment start to the last non-blank, non-comment line before the next.
     let starts: Vec<(usize, String)> = lines
@@ -290,9 +299,17 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
         while to > *from && (lines[to].trim().is_empty() || lines[to].starts_with("//")) {
             to -= 1;
         }
+        if !members.contains_key(name) {
+            order.push(name.clone());
+        }
         members.insert(name.clone(), lines[*from..=to].join("\n"));
     }
-    members
+    (order, members)
+}
+
+#[cfg(test)]
+fn shim_members(source: &str) -> BTreeMap<String, String> {
+    shim_members_ordered(source).1
 }
 
 /// The closure of `direct` over any shim source, parsed here. The bundled shim's closure is

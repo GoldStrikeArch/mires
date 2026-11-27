@@ -23,6 +23,7 @@ pub(crate) mod byte_view;
 pub mod call;
 pub mod constant;
 pub mod emit;
+pub mod export_boundary;
 mod fn_opt;
 pub mod function;
 pub mod host;

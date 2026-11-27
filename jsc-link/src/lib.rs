@@ -11,6 +11,7 @@
 //! the [`rcgjs_object::manifest`], which the dylib writes before it execs the `jsc-link` binary.
 
 pub mod diag;
+pub mod runtime_emit;
 
 /// The `js!{}` block and `#[js_extern]` descriptor formats, shared via `mires-marker-abi`.
 pub(crate) use mires_marker_abi::{block, descriptor};

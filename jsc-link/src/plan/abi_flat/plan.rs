@@ -1782,7 +1782,10 @@ fn canonical_clone_allowed(
         && !tracked_caller
         && func.sig.abi.spread.is_none()
         && !func.sig.abi.caller_location
-        && !matches!(semantic, Some(BodySemantic::DropGlue(_)))
+        && !matches!(
+            semantic,
+            Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport)
+        )
         && !matches!(
             semantic,
             Some(BodySemantic::Standard(operation))
@@ -1814,7 +1817,10 @@ pub(super) fn refuses(
     if func.sig.abi.spread.is_some() || func.sig.abi.caller_location {
         return Some(BoundaryDecline::SpreadAbi);
     }
-    if matches!(semantic, Some(BodySemantic::DropGlue(_))) {
+    if matches!(
+        semantic,
+        Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport)
+    ) {
         return Some(BoundaryDecline::NonCallReference);
     }
     if matches!(

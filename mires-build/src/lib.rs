@@ -1,59 +1,83 @@
-//! Compiles a client crate to JavaScript from a Cargo build script.
+//! Compiles Rust client crates to JavaScript from a Cargo build script.
 //!
-//! This is a wrapper around the `rustc_codegen_js` backend and the
-//! `scripts/compile_core.sh` script that drives it. A build script points it
-//! at one `.rs` file and gets a program, a source map, and the runtime shim in
-//! `$OUT_DIR`:
+//! Two builders cover the two ways a host Cargo crate embeds Rust-compiled
+//! JavaScript:
 //!
-//! ```rust,no_run
-//! mires_build::BuildConfig::new("client/app.rs")
-//!     .render()
-//!     .unwrap();
-//! ```
+//! * [`Crate`] compiles a full Cargo package (with its own `Cargo.toml`, `std`,
+//!   `alloc`, and crates.io dependencies) via `cargo-mires`, defaulting to
+//!   self-contained ES modules with inline runtime, `.d.ts` declarations, source
+//!   maps, and an isolated `--target-dir` under `$OUT_DIR`:
 //!
-//! The compiled program can then be served like any other generated file, for
-//! example `asset!(concat!(env!("OUT_DIR"), "/app.js"))`.
+//!   ```rust,no_run
+//!   let client = mires_build::Crate::new("../client")
+//!       .build()
+//!       .unwrap();
+//!   ```
+//!
+//! * [`BuildConfig`] drives `rustc` directly on a single `.rs` root file
+//!   (useful for lightweight scripts or multi-island chunked builds), publishing
+//!   the compiled program, source map, optional `.d.ts`, and runtime shim into
+//!   `$OUT_DIR`:
+//!
+//!   ```rust,no_run
+//!   use mires_build::{BuildConfig, ModuleFormat, Profile, RuntimeMode};
+//!
+//!   BuildConfig::new("client/app.rs")
+//!       .profile(Profile::ReleaseBalanced)
+//!       .format(ModuleFormat::Esm)
+//!       .runtime(RuntimeMode::Inline)
+//!       .dts(true)
+//!       .render()
+//!       .unwrap();
+//!   ```
+//!
+//! The compiled program can then be embedded or served like any other generated
+//! file, for example `include_str!(concat!(env!("OUT_DIR"), "/app.js"))`.
 //!
 //! # Setup
 //!
-//! The pinned nightly, the backend built with it, and the `core` it compiles
-//! against are set up once per checkout, and take minutes:
+//! The pinned nightly, the backend built with it, and the sysroot (`core`,
+//! `alloc`, and Mires's `std`) are set up once per Mires checkout:
 //!
 //! ```sh
 //! rustup toolchain install "$(...)"           # the nightly the backend loads into
-//! scripts/build.sh                            # the codegen backend
-//! JS_EXTRA_ARGS='' scripts/build_sysroot.sh   # `core`, compiled by it
+//! scripts/build.sh                            # the codegen backend + jsc-link
+//! JS_EXTRA_ARGS='' scripts/build_sysroot.sh   # `core`, `alloc`, and `std`
 //! ```
 //!
-//! Until they are all there, [`BuildConfig::render`] reports the first one that
-//! is missing and repeats the command that builds it. An unattended machine can
-//! run them itself with [`BuildConfig::bootstrap`].
+//! [`Crate::build`] invokes `cargo-mires`, which automatically ensures the
+//! backend and matching cached sysroot exist. [`BuildConfig::render`] reports
+//! the first missing precondition with its fix-it command, or builds them
+//! automatically when [`BuildConfig::bootstrap`] is enabled.
 //!
-//! [`Toolchain::preconditions`] is that list of steps, and
+//! [`Toolchain::preconditions`] returns the unmet steps, and
 //! [`Toolchain::apply`] performs one, so a tool outside a build script can set
 //! the checkout up without a second opinion about when it is ready.
 //!
 //! The `JS_EXTRA_ARGS` the sysroot was built with are recorded next to it. Any
 //! backend option that changes how items are spelled has to be the same on
 //! both sides, so [`BuildConfig::emit_arg`] is checked against that record and
-//! refuses a sysroot that disagrees. [`BuildConfig::crate_arg`] carries the
-//! options that only change this crate's own output, which need no rebuild.
+//! refuses a sysroot that disagrees. [`BuildConfig::crate_arg`] and link-only
+//! typed options ([`BuildConfig::format`], [`BuildConfig::runtime`],
+//! [`BuildConfig::dts`], [`BuildConfig::chunks`]) only affect linking and need
+//! no sysroot rebuild.
 //!
-//! # The client crate
+//! # Single-file client crates (`BuildConfig`)
 //!
-//! The client crate is not a Cargo target: rustc is handed a single root file,
-//! at the edition the script fixes (2021). It has these constraints.
+//! When using [`BuildConfig`] directly rather than [`Crate`], `rustc` is handed
+//! a single `.rs` root file (edition 2021):
 //!
-//! * Extra modules are reached with `#[path = "..."] mod name;`, since there is no Cargo target
-//!   directory layout to infer them from.
-//! * The crate is `#![no_std]` and `#![no_main]` and defines its own `#[panic_handler]`.
-//! * Only `core` is available. There is no `alloc`, so no `Box`, `Vec`, or `String`.
-//! * `#[no_mangle]` functions are the exports. They are also the roots for dead code elimination,
-//!   which drops everything they do not reach, and their names appear in the JavaScript exactly as
-//!   written. Four characters or more keeps them clear of the short names minification generates.
-//! * An `extern "C"` function has no body to compile, so a call to one lowers to
-//!   `__rt.<name>(...)`. The page has to define `__rt`, which is what the published `shim.js` does
-//!   for the names it knows.
+//! * The Mires sysroot provides `core`, `alloc` (`Box`, `Vec`, `String`,
+//!   `BTreeMap`, ...), and Mires's `std` crate.
+//! * Extra modules are reached with `#[path = "..."] mod name;` (or switch to
+//!   [`Crate`] for full Cargo package layout and external crate dependencies).
+//! * `#[no_mangle]` / `#[mires::export]` functions are the exports and roots
+//!   for whole-program dead code elimination, keeping their names unchanged in
+//!   the emitted JavaScript.
+//! * An `extern "C"` function lowers to `__rt.<name>(...)`. With
+//!   [`RuntimeMode::Inline`] the minimal runtime closure is bundled directly
+//!   into the output; with [`RuntimeMode::External`] `jsc-link --emit-runtime`
+//!   emits a canonical runtime module in pure Rust without Node.js.
 //!
 //! # Chunks
 //!
@@ -62,11 +86,11 @@
 //! file holding what two or more of them reach:
 //!
 //! ```rust,no_run
-//! use mires_build::{BuildConfig, Chunking};
+//! use mires_build::{BuildConfig, Chunking, ModuleFormat};
 //!
 //! let artifacts = BuildConfig::new("client-island/island.rs")
 //!     .output_name("islands.js")
-//!     .crate_arg("js-modules=esm")
+//!     .format(ModuleFormat::Esm)
 //!     .chunks(
 //!         Chunking::new()
 //!             .island("counter")
@@ -97,27 +121,17 @@
 //! [`Chunking::import`], which is how the runtime the islands import gets its
 //! entry.
 //!
-//! Whether the program is really split is up to the backend. One that cannot
-//! answers with a single file, and every requested chunk then names it: the
-//! directory, the URLs, and the import map are the ones a split program has, so
-//! the page and the loader do not change when the backend learns to split. What
-//! the backend is asked for, and what it writes when it obliges, is on
-//! [`Chunking`].
-//!
 //! # Rebuilds
 //!
-//! [`BuildConfig::render`] emits `cargo:rerun-if-changed` for the client
-//! crate's sources and for the toolchain files that decide what they compile
-//! to. A module the crate reaches with `#[path]` out of its own directory
-//! counts as a source, which is how an island shared with the server half gets
-//! watched. Emitting any such directive replaces cargo's default rule of
-//! rerunning on any change in the package, which is deliberate: editing the
-//! server half of an app no longer recompiles the client half. Output is
-//! published only when its bytes change, so a recompile that lands on the same
-//! JavaScript does not look like an edit to anything watching `$OUT_DIR`.
+//! Both [`Crate::build`] and [`BuildConfig::render`] emit
+//! `cargo:rerun-if-changed` and `cargo:rerun-if-env-changed` directives for the
+//! client crate's sources and toolchain inputs. Emitting any such directive
+//! replaces Cargo's default rule of rerunning on any change in the host
+//! package, so editing server code no longer recompiles client JavaScript.
 
 mod chunk;
 mod config;
+mod crate_build;
 mod error;
 mod pinned;
 mod preconditions;
@@ -127,13 +141,14 @@ mod toolchain;
 
 pub use chunk::*;
 pub use config::*;
+pub use crate_build::*;
 pub use error::*;
 pub use pinned::*;
 pub use preconditions::*;
 pub use rcgjs_object::artifact::EntryRole;
 #[doc(hidden)]
 pub use rcgjs_object::opts::OptimizerPass;
-pub use rcgjs_object::opts::{Lane, OptimizerMode, Profile};
+pub use rcgjs_object::opts::{Lane, Modules as ModuleFormat, OptimizerMode, Profile, RuntimeMode};
 pub use rerun::*;
 pub use shimcheck::*;
 pub use toolchain::*;

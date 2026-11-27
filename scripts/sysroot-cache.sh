@@ -247,6 +247,28 @@ jsc_patches_digest() {
 	} | jsc_sha256
 }
 
+# The digest of `mires-std/Cargo.toml` and every Rust source file under `mires-std/src/`.
+jsc_mires_std_digest() {
+	local root=$1
+	local dir="$root/mires-std"
+	local found=0
+	local file
+	{
+		if [ -f "$dir/Cargo.toml" ]; then
+			found=1
+			printf 'Cargo.toml %s\n' "$(jsc_sha256_file "$dir/Cargo.toml")"
+		fi
+		if [ -d "$dir/src" ]; then
+			while IFS= read -r file; do
+				[ -f "$file" ] || continue
+				found=1
+				printf '%s %s\n' "${file#"$dir"/}" "$(jsc_sha256_file "$file")"
+			done < <(find "$dir/src" -type f -name '*.rs' | LC_ALL=C sort)
+		fi
+		[ "$found" = 1 ] || printf 'none\n'
+	} | jsc_sha256
+}
+
 jsc_pinned_channel() {
 	local root=$1
 	local channel
@@ -287,6 +309,7 @@ jsc_sysroot_key() {
 		printf 'cache-format=1\n'
 		printf 'backend=%s\n' "$(jsc_sha256_file "$dylib")"
 		printf 'patches=%s\n' "$(jsc_patches_digest "$root")"
+		printf 'mires-std=%s\n' "$(jsc_mires_std_digest "$root")"
 		printf 'channel=%s\n' "$channel"
 		printf 'rustc=%s\n' "$rustc_identity"
 		printf 'target=%s\n' "$target"

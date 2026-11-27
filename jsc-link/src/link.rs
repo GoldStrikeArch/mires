@@ -51,7 +51,7 @@ use crate::jir::summary::{MergeDecision, Side};
 use crate::jsast;
 use crate::lane_report::{ItemLane, LaneAvailability, LaneItem};
 use crate::manifest::{Manifest, Mode};
-use crate::opts::Modules;
+use crate::opts::{Modules, RuntimeMode};
 
 // `pub(crate)`: the representation planner (`plan/representation.rs`, W4b) fills the sidecar's
 // `ReprBlock`, which is defined beside the sidecar it is rendered into.
@@ -279,7 +279,7 @@ fn resolve(
     path: Option<&Path>,
 ) -> String {
     let opts = crate::opts::get();
-    if opts.modules == Modules::Esm {
+    if opts.modules == Modules::Esm && opts.runtime == RuntimeMode::External {
         items.push(shim_import());
     }
 
@@ -1053,7 +1053,16 @@ fn print_units(
     units: &[Unit<'_>],
     wide_byte_views: bool,
 ) -> Vec<PrintedUnit> {
-    let opts = crate::opts::get();
+    print_units_with_opts(dcx, crate::opts::get(), sources, units, wide_byte_views)
+}
+
+fn print_units_with_opts(
+    dcx: &Sink,
+    opts: &crate::opts::Opts,
+    sources: &BTreeMap<String, String>,
+    units: &[Unit<'_>],
+    wide_byte_views: bool,
+) -> Vec<PrintedUnit> {
     let bodies: Vec<String> = units
         .iter()
         .map(|unit| write_program(&prologue(&unit.label), &unit.items).0)
@@ -1088,7 +1097,7 @@ fn print_units(
             })
             .collect();
         let renamed_refs: Vec<&LinkItem> = renamed.iter().collect();
-        let (mut text, starts) = write_program(&prologue(&unit.label), &renamed_refs);
+        let (mut text, mut starts) = write_program(&prologue(&unit.label), &renamed_refs);
         if wide_byte_views {
             let direct = crate::plan::cost::runtime_members(&text);
             if !direct.is_empty()
@@ -1099,8 +1108,12 @@ fn print_units(
         }
         // After the rename, so that the clause is written once, out of the names that survived it,
         // and never scanned as if it were an item's code.
-        text.push_str(&export_clause(unit, &renames));
-        text.push_str(&chunk_registration(unit, &renames));
+        text.push_str(&export_clause(opts, unit, &renames));
+        text.push_str(&chunk_registration(opts, unit, &renames));
+
+        if opts.runtime == RuntimeMode::Inline {
+            apply_inline_runtime(dcx, &mut text, &mut starts);
+        }
 
         if let (true, Some(path)) = (opts.source_map, &unit.path) {
             let comment = write_source_map(dcx, sources, path, &text, &renamed_refs, &starts);
@@ -1126,7 +1139,7 @@ fn print_units(
             .len()
             .checked_sub(item_total)
             .expect("renamed items are contained in their printed unit");
-        let artifacts = artifact_records(dcx, unit, &text, &renames);
+        let artifacts = artifact_records(dcx, opts, unit, &text, &renames);
         printed.push(PrintedUnit {
             text,
             item_bytes,
@@ -1135,6 +1148,45 @@ fn print_units(
         });
     }
     printed
+}
+
+fn apply_inline_runtime(dcx: &Sink, text: &mut String, starts: &mut [u32]) {
+    let members = crate::plan::cost::runtime_members(text);
+    if members.is_empty() {
+        return;
+    }
+    let helpers = crate::plan::cost::helper_bytes();
+    let (direct, external): (BTreeSet<_>, BTreeSet<_>) = members
+        .into_iter()
+        .partition(|member| helpers.contains_key(member));
+    if !external.is_empty() {
+        let missing: Vec<&str> = external.iter().map(String::as_str).collect();
+        dcx.err(format!(
+            "rustc_codegen_js: `js-runtime=inline` cannot supply external runtime members ({}); \
+             use `js-runtime=external` or `js-runtime=none`",
+            missing.join(", ")
+        ));
+    }
+    if direct.is_empty() {
+        return;
+    }
+    match crate::runtime_emit::emit_minimal_shim(
+        &direct,
+        crate::runtime_emit::RuntimeFormat::InlinePrelude,
+    ) {
+        Ok(prelude) if !prelude.is_empty() => {
+            let prelude_lines = prelude.bytes().filter(|&b| b == b'\n').count() as u32;
+            for start in starts {
+                *start += prelude_lines;
+            }
+            let mut combined = String::with_capacity(prelude.len() + text.len());
+            combined.push_str(&prelude);
+            combined.push_str(text);
+            *text = combined;
+        }
+        Ok(_) => {}
+        Err(err) => dcx.err(format!("rustc_codegen_js: {err}")),
+    }
 }
 
 fn root_identity(item: &LinkItem) -> String {
@@ -1154,6 +1206,7 @@ fn root_identity(item: &LinkItem) -> String {
 
 fn artifact_records(
     dcx: &Sink,
+    opts: &crate::opts::Opts,
     unit: &Unit<'_>,
     text: &str,
     renames: &BTreeMap<String, String>,
@@ -1166,7 +1219,6 @@ fn artifact_records(
         dcx.err("artifact output needs a UTF-8 file name");
         return artifacts;
     };
-    let opts = crate::opts::get();
     let mut program = Artifact::new(ArtifactKind::Program, text.as_bytes());
     // Every compiler-generated import stores its module specifier as the item's debug path.
     // This holds for extern imports, DOM imports, the runtime, and cross-chunk imports.
@@ -1185,20 +1237,23 @@ fn artifact_records(
             );
         }
     }
-    let members = crate::plan::cost::runtime_members(text);
-    if !members.is_empty() {
-        let helpers = crate::plan::cost::helper_bytes();
-        let (direct, external): (BTreeSet<_>, BTreeSet<_>) = members
-            .into_iter()
-            .partition(|member| helpers.contains_key(member));
-        program.runtime = Some(RuntimeRequirement {
-            module: (opts.modules == Modules::Esm).then(|| opts.shim_module.clone()),
-            source_sha256: crate::plan::cost::runtime_source_sha256(),
-            closure: crate::plan::cost::helper_closure(&direct),
-            direct,
-            external,
-            artifact: None,
-        });
+    if opts.runtime != RuntimeMode::Inline {
+        let members = crate::plan::cost::runtime_members(text);
+        if !members.is_empty() {
+            let helpers = crate::plan::cost::helper_bytes();
+            let (direct, external): (BTreeSet<_>, BTreeSet<_>) = members
+                .into_iter()
+                .partition(|member| helpers.contains_key(member));
+            program.runtime = Some(RuntimeRequirement {
+                module: (opts.modules == Modules::Esm && opts.runtime == RuntimeMode::External)
+                    .then(|| opts.shim_module.clone()),
+                source_sha256: crate::plan::cost::runtime_source_sha256(),
+                closure: crate::plan::cost::helper_closure(&direct),
+                direct,
+                external,
+                artifact: None,
+            });
+        }
     }
     for (enabled, related, kind) in [
         (
@@ -1287,8 +1342,11 @@ fn shim_import() -> LinkItem {
 /// A name another chunk imports is a different case: it is internal to the program and gets
 /// shortened like any other, so the clause is written out of `renames` rather than out of the
 /// items, which is what makes the two ends of a cross-chunk import agree.
-fn export_clause(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> String {
-    let opts = crate::opts::get();
+fn export_clause(
+    opts: &crate::opts::Opts,
+    unit: &Unit<'_>,
+    renames: &BTreeMap<String, String>,
+) -> String {
     if opts.modules != Modules::Esm {
         return String::new();
     }
@@ -1316,7 +1374,11 @@ fn export_clause(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> String 
 ///
 /// Dynamic `import()` is ES2020 syntax. A module script still executes ordinary ES2018 module
 /// syntax, and this shared map gives its loader the entry value after the script's load event.
-fn chunk_registration(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> String {
+fn chunk_registration(
+    opts: &crate::opts::Opts,
+    unit: &Unit<'_>,
+    renames: &BTreeMap<String, String>,
+) -> String {
     let Some(entry) = unit.entry else {
         return String::new();
     };
@@ -1331,14 +1393,14 @@ fn chunk_registration(unit: &Unit<'_>, renames: &BTreeMap<String, String>) -> St
         jsast::member(registry, "set"),
         vec![jsast::string(&unit.label), jsast::id(entry)],
     );
-    let style = match crate::opts::get().minify.is_enabled() {
+    let style = match opts.minify.is_enabled() {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
     jsast::program_to_string_styled_for_target(
         &[jsast::expr_stmt(register)],
         style,
-        crate::opts::get().ecma_target,
+        opts.ecma_target,
     )
 }
 
@@ -3315,5 +3377,154 @@ mod tests {
         assert!(facade_js.contains("col: 1"), "{facade_js}");
         assert!(!facade_js.contains("file:"), "{facade_js}");
         assert!(!facade_js.contains("{ name:"), "{facade_js}");
+    }
+
+    #[test]
+    fn inline_runtime_rebases_source_map_lines_and_clears_manifest_runtime() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jsc-link-inline-rt-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut item = duplicate(
+            "run",
+            "function run() {\n  return __rt.js_catch_unwind(() => __rt.js_now_ms(), 0);\n}\n",
+            Some(1),
+            Some(1),
+        );
+        item.linkage = Linkage::exported("run".to_owned());
+        item.map = ItemMap {
+            sources: vec!["src/lib.rs".to_owned()],
+            names: vec!["run".to_owned()],
+            // Line 1, col 9 inside `item.js` -> `__rt.js_catch_unwind...` at src line 10, col 4.
+            segments: vec![(1, 9, 0, 10, 4, 0)],
+        };
+
+        let out_path = dir.join("app.js");
+        let unit = Unit {
+            label: "program".to_owned(),
+            path: Some(out_path),
+            items: vec![&item],
+            exports: BTreeSet::new(),
+            entry: None,
+        };
+        let sources = BTreeMap::from([("src/lib.rs".to_owned(), "fn run() {}\n".to_owned())]);
+        let opts = crate::opts::Opts {
+            modules: Modules::Esm,
+            runtime: RuntimeMode::Inline,
+            source_map: true,
+            ..crate::opts::Opts::default()
+        };
+
+        let dcx = Sink::new();
+        let printed = print_units_with_opts(&dcx, &opts, &sources, &[unit], false);
+        assert_eq!(dcx.errors(), 0);
+        let printed = &printed[0];
+
+        // Prelude is prepended ahead of the prologue with no import and no global mutation.
+        assert!(!printed.text.contains("import * as __rt"));
+        assert!(!printed.text.contains("globalThis.__rt."));
+        assert!(printed.text.contains(
+            "const __rt = { js_now_ms: $rt_js_now_ms, js_catch_unwind: $rt_js_catch_unwind };"
+        ));
+        assert!(printed.text.contains("export { run };\n"));
+
+        // Self-contained inline module clears `program.runtime`.
+        let program_artifact = &printed.artifacts["app.js"];
+        assert!(program_artifact.runtime.is_none());
+        assert!(program_artifact.imports.is_empty());
+
+        // Find the actual 0-based line index of the mapped statement in the emitted program.
+        let actual_line = printed
+            .text
+            .lines()
+            .position(|line| line.contains("__rt.js_catch_unwind"))
+            .expect("mapped line present in output");
+        assert!(
+            actual_line > 2,
+            "prelude must shift the item down: {actual_line}"
+        );
+
+        // Read the emitted source map and verify the mapping landed on `actual_line` (not line 2).
+        let map_text = fs::read_to_string(dir.join("app.js.map")).expect("read source map");
+        let map_json: serde_json::Value = serde_json::from_str(&map_text).expect("valid map JSON");
+        let mappings = map_json["mappings"].as_str().expect("mappings string");
+        let mapping_lines: Vec<&str> = mappings.split(';').collect();
+        // Every line before `actual_line` maps only to the generated source (col 0, single 4-tuple).
+        // `actual_line` carries the 5-tuple segment with `name` index 0 (column 9).
+        assert!(actual_line < mapping_lines.len());
+        // Column 9 in VLQ is 'S' (9 << 1 = 18 -> BASE64[18] = 'S').
+        assert!(
+            mapping_lines[actual_line].starts_with('S'),
+            "expected column-9 mapping on line {actual_line}, got `{}`",
+            mapping_lines[actual_line]
+        );
+        // Line 2 (where the unshifted segment would have landed) must NOT carry that mapping.
+        assert!(
+            !mapping_lines[2].starts_with('S'),
+            "old unshifted line 2 should only have generated filler, got `{}`",
+            mapping_lines[2]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_runtime_reports_unknown_external_members_and_none_mode_omits_module() {
+        let mut ext_item = duplicate(
+            "run",
+            "function run() { return __rt.host_only(); }\n",
+            Some(1),
+            Some(1),
+        );
+        ext_item.linkage = Linkage::exported("run".to_owned());
+
+        let unit = Unit {
+            label: "program".to_owned(),
+            path: Some(PathBuf::from("/tmp/nonexistent-test-unit.js")),
+            items: vec![&ext_item],
+            exports: BTreeSet::new(),
+            entry: None,
+        };
+        let inline_opts = crate::opts::Opts {
+            modules: Modules::Esm,
+            runtime: RuntimeMode::Inline,
+            ..crate::opts::Opts::default()
+        };
+        let dcx = Sink::new();
+        let _ = print_units_with_opts(&dcx, &inline_opts, &BTreeMap::new(), &[unit], false);
+        assert_eq!(dcx.errors(), 1, "external member in inline mode must error");
+
+        let unit_none = Unit {
+            label: "program".to_owned(),
+            path: Some(PathBuf::from("/tmp/nonexistent-test-unit.js")),
+            items: vec![&ext_item],
+            exports: BTreeSet::new(),
+            entry: None,
+        };
+        let none_opts = crate::opts::Opts {
+            modules: Modules::Esm,
+            runtime: RuntimeMode::None,
+            ..crate::opts::Opts::default()
+        };
+        let dcx_none = Sink::new();
+        let printed =
+            print_units_with_opts(&dcx_none, &none_opts, &BTreeMap::new(), &[unit_none], false);
+        assert_eq!(dcx_none.errors(), 0);
+        let rt = printed[0].artifacts["nonexistent-test-unit.js"]
+            .runtime
+            .as_ref()
+            .expect("none mode still records runtime requirement");
+        assert!(
+            rt.module.is_none(),
+            "none mode does not declare an ESM import"
+        );
+        assert!(rt.external.contains("host_only"));
     }
 }

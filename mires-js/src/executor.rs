@@ -168,7 +168,14 @@ where
     host_spawn(future);
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.spawn")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host executor marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.spawn"))]
 #[inline(never)]
 fn host_spawn<F>(future: F)
 where
@@ -194,7 +201,17 @@ where
     host_native_promise_future(future)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.futurepromise")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host executor marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.futurepromise")
+)]
 #[inline(never)]
 fn host_promise_future<F>(future: F) -> JsValue
 where
@@ -207,7 +224,14 @@ where
 
 #[cfg_attr(
     target_arch = "wasm32",
-    link_section = "rcgjs.host.futurenativepromise"
+    allow(
+        unsafe_code,
+        reason = "host executor marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.futurenativepromise")
 )]
 #[inline(never)]
 fn host_native_promise_future<F>(future: F) -> JsValue

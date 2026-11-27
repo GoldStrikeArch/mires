@@ -98,7 +98,7 @@ fn compute_reachable_items(
             .map(|b| b.semantic);
         let is_special_runtime = matches!(
             semantic,
-            Some(BodySemantic::DropGlue(_) | BodySemantic::PanicImpl)
+            Some(BodySemantic::DropGlue(_) | BodySemantic::PanicImpl | BodySemantic::JsExport)
         ) || matches!(
             semantic,
             Some(BodySemantic::Standard(op))

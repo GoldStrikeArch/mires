@@ -19,6 +19,7 @@
 //! -Cllvm-args=js-ecma-target=latest 2018|latest       emitted JavaScript syntax ceiling
 //! -Cllvm-args=js-hoist-consts=off on|off             share repeated constants (cgu.rs)
 //! -Cllvm-args=js-modules=script   esm|script         ES module or plain script (link.rs)
+//! -Cllvm-args=js-runtime=external external|inline|none how the runtime shim is supplied (link.rs)
 //! -Cllvm-args=js-shim-module=...  a module specifier where `__rt` is imported from
 //! -Cllvm-args=js-entry-role=main main|worker|island|procedure|shared deployment role
 //! -Cllvm-args=js-chunk-role=NAME:ROLE repeatable     declared role of a chunk root
@@ -483,6 +484,40 @@ pub enum Modules {
     Script,
 }
 
+/// How the runtime shim is supplied to the linked JavaScript program (`js-runtime`).
+///
+/// Link-only: object files emit `__rt.<name>` calls identically in every mode, so this never joins
+/// [`crate::item::normalized_emit_args`] or the sysroot cache key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeMode {
+    /// Import `__rt` from `js-shim-module` in ESM output, or expect global `__rt` in script output.
+    #[default]
+    External,
+    /// Inline the minimal transitive runtime closure as a lexical prelude inside each emitted unit.
+    Inline,
+    /// Emit neither a runtime import nor an inline prelude; the host supplies `__rt`.
+    None,
+}
+
+impl RuntimeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Inline => "inline",
+            Self::None => "none",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "external" => Some(Self::External),
+            "inline" => Some(Self::Inline),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Opts {
     pub names: NameStyle,
@@ -506,6 +541,9 @@ pub struct Opts {
     pub ecma_target: EcmaTarget,
     /// Whether the program is an ES module or a plain script. See [`Modules`].
     pub modules: Modules,
+    /// How the runtime shim is supplied to the linked program. See [`RuntimeMode`]. Link-only.
+    #[serde(default)]
+    pub runtime: RuntimeMode,
     /// The module the runtime shim's `__rt` namespace is imported from, in ES module output.
     pub shim_module: String,
     /// Declared deployment role of the unsplit program. Does not affect object emission.
@@ -627,6 +665,7 @@ impl Default for Opts {
             minify: MinifyMode::Off,
             ecma_target: EcmaTarget::Latest,
             modules: Modules::Script,
+            runtime: RuntimeMode::External,
             shim_module: "./shim.js".to_owned(),
             entry_role: crate::artifact::EntryRole::Main,
             chunk_roles: Vec::new(),
@@ -874,6 +913,10 @@ fn parse_flag(arg: &str, opts: &mut Opts, dcx: &dyn Diagnostics) {
             Some("esm") => opts.modules = Modules::Esm,
             Some("script") => opts.modules = Modules::Script,
             other => bad_value(dcx, key, other, "esm`, `script"),
+        },
+        "js-runtime" => match value.and_then(RuntimeMode::parse) {
+            Some(mode) => opts.runtime = mode,
+            None => bad_value(dcx, key, value, "external`, `inline`, `none"),
         },
         "js-shim-module" => match value {
             Some(spec) if !spec.is_empty() => opts.shim_module = spec.to_owned(),
@@ -1585,5 +1628,33 @@ mod tests {
         assert!(opts.analyzes(OptimizerPass::AstDce));
         assert!(opts.applies(OptimizerPass::AstDce));
         assert!(!opts.applies(OptimizerPass::FuturePoller));
+    }
+
+    #[test]
+    fn runtime_mode_is_parsed_validated_and_link_only() {
+        assert_eq!(opts_of("").runtime, RuntimeMode::External);
+        assert_eq!(
+            opts_of("js-runtime=external").runtime,
+            RuntimeMode::External
+        );
+        assert_eq!(opts_of("js-runtime=inline").runtime, RuntimeMode::Inline);
+        assert_eq!(opts_of("js-runtime=none").runtime, RuntimeMode::None);
+
+        assert_eq!(RuntimeMode::External.as_str(), "external");
+        assert_eq!(RuntimeMode::Inline.as_str(), "inline");
+        assert_eq!(RuntimeMode::None.as_str(), "none");
+        assert_eq!(RuntimeMode::parse("external"), Some(RuntimeMode::External));
+        assert_eq!(RuntimeMode::parse("inline"), Some(RuntimeMode::Inline));
+        assert_eq!(RuntimeMode::parse("none"), Some(RuntimeMode::None));
+        assert_eq!(RuntimeMode::parse("bundled"), None);
+
+        for line in ["js-runtime=bundled", "js-runtime=", "js-runtime"] {
+            let (_, collected) = parse_line(line);
+            assert_eq!(collected.errors.borrow().len(), 1, "{line}");
+        }
+
+        // Link-only: `js-runtime` must never join normalized emit args or sysroot keys.
+        let args = ["js-runtime=inline".to_owned(), "js-opt=on".to_owned()];
+        assert_eq!(crate::item::normalized_emit_args(&args), "js-opt=on");
     }
 }

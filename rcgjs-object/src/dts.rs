@@ -68,6 +68,9 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
     // Rust type describe it the same way, because both came from the same walk over that type.
     let mut types: BTreeMap<&str, &str> = BTreeMap::new();
     for item in items {
+        if !item.linkage.exported {
+            continue;
+        }
         let Some(dts) = &item.dts else { continue };
         for (name, body) in &dts.types {
             types.entry(name).or_insert(body);
@@ -120,9 +123,19 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
         let params: Vec<String> = dts
             .params
             .iter()
-            .map(|(param, ty)| format!("{}: {ty}", crate::jsast::sanitize_ident(param)))
+            .map(|(param, ty)| {
+                if let Some(base) = param.strip_suffix('?') {
+                    format!("{}?: {ty}", crate::jsast::sanitize_ident(base))
+                } else {
+                    format!("{}: {ty}", crate::jsast::sanitize_ident(param))
+                }
+            })
             .collect();
-        out.push_str(&format!("/** `{}` */\n", dts.rust));
+        if let Some((sig, rest)) = dts.rust.split_once('\n') {
+            out.push_str(&format!("/**\n * `{sig}`\n * {rest}\n */\n"));
+        } else {
+            out.push_str(&format!("/** `{}` */\n", dts.rust));
+        }
         out.push_str(&format!(
             "export declare function {name}({}): {};\n",
             params.join(", "),
@@ -173,5 +186,52 @@ mod tests {
         // The Rust path is squashed rather than escaped, so `Option<&str>` and `core::fmt::Error`
         // both come out as something TypeScript will take as a name.
         assert!(!"OptionStr".contains(|c: char| !c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn module_dts_formats_single_line_and_throws_jsdoc() {
+        use crate::item::{ItemKind, JsName, LinkItem, Linkage};
+
+        let make_item = |name: &str, dts: Dts| LinkItem {
+            name: JsName::new(name.to_owned()),
+            kind: ItemKind::Fn,
+            js: String::new(),
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: Linkage::exported(name.to_owned()),
+            debug_path: name.to_owned(),
+            crate_name: "demo".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: Some(dts),
+            optimization: Default::default(),
+            allocator_provider: Default::default(),
+            jir: Default::default(),
+        };
+
+        let plain = make_item(
+            "greet",
+            Dts {
+                params: vec![("name".to_owned(), "string".to_owned())],
+                ret: "string".to_owned(),
+                types: Vec::new(),
+                rust: "fn(&str) -> String".to_owned(),
+            },
+        );
+        let throwing = make_item(
+            "parse",
+            Dts {
+                params: vec![("input".to_owned(), "string".to_owned())],
+                ret: "string".to_owned(),
+                types: vec![("ParseOptions".to_owned(), "{ gfm?: boolean }".to_owned())],
+                rust: "fn(&str) -> Result<String, String>\n@throws {string}".to_owned(),
+            },
+        );
+        let text = module_dts("demo", &[&plain, &throwing]);
+        assert!(text.contains("type ParseOptions = { gfm?: boolean };\n"));
+        assert!(text.contains(
+            "/** `fn(&str) -> String` */\nexport declare function greet(name: string): string;\n"
+        ));
+        assert!(text.contains("/**\n * `fn(&str) -> Result<String, String>`\n * @throws {string}\n */\nexport declare function parse(input: string): string;\n"));
     }
 }

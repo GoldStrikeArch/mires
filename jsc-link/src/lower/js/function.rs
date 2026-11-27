@@ -529,6 +529,18 @@ fn build_function_decl(
         out = jsast::wrap_panic_impl_body(out);
     }
 
+    let mut marshaled_params = HashSet::new();
+    if input.body.semantic == BodySemantic::JsExport && cx.target_abi.is_none() {
+        let boundary = super::export_boundary::BoundaryCx {
+            table: input.table,
+            interns: input.interns,
+            heap: cx.heap(),
+            bstr: cx.bstr_enabled(),
+        };
+        marshaled_params =
+            super::export_boundary::wrap_js_export(&boundary, func, &params, &mut out);
+    }
+
     let decl = jsast::function(input.name.as_str(), params, out);
     let mut immutable_slices: HashSet<String> = HashSet::new();
     for &param in &func.params {
@@ -543,7 +555,8 @@ fn build_function_decl(
             .param_cells
             .iter()
             .any(|(cell, p)| *p == param && cx.cell_boxed(*cell));
-        if !is_boxed_param && formal_param_names.contains(name) {
+        if !is_boxed_param && formal_param_names.contains(name) && !marshaled_params.contains(name)
+        {
             immutable_slices.insert(name.to_owned());
         }
     }

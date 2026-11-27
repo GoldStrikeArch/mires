@@ -73,7 +73,21 @@ pub fn js_bindings(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Exports a Rust function under its Rust name without an unsafe source-level attribute.
+/// Exports a Rust function to JavaScript.
+///
+/// Supported attribute forms:
+///
+/// - `#[js_export]` — exports under the Rust function's name with JS boundary marshaling.
+/// - `#[js_export(name = "parseMarkdown")]` — exports under `"parseMarkdown"` with JS boundary
+///   marshaling.
+/// - `#[js_export(raw)]` — exports under the Rust function's name using the raw internal ABI
+///   without boundary marshaling.
+/// - `#[js_export(name = "foo", raw)]` or `#[js_export(raw, name = "foo")]` — exports under
+///   `"foo"` using the raw internal ABI.
+///
+/// On native host targets (`not(target_arch = "wasm32")`), no symbol-export or `link_section`
+/// attributes are emitted so exported functions can be tested normally with `cargo test` without
+/// symbol collisions.
 #[proc_macro_attribute]
 pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     match expand_export(attr.into(), item.into()) {
@@ -82,19 +96,194 @@ pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Link section tagging JS exports that need boundary marshaling by `rustc_codegen_js`.
+const EXPORT_MARSHAL_SECTION: &str = "rcgjs.export.v1";
+
+/// ECMAScript strict-mode reserved words (sorted for binary search).
+const JS_RESERVED_WORDS: &[&str] = &[
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+/// Arguments parsed from `#[js_export(..)]`.
+struct ExportAttr {
+    name: Option<String>,
+    raw: bool,
+}
+
+/// One entry inside `#[js_export(..)]`.
+enum ExportEntry {
+    Name(proc_macro2::Span, String),
+    Raw(proc_macro2::Span),
+}
+
+impl Parse for ExportEntry {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let key: Ident = input.parse()?;
+        match key.to_string().as_str() {
+            "name" => {
+                if !input.peek(Token![=]) {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`name` in `#[js_export(..)]` requires a JavaScript identifier string, \
+                         e.g. `#[js_export(name = \"myFunc\")]`",
+                    ));
+                }
+                input.parse::<Token![=]>()?;
+                let lit: LitStr = input.parse()?;
+                Ok(Self::Name(lit.span(), lit.value()))
+            }
+            "raw" => {
+                if input.peek(Token![=]) {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`raw` in `#[js_export(..)]` takes no value",
+                    ));
+                }
+                Ok(Self::Raw(key.span()))
+            }
+            other => Err(syn::Error::new(
+                key.span(),
+                format!(
+                    "unknown `#[js_export]` argument `{other}`; expected `name = \"..\"` or `raw`"
+                ),
+            )),
+        }
+    }
+}
+
+impl Parse for ExportAttr {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut name = None;
+        let mut raw = false;
+
+        for entry in Punctuated::<ExportEntry, Token![,]>::parse_terminated(input)? {
+            match entry {
+                ExportEntry::Name(span, value) => {
+                    if name.is_some() {
+                        return Err(syn::Error::new(
+                            span,
+                            "duplicate `name` in `#[js_export(..)]`",
+                        ));
+                    }
+                    validate_js_export_ident(&value, span)?;
+                    name = Some(value);
+                }
+                ExportEntry::Raw(span) => {
+                    if raw {
+                        return Err(syn::Error::new(
+                            span,
+                            "duplicate `raw` in `#[js_export(..)]`",
+                        ));
+                    }
+                    raw = true;
+                }
+            }
+        }
+
+        Ok(Self { name, raw })
+    }
+}
+
+/// Validates that `name` is a legal JavaScript identifier for a `#[js_export(name = "..")]` export.
+fn validate_js_export_ident(name: &str, span: proc_macro2::Span) -> syn::Result<()> {
+    if name.is_empty() {
+        return Err(syn::Error::new(
+            span,
+            "`name` in `#[js_export(name = \"..\")]` must not be empty",
+        ));
+    }
+    if !is_js_ident(name) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`{name}` is not a valid JavaScript identifier: it must start with an ASCII \
+                 letter, `_`, or `$`, and contain only ASCII alphanumerics, `_`, or `$`"
+            ),
+        ));
+    }
+    if is_js_reserved_word(name) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`{name}` is a JavaScript reserved word and cannot be used as a `#[js_export]` name"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `name` is an ECMAScript strict-mode reserved word.
+fn is_js_reserved_word(name: &str) -> bool {
+    JS_RESERVED_WORDS.binary_search(&name).is_ok()
+}
+
 fn expand_export(
     attr: proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    if !attr.is_empty() {
-        return Err(syn::Error::new(
-            attr.span(),
-            "`js_export` takes no arguments",
-        ));
-    }
+    let args: ExportAttr = syn::parse2(attr)?;
     let function: ItemFn = syn::parse2(item)?;
+    let symbol_attr = match args.name {
+        Some(export_name) => {
+            quote! { #[cfg_attr(target_arch = "wasm32", unsafe(export_name = #export_name))] }
+        }
+        None => {
+            quote! { #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))] }
+        }
+    };
+    let section_attr = if args.raw {
+        quote! {}
+    } else {
+        quote! { #[cfg_attr(target_arch = "wasm32", unsafe(link_section = #EXPORT_MARSHAL_SECTION))] }
+    };
     Ok(quote! {
-        #[unsafe(no_mangle)]
+        #symbol_attr
+        #section_attr
         #function
     })
 }
@@ -664,10 +853,10 @@ fn emit_marker(
     let section = descriptor.encode();
     let ident = &signature.ident;
     let unreachable =
-        format!("`{ident}` is a `#[js_extern]` declaration, which only rustc_codegen_js can lower");
+        format!("mires JS binding '{ident}' is only available on the mires JS target");
     quote! {
         #(#kept_attrs)*
-        #[cfg_attr(target_arch = "wasm32", link_section = #section)]
+        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = #section))]
         #[inline(never)]
         // The body names none of the parameters and never can: it is a placeholder for an
         // emission, and the signature is the declaration's own.
@@ -734,20 +923,22 @@ fn returns_result_js_value(signature: &Signature) -> bool {
         .is_some_and(|segment| segment.ident == "JsValue")
 }
 
+/// Whether `name` can be written as a single JavaScript identifier.
+fn is_js_ident(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Whether `name` can be written as a JavaScript identifier, or as a dotted path of them.
 ///
 /// A path is what a walk needs. `instance.data.datasets` is one property read written twice, and
 /// declaring a getter per segment would turn one interface into three for nothing; `Math.max` and
 /// `window.crypto` are the same idea rooted at a global instead.
 fn is_js_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.split('.').all(|segment| {
-            let mut characters = segment.chars();
-            characters
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
-                && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-        })
+    !name.is_empty() && name.split('.').all(is_js_ident)
 }
 
 #[cfg(test)]
@@ -898,11 +1089,145 @@ mod tests {
     }
 
     #[test]
-    fn js_export_rejects_arguments() {
-        let attr: proc_macro2::TokenStream = "foo".parse().unwrap();
+    fn js_reserved_words_list_is_sorted() {
+        assert!(
+            JS_RESERVED_WORDS.windows(2).all(|pair| pair[0] < pair[1]),
+            "JS_RESERVED_WORDS must remain strictly sorted for binary_search"
+        );
+    }
+
+    #[test]
+    fn js_export_default_emits_no_mangle_and_marshal_section() {
+        let attr = proc_macro2::TokenStream::new();
+        let item: proc_macro2::TokenStream = "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+            .parse()
+            .unwrap();
+        let expanded = expand_export(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains(r#"cfg_attr (target_arch = "wasm32" , unsafe (no_mangle))"#),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains(
+                r#"cfg_attr (target_arch = "wasm32" , unsafe (link_section = "rcgjs.export.v1"))"#
+            ),
+            "{expanded}"
+        );
+        assert!(!expanded.contains("export_name"), "{expanded}");
+        assert!(expanded.contains("pub fn add"), "{expanded}");
+    }
+
+    #[test]
+    fn js_export_with_name_emits_export_name_and_marshal_section() {
+        for valid_name in ["parseMarkdown", "_private", "$helper", "a1_b$2"] {
+            let attr: proc_macro2::TokenStream =
+                format!(r#"name = "{valid_name}""#).parse().unwrap();
+            let item: proc_macro2::TokenStream = "pub fn parse() {}".parse().unwrap();
+            let expanded = expand_export(attr, item).unwrap().to_string();
+            assert!(
+                expanded.contains(&format!(
+                    r#"cfg_attr (target_arch = "wasm32" , unsafe (export_name = "{valid_name}"))"#
+                )),
+                "{expanded}"
+            );
+            assert!(
+                expanded.contains(
+                    r#"cfg_attr (target_arch = "wasm32" , unsafe (link_section = "rcgjs.export.v1"))"#
+                ),
+                "{expanded}"
+            );
+            assert!(!expanded.contains("no_mangle"), "{expanded}");
+        }
+    }
+
+    #[test]
+    fn js_export_raw_omits_marshal_section() {
+        let attr: proc_macro2::TokenStream = "raw".parse().unwrap();
+        let item: proc_macro2::TokenStream = "pub fn fast_entry() {}".parse().unwrap();
+        let expanded = expand_export(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains(r#"cfg_attr (target_arch = "wasm32" , unsafe (no_mangle))"#),
+            "{expanded}"
+        );
+        assert!(!expanded.contains("rcgjs.export.v1"), "{expanded}");
+        assert!(!expanded.contains("link_section"), "{expanded}");
+    }
+
+    #[test]
+    fn js_export_name_and_raw_work_in_either_order() {
+        for attr_src in [
+            r#"name = "foo", raw"#,
+            r#"raw, name = "foo""#,
+            r#"raw, name = "foo","#,
+        ] {
+            let attr: proc_macro2::TokenStream = attr_src.parse().unwrap();
+            let item: proc_macro2::TokenStream = "pub fn f() {}".parse().unwrap();
+            let expanded = expand_export(attr, item).unwrap().to_string();
+            assert!(
+                expanded.contains(
+                    r#"cfg_attr (target_arch = "wasm32" , unsafe (export_name = "foo"))"#
+                ),
+                "`{attr_src}` -> {expanded}"
+            );
+            assert!(
+                !expanded.contains("no_mangle"),
+                "`{attr_src}` -> {expanded}"
+            );
+            assert!(
+                !expanded.contains("rcgjs.export.v1"),
+                "`{attr_src}` -> {expanded}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_export_rejects_invalid_and_reserved_names() {
         let item: proc_macro2::TokenStream = "pub fn f() {}".parse().unwrap();
-        let err = expand_export(attr, item).unwrap_err();
-        assert!(err.to_string().contains("takes no arguments"), "{err}");
+        for (bad_name, expected_fragment) in [
+            ("", "must not be empty"),
+            ("1abc", "not a valid JavaScript identifier"),
+            ("foo-bar", "not a valid JavaScript identifier"),
+            ("foo.bar", "not a valid JavaScript identifier"),
+            ("foo bar", "not a valid JavaScript identifier"),
+            ("class", "JavaScript reserved word"),
+            ("return", "JavaScript reserved word"),
+            ("default", "JavaScript reserved word"),
+            ("function", "JavaScript reserved word"),
+            ("null", "JavaScript reserved word"),
+            ("true", "JavaScript reserved word"),
+            ("await", "JavaScript reserved word"),
+            ("yield", "JavaScript reserved word"),
+        ] {
+            let attr: proc_macro2::TokenStream = format!(r#"name = "{bad_name}""#).parse().unwrap();
+            let err = expand_export(attr, item.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains(expected_fragment),
+                "name `{bad_name}` reported `{err}`"
+            );
+        }
+    }
+
+    #[test]
+    fn js_export_rejects_unknown_duplicate_and_malformed_arguments() {
+        let item: proc_macro2::TokenStream = "pub fn f() {}".parse().unwrap();
+        for (attr_src, expected_fragment) in [
+            ("foo", "unknown `#[js_export]` argument `foo`"),
+            (r#"foo = "bar""#, "unknown `#[js_export]` argument `foo`"),
+            ("raw, raw", "duplicate `raw`"),
+            (r#"name = "a", name = "b""#, "duplicate `name`"),
+            (
+                r#"raw = "yes""#,
+                "`raw` in `#[js_export(..)]` takes no value",
+            ),
+            ("name", "`name` in `#[js_export(..)]` requires"),
+        ] {
+            let attr: proc_macro2::TokenStream = attr_src.parse().unwrap();
+            let err = expand_export(attr, item.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains(expected_fragment),
+                "`{attr_src}` reported `{err}`"
+            );
+        }
     }
 
     #[test]
@@ -1121,7 +1446,12 @@ mod tests {
         assert!(text.contains("doc"), "{text}");
         assert!(text.contains("inline (never)"), "{text}");
         assert!(text.contains("target_arch = \"wasm32\""), "{text}");
+        assert!(text.contains("unsafe (link_section"), "{text}");
         assert!(text.contains(":: core :: unreachable !"), "{text}");
+        assert!(
+            text.contains("mires JS binding 'Chart' is only available on the mires JS target"),
+            "{text}"
+        );
     }
 
     #[test]

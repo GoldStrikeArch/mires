@@ -49,6 +49,13 @@ impl Chunk {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     }
+
+    /// The TypeScript declaration file (`.d.ts`) published beside this chunk, if present.
+    #[must_use]
+    pub fn dts(&self) -> Option<PathBuf> {
+        let dts = self.path.with_extension("d.ts");
+        dts.is_file().then_some(dts)
+    }
 }
 
 #[derive(Debug, Clone)]

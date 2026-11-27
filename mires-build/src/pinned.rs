@@ -9,7 +9,7 @@ use crate::scrub;
 /// The channel assumed by a checkout whose toolchain file cannot be read.
 const DEFAULT_CHANNEL: &str = "nightly";
 
-/// The Rust toolchain a spike checkout pins, read from its
+/// The Rust toolchain a Mires checkout pins, read from its
 /// `rust-toolchain.toml`.
 ///
 /// The codegen backend is a rustc plugin, so it only loads into the exact

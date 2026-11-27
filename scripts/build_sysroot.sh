@@ -342,11 +342,10 @@ echo "==> building alloc"
 cargo "+$channel" ${jsc_cargo_args[@]+"${jsc_cargo_args[@]}"} build --release --target "$jsc_target" \
 	--manifest-path "$stdlib/library/alloc/Cargo.toml"
 
-elapsed=$(($(date +%s) - start))
 printf '%s' "$digest" >"$stamp"
 
 # ---------------------------------------------------------------------------
-# 4. installation
+# 4. installation (and thin `std` sysroot crate)
 # ---------------------------------------------------------------------------
 
 deps="$stdlib/library/target/$target/release/deps"
@@ -372,6 +371,47 @@ if [ "$found" -lt 3 ]; then
 	ls -la "$deps" >&2 || true
 	exit 1
 fi
+
+# Build the thin `mires-std` sysroot crate as `std` against the newly installed
+# `core`, `compiler_builtins`, and `alloc`. Compiled WITHOUT `-Zforce-unstable-if-unmarked`
+# so ordinary crates can use `std::*` without `#![feature(...)]`.
+if [ -f "$root/mires-std/src/lib.rs" ]; then
+	echo "==> building std (mires-std)"
+	std_hash=$(printf '%s' "$key" | cut -c1-16)
+	std_backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
+	if [ -n "${JS_EXTRA_ARGS:-}" ]; then
+		for arg in $JS_EXTRA_ARGS; do
+			std_backend_args+=(-Cllvm-args="$arg")
+		done
+	fi
+	rustc "+$channel" \
+		--crate-name std \
+		--crate-type rlib \
+		--edition 2024 \
+		--target "$jsc_target" \
+		${jsc_unstable_args[@]+"${jsc_unstable_args[@]}"} \
+		--sysroot "$install" \
+		-Zcodegen-backend="$dylib" \
+		-Zinline-mir \
+		"$jsc_panic_flag" \
+		-Ccodegen-units=1 \
+		-Coverflow-checks=off \
+		-Cdebug-assertions=off \
+		-Cdebuginfo=0 \
+		-Copt-level="${JSC_RUST_OPT_LEVEL:-3}" \
+		-Cmetadata="mires_std_$std_hash" \
+		-Cextra-filename="-$std_hash" \
+		--remap-path-prefix "$root/=" \
+		"${std_backend_args[@]}" \
+		--out-dir "$install_lib" \
+		"$root/mires-std/src/lib.rs"
+	if [ ! -f "$install_lib/libstd-$std_hash.rlib" ]; then
+		echo "build_sysroot.sh: expected libstd-$std_hash.rlib in $install_lib" >&2
+		exit 1
+	fi
+fi
+
+elapsed=$(($(date +%s) - start))
 
 # The backend options this sysroot was built with, for scripts/test.sh to compare
 # against its own $JS_EXTRA_ARGS. An option that changes the JavaScript an item

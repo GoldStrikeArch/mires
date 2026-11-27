@@ -6,7 +6,7 @@ use std::{
 
 use rcgjs_object::{
     artifact::{self, ArtifactManifest, EntryRole},
-    opts::{Lane, OptimizerMode, OptimizerPass, Profile},
+    opts::{Lane, Modules as ModuleFormat, OptimizerMode, OptimizerPass, Profile, RuntimeMode},
 };
 
 use crate::{
@@ -55,6 +55,28 @@ fn lane_arg(lane: Lane) -> &'static str {
     }
 }
 
+pub(crate) fn module_format_str(format: ModuleFormat) -> &'static str {
+    match format {
+        ModuleFormat::Esm => "esm",
+        ModuleFormat::Script => "script",
+    }
+}
+
+fn module_format_arg(format: ModuleFormat) -> &'static str {
+    match format {
+        ModuleFormat::Esm => "js-modules=esm",
+        ModuleFormat::Script => "js-modules=script",
+    }
+}
+
+fn runtime_mode_arg(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::External => "js-runtime=external",
+        RuntimeMode::Inline => "js-runtime=inline",
+        RuntimeMode::None => "js-runtime=none",
+    }
+}
+
 /// A rustc optimization level applied consistently to the client and its JavaScript sysroot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RustOptLevel {
@@ -79,30 +101,37 @@ impl RustOptLevel {
     }
 }
 
-/// Builder for a client crate compiled to JavaScript from a Cargo build
-/// script.
+/// Builder for a single-file or island client crate compiled to JavaScript from
+/// a Cargo build script.
 ///
-/// The default configuration compiles the crate rooted at the given file with
-/// the backend and sysroot already built in the spike checkout, and publishes
-/// `app.js`, `app.js.map`, and `shim.js` into `$OUT_DIR`:
+/// The default configuration compiles the crate rooted at the given `.rs` file
+/// with the backend and sysroot (`core`, `alloc`, and `std`) already built in
+/// the Mires checkout, and publishes `app.js`, `app.js.map`, and `shim.js` into
+/// `$OUT_DIR`:
 ///
 /// ```rust,no_run
 /// mires_build::BuildConfig::new("client/app.rs")
 ///     .render()
 ///     .unwrap();
 /// ```
+///
+/// To compile a full Cargo crate with its own `Cargo.toml` and dependencies
+/// (including `std`, `alloc`, and crates.io packages), prefer [`Crate`](crate::Crate).
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
     client_root: PathBuf,
     output_name: String,
     source_map: bool,
     shim_mode: ShimMode,
+    format: Option<ModuleFormat>,
+    runtime: Option<RuntimeMode>,
+    dts: Option<bool>,
     emit_args: Vec<String>,
     crate_args: Vec<String>,
     entry_role: Option<EntryRole>,
     cfgs: Vec<String>,
     chunking: Option<Chunking>,
-    spike_root: Option<PathBuf>,
+    toolchain_root: Option<PathBuf>,
     bootstrap: bool,
     shim_module_source: Option<PathBuf>,
     optimizer: OptimizerMode,
@@ -121,13 +150,12 @@ impl BuildConfig {
     /// `client_root`, ready to be customized with the builder methods and
     /// executed with [`render`](Self::render).
     ///
-    /// `client_root` is the single `.rs` file rustc is pointed at. The crate
-    /// under it is `#![no_std]` and `#![no_main]`, carries its own
-    /// `#[panic_handler]`, and has `core` and nothing else: there is no
-    /// `alloc`. Extra modules are reached with `#[path = "..."] mod`, since
-    /// there is no Cargo target to lay them out. Its `#[no_mangle]` functions
-    /// are both the exports and the roots dead code elimination keeps, and
-    /// their names survive into the JavaScript unchanged.
+    /// `client_root` is the `.rs` root file passed directly to `rustc`. The
+    /// sysroot provides `core`, `alloc` (`Box`, `Vec`, `String`), and Mires's
+    /// `std` crate. Extra modules are reached with `#[path = "..."] mod`, or
+    /// use [`Crate`](crate::Crate) to compile a full Cargo package. Its
+    /// `#[no_mangle]` functions are both the exports and the roots dead code
+    /// elimination keeps, and their names survive into the JavaScript unchanged.
     #[must_use]
     pub fn new(client_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -135,12 +163,15 @@ impl BuildConfig {
             output_name: DEFAULT_OUTPUT_NAME.to_owned(),
             source_map: true,
             shim_mode: ShimMode::Full,
+            format: None,
+            runtime: None,
+            dts: None,
             emit_args: Vec::new(),
             crate_args: Vec::new(),
             entry_role: None,
             cfgs: Vec::new(),
             chunking: None,
-            spike_root: None,
+            toolchain_root: None,
             bootstrap: false,
             shim_module_source: None,
             optimizer: OptimizerMode::Off,
@@ -221,7 +252,8 @@ impl BuildConfig {
     /// Publish only runtime members transitively reached by the emitted program.
     ///
     /// Defaults to `false`, preserving the complete development shim. When enabled, the build
-    /// runs `scripts/minimal-shim.mjs` after linking and publishes its closed subset instead.
+    /// runs `jsc-link --emit-runtime` in pure Rust after linking and publishes its closed subset
+    /// instead.
     #[must_use]
     pub fn minimal_shim(mut self, on: bool) -> Self {
         self.shim_mode = match (self.shim_mode, on) {
@@ -229,6 +261,34 @@ impl BuildConfig {
             (ShimMode::Minimal, false) => ShimMode::Full,
             (other, false) => other,
         };
+        self
+    }
+
+    /// Select the output JavaScript module format (`js-modules=esm|script`).
+    ///
+    /// Link-only: changing this never rebuilds the sysroot.
+    #[must_use]
+    pub fn format(mut self, format: ModuleFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    /// Select how the runtime shim is supplied (`js-runtime=external|inline|none`).
+    ///
+    /// Link-only: changing this never rebuilds the sysroot. When set to
+    /// [`RuntimeMode::Inline`] or [`RuntimeMode::None`], no external shim file is emitted.
+    #[must_use]
+    pub fn runtime(mut self, mode: RuntimeMode) -> Self {
+        self.runtime = Some(mode);
+        self
+    }
+
+    /// Emit TypeScript `.d.ts` declarations beside each compiled program (`js-dts=on|off`).
+    ///
+    /// Link-only: changing this never rebuilds the sysroot.
+    #[must_use]
+    pub fn dts(mut self, on: bool) -> Self {
+        self.dts = Some(on);
         self
     }
 
@@ -382,13 +442,19 @@ impl BuildConfig {
         self
     }
 
-    /// Override the spike checkout the backend, sysroot, and scripts come
-    /// from. Defaults to the checkout this crate itself lives in, and is
-    /// overridden in turn by [`SPIKE_ROOT_ENV`](crate::SPIKE_ROOT_ENV).
+    /// Override the Mires toolchain checkout the backend, sysroot, and scripts
+    /// come from. Defaults to the checkout this crate itself lives in, and is
+    /// overridden in turn by [`TOOLCHAIN_ROOT_ENV`](crate::TOOLCHAIN_ROOT_ENV).
     #[must_use]
-    pub fn spike_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.spike_root = Some(root.into());
+    pub fn toolchain_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.toolchain_root = Some(root.into());
         self
+    }
+
+    /// Legacy alias for [`toolchain_root`](Self::toolchain_root).
+    #[must_use]
+    pub fn spike_root(self, root: impl Into<PathBuf>) -> Self {
+        self.toolchain_root(root)
     }
 
     /// Build the backend and the sysroot when they are missing or built with
@@ -415,7 +481,7 @@ impl BuildConfig {
         let out_dir = env::var_os("OUT_DIR")
             .map(PathBuf::from)
             .ok_or(BuildError::NoOutDir)?;
-        let toolchain = Toolchain::resolve(self.spike_root.clone())?;
+        let toolchain = Toolchain::resolve(self.toolchain_root.clone())?;
         self.check_report_shape()?;
 
         // Before anything that can fail: a build that ends in an error still
@@ -506,6 +572,12 @@ impl BuildConfig {
     /// Generate the runtime at the location imported by the published entry graph, then
     /// bind that provider's bytes into the manifest.
     fn publish_shim(&self, toolchain: &Toolchain, manifest_path: &Path) -> Result<Option<PathBuf>> {
+        if matches!(
+            self.effective_runtime(),
+            Some(RuntimeMode::Inline | RuntimeMode::None)
+        ) {
+            return Ok(None);
+        }
         let minimal = match self.shim_mode {
             ShimMode::None => return Ok(None),
             ShimMode::Full => false,
@@ -745,6 +817,16 @@ impl BuildConfig {
         Some(format!("js-opt-passes={value}"))
     }
 
+    fn effective_runtime(&self) -> Option<RuntimeMode> {
+        if let Some(mode) = self.runtime {
+            return Some(mode);
+        }
+        self.crate_args
+            .iter()
+            .rev()
+            .find_map(|arg| arg.strip_prefix("js-runtime=").and_then(RuntimeMode::parse))
+    }
+
     fn extra_args_for(&self, report: Option<&Path>, workspace_root: Option<&Path>) -> String {
         let source_map = self.source_map.then_some("js-source-map=on");
         let warnings = (!self.optimization_warnings).then_some("js-opt-warnings=off");
@@ -761,6 +843,11 @@ impl BuildConfig {
         let profile_args = self.profile_emit_args();
         let profile = self.profile.map(Profile::backend_arg);
         let jir = (!self.jir).then_some("js-jir=off");
+        let format = self.format.map(module_format_arg);
+        let runtime = self.runtime.map(runtime_mode_arg);
+        let dts = self
+            .dts
+            .map(|on| if on { "js-dts=on" } else { "js-dts=off" });
         let entry_role = self
             .entry_role
             .map(|role| format!("js-entry-role={}", role.as_str()));
@@ -774,6 +861,9 @@ impl BuildConfig {
             .chain(optimizer_mode_arg(self.optimizer))
             .chain(optimizer_passes.as_deref())
             .chain(self.crate_args.iter().map(String::as_str))
+            .chain(format)
+            .chain(runtime)
+            .chain(dts)
             .chain(entry_role.as_deref())
             .chain(lane)
             .chain(chunks.iter().map(String::as_str))
@@ -847,6 +937,12 @@ impl Artifacts {
             .iter()
             .chain(&self.shared)
             .find(|chunk| chunk.name == name)
+    }
+
+    /// The TypeScript declaration file (`.d.ts`) published beside the unsplit program, if present.
+    #[must_use]
+    pub fn dts(&self) -> Option<PathBuf> {
+        self.program().and_then(Chunk::dts)
     }
 }
 
@@ -1785,5 +1881,107 @@ mod tests {
             matches!(error, BuildError::RuntimeProviderMismatch { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn typed_format_runtime_and_dts_options_are_link_only() {
+        let config = BuildConfig::new("client/app.rs")
+            .source_map(false)
+            .format(ModuleFormat::Esm)
+            .runtime(RuntimeMode::Inline)
+            .dts(true)
+            .toolchain_root("/mires");
+
+        assert_eq!(config.emit_arguments(), "");
+        assert_eq!(
+            config.extra_args(),
+            "js-modules=esm js-runtime=inline js-dts=on"
+        );
+        assert_eq!(config.toolchain_root.as_deref(), Some(Path::new("/mires")));
+
+        let script = BuildConfig::new("client/app.rs")
+            .source_map(false)
+            .format(ModuleFormat::Script)
+            .runtime(RuntimeMode::None)
+            .dts(false)
+            .spike_root("/legacy");
+        assert_eq!(script.emit_arguments(), "");
+        assert_eq!(
+            script.extra_args(),
+            "js-modules=script js-runtime=none js-dts=off"
+        );
+        assert_eq!(script.toolchain_root.as_deref(), Some(Path::new("/legacy")));
+
+        let external = BuildConfig::new("client/app.rs")
+            .source_map(false)
+            .runtime(RuntimeMode::External);
+        assert_eq!(external.extra_args(), "js-runtime=external");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn inline_and_none_runtime_skip_shim_publication_without_provider() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let toolchain = Toolchain::new(root).unwrap();
+        let dir = TempDir::new("runtime-inline-none");
+        let program = staged(dir.path(), &["islands.js"]);
+        let manifest_path = artifact::manifest_path(&program);
+
+        // Even with a manifest whose runtime declares a bare external specifier (which
+        // would normally fail under external runtime mode), Inline and None return Ok(None).
+        let shim_sha = artifact::sha256(&fs::read(toolchain.shim()).unwrap());
+        let mut manifest = ArtifactManifest::read(&manifest_path).unwrap();
+        let prog = manifest.artifacts.get_mut("islands.js").unwrap();
+        prog.imports.insert("external-rt".to_owned(), None);
+        prog.runtime = Some(artifact::RuntimeRequirement {
+            module: Some("external-rt".to_owned()),
+            source_sha256: shim_sha,
+            direct: BTreeSet::from(["host_task".to_owned()]),
+            closure: BTreeSet::from(["host_task".to_owned()]),
+            external: BTreeSet::new(),
+            artifact: None,
+        });
+        manifest.write(&manifest_path).unwrap();
+
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .runtime(RuntimeMode::Inline)
+                .publish_shim(&toolchain, &manifest_path)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            BuildConfig::new("client/app.rs")
+                .runtime(RuntimeMode::None)
+                .publish_shim(&toolchain, &manifest_path)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn chunk_and_artifacts_expose_published_dts_when_present() {
+        let dir = TempDir::new("chunk-dts");
+        let out = dir.path();
+        let program = staged(out, &["islands.js", "islands.d.ts"]);
+        let config = BuildConfig::new("client/app.rs")
+            .output_name("islands.js")
+            .source_map(false)
+            .dts(true);
+
+        let (chunks, shared, artifact_manifest) = config
+            .publish_chunks(program.parent().unwrap(), &program, out)
+            .unwrap();
+        assert_eq!(chunks[0].dts(), Some(out.join("islands.d.ts")));
+
+        let artifacts = Artifacts {
+            artifact_manifest,
+            chunks,
+            shared,
+            shim: None,
+            import_map: None,
+            optimization_report: None,
+        };
+        assert_eq!(artifacts.dts(), Some(out.join("islands.d.ts")));
     }
 }

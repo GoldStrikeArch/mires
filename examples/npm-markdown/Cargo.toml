@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "npm-markdown"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone Rust-to-npm Markdown renderer compiled to ES modules with mires"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mires = { path = "../../mires" }
+
+[package.metadata.mires]
+format = "esm"
+runtime = "inline"
+dts = true
+npm = true

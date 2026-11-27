@@ -138,17 +138,31 @@ impl HostValue for JsValue {
 impl core::ops::Add for JsValue {
     type Output = Self;
 
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.add")]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            unsafe_code,
+            reason = "host marker link_section lowered by rustc_codegen_js"
+        )
+    )]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.add"))]
     #[inline(never)]
     fn add(self, other: Self) -> Self {
         host_add(self, other)
     }
 }
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section attributes lowered by rustc_codegen_js"
+    )
+)]
 impl JsValue {
     /// JavaScript `undefined`.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.undefined")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.undefined"))]
     #[inline(never)]
     pub fn undefined() -> Self {
         host_undefined()
@@ -156,7 +170,7 @@ impl JsValue {
 
     /// JavaScript `null`.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.null")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.null"))]
     #[inline(never)]
     pub fn null() -> Self {
         host_null()
@@ -164,7 +178,10 @@ impl JsValue {
 
     /// Whether this value is `undefined`.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isundefined")]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        unsafe(link_section = "rcgjs.host.isundefined")
+    )]
     #[inline(never)]
     pub fn is_undefined(self) -> bool {
         host_is_undefined(self)
@@ -172,7 +189,7 @@ impl JsValue {
 
     /// Whether this value is `null`.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isnull")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isnull"))]
     #[inline(never)]
     pub fn is_null(self) -> bool {
         host_is_null(self)
@@ -180,7 +197,7 @@ impl JsValue {
 
     /// Whether JavaScript considers this value truthy.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.truthy")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.truthy"))]
     #[inline(never)]
     pub fn is_truthy(self) -> bool {
         host_is_truthy(self)
@@ -188,7 +205,7 @@ impl JsValue {
 
     /// Whether this value and `other` are strictly equal.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.stricteq")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.stricteq"))]
     #[inline(never)]
     pub fn strictly_equals(self, other: Self) -> bool {
         host_strictly_equals(self, other)
@@ -196,7 +213,7 @@ impl JsValue {
 
     /// JavaScript's `typeof` predicate for booleans.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isboolean")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isboolean"))]
     #[inline(never)]
     pub fn is_boolean(self) -> bool {
         host_is_boolean(self)
@@ -204,7 +221,7 @@ impl JsValue {
 
     /// JavaScript's `typeof` predicate for numbers.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isnumber")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isnumber"))]
     #[inline(never)]
     pub fn is_number(self) -> bool {
         host_is_number(self)
@@ -212,7 +229,7 @@ impl JsValue {
 
     /// JavaScript's `typeof` predicate for big integers.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isbigint")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isbigint"))]
     #[inline(never)]
     pub fn is_bigint(self) -> bool {
         host_is_bigint(self)
@@ -220,7 +237,7 @@ impl JsValue {
 
     /// JavaScript's `typeof` predicate for strings.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isstring")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isstring"))]
     #[inline(never)]
     pub fn is_string(self) -> bool {
         host_is_string(self)
@@ -228,7 +245,7 @@ impl JsValue {
 
     /// JavaScript's `typeof` predicate for functions.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isfunction")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isfunction"))]
     #[inline(never)]
     pub fn is_function(self) -> bool {
         host_is_function(self)
@@ -236,7 +253,7 @@ impl JsValue {
 
     /// Whether the value is a non-null object.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.isobject")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.isobject"))]
     #[inline(never)]
     pub fn is_object(self) -> bool {
         host_is_object(self)
@@ -244,7 +261,7 @@ impl JsValue {
 
     /// Whether the value is an `Error` in the current realm.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.iserror")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.iserror"))]
     #[inline(never)]
     pub fn is_error(self) -> bool {
         host_is_error(self)
@@ -252,7 +269,7 @@ impl JsValue {
 
     /// Erases the Rust view of a host-compatible value.
     #[must_use]
-    #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.erase")]
+    #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.erase"))]
     #[inline(never)]
     pub fn erase<T: HostValue>(value: T) -> Self {
         host_erase(value)
@@ -343,7 +360,14 @@ where
 
 /// Calls `function` with an explicit `this` value and positional arguments.
 #[must_use]
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.invoke")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.invoke"))]
 #[inline(never)]
 pub fn invoke(function: JsValue, this: JsValue, arguments: &[JsValue]) -> JsValue {
     host_invoke(function, this, arguments)
@@ -351,7 +375,14 @@ pub fn invoke(function: JsValue, this: JsValue, arguments: &[JsValue]) -> JsValu
 
 /// Constructs a value dynamically, using `constructor` and positional arguments.
 #[must_use]
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.construct")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.construct"))]
 #[inline(never)]
 pub fn construct(constructor: JsValue, arguments: &[JsValue]) -> JsValue {
     host_construct(constructor, arguments)
@@ -374,7 +405,14 @@ pub fn throw_value(value: JsValue) -> ! {
 ///
 /// Unlike [`throw_value`], the thrown error is registered as a compiler abort (`__rt.abort_error`),
 /// so every unwind frame rethrows it immediately without running cleanup.
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.abort")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.abort"))]
 #[inline(never)]
 pub fn abort(message: &str) -> ! {
     host_abort(message)
@@ -382,7 +420,14 @@ pub fn abort(message: &str) -> ! {
 
 macro_rules! marker {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty, $section:literal, $body:block) => {
-        #[cfg_attr(target_arch = "wasm32", link_section = $section)]
+        #[cfg_attr(
+            target_arch = "wasm32",
+            allow(
+                unsafe_code,
+                reason = "host marker link_section lowered by rustc_codegen_js"
+            )
+        )]
+        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = $section))]
         #[inline(never)]
         fn $name($($arg: $ty),*) -> $result $body
     };
@@ -395,41 +440,98 @@ marker!(host_null() -> JsValue, "rcgjs.host.null", {
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 });
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.base64url")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.base64url"))]
 #[inline(never)]
 pub(crate) fn host_base64_url(value: crate::JsUint8Array) -> crate::JsString {
     let _ = value;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.base64urlnative")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.base64urlnative")
+)]
 #[inline(never)]
 pub(crate) fn host_base64_url_native(value: crate::JsUint8Array) -> crate::JsString {
     let _ = value;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.base64urlsupported")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.base64urlsupported")
+)]
 #[inline(never)]
 pub(crate) fn host_base64_url_supported() -> bool {
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arrayfrombytes")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.u8arrayfrombytes")
+)]
 #[inline(never)]
 pub(crate) fn host_u8array_from_bytes(bytes: &[u8]) -> crate::JsUint8Array {
     let _ = bytes;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arraylength")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.u8arraylength")
+)]
 #[inline(never)]
 pub(crate) fn host_u8array_length(value: crate::JsUint8Array) -> usize {
     let _ = value;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arrayintobytes")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    unsafe(link_section = "rcgjs.host.u8arrayintobytes")
+)]
 #[inline(never)]
 pub(crate) fn host_u8array_into_bytes(source: crate::JsUint8Array, destination: &mut [u8]) {
     let _ = (source, destination);
@@ -547,21 +649,42 @@ marker!(host_bad_read() -> !, "rcgjs.host.badread", {
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 });
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.erase")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.erase"))]
 #[inline(never)]
 fn host_erase<T: HostValue>(value: T) -> JsValue {
     let _ = value;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.read")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.read"))]
 #[inline(never)]
 fn host_read<T: HostValue>(value: JsValue) -> T {
     let _ = value;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.callback0")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.callback0"))]
 #[inline(never)]
 fn host_callback0<F>(f: F) -> JsValue
 where
@@ -572,7 +695,14 @@ where
     result
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.callback1")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.callback1"))]
 #[inline(never)]
 fn host_callback1<F>(f: F) -> JsValue
 where
@@ -583,7 +713,14 @@ where
     result
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.callback2")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.callback2"))]
 #[inline(never)]
 fn host_callback2<F>(f: F) -> JsValue
 where
@@ -594,7 +731,14 @@ where
     result
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.callback3")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.callback3"))]
 #[inline(never)]
 fn host_callback3<F>(f: F) -> JsValue
 where
@@ -609,7 +753,14 @@ where
     result
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.callback4")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.callback4"))]
 #[inline(never)]
 fn host_callback4<F>(f: F) -> JsValue
 where
@@ -625,21 +776,42 @@ where
     result
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.invoke")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.invoke"))]
 #[inline(never)]
 fn host_invoke(function: JsValue, this: JsValue, arguments: &[JsValue]) -> JsValue {
     let _ = (function, this, arguments);
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.construct")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.construct"))]
 #[inline(never)]
 fn host_construct(constructor: JsValue, arguments: &[JsValue]) -> JsValue {
     let _ = (constructor, arguments);
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.try")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.try"))]
 #[inline(never)]
 fn host_try<F>(f: F) -> Result<JsValue, JsValue>
 where
@@ -666,7 +838,14 @@ where
     host_local_waker(f)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.localwaker")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.localwaker"))]
 #[inline(never)]
 fn host_local_waker<F>(f: F) -> Waker
 where
@@ -684,7 +863,14 @@ where
     host_microtask(f)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.microtask")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.microtask"))]
 #[inline(never)]
 fn host_microtask<F>(f: F)
 where
@@ -701,7 +887,14 @@ where
     host_on_settled(value, f)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.settled")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.settled"))]
 #[inline(never)]
 fn host_on_settled<F>(value: JsValue, f: F)
 where
@@ -718,7 +911,14 @@ where
     host_promise_new(f)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.promise")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.promise"))]
 #[inline(never)]
 fn host_promise_new<F>(f: F) -> JsValue
 where
@@ -736,7 +936,14 @@ where
     host_task(f)
 }
 
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.task")]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        unsafe_code,
+        reason = "host marker link_section lowered by rustc_codegen_js"
+    )
+)]
+#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.host.task"))]
 #[inline(never)]
 fn host_task<F>(f: F)
 where

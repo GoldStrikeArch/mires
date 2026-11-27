@@ -2,11 +2,99 @@
 
 use alloc::rc::Rc;
 use core::cell::Cell;
-use core::future::Future;
+use core::future::{Future, IntoFuture};
 use core::pin::Pin;
 use core::task::{Context, LocalWaker, Poll};
 
-use crate::{native_promise_from_future, on_settled, promise_from_future, task, JsValue};
+use crate::{
+    js_bindings, native_promise_from_future, on_settled, promise_from_future, task, HostHandle,
+    HostValue, JsValue,
+};
+
+/// A native JavaScript `Promise`.
+///
+/// Wraps an opaque host `Promise` object as one transparent handle word. Implements
+/// [`IntoFuture`] so a `Promise` can be `.await`ed directly inside Rust `async` functions, and
+/// [`Promise::from_future`] converts a Rust `Future` into a host `Promise`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Promise {
+    #[allow(dead_code, reason = "opaque host handle lowered by backend")]
+    handle: HostHandle,
+}
+
+impl crate::host::sealed::Sealed for Promise {}
+impl HostValue for Promise {
+    fn accepts(value: JsValue) -> bool {
+        value.is_object() && is_prototype_of(promise_prototype(), value)
+    }
+}
+
+impl Promise {
+    /// Creates a `Promise` resolved with `value` (`Promise.resolve(value)`).
+    #[must_use]
+    pub fn resolve(value: JsValue) -> Self {
+        promise_resolve(value)
+    }
+
+    /// Creates a `Promise` rejected with `reason` (`Promise.reject(reason)`).
+    #[must_use]
+    pub fn reject(reason: JsValue) -> Self {
+        promise_reject(reason)
+    }
+
+    /// Converts a Rust future into a native JavaScript `Promise`.
+    #[must_use]
+    pub fn from_future<F>(future: F) -> Self
+    where
+        F: Future<Output = Result<JsValue, JsValue>> + 'static,
+    {
+        future_to_promise(future).read()
+    }
+
+    /// Erases this `Promise` handle to an opaque [`JsValue`].
+    #[must_use]
+    pub fn as_value(self) -> JsValue {
+        JsValue::erase(self)
+    }
+}
+
+impl From<Promise> for JsValue {
+    fn from(value: Promise) -> Self {
+        value.as_value()
+    }
+}
+
+impl TryFrom<JsValue> for Promise {
+    type Error = JsValue;
+
+    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
+        value.try_read()
+    }
+}
+
+impl IntoFuture for Promise {
+    type Output = Result<JsValue, JsValue>;
+    type IntoFuture = PromiseFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        await_promise(self.as_value())
+    }
+}
+
+js_bindings! {
+    #[js(call = "Promise.resolve")]
+    fn promise_resolve(value: JsValue) -> Promise;
+
+    #[js(call = "Promise.reject")]
+    fn promise_reject(reason: JsValue) -> Promise;
+
+    #[js(global, get = "Promise.prototype")]
+    fn promise_prototype() -> JsValue;
+
+    #[js(method = "isPrototypeOf")]
+    fn is_prototype_of(prototype: JsValue, value: JsValue) -> bool;
+}
 
 /// How far a host value has settled.
 enum PromiseState {
@@ -414,5 +502,19 @@ mod tests {
 
         // Polling again after subscription error must panic as poll-after-completion.
         let _ = with_local_context(&wake, |cx| poll_promise_state(&state, cx, |_| Ok(())));
+    }
+
+    #[test]
+    fn promise_has_same_layout_as_js_value() {
+        assert_eq!(
+            core::mem::size_of::<Promise>(),
+            core::mem::size_of::<JsValue>()
+        );
+        assert_eq!(
+            core::mem::align_of::<Promise>(),
+            core::mem::align_of::<JsValue>()
+        );
+        fn assert_host_value<T: HostValue + Copy>() {}
+        assert_host_value::<Promise>();
     }
 }

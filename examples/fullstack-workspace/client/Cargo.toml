@@ -1,0 +1,17 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shared = { path = "../shared" }
+mires = { path = "../../../mires" }
+
+[package.metadata.mires]
+format = "esm"
+runtime = "inline"
+dts = true

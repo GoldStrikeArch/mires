@@ -11,7 +11,7 @@ pub enum Step {
     Toolchain,
     /// The codegen backend dylib.
     Backend,
-    /// The sysroot holding the `core` the backend compiled.
+    /// The sysroot holding `core`, `alloc`, and `std` compiled by the backend.
     Sysroot,
 }
 

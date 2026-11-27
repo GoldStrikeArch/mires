@@ -27,12 +27,29 @@ pub enum BuildError {
     Unmet(Box<Unmet>),
     #[error("the {} step failed with {status}", step.label())]
     Fix { step: Step, status: ExitStatus },
-    #[error(
-        "rustc exited with {status} compiling the client crate{}{}",
+    #[error("rustc exited with {status} compiling the client crate{}{}",
         if stderr.trim().is_empty() { "" } else { ":\n" },
         stderr.trim()
     )]
     Compile { status: ExitStatus, stderr: String },
+    #[error("no Cargo manifest at {}", path.display())]
+    ManifestMissing { path: PathBuf },
+    #[error(
+        "could not locate the `cargo-mires` executable (searched: {}); \
+         build it with `cargo build --release -p cargo-mires` or add it to `PATH`",
+        searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    CargoMiresMissing { searched: Vec<PathBuf> },
+    #[error(
+        "cargo-mires build exited with {status}{}{}",
+        if stderr.trim().is_empty() { "" } else { ":\n" },
+        stderr.trim()
+    )]
+    CargoMires { status: ExitStatus, stderr: String },
     #[error("minimal runtime extraction exited with {status}:\n{stderr}")]
     MinimalShim { status: ExitStatus, stderr: String },
     #[error("the compiler produced no {}", path.display())]

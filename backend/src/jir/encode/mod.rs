@@ -411,6 +411,25 @@ pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> Item
     }
 }
 
+/// Link section emitted by `#[js_export]` to request automatic JS↔Rust boundary marshaling.
+pub(crate) const JS_EXPORT_SECTION: &str = "rcgjs.export.v1";
+
+/// Whether `instance` is a function tagged with `#[js_export]` (`link_section = "rcgjs.export.v1"`).
+pub(crate) fn is_js_export_fn<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    let ty::InstanceKind::Item(def_id) = instance.def else {
+        return false;
+    };
+    if !matches!(
+        tcx.def_kind(def_id),
+        rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+    ) {
+        return false;
+    }
+    tcx.codegen_fn_attrs(def_id)
+        .link_section
+        .is_some_and(|section| section.as_str() == JS_EXPORT_SECTION)
+}
+
 /// Emitted parameter names of `instance` for `.d.ts` signature synthesis.
 pub(crate) fn dts_params<'tcx>(
     tcx: TyCtxt<'tcx>,

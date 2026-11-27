@@ -2,6 +2,49 @@
 
 `mires` is a Rust-to-JavaScript compiler implemented as a `rustc` codegen backend (`rustc_codegen_mires`) paired with a whole-program linker and optimizer (`jsc-link`). It compiles monomorphized Rust MIR, including the real `core` and `alloc` libraries, directly into JavaScript ES modules with no WebAssembly runtime and no linear memory heap.
 
+## Ergonomic Workflow (`cargo mires`, `mires-std`, Zero-Macro `#[js_export]`)
+
+Compile ordinary Rust crates — using `std` (`std::collections::HashMap`, `Vec`, `String`, `Result`) with no `#![no_std]`, no `extern crate alloc`, no `#[panic_handler]`, and no serialization derives — directly into self-contained ES modules, TypeScript `.d.ts` declarations, source maps, and npm packages:
+
+```rust
+use mires::js_export;
+
+pub struct RenderOptions { pub heading_ids: Option<bool>, pub strict: Option<bool> }
+pub struct RenderOutput { pub html: String, pub headings: Vec<String>, pub word_count: u32 }
+
+#[js_export(name = "renderMarkdown")]
+pub fn render_markdown(input: &str, options: Option<RenderOptions>) -> Result<RenderOutput, String> {
+    if options.as_ref().and_then(|o| o.strict).unwrap_or(false) && input.trim().is_empty() {
+        return Err("empty markdown input".to_owned());
+    }
+    // Ordinary `std` code; structs, enums, Vec, String, Option, and Result marshal automatically.
+    Ok(RenderOutput { html: format!("<p>{}</p>\n", input.trim()), headings: vec![], word_count: 1 })
+}
+```
+
+Build and publish with `cargo-mires` (defaults: ESM, self-contained inline runtime, `.d.ts`, and `.mjs.map`):
+
+```sh
+# Standalone Rust -> npm/TypeScript package (emits .mjs, .d.ts, .mjs.map, package.json)
+cargo mires build --manifest-path examples/npm-markdown/Cargo.toml --release --npm
+
+# Multi-crate workspace sharing domain types between native server & JS client
+cargo mires build --manifest-path examples/fullstack-workspace/Cargo.toml -p client --release
+```
+
+Or compile a workspace client crate automatically from a native server's `build.rs`:
+
+```rust
+mires_build::Crate::new("../client")
+    .release()
+    .build()
+    .expect("compile client crate to JS");
+```
+
+See the complete runnable examples:
+- [`examples/fullstack-workspace/`](examples/fullstack-workspace/) — 3-crate Cargo workspace (`shared`, `client`, `server`) sharing plain Rust domain types and `std::collections::HashMap` logic across native Rust and compiled ES modules.
+- [`examples/npm-markdown/`](examples/npm-markdown/) — standalone Rust-to-npm Markdown library with zero-macro `#[js_export]` marshaling, TypeScript `.d.ts` declarations, and generated `package.json`.
+
 ## How it works
 
 Compilation splits cleanly across two executables so `rustc` handles front-end analysis, borrow checking, monomorphization, and per-crate MIR encoding, while `jsc-link` sees the entire program at once for dead-code elimination, representation planning, optimization, and JavaScript emission.

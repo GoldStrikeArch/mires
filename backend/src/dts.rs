@@ -48,6 +48,12 @@ const MAX_DEPTH: u32 = 8;
 
 /// The signature of `instance`, whose emitted parameters are `params`.
 ///
+/// When `is_js_export` is `true` (`#[js_export]` / `link_section = "rcgjs.export.v1"`), the
+/// generated TypeScript describes the marshaled JavaScript boundary surface (`string` for
+/// `String`, `T[]` for `Vec<T>`/`&[T]`, `T | undefined` / `field?: T` for `Option<T>`, unwrapped
+/// `T` with `@throws` for top-level `Result<T, E>`, and native types for `JsValue`/`JsString`/
+/// `JsArray`). When `false`, the signature reflects the raw internal value model unchanged.
+///
 /// Returns `None` when the emitted parameter list and the Rust signature disagree in length, which
 /// is every shape that takes a hidden argument: a `#[track_caller]` callee takes a `Location`, and
 /// a `"rust-call"` body takes its arguments splatted out of a tuple. Neither is an exported entry
@@ -56,6 +62,7 @@ pub(crate) fn signature<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     params: &[String],
+    is_js_export: bool,
 ) -> Option<Dts> {
     let sig = tcx.normalize_erasing_late_bound_regions(
         crate::value::typing_env(),
@@ -66,22 +73,167 @@ pub(crate) fn signature<'tcx>(
     }
 
     let mut types = BTreeMap::new();
+    let optional_tail_start = if is_js_export {
+        sig.inputs()
+            .iter()
+            .rposition(|ty| option_inner_ty(tcx, *ty).is_none())
+            .map_or(0, |idx| idx + 1)
+    } else {
+        sig.inputs().len()
+    };
     let named = params
         .iter()
         .zip(sig.inputs())
-        .map(|(name, ty)| (name.clone(), ts_type(tcx, *ty, &mut types, 0)))
+        .enumerate()
+        .map(|(idx, (name, ty))| {
+            if is_js_export && idx >= optional_tail_start {
+                if let Some(inner) = option_inner_ty(tcx, *ty) {
+                    return (format!("{name}?"), ts_type(tcx, inner, &mut types, 0, true));
+                }
+            }
+            (name.clone(), ts_type(tcx, *ty, &mut types, 0, is_js_export))
+        })
         .collect();
-    let ret = match sig.output().is_unit() {
-        true => "void".to_owned(),
-        false => ts_type(tcx, sig.output(), &mut types, 0),
+    let mut rust = format!("{sig}");
+    let ret = if is_js_export {
+        if let Some((ok_ty, err_ty)) = result_type_args(tcx, sig.output()) {
+            let ok_ts = if ok_ty.is_unit() {
+                "void".to_owned()
+            } else {
+                ts_type(tcx, ok_ty, &mut types, 0, true)
+            };
+            let err_ts = ts_type(tcx, err_ty, &mut types, 0, true);
+            rust = format!("{sig}\n@throws {{{err_ts}}}");
+            ok_ts
+        } else if sig.output().is_unit() {
+            "void".to_owned()
+        } else {
+            ts_type(tcx, sig.output(), &mut types, 0, true)
+        }
+    } else {
+        match sig.output().is_unit() {
+            true => "void".to_owned(),
+            false => ts_type(tcx, sig.output(), &mut types, 0, false),
+        }
     };
 
     Some(Dts {
         params: named,
         ret,
         types: types.into_iter().collect(),
-        rust: format!("{sig}"),
+        rust,
     })
+}
+
+/// Formats `inner` as a TypeScript array type, parenthesizing unions (`(A | B)[]`).
+fn ts_array_type(inner: String) -> String {
+    if inner.contains(" | ") {
+        format!("({inner})[]")
+    } else {
+        format!("{inner}[]")
+    }
+}
+
+/// Whether `did` is `alloc::string::String` (`std::string::String`).
+fn is_string_def(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    tcx.lang_items().string() == Some(did)
+        || tcx
+            .get_diagnostic_name(did)
+            .is_some_and(|name| name.as_str() == "String")
+        || matches!(
+            tcx.def_path_str(did).as_str(),
+            "alloc::string::String" | "std::string::String"
+        )
+}
+
+/// Whether `did` is `alloc::vec::Vec` (`std::vec::Vec`).
+fn is_vec_def(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    tcx.get_diagnostic_name(did)
+        .is_some_and(|name| name.as_str() == "Vec")
+        || matches!(
+            tcx.def_path_str(did).as_str(),
+            "alloc::vec::Vec" | "std::vec::Vec"
+        )
+}
+
+/// Whether `did` is `core::option::Option` (`std::option::Option`).
+fn is_option_def(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    tcx.lang_items().option_type() == Some(did)
+        || tcx
+            .get_diagnostic_name(did)
+            .is_some_and(|name| name.as_str() == "Option")
+        || matches!(
+            tcx.def_path_str(did).as_str(),
+            "core::option::Option" | "std::option::Option"
+        )
+}
+
+/// Whether `did` is `core::result::Result` (`std::result::Result`).
+fn is_result_def(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    tcx.get_diagnostic_name(did)
+        .is_some_and(|name| name.as_str() == "Result")
+        || matches!(
+            tcx.def_path_str(did).as_str(),
+            "core::result::Result" | "std::result::Result"
+        )
+}
+
+/// If `ty` is `Option<T>`, returns `Some(T)`.
+fn option_inner_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    let ty::Adt(def, args) = ty.kind() else {
+        return None;
+    };
+    if !is_option_def(tcx, def.did()) {
+        return None;
+    }
+    args.types().next()
+}
+
+/// If `ty` is `Result<T, E>`, returns `Some((T, E))`.
+fn result_type_args<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
+    let ty::Adt(def, args) = ty.kind() else {
+        return None;
+    };
+    if !is_result_def(tcx, def.did()) {
+        return None;
+    }
+    let mut types = args.types();
+    Some((types.next()?, types.next()?))
+}
+
+/// Recognized `mires_js` host handle types for `#[js_export]` `.d.ts` output.
+fn mires_js_host_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_hir::def_id::DefId,
+    args: ty::GenericArgsRef<'tcx>,
+    types: &mut BTreeMap<String, String>,
+    depth: u32,
+) -> Option<String> {
+    let crate_name = tcx.crate_name(did.krate);
+    let item_name = tcx.item_name(did);
+    let is_mires_js = crate_name.as_str() == "mires_js";
+    let path = (!is_mires_js).then(|| tcx.def_path_str(did));
+    let matches_type = |expected_item: &str, expected_suffix: &str| {
+        (is_mires_js && item_name.as_str() == expected_item)
+            || path.as_deref().is_some_and(|p| {
+                p == expected_suffix || p.ends_with(&format!("::{expected_suffix}"))
+            })
+    };
+    if matches_type("JsValue", "mires_js::host::JsValue") {
+        return Some("unknown".to_owned());
+    }
+    if matches_type("JsString", "mires_js::host_value::JsString") {
+        return Some("string".to_owned());
+    }
+    if matches_type("JsArray", "mires_js::host_value::JsArray") {
+        let elem = args
+            .types()
+            .next()
+            .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Some(ts_array_type(elem));
+    }
+    None
 }
 
 /// The TypeScript for `ty`, registering any named types it needs in `types`.
@@ -90,6 +242,7 @@ fn ts_type<'tcx>(
     ty: Ty<'tcx>,
     types: &mut BTreeMap<String, String>,
     depth: u32,
+    is_js_export: bool,
 ) -> String {
     if depth > MAX_DEPTH {
         return "unknown".to_owned();
@@ -106,6 +259,12 @@ fn ts_type<'tcx>(
         ty::Str => "string".to_owned(),
         ty::Never => "never".to_owned(),
         ty::Ref(_, pointee, mutbl) => {
+            if is_js_export && !mutbl.is_mut() {
+                if let ty::Slice(elem) = pointee.kind() {
+                    let elem_ts = ts_type(tcx, *elem, types, depth + 1, true);
+                    return ts_array_type(elem_ts);
+                }
+            }
             match crate::value::is_slot(tcx, ty)
                 || (mutbl.is_mut() && matches!(pointee.kind(), ty::Str))
             {
@@ -113,18 +272,56 @@ fn ts_type<'tcx>(
                 // a pointer into a buffer, which has no useful TypeScript type: it is the model's
                 // own bookkeeping.
                 true => "unknown".to_owned(),
-                false => ts_type(tcx, *pointee, types, depth + 1),
+                false => ts_type(tcx, *pointee, types, depth + 1, is_js_export),
             }
         }
         ty::Tuple(fields) if fields.is_empty() => "undefined".to_owned(),
         ty::Tuple(fields) => {
             let members: Vec<String> = fields
                 .iter()
-                .map(|field| ts_type(tcx, field, types, depth + 1))
+                .map(|field| ts_type(tcx, field, types, depth + 1, is_js_export))
                 .collect();
             format!("[{}]", members.join(", "))
         }
         ty::Adt(def, args) => {
+            if is_js_export {
+                if let Some(host_ts) = mires_js_host_type(tcx, def.did(), args, types, depth) {
+                    return host_ts;
+                }
+                if is_string_def(tcx, def.did()) {
+                    return "string".to_owned();
+                }
+                if is_vec_def(tcx, def.did()) {
+                    let elem = args
+                        .types()
+                        .next()
+                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    return ts_array_type(elem);
+                }
+                if is_option_def(tcx, def.did()) {
+                    let inner = args
+                        .types()
+                        .next()
+                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    return format!("{inner} | undefined");
+                }
+                if is_result_def(tcx, def.did()) {
+                    let mut type_args = args.types();
+                    let ok_ts = type_args
+                        .next()
+                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let err_ts = type_args
+                        .next()
+                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    return format!(
+                        "{{ {TAG}: \"Ok\"; _0: {ok_ts} }} | {{ {TAG}: \"Err\"; _0: {err_ts} }}"
+                    );
+                }
+            }
             if let Some(opaque) = opaque_handle(tcx, def.did()) {
                 types.insert(
                     opaque.to_owned(),
@@ -133,8 +330,8 @@ fn ts_type<'tcx>(
                 return opaque.to_owned();
             }
             match def.is_enum() {
-                true => ts_enum(tcx, ty, *def, args, types, depth),
-                false => ts_struct(tcx, ty, *def, args, types, depth),
+                true => ts_enum(tcx, ty, *def, args, types, depth, is_js_export),
+                false => ts_struct(tcx, ty, *def, args, types, depth, is_js_export),
             }
         }
         _ => "unknown".to_owned(),
@@ -158,6 +355,7 @@ fn ts_struct<'tcx>(
     args: ty::GenericArgsRef<'tcx>,
     types: &mut BTreeMap<String, String>,
     depth: u32,
+    is_js_export: bool,
 ) -> String {
     let variant = def.non_enum_variant();
     // A `repr(transparent)` struct IS its field in the value model, so it is that field's type.
@@ -168,6 +366,7 @@ fn ts_struct<'tcx>(
             tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
             types,
             depth + 1,
+            is_js_export,
         );
     }
     let name = ts_name(tcx, ty);
@@ -180,17 +379,33 @@ fn ts_struct<'tcx>(
         .fields
         .iter()
         .map(|field| {
-            let field_ty = ts_type(
-                tcx,
-                tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
-                types,
-                depth + 1,
-            );
-            format!("{}: {field_ty}", field.name)
+            let rust_field_ty =
+                tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args));
+            let field_name = ts_field_name(field.name.as_str(), is_js_export);
+            if is_js_export {
+                if let Some(inner) = option_inner_ty(tcx, rust_field_ty) {
+                    let inner_ts = ts_type(tcx, inner, types, depth + 1, true);
+                    return format!("{field_name}?: {inner_ts}");
+                }
+            }
+            let field_ty = ts_type(tcx, rust_field_ty, types, depth + 1, is_js_export);
+            format!("{field_name}: {field_ty}")
         })
         .collect();
     types.insert(name.clone(), object(&members));
     name
+}
+
+/// Formats a struct or variant field name for TypeScript (`_0` for positional fields on
+/// `#[js_export]` boundaries to match the runtime object keys; raw Rust field names otherwise).
+fn ts_field_name(name: &str, is_js_export: bool) -> String {
+    if is_js_export && name.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("_{name}")
+    } else if is_js_export && name == TAG {
+        format!("{name}_")
+    } else {
+        name.to_owned()
+    }
 }
 
 /// An object type, written `{}` when it has no members rather than `{  }`.
@@ -209,6 +424,7 @@ fn ts_enum<'tcx>(
     args: ty::GenericArgsRef<'tcx>,
     types: &mut BTreeMap<String, String>,
     depth: u32,
+    is_js_export: bool,
 ) -> String {
     let Some(repr) = enum_repr(tcx, ty) else {
         return "unknown".to_owned();
@@ -244,13 +460,17 @@ fn ts_enum<'tcx>(
             }
             let mut members = vec![format!("{TAG}: \"{}\"", variant.name)];
             members.extend(variant.fields.iter().map(|field| {
-                let field_ty = ts_type(
-                    tcx,
-                    tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
-                    types,
-                    depth + 1,
-                );
-                format!("{}: {field_ty}", field.name)
+                let rust_field_ty =
+                    tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args));
+                let field_name = ts_field_name(field.name.as_str(), is_js_export);
+                if is_js_export {
+                    if let Some(inner) = option_inner_ty(tcx, rust_field_ty) {
+                        let inner_ts = ts_type(tcx, inner, types, depth + 1, true);
+                        return format!("{field_name}?: {inner_ts}");
+                    }
+                }
+                let field_ty = ts_type(tcx, rust_field_ty, types, depth + 1, is_js_export);
+                format!("{field_name}: {field_ty}")
             }));
             object(&members)
         })

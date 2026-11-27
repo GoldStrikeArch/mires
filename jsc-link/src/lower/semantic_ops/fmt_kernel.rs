@@ -840,7 +840,7 @@ pub(crate) fn commit_universal_native_string_sites(
         };
         if !matches!(
             link_item.jir.body.as_ref().map(|body| body.semantic),
-            Some(BodySemantic::Ordinary)
+            Some(BodySemantic::Ordinary | BodySemantic::JsExport)
         ) {
             continue;
         }

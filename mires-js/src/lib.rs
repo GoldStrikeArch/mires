@@ -49,14 +49,14 @@ impl HostHandle {
 }
 
 pub mod collections;
+pub mod web;
 
-pub use js_extern_macro::{js_bindings, js_export};
+pub use js_extern_macro::{js_bindings, js_export, js_extern};
 
 mod executor;
 mod host;
 mod host_value;
 mod promise;
-mod web;
 
 pub use executor::*;
 pub use host::*;

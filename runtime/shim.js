@@ -6549,3 +6549,11 @@ globalThis.__rt.nv_reserve_f64 = (v, used, add, minCap, exact, maxElems) => {
   if (old > 0) nb.set(v.buf);
   v.buf = nb;
 };
+
+// Std-support helpers. Append below, do not reorder.
+globalThis.__rt.js_eprint_str = (s) => console.error(s);
+globalThis.__rt.js_panic_error = (msg) => { throw new Error("rust panic: " + msg); };
+globalThis.__rt.js_throw_error = (msg) => { throw new Error(msg); };
+globalThis.__rt.js_now_ms = () => (typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now());
+globalThis.__rt.js_epoch_ms = () => Date.now();
+globalThis.__rt.js_catch_unwind = (fn, arg) => { try { return { ok: true, value: fn(arg) }; } catch (e) { if (__rt.is_abort(e)) throw e; return { ok: false, error: e }; } };

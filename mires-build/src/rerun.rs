@@ -48,14 +48,20 @@ impl Rerun {
             toolchain.linker().to_path_buf(),
             toolchain.shim(),
             toolchain.script("compile_core.sh"),
-            toolchain.script("minimal-shim.mjs"),
-            toolchain.script("artifact-manifest.mjs"),
             toolchain.script("sysroot-cache.sh"),
             toolchain.root().join("rust-toolchain.toml"),
             toolchain.sysroot_args(),
             patch_dir,
         ]);
         paths.extend(patches);
+        let mires_std_dir = toolchain.root().join("mires-std");
+        if mires_std_dir.is_dir() {
+            paths.push(mires_std_dir.clone());
+            let mut std_inputs = Vec::new();
+            collect_inputs(&mires_std_dir, &mut std_inputs);
+            std_inputs.sort();
+            paths.extend(std_inputs);
+        }
         // The unwind build mode's own inputs: its target spec, and the patches only it applies.
         if toolchain.panic_mode() == PanicMode::Unwind {
             let unwind_patches = toolchain.root().join("patches").join("unwind");
@@ -439,5 +445,32 @@ mod tests {
         );
         assert!(WATCHED_ENV_VARS.contains(&RUST_MIR_INLINE_ENV));
         assert!(WATCHED_ENV_VARS.contains(&REMAP_ROOT_ENV));
+    }
+
+    #[test]
+    fn watches_mires_std_sources_when_present() {
+        let root = TempDir::new("rerun-mires-std");
+        fs::create_dir_all(root.path().join("mires-std/src/sub")).unwrap();
+        fs::write(root.path().join("mires-std/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(root.path().join("mires-std/src/lib.rs"), "").unwrap();
+        fs::write(root.path().join("mires-std/src/sub/mod.rs"), "").unwrap();
+        let toolchain = Toolchain::new(root.path()).unwrap();
+
+        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain);
+        let std_paths: Vec<_> = rerun
+            .paths()
+            .iter()
+            .filter(|path| path.starts_with(root.path().join("mires-std")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            std_paths,
+            [
+                root.path().join("mires-std"),
+                root.path().join("mires-std/Cargo.toml"),
+                root.path().join("mires-std/src/lib.rs"),
+                root.path().join("mires-std/src/sub/mod.rs"),
+            ]
+        );
     }
 }

@@ -170,12 +170,19 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
         ) {
             return Ok(BodySemantic::PanicImpl);
         }
-        Ok(crate::jir::classify::standard_operation(
+        if let Some(op) = crate::jir::classify::standard_operation(
             self.tcx(),
             self.instance.def_id(),
             self.instance.args,
-        )
-        .map_or(BodySemantic::Ordinary, BodySemantic::Standard))
+        ) {
+            return Ok(BodySemantic::Standard(op));
+        }
+        if super::is_js_export_fn(self.tcx(), self.instance)
+            && self.core.cgu.namer.linkage_of(self.instance).exported
+        {
+            return Ok(BodySemantic::JsExport);
+        }
+        Ok(BodySemantic::Ordinary)
     }
 
     fn basic_block(

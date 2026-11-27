@@ -1,0 +1,12 @@
+[package]
+name = "mires"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mires-js = { path = "../mires-js" }
+js-macro = { path = "../js-macro" }
+
+[lints]
+workspace = true

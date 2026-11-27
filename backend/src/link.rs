@@ -31,6 +31,7 @@ use rustc_codegen_ssa::diagnostics::LinkRlibError;
 use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleKind};
 use rustc_metadata::EncodedMetadata;
 use rustc_session::config::{CrateType, OutFileName, OutputFilenames, OutputType};
+use rustc_session::output::out_filename;
 use rustc_session::Session;
 
 use rcgjs_object::manifest::{Manifest, Mode, MANIFEST_VERSION};
@@ -43,102 +44,122 @@ const BIN_ENV: &str = "JSC_LINK_BIN";
 pub(crate) fn link(
     sess: &Session,
     mut compiled_modules: CompiledModules,
-    crate_info: CrateInfo,
+    mut crate_info: CrateInfo,
     metadata: EncodedMetadata,
     outputs: &OutputFilenames,
 ) {
-    // An rlib is not a program: it is a bag of objects for a later link to pick from, and rustc
-    // already knows how to build one. Deleting unreachable items here would delete exactly the
-    // items the downstream crate is about to ask for.
-    if !sess.opts.crate_types.iter().any(is_program) {
-        // Refresh this member even when every codegen unit came from the incremental cache.
-        let crate_name = sess.opts.crate_name.as_deref().unwrap_or_default();
-        let name = format!("{crate_name}.rcgjs-sources");
-        let path = outputs.temp_path_for_cgu(OutputType::Object, &name);
-        let bytes = crate::item::write_object(
-            "",
-            &[],
-            false,
-            crate_name,
-            &crate::item::object_identity(sess),
-            rcgjs_object::jir::interns::Interns::new(),
-            &source_texts(sess),
-        );
-        if let Err(error) = std::fs::write(&path, bytes) {
-            sess.dcx().err(format!(
-                "cannot retain source text in `{}`: {error}",
-                path.display()
-            ));
-            return;
+    let program_types: Vec<CrateType> = crate_info
+        .crate_types
+        .iter()
+        .copied()
+        .filter(is_program)
+        .collect();
+    let has_non_program = crate_info.crate_types.iter().any(|ct| !is_program(ct));
+
+    // Link every program crate type (`cdylib`, `bin`, `dylib`) via `jsc-link` BEFORE running
+    // `link_binary` for any non-program crate types (e.g. `rlib` in a combined `["cdylib", "rlib"]`
+    // build), because `link_binary` consumes `compiled_modules` and cleans up its temporary CGU
+    // objects.
+    if !program_types.is_empty() {
+        let mut objects: Vec<PathBuf> = Vec::new();
+        for module in compiled_modules
+            .modules
+            .iter()
+            .chain(&compiled_modules.allocator_module)
+        {
+            if let Some(path) = &module.object {
+                objects.push(path.clone());
+            }
         }
-        compiled_modules.modules.push(CompiledModule {
-            name,
-            kind: ModuleKind::Regular,
-            object: Some(path),
-            global_asm_object: None,
-            dwarf_object: None,
-            bytecode: None,
-            assembly: None,
-            llvm_ir: None,
-            links_from_incr_cache: Vec::new(),
-        });
-        link_binary(
-            sess,
-            &ArArchiveBuilderBuilder,
-            compiled_modules,
-            crate_info,
-            metadata,
-            outputs,
-            "js",
-        );
+
+        for crate_type in program_types {
+            let mut rlibs: Vec<PathBuf> = Vec::new();
+            if let Err(err) = each_linked_rlib(&crate_info, Some(crate_type), &mut |_, path| {
+                rlibs.push(path.to_path_buf());
+            }) {
+                // The error type is not `Debug`; its variants all mean the same thing here, which
+                // is that a dependency has no rlib to read items out of.
+                let reason = match err {
+                    LinkRlibError::MissingFormat => "no dependency format was computed",
+                    LinkRlibError::IncompatibleDependencyFormats { .. } => {
+                        "the crate types disagree about how dependencies are linked"
+                    }
+                    LinkRlibError::NotFound { .. } => "a dependency's rlib is missing",
+                    LinkRlibError::OnlyRmetaFound { .. } => "a dependency has metadata but no rlib",
+                };
+                sess.dcx().err(format!(
+                    "rustc_codegen_js cannot read the linked rlibs: {reason}"
+                ));
+            }
+
+            let out = out_filename(sess, crate_type, outputs, crate_info.local_crate_name);
+            let mode = match out {
+                OutFileName::Real(path) => Mode::Program { output: Some(path) },
+                OutFileName::Stdout => Mode::Program { output: None },
+            };
+            run(
+                sess,
+                outputs,
+                manifest(
+                    sess,
+                    Some(format!("{crate_type}")),
+                    mode,
+                    objects.clone(),
+                    rlibs,
+                ),
+            );
+        }
+    }
+
+    if !has_non_program {
         return;
     }
 
-    let mut objects: Vec<PathBuf> = Vec::new();
-    for module in compiled_modules
-        .modules
-        .iter()
-        .chain(&compiled_modules.allocator_module)
-    {
-        if let Some(path) = &module.object {
-            objects.push(path.clone());
-        }
-    }
-
-    let crate_type = sess.opts.crate_types.iter().copied().find(is_program);
-    let mut rlibs: Vec<PathBuf> = Vec::new();
-    if let Err(err) = each_linked_rlib(&crate_info, crate_type, &mut |_, path| {
-        rlibs.push(path.to_path_buf());
-    }) {
-        // The error type is not `Debug`; its variants all mean the same thing here, which is
-        // that a dependency has no rlib to read items out of.
-        let reason = match err {
-            LinkRlibError::MissingFormat => "no dependency format was computed",
-            LinkRlibError::IncompatibleDependencyFormats { .. } => {
-                "the crate types disagree about how dependencies are linked"
-            }
-            LinkRlibError::NotFound { .. } => "a dependency's rlib is missing",
-            LinkRlibError::OnlyRmetaFound { .. } => "a dependency has metadata but no rlib",
-        };
+    // An rlib is not a program: it is a bag of objects for a later link to pick from, and rustc
+    // already knows how to build one. Deleting unreachable items here would delete exactly the
+    // items the downstream crate is about to ask for. Refresh this member even when every codegen
+    // unit came from the incremental cache.
+    let crate_name = sess.opts.crate_name.as_deref().unwrap_or_default();
+    let name = format!("{crate_name}.rcgjs-sources");
+    let path = outputs.temp_path_for_cgu(OutputType::Object, &name);
+    let bytes = crate::item::write_object(
+        "",
+        &[],
+        false,
+        crate_name,
+        &crate::item::object_identity(sess),
+        rcgjs_object::jir::interns::Interns::new(),
+        &source_texts(sess),
+    );
+    if let Err(error) = std::fs::write(&path, bytes) {
         sess.dcx().err(format!(
-            "rustc_codegen_js cannot read the linked rlibs: {reason}"
+            "cannot retain source text in `{}`: {error}",
+            path.display()
         ));
+        return;
     }
-
-    let mode = match outputs.path(OutputType::Exe) {
-        OutFileName::Real(path) => Mode::Program { output: Some(path) },
-        OutFileName::Stdout => Mode::Program { output: None },
-    };
-    run(
+    compiled_modules.modules.push(CompiledModule {
+        name,
+        kind: ModuleKind::Regular,
+        object: Some(path),
+        global_asm_object: None,
+        dwarf_object: None,
+        bytecode: None,
+        assembly: None,
+        llvm_ir: None,
+        links_from_incr_cache: Vec::new(),
+    });
+    // Strip already-linked program crate types so `link_binary` only archives non-program outputs
+    // (such as `.rlib`) and never invokes a native linker on JavaScript CGU objects.
+    crate_info.crate_types.retain(|ct| !is_program(ct));
+    link_binary(
         sess,
+        &ArArchiveBuilderBuilder,
+        compiled_modules,
+        crate_info,
+        metadata,
         outputs,
-        manifest(
-            sess,
-            crate_type.map(|crate_type| format!("{crate_type}")),
-            mode,
-            objects,
-            rlibs,
-        ),
+        "js",
     );
 }
 
