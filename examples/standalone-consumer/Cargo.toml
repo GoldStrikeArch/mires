@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [build-dependencies]
-mires-build = { path = "../../mires-build" }
+mires-build = { path = "../../mires-build", features = ["single-file"] }
 
 [workspace]

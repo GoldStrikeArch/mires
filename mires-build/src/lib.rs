@@ -3,10 +3,11 @@
 //! Two builders cover the two ways a host Cargo crate embeds Rust-compiled
 //! JavaScript:
 //!
-//! * [`Crate`] compiles a full Cargo package (with its own `Cargo.toml`, `std`,
-//!   `alloc`, and crates.io dependencies) via `cargo-mires`, defaulting to
-//!   self-contained ES modules with inline runtime, `.d.ts` declarations, source
-//!   maps, and an isolated `--target-dir` under `$OUT_DIR`:
+//! * [`Crate`] (always available, zero heavy dependencies) compiles a full
+//!   Cargo package (with its own `Cargo.toml`, `std`, `alloc`, and crates.io
+//!   dependencies) via `cargo-mires`, defaulting to self-contained ES modules
+//!   with inline runtime, `.d.ts` declarations, source maps, and an isolated
+//!   `--target-dir` under `$OUT_DIR`:
 //!
 //!   ```rust,no_run
 //!   let client = mires_build::Crate::new("../client")
@@ -14,12 +15,14 @@
 //!       .unwrap();
 //!   ```
 //!
-//! * [`BuildConfig`] drives `rustc` directly on a single `.rs` root file
-//!   (useful for lightweight scripts or multi-island chunked builds), publishing
-//!   the compiled program, source map, optional `.d.ts`, and runtime shim into
-//!   `$OUT_DIR`:
+//! * `BuildConfig` (requires the optional `single-file` Cargo feature) drives
+//!   `rustc` directly on a single `.rs` root file (useful for lightweight
+//!   scripts or multi-island chunked builds), publishing the compiled program,
+//!   source map, optional `.d.ts`, and runtime shim into `$OUT_DIR`:
 //!
 //!   ```rust,no_run
+//!   # #[cfg(feature = "single-file")]
+//!   # fn main() {
 //!   use mires_build::{BuildConfig, ModuleFormat, Profile, RuntimeMode};
 //!
 //!   BuildConfig::new("client/app.rs")
@@ -29,6 +32,9 @@
 //!       .dts(true)
 //!       .render()
 //!       .unwrap();
+//!   # }
+//!   # #[cfg(not(feature = "single-file"))]
+//!   # fn main() {}
 //!   ```
 //!
 //! The compiled program can then be embedded or served like any other generated
@@ -36,8 +42,13 @@
 //!
 //! # Setup
 //!
-//! The pinned nightly, the backend built with it, and the sysroot (`core`,
-//! `alloc`, and Mires's `std`) are set up once per Mires checkout:
+//! For installed users, install `cargo-mires` (e.g. via `cargo binstall cargo-mires`
+//! or `cargo install cargo-mires`). [`Crate::build`] invokes `cargo-mires`, which
+//! resolves its managed toolchain cache automatically (or downloads a prebuilt
+//! toolchain bundle when [`Crate::auto_install`] is enabled).
+//!
+//! From a local Mires checkout, the pinned nightly, the backend built with it,
+//! and the sysroot (`core`, `alloc`, and Mires's `std`) are set up once:
 //!
 //! ```sh
 //! rustup toolchain install "$(...)"           # the nightly the backend loads into
@@ -45,26 +56,14 @@
 //! JS_EXTRA_ARGS='' scripts/build_sysroot.sh   # `core`, `alloc`, and `std`
 //! ```
 //!
-//! [`Crate::build`] invokes `cargo-mires`, which automatically ensures the
-//! backend and matching cached sysroot exist. [`BuildConfig::render`] reports
-//! the first missing precondition with its fix-it command, or builds them
-//! automatically when [`BuildConfig::bootstrap`] is enabled.
+//! With the `single-file` feature enabled, `BuildConfig::render` reports the
+//! first missing precondition with its fix-it command (or builds them
+//! automatically when `BuildConfig::bootstrap` is enabled), and
+//! `Toolchain::preconditions` / `Toolchain::apply` expose those checks directly.
 //!
-//! [`Toolchain::preconditions`] returns the unmet steps, and
-//! [`Toolchain::apply`] performs one, so a tool outside a build script can set
-//! the checkout up without a second opinion about when it is ready.
+//! # Single-file client crates (`feature = "single-file"`)
 //!
-//! The `JS_EXTRA_ARGS` the sysroot was built with are recorded next to it. Any
-//! backend option that changes how items are spelled has to be the same on
-//! both sides, so [`BuildConfig::emit_arg`] is checked against that record and
-//! refuses a sysroot that disagrees. [`BuildConfig::crate_arg`] and link-only
-//! typed options ([`BuildConfig::format`], [`BuildConfig::runtime`],
-//! [`BuildConfig::dts`], [`BuildConfig::chunks`]) only affect linking and need
-//! no sysroot rebuild.
-//!
-//! # Single-file client crates (`BuildConfig`)
-//!
-//! When using [`BuildConfig`] directly rather than [`Crate`], `rustc` is handed
+//! When using `BuildConfig` directly rather than [`Crate`], `rustc` is handed
 //! a single `.rs` root file (edition 2021):
 //!
 //! * The Mires sysroot provides `core`, `alloc` (`Box`, `Vec`, `String`,
@@ -79,13 +78,15 @@
 //!   into the output; with [`RuntimeMode::External`] `jsc-link --emit-runtime`
 //!   emits a canonical runtime module in pure Rust without Node.js.
 //!
-//! # Chunks
+//! # Chunks (`feature = "single-file"`)
 //!
 //! A page with several islands does not have to load all of them out of one
-//! file. [`BuildConfig::chunks`] asks for one file per island, plus a shared
+//! file. `BuildConfig::chunks` asks for one file per island, plus a shared
 //! file holding what two or more of them reach:
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "single-file")]
+//! # fn main() {
 //! use mires_build::{BuildConfig, Chunking, ModuleFormat};
 //!
 //! let artifacts = BuildConfig::new("client-island/island.rs")
@@ -99,58 +100,60 @@
 //!     )
 //!     .render()
 //!     .unwrap();
+//! # }
+//! # #[cfg(not(feature = "single-file"))]
+//! # fn main() {}
 //! ```
-//!
-//! [`Artifacts::chunks`] names each emitted file, and they all land in one
-//! directory inside `OUT_DIR`, so a single route serving that directory serves
-//! the whole program. Splitting is a link step decision, so it costs no sysroot
-//! rebuild.
-//!
-//! A chunk is imported by a bare specifier, its prefix and its name, which the
-//! page's import map resolves to the URL the chunk is served from.
-//! [`Chunking::url_base`] says where that is and turns the map on;
-//! [`render`](BuildConfig::render) writes it beside the program as
-//! `<name>.importmap.json`, ready to be the body of a
-//! `<script type="importmap">`:
-//!
-//! ```text
-//! const IMPORT_MAP: &str = include_str!(concat!(env!("OUT_DIR"), "/islands.importmap.json"));
-//! ```
-//!
-//! Whatever else the page resolves goes in the same map through
-//! [`Chunking::import`], which is how the runtime the islands import gets its
-//! entry.
 //!
 //! # Rebuilds
 //!
-//! Both [`Crate::build`] and [`BuildConfig::render`] emit
+//! Both [`Crate::build`] and `BuildConfig::render` emit
 //! `cargo:rerun-if-changed` and `cargo:rerun-if-env-changed` directives for the
 //! client crate's sources and toolchain inputs. Emitting any such directive
 //! replaces Cargo's default rule of rerunning on any change in the host
 //! package, so editing server code no longer recompiles client JavaScript.
 
+#[cfg(feature = "single-file")]
 mod chunk;
+#[cfg(feature = "single-file")]
 mod config;
 mod crate_build;
 mod error;
+mod options;
+#[cfg(feature = "single-file")]
 mod pinned;
+#[cfg(feature = "single-file")]
 mod preconditions;
+#[cfg(feature = "single-file")]
 mod rerun;
+#[cfg(feature = "single-file")]
 mod shimcheck;
+#[cfg(feature = "single-file")]
 mod toolchain;
 
+#[cfg(feature = "single-file")]
 pub use chunk::*;
+#[cfg(feature = "single-file")]
 pub use config::*;
 pub use crate_build::*;
 pub use error::*;
+pub use options::*;
+#[cfg(feature = "single-file")]
 pub use pinned::*;
+#[cfg(feature = "single-file")]
 pub use preconditions::*;
+#[cfg(feature = "single-file")]
 pub use rcgjs_object::artifact::EntryRole;
+#[cfg(feature = "single-file")]
 #[doc(hidden)]
 pub use rcgjs_object::opts::OptimizerPass;
-pub use rcgjs_object::opts::{Lane, Modules as ModuleFormat, OptimizerMode, Profile, RuntimeMode};
+#[cfg(feature = "single-file")]
+pub use rcgjs_object::opts::{Lane, OptimizerMode};
+#[cfg(feature = "single-file")]
 pub use rerun::*;
+#[cfg(feature = "single-file")]
 pub use shimcheck::*;
+#[cfg(feature = "single-file")]
 pub use toolchain::*;
 
 #[cfg(test)]

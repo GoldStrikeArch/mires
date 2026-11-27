@@ -2,6 +2,12 @@
 name = "mires"
 version = "0.1.0"
 edition = "2021"
+description = "User-facing facade crate for compiling Rust directly to JavaScript ES modules with mires"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "compiler", "mires", "esm", "web"]
+categories = ["web-programming", "compilers", "no-std"]
 publish = false
 
 [dependencies]

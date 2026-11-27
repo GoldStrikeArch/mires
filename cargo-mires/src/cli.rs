@@ -202,6 +202,52 @@ pub struct SysrootCliOptions {
     pub verbose: bool,
 }
 
+/// CLI options for `cargo mires setup`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SetupCliOptions {
+    pub version: Option<String>,
+    pub from_archive: Option<PathBuf>,
+    pub url: Option<String>,
+    pub sha256: Option<String>,
+    pub no_rustup: bool,
+    pub force: bool,
+    pub verbose: bool,
+}
+
+/// CLI options for `cargo mires toolchain path`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ToolchainPathOptions {
+    pub mires_root: Option<PathBuf>,
+}
+
+/// CLI options for `cargo mires toolchain clean`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ToolchainCleanOptions {
+    pub all: bool,
+    pub version: Option<String>,
+}
+
+/// CLI options for `cargo mires toolchain package`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolchainPackageOptions {
+    pub out: PathBuf,
+    pub mires_root: Option<PathBuf>,
+    pub version: Option<String>,
+    pub host: Option<String>,
+    pub include_cli: bool,
+    pub no_sysroots: bool,
+    pub verbose: bool,
+}
+
+/// Subcommands under `cargo mires toolchain`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolchainCliCommand {
+    List,
+    Path(ToolchainPathOptions),
+    Clean(ToolchainCleanOptions),
+    Package(ToolchainPackageOptions),
+}
+
 /// Parsed top-level command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -209,6 +255,8 @@ pub enum Command {
     Check(BuildCliOptions),
     Watch(BuildCliOptions),
     Sysroot(SysrootCliOptions),
+    Setup(SetupCliOptions),
+    Toolchain(ToolchainCliCommand),
     Help(Option<String>),
     Version,
 }
@@ -254,8 +302,16 @@ where
             ParsedSubcommand::Help => Command::Help(Some("sysroot".to_owned())),
             ParsedSubcommand::Opts(opts) => Command::Sysroot(opts),
         }),
+        "setup" => parse_setup(rest).map(|parsed| match parsed {
+            ParsedSubcommand::Help => Command::Help(Some("setup".to_owned())),
+            ParsedSubcommand::Opts(opts) => Command::Setup(opts),
+        }),
+        "toolchain" => parse_toolchain(rest).map(|parsed| match parsed {
+            ParsedSubcommand::Help => Command::Help(Some("toolchain".to_owned())),
+            ParsedSubcommand::Opts(cmd) => Command::Toolchain(cmd),
+        }),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `build`, `check`, `watch`, or `sysroot`)"
+            "unknown subcommand `{other}` (expected `build`, `check`, `watch`, `sysroot`, `setup`, or `toolchain`)"
         )),
     }
 }
@@ -483,6 +539,221 @@ fn parse_sysroot(args: &[String]) -> Result<ParsedSubcommand<SysrootCliOptions>,
     Ok(ParsedSubcommand::Opts(opts))
 }
 
+fn parse_setup(args: &[String]) -> Result<ParsedSubcommand<SetupCliOptions>, String> {
+    let mut opts = SetupCliOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+
+        let (flag, inline_value) = split_flag(arg);
+        match flag {
+            "--version" => {
+                opts.version = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--from-archive" => {
+                opts.from_archive = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "--url" => {
+                opts.url = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--sha256" => {
+                opts.sha256 = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--no-rustup" => {
+                reject_value(flag, inline_value)?;
+                opts.no_rustup = true;
+            }
+            "--force" => {
+                reject_value(flag, inline_value)?;
+                opts.force = true;
+            }
+            "-v" | "--verbose" => {
+                reject_value(flag, inline_value)?;
+                opts.verbose = true;
+            }
+            other => {
+                return Err(format!("unknown option `{other}` for `setup`"));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParsedSubcommand::Opts(opts))
+}
+
+fn parse_toolchain(args: &[String]) -> Result<ParsedSubcommand<ToolchainCliCommand>, String> {
+    let Some((sub, rest)) = args.split_first() else {
+        return Ok(ParsedSubcommand::Help);
+    };
+
+    match sub.as_str() {
+        "-h" | "--help" | "help" => Ok(ParsedSubcommand::Help),
+        "list" => parse_toolchain_list(rest),
+        "path" => parse_toolchain_path(rest),
+        "clean" => parse_toolchain_clean(rest),
+        "package" => parse_toolchain_package(rest),
+        other => Err(format!(
+            "unknown `toolchain` subcommand `{other}` (expected `list`, `path`, `clean`, or `package`)"
+        )),
+    }
+}
+
+fn parse_toolchain_list(args: &[String]) -> Result<ParsedSubcommand<ToolchainCliCommand>, String> {
+    if let Some(arg) = args.first() {
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+        return Err(format!("unknown option `{arg}` for `toolchain list`"));
+    }
+    Ok(ParsedSubcommand::Opts(ToolchainCliCommand::List))
+}
+
+fn parse_toolchain_path(args: &[String]) -> Result<ParsedSubcommand<ToolchainCliCommand>, String> {
+    let mut opts = ToolchainPathOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+        let (flag, inline_value) = split_flag(arg);
+        match flag {
+            "--mires-root" => {
+                opts.mires_root = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            other => {
+                return Err(format!("unknown option `{other}` for `toolchain path`"));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParsedSubcommand::Opts(ToolchainCliCommand::Path(opts)))
+}
+
+fn parse_toolchain_clean(args: &[String]) -> Result<ParsedSubcommand<ToolchainCliCommand>, String> {
+    let mut opts = ToolchainCleanOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+        let (flag, inline_value) = split_flag(arg);
+        match flag {
+            "--all" => {
+                reject_value(flag, inline_value)?;
+                opts.all = true;
+            }
+            "--version" => {
+                opts.version = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            other => {
+                return Err(format!("unknown option `{other}` for `toolchain clean`"));
+            }
+        }
+        index += 1;
+    }
+
+    if opts.all && opts.version.is_some() {
+        return Err("cannot pass both `--all` and `--version` to `toolchain clean`".to_owned());
+    }
+
+    Ok(ParsedSubcommand::Opts(ToolchainCliCommand::Clean(opts)))
+}
+
+fn parse_toolchain_package(
+    args: &[String],
+) -> Result<ParsedSubcommand<ToolchainCliCommand>, String> {
+    let mut out: Option<PathBuf> = None;
+    let mut mires_root: Option<PathBuf> = None;
+    let mut version: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut include_cli = false;
+    let mut no_sysroots = false;
+    let mut verbose = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+        let (flag, inline_value) = split_flag(arg);
+        match flag {
+            "--out" => {
+                out = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "--mires-root" => {
+                mires_root = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "--version" => {
+                version = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--host" => {
+                host = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--include-cli" => {
+                reject_value(flag, inline_value)?;
+                include_cli = true;
+            }
+            "--no-sysroots" => {
+                reject_value(flag, inline_value)?;
+                no_sysroots = true;
+            }
+            "-v" | "--verbose" => {
+                reject_value(flag, inline_value)?;
+                verbose = true;
+            }
+            other => {
+                return Err(format!("unknown option `{other}` for `toolchain package`"));
+            }
+        }
+        index += 1;
+    }
+
+    let out =
+        out.ok_or_else(|| "`toolchain package` requires `--out <archive.tar.gz>`".to_owned())?;
+
+    Ok(ParsedSubcommand::Opts(ToolchainCliCommand::Package(
+        ToolchainPackageOptions {
+            out,
+            mires_root,
+            version,
+            host,
+            include_cli,
+            no_sysroots,
+            verbose,
+        },
+    )))
+}
+
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
     if let Some((flag, value)) = arg.split_once('=') {
         if flag.starts_with('-') {
@@ -522,6 +793,40 @@ fn reject_value(flag: &str, inline_value: Option<&str>) -> Result<(), String> {
 /// Format top-level or subcommand usage help.
 pub fn help_text(topic: Option<&str>) -> &'static str {
     match topic {
+        Some("setup") => {
+            "\
+Download and install a prebuilt Mires compiler toolchain bundle
+
+Usage: cargo mires setup [OPTIONS]
+
+Options:
+      --version <VER>         Toolchain version to install (default: current cargo-mires version)
+      --from-archive <PATH>   Install from a local `.tar.gz` toolchain archive instead of downloading
+      --url <BASE_URL>        Override release download base URL (env: MIRES_RELEASE_URL)
+      --sha256 <HEX>          Verify archive against an explicit SHA-256 hex digest
+      --no-rustup             Skip automatic `rustup toolchain install` check for pinned nightly
+      --force                 Reinstall even if this version is already cached
+  -v, --verbose               Print verbose download and setup logs
+  -h, --help                  Print help
+"
+        }
+        Some("toolchain") => {
+            "\
+Inspect, clean, or package Mires compiler toolchain bundles
+
+Usage: cargo mires toolchain <SUBCOMMAND> [OPTIONS]
+
+Subcommands:
+  list      List installed managed Mires toolchains in MIRES_HOME
+  path      Print the active resolved Mires toolchain root directory
+            Options: [--mires-root <PATH>]
+  clean     Remove temporary files or installed toolchains
+            Options: [--all | --version <VER>]
+  package   Package a Mires source checkout into a release `.tar.gz` bundle + `.sha256`
+            Options: --out <ARCHIVE.tar.gz> [--mires-root <DIR>] [--version <VER>]
+                     [--host <TRIPLE>] [--include-cli] [--no-sysroots] [--verbose]
+"
+        }
         Some("sysroot") => {
             "\
 Build or refresh the cached Mires sysroot
@@ -533,7 +838,7 @@ Options:
       --release             Target the `release-balanced` profile
       --profile <PROFILE>   Profile: dev|report|release-size|release-balanced|release-speed
       --panic <MODE>        Panic strategy: unwind|abort (default: unwind)
-      --mires-root <PATH>   Path to the Mires toolchain checkout
+      --mires-root <PATH>   Path to the Mires toolchain checkout or installed bundle
       --manifest-path <P>   Path to Cargo.toml
   -p, --package <NAME>      Package whose `[package.metadata.mires]` to read
   -v, --verbose             Print verbose command logs
@@ -559,7 +864,7 @@ Options:
                               Emit source map .map files (default: on)
       --npm / --no-npm        Emit package.json in --out-dir
       --panic <MODE>          Panic strategy: unwind|abort (default: unwind)
-      --mires-root <PATH>     Path to the Mires toolchain checkout
+      --mires-root <PATH>     Path to the Mires toolchain checkout or installed bundle
   -F, --features <LIST>       Space or comma separated Cargo features
       --all-features          Activate all available features
       --no-default-features   Do not activate the `default` feature
@@ -577,11 +882,13 @@ Cargo subcommand for compiling Rust crates to JavaScript with Mires
 Usage: cargo mires <COMMAND> [OPTIONS]
 
 Commands:
-  build     Compile a crate to JavaScript and publish artifacts
-  check     Typecheck a crate against the Mires sysroot without codegen
-  watch     Rebuild automatically whenever Rust sources or Cargo.toml change
-  sysroot   Ensure or rebuild the cached Mires sysroot
-  help      Print this message or help for a subcommand
+  build      Compile a crate to JavaScript and publish artifacts
+  check      Typecheck a crate against the Mires sysroot without codegen
+  watch      Rebuild automatically whenever Rust sources or Cargo.toml change
+  sysroot    Ensure or rebuild the cached Mires sysroot
+  setup      Download and install a prebuilt Mires toolchain bundle
+  toolchain  Inspect, clean, or package Mires toolchain bundles
+  help       Print this message or help for a subcommand
 
 Options:
   -h, --help     Print help
@@ -725,6 +1032,104 @@ mod tests {
     }
 
     #[test]
+    fn parses_setup_and_toolchain_subcommands() {
+        assert_eq!(
+            parse_args([
+                "cargo-mires",
+                "mires",
+                "setup",
+                "--version",
+                "0.2.0",
+                "--from-archive=/tmp/tc.tar.gz",
+                "--url",
+                "https://example.invalid/releases",
+                "--sha256",
+                "deadbeef",
+                "--no-rustup",
+                "--force",
+                "--verbose",
+            ])
+            .unwrap(),
+            Command::Setup(SetupCliOptions {
+                version: Some("0.2.0".to_owned()),
+                from_archive: Some(PathBuf::from("/tmp/tc.tar.gz")),
+                url: Some("https://example.invalid/releases".to_owned()),
+                sha256: Some("deadbeef".to_owned()),
+                no_rustup: true,
+                force: true,
+                verbose: true,
+            })
+        );
+
+        assert_eq!(
+            parse_args(["cargo-mires", "mires", "toolchain", "list"]).unwrap(),
+            Command::Toolchain(ToolchainCliCommand::List)
+        );
+        assert_eq!(
+            parse_args([
+                "cargo-mires",
+                "toolchain",
+                "path",
+                "--mires-root",
+                "/opt/mires"
+            ])
+            .unwrap(),
+            Command::Toolchain(ToolchainCliCommand::Path(ToolchainPathOptions {
+                mires_root: Some(PathBuf::from("/opt/mires")),
+            }))
+        );
+        assert_eq!(
+            parse_args(["cargo-mires", "toolchain", "clean", "--all"]).unwrap(),
+            Command::Toolchain(ToolchainCliCommand::Clean(ToolchainCleanOptions {
+                all: true,
+                version: None,
+            }))
+        );
+        assert_eq!(
+            parse_args(["cargo-mires", "toolchain", "clean", "--version=0.1.0"]).unwrap(),
+            Command::Toolchain(ToolchainCliCommand::Clean(ToolchainCleanOptions {
+                all: false,
+                version: Some("0.1.0".to_owned()),
+            }))
+        );
+        assert_eq!(
+            parse_args([
+                "cargo-mires",
+                "toolchain",
+                "package",
+                "--out",
+                "dist/mires.tar.gz",
+                "--mires-root=/src/mires",
+                "--version",
+                "0.1.0",
+                "--host",
+                "aarch64-apple-darwin",
+                "--include-cli",
+                "--no-sysroots",
+                "-v",
+            ])
+            .unwrap(),
+            Command::Toolchain(ToolchainCliCommand::Package(ToolchainPackageOptions {
+                out: PathBuf::from("dist/mires.tar.gz"),
+                mires_root: Some(PathBuf::from("/src/mires")),
+                version: Some("0.1.0".to_owned()),
+                host: Some("aarch64-apple-darwin".to_owned()),
+                include_cli: true,
+                no_sysroots: true,
+                verbose: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(["cargo-mires", "setup", "--help"]).unwrap(),
+            Command::Help(Some("setup".to_owned()))
+        );
+        assert_eq!(
+            parse_args(["cargo-mires", "toolchain", "--help"]).unwrap(),
+            Command::Help(Some("toolchain".to_owned()))
+        );
+    }
+
+    #[test]
     fn rejects_invalid_and_conflicting_flags() {
         assert!(parse_args(["cargo-mires", "build", "--lib", "--bin", "foo"]).is_err());
         assert!(parse_args(["cargo-mires", "build", "--profile", "bogus"]).is_err());
@@ -733,6 +1138,17 @@ mod tests {
         assert!(parse_args(["cargo-mires", "build", "--panic", "trap"]).is_err());
         assert!(parse_args(["cargo-mires", "build", "--out-dir"]).is_err());
         assert!(parse_args(["cargo-mires", "build", "--release=true"]).is_err());
+        assert!(parse_args([
+            "cargo-mires",
+            "toolchain",
+            "clean",
+            "--all",
+            "--version",
+            "0.1.0"
+        ])
+        .is_err());
+        assert!(parse_args(["cargo-mires", "toolchain", "package"]).is_err());
+        assert!(parse_args(["cargo-mires", "toolchain", "bogus"]).is_err());
         assert!(parse_args(["cargo-mires", "bogus"]).is_err());
     }
 }

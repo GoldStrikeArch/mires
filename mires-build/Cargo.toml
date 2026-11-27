@@ -3,11 +3,21 @@ name = "mires-build"
 version = "0.1.0"
 edition = "2021"
 publish = false
+description = "Cargo build.rs helper for embedding Mires-compiled Rust-to-JavaScript crates"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "build-script", "codegen", "mires"]
+categories = ["development-tools::build-utils", "web-programming"]
+
+[features]
+default = []
+single-file = ["dep:rcgjs-object"]
 
 [dependencies]
 # The `Display` impls for `BuildError`, which carry the fix-it commands.
 thiserror = "2.0.19"
-rcgjs-object = { path = "../rcgjs-object" }
+rcgjs-object = { path = "../rcgjs-object", optional = true }
 
 [lints]
 workspace = true

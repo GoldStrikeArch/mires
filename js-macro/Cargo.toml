@@ -2,6 +2,12 @@
 name = "js-macro"
 version = "0.1.0"
 edition = "2021"
+description = "Procedural macro for embedding inline js!{} JavaScript expressions with Rust captures in mires"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "proc-macro", "mires", "interop", "web"]
+categories = ["development-tools::procedural-macro-helpers", "web-programming"]
 publish = false
 
 [lib]

@@ -17,11 +17,13 @@ jobs:
       - run: rustc --version --verbose
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p mires-build --all-features --all-targets -- -D warnings
       - run: cargo clippy -p rcgjs-object --features interp --all-targets -- -D warnings
       - run: npm ci --ignore-scripts
       - run: bash scripts/build.sh --locked
       - run: cargo build --release --locked -p cargo-mires
       - run: cargo test --workspace
+      - run: cargo test -p mires-build --all-features
       - run: SKIP_BUILD=1 bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/test.sh --require-core

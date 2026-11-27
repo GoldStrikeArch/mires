@@ -1,10 +1,14 @@
-//! `cargo-mires` — Cargo subcommand and `RUSTC_WRAPPER` for compiling Rust crates to JavaScript.
+//! `cargo-mires` — Cargo subcommand, `RUSTC_WRAPPER`, and toolchain manager for Mires.
 
+mod archive;
 mod build;
 mod cli;
 mod metadata;
 mod npm;
+mod patch;
 mod sysroot;
+mod sysroot_build;
+mod toolchain;
 mod watch;
 mod wrapper;
 
@@ -42,6 +46,8 @@ fn main() -> ExitCode {
         Command::Check(opts) => build::run_check(&opts),
         Command::Watch(opts) => watch::run(&opts),
         Command::Sysroot(opts) => sysroot::run_sysroot_cmd(&opts),
+        Command::Setup(opts) => toolchain::run_setup_cmd(&opts),
+        Command::Toolchain(cmd) => toolchain::run_toolchain_cmd(&cmd),
     };
 
     match result {

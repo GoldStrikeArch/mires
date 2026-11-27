@@ -2,6 +2,12 @@
 name = "js-extern-macro"
 version = "0.1.0"
 edition = "2021"
+description = "Procedural macros for #[js_extern], #[js_export], and js_bindings! in mires"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "proc-macro", "ffi", "mires", "interop"]
+categories = ["development-tools::procedural-macro-helpers", "development-tools::ffi", "web-programming"]
 publish = false
 
 [lib]

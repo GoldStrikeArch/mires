@@ -2,6 +2,12 @@
 name = "mires-marker-abi"
 version = "0.1.0"
 edition = "2021"
+description = "Zero-dependency shared wire format for js!{} blocks and #[js_extern] descriptors in mires"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "abi", "mires", "compiler", "ffi"]
+categories = ["compilers", "development-tools::ffi"]
 publish = false
 
 [lints]

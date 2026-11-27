@@ -1,0 +1,364 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version for dry-run builds (e.g. 0.1.0). Defaults to cargo-mires/Cargo.toml version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Resolve release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            raw="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_VERSION}" ]; then
+            raw="${INPUT_VERSION}"
+          else
+            raw=$(grep -m1 -E '^version[[:space:]]*=' cargo-mires/Cargo.toml | cut -d'"' -f2)
+          fi
+          version="${raw#v}"
+          if [ -z "${version}" ]; then
+            echo "::error::Could not determine release version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: ${version}"
+
+      - name: Install pinned nightly toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Build compiler and cargo-mires
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p rustc_codegen_mires -p jsc-link -p cargo-mires
+
+      - name: Package toolchain bundle and CLI archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ./target/release/cargo-mires toolchain package \
+            --out "dist/mires-toolchain-v${VERSION}-${TARGET}.tar.gz" \
+            --version "${VERSION}" \
+            --host "${TARGET}"
+          COPYFILE_DISABLE=1 tar -czf "dist/cargo-mires-v${VERSION}-${TARGET}.tar.gz" \
+            -C target/release cargo-mires
+          ls -lh dist
+
+      - name: Package toolchain bundle and CLI archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & .\target\release\cargo-mires.exe toolchain package `
+            --out "dist/mires-toolchain-v${env:VERSION}-${env:TARGET}.tar.gz" `
+            --version "${env:VERSION}" `
+            --host "${env:TARGET}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive `
+            -Path target\release\cargo-mires.exe `
+            -DestinationPath "dist\cargo-mires-v${env:VERSION}-${env:TARGET}.zip" `
+            -Force
+          Get-ChildItem dist
+
+      - name: Clean-room smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          smoke_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/mires-smoke.XXXXXX")
+          trap 'rm -rf "$smoke_dir"' EXIT
+
+          tar -xzf "dist/cargo-mires-v${VERSION}-${TARGET}.tar.gz" -C "$smoke_dir"
+          cp "dist/mires-toolchain-v${VERSION}-${TARGET}.tar.gz" "$smoke_dir/"
+          manifest="$GITHUB_WORKSPACE/examples/npm-markdown/Cargo.toml"
+
+          (
+            cd "$smoke_dir"
+            unset MIRES_ROOT
+            export MIRES_HOME="$smoke_dir/mires-home"
+            export MIRES_NO_DEV_FALLBACK=1
+
+            "$smoke_dir/cargo-mires" setup \
+              --from-archive "$smoke_dir/mires-toolchain-v${VERSION}-${TARGET}.tar.gz" \
+              --version "${VERSION}"
+
+            "$smoke_dir/cargo-mires" build \
+              --manifest-path "$manifest" \
+              --release --npm \
+              --out-dir "$smoke_dir/out" \
+              --target-dir "$smoke_dir/target"
+          )
+
+          MIRES_SMOKE_MODULE="$smoke_dir/out/npm_markdown.mjs" node --input-type=module <<'EOF'
+          import assert from "node:assert/strict";
+          import { pathToFileURL } from "node:url";
+
+          const mod = await import(pathToFileURL(process.env.MIRES_SMOKE_MODULE).href);
+          const out = mod.renderMarkdown("# Hi", { heading_ids: true });
+          assert.equal(out.html, '<h1 id="hi">Hi</h1>\n');
+          assert.deepEqual(out.headings, ["Hi"]);
+          assert.equal(out.word_count, 1);
+          console.log("CLEAN_ROOM_SMOKE_OK", out);
+          EOF
+
+      - name: Clean-room smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeDir = Join-Path $env:RUNNER_TEMP ("mires-smoke-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+          try {
+            Expand-Archive `
+              -Path "dist\cargo-mires-v${env:VERSION}-${env:TARGET}.zip" `
+              -DestinationPath $smokeDir `
+              -Force
+            $toolchainArchive = Join-Path $smokeDir "mires-toolchain-v${env:VERSION}-${env:TARGET}.tar.gz"
+            Copy-Item "dist\mires-toolchain-v${env:VERSION}-${env:TARGET}.tar.gz" -Destination $toolchainArchive
+
+            $manifest = Join-Path $env:GITHUB_WORKSPACE "examples\npm-markdown\Cargo.toml"
+            $cli = Join-Path $smokeDir "cargo-mires.exe"
+            $outDir = Join-Path $smokeDir "out"
+            $targetDir = Join-Path $smokeDir "target"
+
+            Push-Location $smokeDir
+            try {
+              Remove-Item Env:MIRES_ROOT -ErrorAction SilentlyContinue
+              $env:MIRES_HOME = Join-Path $smokeDir "mires-home"
+              $env:MIRES_NO_DEV_FALLBACK = "1"
+
+              & $cli setup --from-archive $toolchainArchive --version "${env:VERSION}"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+              & $cli build --manifest-path $manifest --release --npm --out-dir $outDir --target-dir $targetDir
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location
+            }
+
+            $env:MIRES_SMOKE_MODULE = Join-Path $outDir "npm_markdown.mjs"
+            @'
+          import assert from "node:assert/strict";
+          import { pathToFileURL } from "node:url";
+
+          const mod = await import(pathToFileURL(process.env.MIRES_SMOKE_MODULE).href);
+          const out = mod.renderMarkdown("# Hi", { heading_ids: true });
+          assert.equal(out.html, '<h1 id="hi">Hi</h1>\n');
+          assert.deepEqual(out.headings, ["Hi"]);
+          assert.equal(out.word_count, 1);
+          console.log("CLEAN_ROOM_SMOKE_OK", out);
+          '@ | node --input-type=module
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload target artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            raw="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_VERSION}" ]; then
+            raw="${INPUT_VERSION}"
+          else
+            raw=$(grep -m1 -E '^version[[:space:]]*=' cargo-mires/Cargo.toml | cut -d'"' -f2)
+          fi
+          version="${raw#v}"
+          if [ -z "${version}" ]; then
+            echo "::error::Could not determine release version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: ${version}"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Stage installers and compute SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh release-assets/install.sh
+          cp scripts/install.ps1 release-assets/install.ps1
+          chmod +x release-assets/install.sh
+
+          (
+            cd release-assets
+            shopt -s nullglob
+            archives=( *.tar.gz *.zip )
+            if [ "${#archives[@]}" -eq 0 ]; then
+              echo "::error::No release archives found in release-assets/" >&2
+              exit 1
+            fi
+            LC_ALL=C sha256sum "${archives[@]}" | LC_ALL=C sort -k2 > SHA256SUMS
+          )
+          cat release-assets/SHA256SUMS
+
+      - name: Render Homebrew formula
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          sums_path = pathlib.Path("release-assets/SHA256SUMS")
+          tmpl_path = pathlib.Path("packaging/homebrew/cargo-mires.rb.tmpl")
+          out_path = pathlib.Path("release-assets/cargo-mires.rb")
+
+          hashes = {}
+          for line in sums_path.read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              parts = line.split()
+              if len(parts) < 2:
+                  continue
+              digest = parts[0].lower()
+              filename = parts[1].lstrip("*")
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  sys.exit(f"Invalid SHA-256 digest for {filename}: {digest}")
+              hashes[filename] = digest
+
+          targets = {
+              "SHA256_AARCH64_APPLE_DARWIN": f"cargo-mires-v{version}-aarch64-apple-darwin.tar.gz",
+              "SHA256_X86_64_APPLE_DARWIN": f"cargo-mires-v{version}-x86_64-apple-darwin.tar.gz",
+              "SHA256_AARCH64_UNKNOWN_LINUX_GNU": f"cargo-mires-v{version}-aarch64-unknown-linux-gnu.tar.gz",
+              "SHA256_X86_64_UNKNOWN_LINUX_GNU": f"cargo-mires-v{version}-x86_64-unknown-linux-gnu.tar.gz",
+          }
+
+          rendered = tmpl_path.read_text(encoding="utf-8").replace("{{VERSION}}", version)
+          for placeholder, filename in targets.items():
+              if filename not in hashes:
+                  sys.exit(f"Missing expected archive in SHA256SUMS: {filename}")
+              rendered = rendered.replace("{{" + placeholder + "}}", hashes[filename])
+
+          leftover = re.findall(r"\{\{[^}]+\}\}", rendered)
+          if leftover:
+              sys.exit(f"Unresolved template placeholders in Homebrew formula: {leftover}")
+
+          out_path.write_text(rendered, encoding="utf-8")
+          print(f"Rendered {out_path} for v{version}")
+          PY
+
+          if command -v ruby >/dev/null 2>&1; then
+            ruby -c release-assets/cargo-mires.rb
+          fi
+          ls -lh release-assets
+
+      - name: Upload combined release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/*.sha256
+            release-assets/SHA256SUMS
+            release-assets/install.sh
+            release-assets/install.ps1
+            release-assets/cargo-mires.rb

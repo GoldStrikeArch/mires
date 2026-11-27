@@ -6,10 +6,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use rcgjs_object::opts::{Modules as ModuleFormat, Profile, RuntimeMode};
-
 use crate::{
-    config::module_format_str, scrub, BuildError, PanicMode, Result, Toolchain, TOOLCHAIN_ROOT_ENV,
+    checkout_root, dylib_filename, module_format_str, scrub, BuildError, ModuleFormat, PanicMode,
+    Profile, Result, RuntimeMode, AUTO_INSTALL_ENV, TOOLCHAIN_ROOT_ENV,
 };
 
 /// Default nested Cargo target directory inside `out_dir`, isolated from any outer
@@ -60,6 +59,7 @@ pub struct CrateArtifacts {
 /// * `profile`: [`profile_from_cargo()`] (`ReleaseBalanced` in release builds, `Dev` otherwise)
 /// * `out_dir`: `$OUT_DIR`
 /// * `target_dir`: `<out_dir>/mires-target` (isolated from the outer Cargo workspace lock)
+/// * `auto_install`: `false`
 ///
 /// ```rust,no_run
 /// let artifacts = mires_build::Crate::new("../client")
@@ -82,6 +82,7 @@ pub struct Crate {
     out_dir: Option<PathBuf>,
     target_dir: Option<PathBuf>,
     toolchain_root: Option<PathBuf>,
+    auto_install: bool,
     features: Vec<String>,
     all_features: bool,
     no_default_features: bool,
@@ -110,6 +111,7 @@ impl Crate {
             out_dir: None,
             target_dir: None,
             toolchain_root: None,
+            auto_install: false,
             features: Vec::new(),
             all_features: false,
             no_default_features: false,
@@ -189,10 +191,18 @@ impl Crate {
         self
     }
 
-    /// Override the Mires toolchain checkout root (`--mires-root`).
+    /// Override the Mires toolchain checkout or unpacked bundle root (`--mires-root`).
     #[must_use]
     pub fn toolchain_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.toolchain_root = Some(root.into());
+        self
+    }
+
+    /// Allow `cargo-mires` to automatically download a prebuilt toolchain bundle
+    /// if missing (`MIRES_AUTO_INSTALL=1`). Defaults to `false`.
+    #[must_use]
+    pub fn auto_install(mut self, on: bool) -> Self {
+        self.auto_install = on;
         self
     }
 
@@ -248,14 +258,13 @@ impl Crate {
         let cargo_mires = locate_cargo_mires(toolchain_root.as_deref())?;
         let target_dir = self.resolved_target_dir(&out_dir);
         let profile = self.profile.unwrap_or_else(profile_from_cargo);
-        let args = self.build_args(&out_dir, &target_dir, profile, toolchain_root.as_deref());
-
-        let mut command = Command::new(&cargo_mires);
-        command
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        scrub(&mut command);
+        let mut command = self.build_command(
+            &cargo_mires,
+            &out_dir,
+            &target_dir,
+            profile,
+            toolchain_root.as_deref(),
+        );
 
         let output = command.output().map_err(|source| BuildError::Io {
             path: cargo_mires,
@@ -285,6 +294,29 @@ impl Crate {
         self.target_dir
             .clone()
             .unwrap_or_else(|| out_dir.join(DEFAULT_TARGET_SUBDIR))
+    }
+
+    /// Prepare the spawned `cargo-mires` command with scrubbed Cargo env and optional
+    /// `MIRES_AUTO_INSTALL=1`.
+    fn build_command(
+        &self,
+        cargo_mires: &Path,
+        out_dir: &Path,
+        target_dir: &Path,
+        profile: Profile,
+        toolchain_root: Option<&Path>,
+    ) -> Command {
+        let args = self.build_args(out_dir, target_dir, profile, toolchain_root);
+        let mut command = Command::new(cargo_mires);
+        command
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        scrub(&mut command);
+        if self.auto_install {
+            command.env(AUTO_INSTALL_ENV, "1");
+        }
+        command
     }
 
     /// Build the exact CLI arguments passed to `cargo-mires`.
@@ -376,11 +408,9 @@ impl Crate {
         }
 
         if let Some(root) = toolchain_root {
-            if let Ok(toolchain) = Toolchain::new(root) {
-                for bin in [toolchain.dylib(), toolchain.linker()] {
-                    if bin.is_file() {
-                        directives.push(format!("cargo:rerun-if-changed={}", bin.display()));
-                    }
+            for bin in watched_toolchain_binaries(root) {
+                if bin.is_file() {
+                    directives.push(format!("cargo:rerun-if-changed={}", bin.display()));
                 }
             }
         }
@@ -469,16 +499,30 @@ fn resolve_manifest_and_dir(path: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn resolve_toolchain_root(configured: Option<&Path>) -> Option<PathBuf> {
+    resolve_toolchain_root_from(
+        configured,
+        env::var_os(TOOLCHAIN_ROOT_ENV).as_deref(),
+        env::var_os("JSC_SPIKE_ROOT").as_deref(),
+        &checkout_root(),
+    )
+}
+
+fn resolve_toolchain_root_from(
+    configured: Option<&Path>,
+    mires_root_env: Option<&OsStr>,
+    legacy_root_env: Option<&OsStr>,
+    checkout: &Path,
+) -> Option<PathBuf> {
     if let Some(root) = configured {
         return Some(root.to_path_buf());
     }
-    if let Some(env_root) =
-        env::var_os(TOOLCHAIN_ROOT_ENV).or_else(|| env::var_os("JSC_SPIKE_ROOT"))
+    if let Some(env_root) = mires_root_env
+        .filter(|value| !value.is_empty())
+        .or_else(|| legacy_root_env.filter(|value| !value.is_empty()))
     {
         return Some(PathBuf::from(env_root));
     }
-    let checkout = Toolchain::checkout_root();
-    is_mires_root(&checkout).then_some(checkout)
+    is_mires_root(checkout).then(|| checkout.to_path_buf())
 }
 
 fn is_mires_root(dir: &Path) -> bool {
@@ -494,25 +538,82 @@ fn cargo_mires_bin_name() -> &'static str {
     }
 }
 
-fn locate_cargo_mires(toolchain_root: Option<&Path>) -> Result<PathBuf> {
-    locate_cargo_mires_with_path(toolchain_root, env::var_os("PATH").as_deref())
+fn jsc_link_bin_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "jsc-link.exe"
+    } else {
+        "jsc-link"
+    }
 }
 
-fn locate_cargo_mires_with_path(
+fn watched_toolchain_binaries(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dylib) = dylib_filename() {
+        candidates.push(root.join("target").join("release").join(dylib));
+        candidates.push(root.join("lib").join(dylib));
+        candidates.push(root.join("bin").join(dylib));
+    }
+    let linker = jsc_link_bin_name();
+    candidates.push(root.join("target").join("release").join(linker));
+    candidates.push(root.join("bin").join(linker));
+    candidates
+}
+
+fn default_cargo_bin_dir() -> Option<PathBuf> {
+    cargo_bin_dir_from_env(
+        env::var_os("CARGO_HOME").as_deref(),
+        env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .as_deref(),
+    )
+}
+
+fn cargo_bin_dir_from_env(cargo_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(cargo_home) = cargo_home.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(cargo_home).join("bin"));
+    }
+    home.filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".cargo").join("bin"))
+}
+
+fn locate_cargo_mires(toolchain_root: Option<&Path>) -> Result<PathBuf> {
+    let cargo_bin = default_cargo_bin_dir();
+    locate_cargo_mires_in(
+        toolchain_root,
+        cargo_bin.as_deref(),
+        env::var_os("PATH").as_deref(),
+    )
+}
+
+fn locate_cargo_mires_in(
     toolchain_root: Option<&Path>,
+    cargo_bin_dir: Option<&Path>,
     path_var: Option<&OsStr>,
 ) -> Result<PathBuf> {
     let bin = cargo_mires_bin_name();
     let mut searched = Vec::new();
 
     if let Some(root) = toolchain_root {
-        for profile_dir in ["release", "debug"] {
-            let candidate = root.join("target").join(profile_dir).join(bin);
+        let candidates = [
+            root.join("target").join("release").join(bin),
+            root.join("target").join("debug").join(bin),
+            root.join("bin").join(bin),
+        ];
+        for candidate in candidates {
             if candidate.is_file() {
                 return Ok(candidate);
             }
             searched.push(candidate);
         }
+    }
+
+    if let Some(cargo_bin) = cargo_bin_dir {
+        let candidate = cargo_bin.join(bin);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        searched.push(candidate);
     }
 
     if let Some(paths) = path_var {
@@ -737,6 +838,9 @@ mod tests {
                 "/opt/mires",
             ]
         );
+
+        let args_no_root = strings(&builder.build_args(out_dir, &target_dir, Profile::Dev, None));
+        assert!(!args_no_root.iter().any(|arg| arg == "--mires-root"));
     }
 
     #[test]
@@ -753,6 +857,7 @@ mod tests {
             .out_dir("/custom/out")
             .target_dir("/custom/target")
             .toolchain_root("/custom/mires")
+            .auto_install(true)
             .feature("feat-a")
             .feature("feat-b")
             .all_features(true)
@@ -761,6 +866,7 @@ mod tests {
         let out_dir = builder.out_dir.clone().unwrap();
         let target_dir = builder.resolved_target_dir(&out_dir);
         assert_eq!(target_dir, PathBuf::from("/custom/target"));
+        assert!(builder.auto_install);
 
         let args = strings(&builder.build_args(
             &out_dir,
@@ -804,48 +910,217 @@ mod tests {
     }
 
     #[test]
-    fn locate_cargo_mires_prefers_release_then_debug_then_path() {
+    fn auto_install_controls_env_var_on_spawned_command() {
+        let out_dir = Path::new("/tmp/out");
+        let target_dir = Path::new("/tmp/out/mires-target");
+
+        let default_cmd = Crate::new("../client").build_command(
+            Path::new("cargo-mires"),
+            out_dir,
+            target_dir,
+            Profile::Dev,
+            None,
+        );
+        assert!(default_cmd
+            .get_envs()
+            .all(|(key, _)| key != OsStr::new(AUTO_INSTALL_ENV)));
+
+        let auto_cmd = Crate::new("../client").auto_install(true).build_command(
+            Path::new("cargo-mires"),
+            out_dir,
+            target_dir,
+            Profile::Dev,
+            None,
+        );
+        assert_eq!(
+            auto_cmd
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(AUTO_INSTALL_ENV)),
+            Some((OsStr::new(AUTO_INSTALL_ENV), Some(OsStr::new("1"))))
+        );
+    }
+
+    #[test]
+    fn resolve_toolchain_root_omits_root_outside_checkout_when_unconfigured() {
+        let non_checkout = TempDir::new("non-checkout-root");
+        let checkout = TempDir::new("fake-checkout-root");
+        fs::create_dir_all(checkout.path().join("scripts")).unwrap();
+        fs::write(checkout.path().join("rust-toolchain.toml"), "").unwrap();
+        fs::write(checkout.path().join("scripts/build_sysroot.sh"), "").unwrap();
+
+        // Installed crate (not inside a Mires checkout) with no overrides => None.
+        assert_eq!(
+            resolve_toolchain_root_from(None, None, None, non_checkout.path()),
+            None
+        );
+        // Empty env vars are ignored.
+        assert_eq!(
+            resolve_toolchain_root_from(
+                None,
+                Some(OsStr::new("")),
+                Some(OsStr::new("")),
+                non_checkout.path(),
+            ),
+            None
+        );
+        // Inside a local checkout => checkout path.
+        assert_eq!(
+            resolve_toolchain_root_from(None, None, None, checkout.path()),
+            Some(checkout.path().to_path_buf())
+        );
+        // MIRES_ROOT overrides checkout.
+        assert_eq!(
+            resolve_toolchain_root_from(
+                None,
+                Some(OsStr::new("/env/mires")),
+                None,
+                checkout.path()
+            ),
+            Some(PathBuf::from("/env/mires"))
+        );
+        // Explicit `.toolchain_root(...)` wins over everything.
+        assert_eq!(
+            resolve_toolchain_root_from(
+                Some(Path::new("/explicit/mires")),
+                Some(OsStr::new("/env/mires")),
+                Some(OsStr::new("/legacy/mires")),
+                checkout.path(),
+            ),
+            Some(PathBuf::from("/explicit/mires"))
+        );
+    }
+
+    #[test]
+    fn cargo_bin_dir_prefers_cargo_home_then_home_dot_cargo() {
+        assert_eq!(
+            cargo_bin_dir_from_env(
+                Some(OsStr::new("/custom/cargo")),
+                Some(OsStr::new("/home/u"))
+            ),
+            Some(PathBuf::from("/custom/cargo/bin"))
+        );
+        assert_eq!(
+            cargo_bin_dir_from_env(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cargo/bin"))
+        );
+        assert_eq!(
+            cargo_bin_dir_from_env(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cargo/bin"))
+        );
+        assert_eq!(cargo_bin_dir_from_env(None, None), None);
+    }
+
+    #[test]
+    fn locate_cargo_mires_follows_exact_precedence_and_reports_install_hints() {
         let root = TempDir::new("locate-cargo-mires");
+        let cargo_bin = TempDir::new("locate-cargo-mires-cargo-bin");
         let path_dir = TempDir::new("locate-cargo-mires-path");
         let bin = cargo_mires_bin_name();
 
-        let err =
-            locate_cargo_mires_with_path(Some(root.path()), Some(path_dir.path().as_os_str()))
-                .unwrap_err();
+        let err = locate_cargo_mires_in(
+            Some(root.path()),
+            Some(cargo_bin.path()),
+            Some(path_dir.path().as_os_str()),
+        )
+        .unwrap_err();
         assert!(matches!(err, BuildError::CargoMiresMissing { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("cargo binstall cargo-mires"), "{msg}");
+        assert!(msg.contains("cargo install cargo-mires"), "{msg}");
+        assert!(
+            msg.contains("cargo build --release -p cargo-mires"),
+            "{msg}"
+        );
 
-        // Found on PATH when neither release nor debug exists.
+        // 5. Found on PATH when no higher-precedence location exists.
         let on_path = path_dir.path().join(bin);
         fs::write(&on_path, "").unwrap();
         assert_eq!(
-            locate_cargo_mires_with_path(Some(root.path()), Some(path_dir.path().as_os_str()))
-                .unwrap(),
+            locate_cargo_mires_in(
+                Some(root.path()),
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str()),
+            )
+            .unwrap(),
+            on_path
+        );
+        assert_eq!(
+            locate_cargo_mires_in(
+                None,
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str())
+            )
+            .unwrap(),
             on_path
         );
 
-        // Debug binary under toolchain root beats PATH.
+        // 4. $CARGO_HOME/bin (or ~/.cargo/bin) beats PATH.
+        let in_cargo_bin = cargo_bin.path().join(bin);
+        fs::write(&in_cargo_bin, "").unwrap();
+        assert_eq!(
+            locate_cargo_mires_in(
+                Some(root.path()),
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str()),
+            )
+            .unwrap(),
+            in_cargo_bin
+        );
+        assert_eq!(
+            locate_cargo_mires_in(
+                None,
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str())
+            )
+            .unwrap(),
+            in_cargo_bin
+        );
+
+        // 3. Standalone unpacked bundle `<toolchain_root>/bin/cargo-mires` beats cargo bin.
+        let bundle_bin = root.path().join("bin").join(bin);
+        fs::create_dir_all(bundle_bin.parent().unwrap()).unwrap();
+        fs::write(&bundle_bin, "").unwrap();
+        assert_eq!(
+            locate_cargo_mires_in(
+                Some(root.path()),
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str()),
+            )
+            .unwrap(),
+            bundle_bin
+        );
+
+        // 2. Debug binary under toolchain root beats bundle bin.
         let debug_bin = root.path().join("target/debug").join(bin);
         fs::create_dir_all(debug_bin.parent().unwrap()).unwrap();
         fs::write(&debug_bin, "").unwrap();
         assert_eq!(
-            locate_cargo_mires_with_path(Some(root.path()), Some(path_dir.path().as_os_str()))
-                .unwrap(),
+            locate_cargo_mires_in(
+                Some(root.path()),
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str()),
+            )
+            .unwrap(),
             debug_bin
         );
 
-        // Release binary under toolchain root beats debug.
+        // 1. Release binary under toolchain root beats debug.
         let release_bin = root.path().join("target/release").join(bin);
         fs::create_dir_all(release_bin.parent().unwrap()).unwrap();
         fs::write(&release_bin, "").unwrap();
         assert_eq!(
-            locate_cargo_mires_with_path(Some(root.path()), Some(path_dir.path().as_os_str()))
-                .unwrap(),
+            locate_cargo_mires_in(
+                Some(root.path()),
+                Some(cargo_bin.path()),
+                Some(path_dir.path().as_os_str()),
+            )
+            .unwrap(),
             release_bin
         );
     }
 
     #[test]
-    fn rerun_directives_watch_env_manifest_and_src_rs_files() {
+    fn rerun_directives_watch_env_manifest_src_and_toolchain_binaries() {
         let dir = TempDir::new("crate-rerun");
         fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         fs::write(
@@ -877,6 +1152,14 @@ mod tests {
             dir.path().join("src/nested/mod.rs").display()
         )));
         assert!(!directives.iter().any(|line| line.contains("notes.txt")));
+
+        // Standalone unpacked bundle binaries are watched when toolchain_root is set.
+        let bundle = TempDir::new("crate-rerun-bundle");
+        let linker = bundle.path().join("bin").join(jsc_link_bin_name());
+        fs::create_dir_all(linker.parent().unwrap()).unwrap();
+        fs::write(&linker, "").unwrap();
+        let bundle_directives = Crate::new(dir.path()).rerun_directives(Some(bundle.path()));
+        assert!(bundle_directives.contains(&format!("cargo:rerun-if-changed={}", linker.display())));
     }
 
     #[test]
@@ -919,7 +1202,7 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn build_invokes_cargo_mires_with_isolated_target_dir_and_collects_outputs() {
+    fn build_invokes_cargo_mires_with_isolated_target_dir_and_auto_install() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new("crate-build-e2e");
@@ -933,11 +1216,12 @@ mod tests {
         fs::write(client_dir.join("src/lib.rs"), "").unwrap();
 
         let toolchain_dir = dir.path().join("mires");
-        let release_dir = toolchain_dir.join("target/release");
-        fs::create_dir_all(&release_dir).unwrap();
+        let bundle_bin_dir = toolchain_dir.join("bin");
+        fs::create_dir_all(&bundle_bin_dir).unwrap();
         let out_dir = dir.path().join("out");
         let recorded_args = dir.path().join("recorded-args.txt");
-        let fake_cargo_mires = release_dir.join("cargo-mires");
+        let recorded_env = dir.path().join("recorded-env.txt");
+        let fake_cargo_mires = bundle_bin_dir.join("cargo-mires");
         fs::write(
             &fake_cargo_mires,
             format!(
@@ -945,6 +1229,7 @@ mod tests {
                     "#!/usr/bin/env bash\n",
                     "set -euo pipefail\n",
                     "printf '%s\\n' \"$@\" >'{}'\n",
+                    "printf '%s' \"${{MIRES_AUTO_INSTALL:-unset}}\" >'{}'\n",
                     "out='{}'\n",
                     "mkdir -p \"$out\"\n",
                     "printf 'export function hi() {{}}\\n' >\"$out/demo_client.mjs\"\n",
@@ -956,6 +1241,7 @@ mod tests {
                     "printf '  %s/demo_client.d.ts  0.03 KB\\n' \"$out\"\n",
                 ),
                 recorded_args.display(),
+                recorded_env.display(),
                 out_dir.display(),
             ),
         )
@@ -966,6 +1252,7 @@ mod tests {
             .profile(Profile::Dev)
             .out_dir(&out_dir)
             .toolchain_root(&toolchain_dir)
+            .auto_install(true)
             .build()
             .unwrap();
 
@@ -978,6 +1265,7 @@ mod tests {
         assert_eq!(artifacts.runtime, None);
         assert_eq!(artifacts.package_json, None);
         assert_eq!(artifacts.out_dir, out_dir);
+        assert_eq!(fs::read_to_string(&recorded_env).unwrap(), "1");
 
         let recorded: Vec<String> = fs::read_to_string(&recorded_args)
             .unwrap()

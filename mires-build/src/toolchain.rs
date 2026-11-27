@@ -12,12 +12,11 @@ use rcgjs_object::{
     opts::{normalize_optimizer_passes, Profile},
 };
 
-use crate::{BuildError, Fix, Pinned, Result, RustOptLevel, Step, Unmet};
+use crate::{
+    checkout_root, dylib_filename, scrub, BuildError, Fix, PanicMode, Pinned, Result, RustOptLevel,
+    Step, Unmet, PANIC_ENV, TOOLCHAIN_ROOT_ENV,
+};
 
-/// Environment variable overriding the Mires toolchain checkout root.
-pub const TOOLCHAIN_ROOT_ENV: &str = "MIRES_ROOT";
-/// Legacy alias for [`TOOLCHAIN_ROOT_ENV`].
-pub const SPIKE_ROOT_ENV: &str = TOOLCHAIN_ROOT_ENV;
 /// Environment variable the checkout's scripts read the backend's emit options
 /// from.
 pub const EXTRA_ARGS_ENV: &str = "JS_EXTRA_ARGS";
@@ -29,9 +28,6 @@ pub const RUST_MIR_INLINE_ENV: &str = "JSC_RUST_MIR_INLINE";
 pub const SYSROOT_ARGS_ENV: &str = "JSC_SYSROOT_ARGS";
 /// Environment variable remapping checkout paths in compiler diagnostics and source maps.
 pub const REMAP_ROOT_ENV: &str = "JSC_REMAP_ROOT";
-/// Environment variable selecting the build mode: unset (or `unwind`) is the default
-/// `-Cpanic=unwind` build, `abort` the `-Cpanic=abort` override (`scripts/sysroot-cache.sh`, `jsc_panic`).
-pub const PANIC_ENV: &str = "JSC_PANIC";
 
 /// Inputs identifying a cached sysroot build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,69 +53,6 @@ pub struct CompileOptions<'a> {
     pub sysroot_args: Option<&'a str>,
     pub script_args: &'a [String],
     pub opt_level: Option<RustOptLevel>,
-}
-
-/// The build mode [`PANIC_ENV`] selects.
-///
-/// The checkout's scripts read the same variable, and the toolchain passes it to every script it
-/// runs, so a client crate, its sysroot and the scripts can never disagree about the target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanicMode {
-    /// `-Cpanic=abort` on `wasm32-unknown-unknown`: explicit opt-in override.
-    Abort,
-    /// `-Cpanic=unwind` on `targets/mires32-unwind.json`, with `js-cleanup=off` appended by the
-    /// scripts: rustc's unwind edges carry host-exception cleanup (the default).
-    Unwind,
-}
-
-impl PanicMode {
-    /// The mode a [`PANIC_ENV`] value names, or `None` for a value that names none.
-    #[must_use]
-    pub fn parse(value: Option<&str>) -> Option<Self> {
-        match value {
-            None | Some("" | "unwind") => Some(Self::Unwind),
-            Some("abort") => Some(Self::Abort),
-            Some(_) => None,
-        }
-    }
-
-    /// The mode in this process's environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when [`PANIC_ENV`] is set to anything but `abort` or `unwind`.
-    pub fn from_env() -> Result<Self> {
-        let value = env::var(PANIC_ENV).ok();
-        Self::parse(value.as_deref()).ok_or_else(|| BuildError::PanicMode {
-            value: value.unwrap_or_default(),
-        })
-    }
-
-    /// The target's name: what the sysroot's `lib/rustlib/<name>/lib` is called.
-    #[must_use]
-    pub fn target_name(self) -> &'static str {
-        match self {
-            Self::Abort => "wasm32-unknown-unknown",
-            Self::Unwind => "mires32-unwind",
-        }
-    }
-
-    /// The CLI spelling of this panic mode (`"unwind"` or `"abort"`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unwind => "unwind",
-            Self::Abort => "abort",
-        }
-    }
-
-    /// What [`PANIC_ENV`] is set to for a child process; `None` removes an inherited value.
-    fn env_value(self) -> Option<&'static str> {
-        match self {
-            Self::Unwind => None,
-            Self::Abort => Some("abort"),
-        }
-    }
 }
 
 /// The Mires toolchain checkout a client crate is compiled with: the codegen
@@ -189,8 +122,7 @@ impl Toolchain {
     /// The Mires checkout this crate was compiled from: the parent of its own
     /// package directory.
     pub(crate) fn checkout_root() -> PathBuf {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
+        checkout_root()
     }
 
     /// The Mires checkout root.
@@ -1050,16 +982,9 @@ fn path_arg(path: &Path) -> String {
 ///
 /// Returns `Err` on a platform the backend is not built for.
 fn dylib_name() -> Result<&'static str> {
-    if cfg!(target_os = "windows") {
-        return Err(BuildError::UnsupportedPlatform {
-            os: env::consts::OS,
-        });
-    }
-    if cfg!(target_os = "macos") {
-        Ok("librustc_codegen_mires.dylib")
-    } else {
-        Ok("librustc_codegen_mires.so")
-    }
+    dylib_filename().ok_or(BuildError::UnsupportedPlatform {
+        os: env::consts::OS,
+    })
 }
 
 /// Whether two whitespace-delimited backend option sets are equivalent.
@@ -1094,28 +1019,6 @@ fn optional_env(command: &mut Command, key: &str, value: Option<&str>) {
         }
         None => {
             command.env_remove(key);
-        }
-    }
-}
-
-/// Drop the environment cargo set for this build script.
-///
-/// The compile script asks for the spike's pinned nightly with an explicit
-/// `+toolchain`, which an inherited `RUSTUP_TOOLCHAIN` would silently override.
-/// The rest is dropped for the reason a nested `cargo build` drops it: those
-/// variables shift the fingerprint of everything the script builds, so leaving
-/// them set cache-busts every run.
-pub(crate) fn scrub(command: &mut Command) {
-    for (key, _) in env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("CARGO")
-            || name == "RUSTC"
-            || name == "RUSTC_WRAPPER"
-            || name == "RUSTC_WORKSPACE_WRAPPER"
-            || name == "RUSTUP_TOOLCHAIN"
-            || name == "RUSTFLAGS"
-        {
-            command.env_remove(&key);
         }
     }
 }
@@ -1337,17 +1240,6 @@ mod tests {
             fs::read_to_string(recorded).unwrap(),
             "js-opt=report js-comments=off\njs-opt=report\n1",
         );
-    }
-
-    #[test]
-    fn panic_mode_names_the_two_build_modes() {
-        assert_eq!(PanicMode::parse(None), Some(PanicMode::Unwind));
-        assert_eq!(PanicMode::parse(Some("")), Some(PanicMode::Unwind));
-        assert_eq!(PanicMode::parse(Some("unwind")), Some(PanicMode::Unwind));
-        assert_eq!(PanicMode::parse(Some("abort")), Some(PanicMode::Abort));
-        assert_eq!(PanicMode::parse(Some("Unwind")), None);
-        assert_eq!(PanicMode::Abort.target_name(), "wasm32-unknown-unknown");
-        assert_eq!(PanicMode::Unwind.target_name(), "mires32-unwind");
     }
 
     /// The mode travels to the scripts explicitly, and an unwind-mode toolchain masks an inherited

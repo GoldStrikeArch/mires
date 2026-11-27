@@ -55,13 +55,6 @@ fn lane_arg(lane: Lane) -> &'static str {
     }
 }
 
-pub(crate) fn module_format_str(format: ModuleFormat) -> &'static str {
-    match format {
-        ModuleFormat::Esm => "esm",
-        ModuleFormat::Script => "script",
-    }
-}
-
 fn module_format_arg(format: ModuleFormat) -> &'static str {
     match format {
         ModuleFormat::Esm => "js-modules=esm",

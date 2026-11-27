@@ -2,6 +2,12 @@
 name = "mires-js"
 version = "0.1.0"
 edition = "2021"
+description = "JavaScript host value wrappers, collections, Promise interop, and browser API bindings for mires"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "ffi", "mires", "interop", "web"]
+categories = ["web-programming", "development-tools::ffi", "no-std"]
 publish = false
 
 [dependencies]

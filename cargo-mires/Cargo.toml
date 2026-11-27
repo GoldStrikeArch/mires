@@ -2,16 +2,30 @@
 name = "cargo-mires"
 version = "0.1.0"
 edition = "2021"
-publish = false
+description = "Cargo driver and toolchain manager for the Mires Rust-to-JavaScript compiler"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GoldStrikeArch/mires"
+homepage = "https://github.com/GoldStrikeArch/mires"
+keywords = ["javascript", "compiler", "cargo", "codegen", "mires"]
+categories = ["development-tools::cargo-plugins", "web-programming"]
 
 [[bin]]
 name = "cargo-mires"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lints]
 workspace = true

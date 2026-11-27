@@ -1,17 +1,20 @@
-//! Mires toolchain discovery, backend building, and cached sysroot management.
+//! Mires toolchain resolution and cached sysroot management (100% pure Rust, zero `bash`).
 
 use std::env;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
 use crate::cli::{PanicMode, Profile, SysrootCliOptions};
 use crate::metadata;
-
-const DEFAULT_CHANNEL: &str = "nightly";
+use crate::sysroot_build::{self, SysrootBuildRequest};
+use crate::toolchain::{
+    self, ensure_checkout_backend_built, ensure_rustup_channel, resolve_toolchain_source,
+    ToolchainManifest, ToolchainSource, DEFAULT_PINNED_CHANNEL,
+};
 
 /// Resolved toolchain binaries, pinned nightly channel, target, and sysroot directory.
 #[derive(Clone, Debug)]
@@ -77,32 +80,53 @@ pub fn run_sysroot_cmd(opts: &SysrootCliOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// Ensure the backend dylib, `jsc-link`, and matching sysroot exist and return their paths.
+/// Ensure the backend dylib, `jsc-link`, pinned nightly toolchain, and matching sysroot exist.
 pub fn ensure_sysroot(req: &SysrootRequest<'_>) -> Result<ToolchainInfo, String> {
-    let mires_root = locate_mires_root(req.mires_root_override)?;
-    let (dylib_path, jsc_link_path) = ensure_backend_built(&mires_root, req.verbose)?;
-    let channel = read_pinned_channel(&mires_root);
-    let (target_arg, target_name, is_json_target) = resolve_target(&mires_root, req.panic)?;
-
-    let sysroot_dir = resolve_sysroot_path(&mires_root, req.profile, req.panic)?;
-    let needs_build = req.clean || !sysroot_is_ready(&sysroot_dir, &target_name);
-    if needs_build {
-        build_sysroot(&mires_root, req.profile, req.panic, req.clean, req.verbose)?;
-    } else if req.verbose {
-        eprintln!(
-            "cargo-mires: reusing cached sysroot {}",
-            sysroot_dir.display()
-        );
+    match resolve_toolchain_source(req.mires_root_override)? {
+        ToolchainSource::SourceCheckout(checkout_root) => {
+            ensure_from_source_checkout(&checkout_root, req)
+        }
+        ToolchainSource::InstalledBundle { root, manifest } => {
+            ensure_from_installed_bundle(&root, &manifest, req)
+        }
     }
+}
 
-    if !sysroot_is_ready(&sysroot_dir, &target_name) {
+fn ensure_from_source_checkout(
+    checkout_root: &Path,
+    req: &SysrootRequest<'_>,
+) -> Result<ToolchainInfo, String> {
+    let channel = read_pinned_channel(checkout_root);
+    ensure_rustup_channel(&channel, false, req.verbose)?;
+
+    let (dylib_path, jsc_link_path) =
+        ensure_checkout_backend_built(checkout_root, &channel, req.verbose)?;
+    let dylib_sha256 = sha256_file(&dylib_path)?;
+    let spec_path = checkout_root.join("targets/mires32-unwind.json");
+    let (target_arg, target_name, is_json_target) = resolve_target(&spec_path, req.panic)?;
+
+    let emit_args = format!("js-profile={}", req.profile.as_str());
+    let sysroot_dir = sysroot_build::build_sysroot_native(&SysrootBuildRequest {
+        sources_root: checkout_root,
+        cache_root: &checkout_root.join("build"),
+        sysroots_dir: &checkout_root.join("build/sysroots"),
+        dylib_path: &dylib_path,
+        dylib_sha256: &dylib_sha256,
+        channel: &channel,
+        target_spec: is_json_target.then_some(spec_path.as_path()),
+        panic: req.panic,
+        emit_args_raw: &emit_args,
+        rust_opt_level: None,
+        clean: req.clean,
+        verbose: req.verbose,
+    })?;
+
+    if !sysroot_build::sysroot_has_core_libs(&sysroot_dir, &target_name) {
         return Err(format!(
             "sysroot build completed but expected libraries are missing under `{}`",
             sysroot_dir.display()
         ));
     }
-
-    let dylib_sha256 = sha256_file(&dylib_path)?;
 
     Ok(ToolchainInfo {
         channel,
@@ -116,149 +140,133 @@ pub fn ensure_sysroot(req: &SysrootRequest<'_>) -> Result<ToolchainInfo, String>
     })
 }
 
-/// Discover the Mires repository root via CLI flag, `MIRES_ROOT`, current executable,
-/// or compile-time `CARGO_MANIFEST_DIR`.
-pub fn locate_mires_root(cli_override: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(path) = cli_override {
-        return validate_mires_root(path, "--mires-root");
-    }
+fn ensure_from_installed_bundle(
+    bundle_root: &Path,
+    manifest: &ToolchainManifest,
+    req: &SysrootRequest<'_>,
+) -> Result<ToolchainInfo, String> {
+    ensure_rustup_channel(&manifest.channel, false, req.verbose)?;
 
-    if let Some(env_path) = env::var_os("MIRES_ROOT") {
-        let path = PathBuf::from(env_path);
-        return validate_mires_root(&path, "MIRES_ROOT");
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        let mut cursor = exe.parent();
-        for _ in 0..4 {
-            let Some(dir) = cursor else {
-                break;
-            };
-            if is_mires_root(dir) {
-                return Ok(dir.to_path_buf());
-            }
-            cursor = dir.parent();
-        }
-    }
-
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        let candidate = Path::new(manifest_dir)
-            .parent()
-            .unwrap_or_else(|| Path::new(manifest_dir));
-        if is_mires_root(candidate) {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-
-    Err(
-        "could not locate Mires toolchain root; pass `--mires-root <path>` or set `MIRES_ROOT`"
-            .to_owned(),
-    )
-}
-
-fn validate_mires_root(path: &Path, source: &str) -> Result<PathBuf, String> {
-    if is_mires_root(path) {
-        Ok(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-    } else {
-        Err(format!(
-            "`{}` (from {source}) is not a valid Mires root \
-             (expected `rust-toolchain.toml` and `scripts/build_sysroot.sh`)",
-            path.display()
-        ))
-    }
-}
-
-fn is_mires_root(dir: &Path) -> bool {
-    dir.join("rust-toolchain.toml").is_file()
-        && dir.join("scripts").join("build_sysroot.sh").is_file()
-}
-
-fn dylib_filename() -> Result<&'static str, String> {
-    if cfg!(target_os = "windows") {
-        return Err(format!(
-            "Mires codegen backend is not supported on `{}`",
-            env::consts::OS
-        ));
-    }
-    if cfg!(target_os = "macos") {
-        Ok("librustc_codegen_mires.dylib")
-    } else {
-        Ok("librustc_codegen_mires.so")
-    }
-}
-
-fn ensure_backend_built(mires_root: &Path, verbose: bool) -> Result<(PathBuf, PathBuf), String> {
-    let release_dir = mires_root.join("target").join("release");
-    let dylib_path = release_dir.join(dylib_filename()?);
-    let jsc_link_path = env::var_os("JSC_LINK_BIN")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| release_dir.join("jsc-link"));
-
-    if dylib_path.is_file() && jsc_link_path.is_file() {
-        return Ok((dylib_path, jsc_link_path));
-    }
-
-    let build_script = mires_root.join("scripts").join("build.sh");
-    if !build_script.is_file() {
-        return Err(format!(
-            "backend artifacts missing and `{}` does not exist",
-            build_script.display()
-        ));
-    }
-
-    eprintln!("cargo-mires: building compiler backend (`scripts/build.sh`)...");
-    let mut cmd = Command::new("bash");
-    cmd.arg(&build_script)
-        .current_dir(mires_root)
-        .stdout(if verbose {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
-        .stderr(Stdio::inherit());
-    scrub_cargo_env(&mut cmd);
-
-    let status = cmd
-        .status()
-        .map_err(|err| format!("failed to run `{}`: {err}", build_script.display()))?;
-    if !status.success() {
-        return Err(format!("`{}` failed with {status}", build_script.display()));
-    }
-
-    let final_linker = if jsc_link_path.is_file() {
-        jsc_link_path
-    } else {
-        release_dir.join("jsc-link")
-    };
+    let dylib_path = bundle_root.join(&manifest.dylib);
     if !dylib_path.is_file() {
         return Err(format!(
-            "backend build succeeded but `{}` is missing",
-            dylib_path.display()
+            "installed toolchain at `{}` is missing backend `{}`",
+            bundle_root.display(),
+            manifest.dylib
         ));
     }
-    if !final_linker.is_file() {
+    let jsc_link_path = env::var_os("JSC_LINK_BIN")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| bundle_root.join(&manifest.jsc_link));
+    if !jsc_link_path.is_file() {
         return Err(format!(
-            "backend build succeeded but `{}` is missing",
-            final_linker.display()
+            "installed toolchain at `{}` is missing linker `{}`",
+            bundle_root.display(),
+            manifest.jsc_link
         ));
     }
-    Ok((dylib_path, final_linker))
+
+    let dylib_sha256 = sha256_file(&dylib_path)?;
+    let spec_path = bundle_root.join(&manifest.target_spec);
+    let (target_arg, target_name, is_json_target) = resolve_target(&spec_path, req.panic)?;
+
+    // Fast path: reuse a prebuilt sysroot from `manifest.json` instantaneously (no `rust-src` needed!).
+    let profile_key = format!("{}:{}", req.profile.as_str(), req.panic.as_str());
+    if !req.clean {
+        if let Some(rel) = manifest.prebuilt_sysroots.get(&profile_key) {
+            let candidate = bundle_root.join(rel);
+            if sysroot_build::sysroot_has_core_libs(&candidate, &target_name) {
+                if req.verbose {
+                    eprintln!(
+                        "cargo-mires: using prebuilt sysroot `{profile_key}` at {}",
+                        candidate.display()
+                    );
+                }
+                return Ok(ToolchainInfo {
+                    channel: manifest.channel.clone(),
+                    dylib_path,
+                    dylib_sha256,
+                    jsc_link_path,
+                    sysroot_dir: candidate,
+                    target_arg,
+                    target_name,
+                    is_json_target,
+                });
+            }
+        }
+    }
+
+    // Custom profile/panic fallback: build on-demand using bundled `patches/` and `mires-std/`.
+    if !manifest.has_sysroot_sources
+        || !bundle_root.join("patches").is_dir()
+        || !bundle_root.join("mires-std").is_dir()
+    {
+        let available: Vec<&str> = manifest
+            .prebuilt_sysroots
+            .keys()
+            .map(String::as_str)
+            .collect();
+        return Err(format!(
+            "installed toolchain at `{}` has no prebuilt sysroot for `{profile_key}` \
+             (bundled: [{}]) and does not include sysroot sources for on-demand rebuilds",
+            bundle_root.display(),
+            available.join(", ")
+        ));
+    }
+
+    let emit_args = format!("js-profile={}", req.profile.as_str());
+    let sysroot_dir = sysroot_build::build_sysroot_native(&SysrootBuildRequest {
+        sources_root: bundle_root,
+        cache_root: bundle_root,
+        sysroots_dir: &bundle_root.join("sysroots"),
+        dylib_path: &dylib_path,
+        dylib_sha256: &dylib_sha256,
+        channel: &manifest.channel,
+        target_spec: is_json_target.then_some(spec_path.as_path()),
+        panic: req.panic,
+        emit_args_raw: &emit_args,
+        rust_opt_level: None,
+        clean: req.clean,
+        verbose: req.verbose,
+    })?;
+
+    Ok(ToolchainInfo {
+        channel: manifest.channel.clone(),
+        dylib_path,
+        dylib_sha256,
+        jsc_link_path,
+        sysroot_dir,
+        target_arg,
+        target_name,
+        is_json_target,
+    })
 }
 
-fn resolve_target(mires_root: &Path, panic: PanicMode) -> Result<(String, String, bool), String> {
+/// Discover the active Mires root (source checkout or installed bundle).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "kept as public discovery helper for tests and callers"
+    )
+)]
+pub fn locate_mires_root(cli_override: Option<&Path>) -> Result<PathBuf, String> {
+    toolchain::resolve_toolchain_source(cli_override).map(|source| source.root().to_path_buf())
+}
+
+fn resolve_target(spec_path: &Path, panic: PanicMode) -> Result<(String, String, bool), String> {
     match panic {
         PanicMode::Unwind => {
-            let spec = mires_root.join("targets").join("mires32-unwind.json");
-            if !spec.is_file() {
+            if !spec_path.is_file() {
                 return Err(format!(
                     "unwind target spec not found at `{}`",
-                    spec.display()
+                    spec_path.display()
                 ));
             }
-            let spec = fs::canonicalize(&spec).unwrap_or(spec);
+            let canonical = fs::canonicalize(spec_path).unwrap_or_else(|_| spec_path.to_path_buf());
             Ok((
-                spec.to_string_lossy().into_owned(),
+                canonical.to_string_lossy().into_owned(),
                 panic.target_name().to_owned(),
                 true,
             ))
@@ -269,115 +277,6 @@ fn resolve_target(mires_root: &Path, panic: PanicMode) -> Result<(String, String
             false,
         )),
     }
-}
-
-fn resolve_sysroot_path(
-    mires_root: &Path,
-    profile: Profile,
-    panic: PanicMode,
-) -> Result<PathBuf, String> {
-    let script = mires_root.join("scripts").join("sysroot-cache.sh");
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script)
-        .arg("path")
-        .current_dir(mires_root)
-        .env("JS_EXTRA_ARGS", format!("js-profile={}", profile.as_str()))
-        .env("JSC_PANIC", panic.as_str())
-        .env_remove("JSC_SYSROOT_ARGS")
-        .env_remove("JSC_RUST_OPT_LEVEL")
-        .env_remove("JSC_TARGET")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    scrub_cargo_env(&mut cmd);
-
-    let output = cmd
-        .output()
-        .map_err(|err| format!("failed to run `{}`: {err}", script.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!(
-            "`sysroot-cache.sh path` failed: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        ));
-    }
-
-    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if path_str.is_empty() {
-        return Err("`sysroot-cache.sh path` returned an empty path".to_owned());
-    }
-    Ok(PathBuf::from(path_str))
-}
-
-fn sysroot_is_ready(sysroot: &Path, target_name: &str) -> bool {
-    let lib_dir = sysroot
-        .join("lib")
-        .join("rustlib")
-        .join(target_name)
-        .join("lib");
-    if !lib_dir.is_dir() {
-        return false;
-    }
-    let Some(dir_name) = sysroot.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let Ok(recorded_key) = fs::read_to_string(sysroot.join(".cache-key")) else {
-        return false;
-    };
-    if recorded_key.trim() != dir_name {
-        return false;
-    }
-    if let Ok(recorded_target) = fs::read_to_string(sysroot.join(".target")) {
-        if !recorded_target.trim().is_empty() && recorded_target.trim() != target_name {
-            return false;
-        }
-    }
-    true
-}
-
-fn build_sysroot(
-    mires_root: &Path,
-    profile: Profile,
-    panic: PanicMode,
-    clean: bool,
-    verbose: bool,
-) -> Result<(), String> {
-    let script = mires_root.join("scripts").join("build_sysroot.sh");
-    eprintln!(
-        "cargo-mires: preparing sysroot (profile={profile}, panic={panic}{})...",
-        if clean { ", clean" } else { "" }
-    );
-
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script);
-    if clean {
-        cmd.arg("--clean");
-    }
-    cmd.current_dir(mires_root)
-        .env("SKIP_BUILD", "1")
-        .env("JS_EXTRA_ARGS", format!("js-profile={}", profile.as_str()))
-        .env("JSC_PANIC", panic.as_str())
-        .env_remove("JSC_SYSROOT_ARGS")
-        .env_remove("JSC_RUST_OPT_LEVEL")
-        .env_remove("JSC_TARGET")
-        .stdout(if verbose {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
-        .stderr(Stdio::inherit());
-    scrub_cargo_env(&mut cmd);
-
-    let status = cmd
-        .status()
-        .map_err(|err| format!("failed to run `{}`: {err}", script.display()))?;
-    if !status.success() {
-        return Err(format!("`{}` failed with {status}", script.display()));
-    }
-    Ok(())
 }
 
 /// Read the pinned nightly channel from `<mires_root>/rust-toolchain.toml`.
@@ -400,7 +299,7 @@ pub fn parse_pinned_channel(toml_text: &str) -> String {
             }
         }
     }
-    DEFAULT_CHANNEL.to_owned()
+    DEFAULT_PINNED_CHANNEL.to_owned()
 }
 
 /// Compute lowercase hex SHA-256 of a file on disk.
@@ -413,7 +312,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Remove Cargo/rustc/wrapper environment variables that would interfere with nested script runs.
+/// Remove Cargo/rustc/wrapper environment variables that would interfere with nested tool runs.
 pub fn scrub_cargo_env(cmd: &mut Command) {
     for (key, _) in env::vars_os() {
         let name = key.to_string_lossy();
@@ -444,14 +343,13 @@ channel = \"nightly-2026-07-27\" # pinned
 profile = \"minimal\"
 ";
         assert_eq!(parse_pinned_channel(text), "nightly-2026-07-27");
-        assert_eq!(parse_pinned_channel(""), "nightly");
+        assert_eq!(parse_pinned_channel(""), DEFAULT_PINNED_CHANNEL);
     }
 
     #[test]
     fn locates_checkout_mires_root_via_compile_time_fallback() {
-        // When run inside the workspace tests, CARGO_MANIFEST_DIR/.. is the repo root.
         let root = locate_mires_root(None).unwrap();
         assert!(root.join("rust-toolchain.toml").is_file());
-        assert!(root.join("scripts/build_sysroot.sh").is_file());
+        assert!(root.join("patches").is_dir());
     }
 }

@@ -2,6 +2,39 @@
 
 `mires` is a Rust-to-JavaScript compiler implemented as a `rustc` codegen backend (`rustc_codegen_mires`) paired with a whole-program linker and optimizer (`jsc-link`). It compiles monomorphized Rust MIR, including the real `core` and `alloc` libraries, directly into JavaScript ES modules with no WebAssembly runtime and no linear memory heap.
 
+## Installation & Distribution
+
+Install `cargo-mires` using prebuilt binaries (macOS arm64/x64, Linux x64/arm64, Windows x64) or from a local checkout:
+
+```sh
+# cargo-binstall
+cargo binstall cargo-mires
+
+# macOS / Linux shell installer (installs cargo-mires and runs `cargo-mires setup`)
+curl -fsSL https://github.com/GoldStrikeArch/mires/releases/latest/download/install.sh | sh
+
+# Homebrew (macOS / Linux)
+curl -fsSLO https://github.com/GoldStrikeArch/mires/releases/latest/download/cargo-mires.rb && brew install --formula ./cargo-mires.rb
+
+# From a local checkout
+cargo install --path cargo-mires --locked
+```
+
+```powershell
+# Windows (PowerShell 5.1 / 7+)
+irm https://github.com/GoldStrikeArch/mires/releases/latest/download/install.ps1 | iex
+```
+
+Download and manage the prebuilt compiler toolchain (`rustc_codegen_mires`, `jsc-link`, and prebuilt `dev` + `release-balanced` sysroots). **Your own project stays on `stable` Rust** — `cargo mires` isolates the pinned nightly compiler used internally to load the codegen backend:
+
+```sh
+cargo mires setup              # download prebuilt toolchain bundle + configure pinned nightly
+cargo mires toolchain list     # inspect installed toolchains and active location
+cargo mires toolchain clean    # remove unused cached toolchains
+```
+
+For `build.rs` integration, `mires-build` stays slim by default and delegates to `cargo-mires` via `mires_build::Crate::new("../client")`. If you need direct single-file `.rs` compilation via `mires_build::BuildConfig`, opt into the `single-file` feature (`mires-build = { ..., features = ["single-file"] }`).
+
 ## Ergonomic Workflow (`cargo mires`, `mires-std`, Zero-Macro `#[js_export]`)
 
 Compile ordinary Rust crates — using `std` (`std::collections::HashMap`, `Vec`, `String`, `Result`) with no `#![no_std]`, no `extern crate alloc`, no `#[panic_handler]`, and no serialization derives — directly into self-contained ES modules, TypeScript `.d.ts` declarations, source maps, and npm packages:
