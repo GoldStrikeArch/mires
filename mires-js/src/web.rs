@@ -33,7 +33,7 @@ use crate::{js_bindings, HostHandle, HostValue, JsString, JsValue};
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct JsUint8Array {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "opaque host handle lowered by backend")]
     handle: HostHandle,
 }
 
@@ -187,7 +187,10 @@ impl TryFrom<JsValue> for JsUint8Array {
 /// target contract.
 #[derive(Clone, Copy, Debug)]
 pub struct TypedArrayBase64 {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "private zero-sized field prevents external struct construction"
+    )]
     private: (),
 }
 
@@ -246,7 +249,7 @@ macro_rules! compression_stream_type {
         #[repr(transparent)]
         #[derive(Clone, Copy)]
         pub struct $name {
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "opaque host handle lowered by backend")]
             handle: HostHandle,
         }
 

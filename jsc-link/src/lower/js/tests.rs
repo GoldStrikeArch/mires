@@ -1,6 +1,11 @@
 //! Unit tests: hand-built `Func`s and `Plan`s through `js::function::lower`, printed and compared
 //! to the shapes v1's goldens pin (`examples/emit/*.js.expected`).
 
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests construct multi-block JIR fixtures inline"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::item::JsName;
@@ -550,7 +555,10 @@ fn lower(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper threads explicit fixture overrides"
+)]
 fn lower_retargeted(
     interns: &Interns,
     name: &str,
@@ -3721,7 +3729,10 @@ fn unsupported_ops_decline_with_a_class() {
 }
 
 /// Keeps the unused imports honest.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "anchor keeping test helper import used across cfg splits"
+)]
 fn _unused(_: BTreeMap<u32, u32>) {}
 
 // -------------------------------------------------------------------------------------------
@@ -3740,7 +3751,10 @@ fn one_fact(
 }
 
 /// Lowers a function with an item index and a vtable index behind it.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper threads explicit fixture overrides"
+)]
 fn lower_with(
     interns: &Interns,
     name: &str,
@@ -3921,7 +3935,7 @@ fn a_call_inside_a_track_caller_body_forwards_its_own_location() {
         js,
         "function f(x) {\n  return g$h0000000000000002(x, $loc);\n}\n"
     );
-    let mut zero = func.clone();
+    let mut zero = func;
     for operation in zero.blocks.iter_mut().flat_map(|block| &mut block.ops) {
         if let OpKind::Call { args, .. } = &mut operation.kind {
             args.clear();

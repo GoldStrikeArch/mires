@@ -1930,6 +1930,10 @@ fn is_ascii_const(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use rcgjs_object::item::{ItemKind, ItemMap, LinkJir};
@@ -2718,7 +2722,7 @@ mod tests {
         );
         assert_eq!(
             run(&funcs, &table, &interns, &roots).slice_error_fail,
-            Some(real_name.clone())
+            Some(real_name)
         );
 
         // Non-unique authentic `core` candidates must fall back to `None`.

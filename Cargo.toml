@@ -25,6 +25,22 @@ sha2 = "0.10.9"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+[workspace.lints.clippy]
+# Every `unsafe` block must carry an explicit `// SAFETY:` justification.
+undocumented_unsafe_blocks = "deny"
+# Every lint suppression (`#[allow(...)]`) must explain why it is needed.
+allow_attributes_without_reason = "warn"
+# Keep functions focused and prefer sum types / context structs over bool bags
+# (thresholds configured in `clippy.toml`).
+too_many_lines = "warn"
+fn_params_excessive_bools = "warn"
+# Catch stray debug/placeholder code and unnecessary allocations.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+empty_drop = "warn"
+redundant_clone = "warn"
+
 # Dev builds optimise third-party code: the fixture-corpus tests spend a large share of their
 # time in it (miniz_oxide inflate, object, postcard, serde_json; brotli and flate2 in the
 # planner), and opt-level 2 runs them as fast as 3. Workspace members stay at opt-level 0,

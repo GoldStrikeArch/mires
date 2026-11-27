@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests construct multi-block arena fixtures inline"
+)]
+
 use super::*;
 use crate::analysis::heap::HeapPlan;
 use crate::item::LinkJir;

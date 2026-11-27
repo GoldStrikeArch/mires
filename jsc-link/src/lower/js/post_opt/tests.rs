@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests construct multi-case AST fixtures inline"
+)]
+
 use std::collections::HashSet;
 
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt, UnOp};

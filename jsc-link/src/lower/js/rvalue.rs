@@ -2497,7 +2497,7 @@ impl<'a> JsCx<'a> {
     }
 
     /// The scrutinee value of `ValueId` `v` for `SwitchInt` case spelling.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "helper exposed for switch-case lowering tests")]
     pub fn switch_case_value(&self, ty: TypeId, raw: u128) -> Expr {
         value::int_literal(self.table, ty, raw).unwrap_or_else(|| jsast::num(raw as f64))
     }
@@ -2512,5 +2512,5 @@ fn float_round(table: &rcgjs_object::jir::types::TypeTable, ty: TypeId, value: E
 }
 
 /// Unused marker to keep `ValueId` imported for the doc references above.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "keeps ValueId in scope for rustdoc links")]
 fn _value_id(_: ValueId) {}

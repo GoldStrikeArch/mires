@@ -507,7 +507,7 @@ fn origins_are_outside_equality_and_check_lengths() {
     let decoded: OriginTable = postcard::from_bytes(&bytes).expect("deserialize origins");
     assert_eq!(decoded, origins);
 
-    let mut short = origins.clone();
+    let mut short = origins;
     short.statements.pop();
     assert!(body.verify_origins(&short).is_err());
 
@@ -573,7 +573,7 @@ fn verify_rejects_broken_bodies() {
         "late-IR static contains a function CFG"
     );
 
-    let mut bad_string = body.clone();
+    let mut bad_string = body;
     if let Terminator::Call(call) = &mut bad_string.blocks[2].terminator {
         call.callee = Callee::Runtime {
             member: super::interns::StrId(4242),

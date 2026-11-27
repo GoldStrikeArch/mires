@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-statement loop AST fixtures inline"
+)]
+
 use super::super::post_opt::run_speed_post_opts;
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt, UnOp};
 

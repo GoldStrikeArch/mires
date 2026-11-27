@@ -1157,7 +1157,10 @@ impl<'a> JsCx<'a> {
     }
 
     /// The private module-scope sentinel expression (`$sn`) for [`EnumRepr::SentinelNiche`].
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "sentinel helper exposed for SentinelNiche lowering tests"
+    )]
     pub fn sentinel_none_expr(&self) -> Option<Expr> {
         value::sentinel_none_expr(self.table)
     }

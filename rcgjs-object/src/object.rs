@@ -1103,7 +1103,7 @@ mod tests {
             .iter()
             .find(|section| section.id == SectionId::Sources as u16)
             .unwrap();
-        let mut corrupt = bytes.clone();
+        let mut corrupt = bytes;
         corrupt[section.offset as usize] ^= 1;
         assert!(read(&corrupt)
             .unwrap_err()
@@ -1315,7 +1315,7 @@ mod tests {
             ItemClass::HOST.union(ItemClass::UNWIND)
         );
 
-        let mut static_body = plain.clone();
+        let mut static_body = plain;
         static_body.kind = BodyKind::Static {
             init: ConstTree::Unit,
             mutable: false,

@@ -2633,6 +2633,10 @@ fn fuse_straight_lines(func: &mut Func) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::analysis::callgraph;
@@ -3483,7 +3487,7 @@ mod tests {
         let graph = crate::analysis::callgraph::build(&funcs, &interns_map);
         let sizes = BTreeMap::from([
             (f_name.clone(), measured(funcs[&f_name].as_ref().unwrap())),
-            (g_name.clone(), measured(&g)),
+            (g_name, measured(&g)),
         ]);
         let measure = |_: &JsName, func: &Func, meta: &Metadata<'_>| Some(measurement(func, meta));
         let stats = run_with_config(
@@ -4464,7 +4468,7 @@ mod tests {
             })
             .collect();
         let items = ItemIndex::new();
-        let sizes = BTreeMap::from([(f_name.clone(), 1_000), (g_name.clone(), 455)]);
+        let sizes = BTreeMap::from([(f_name, 1_000), (g_name.clone(), 455)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,
@@ -4575,7 +4579,7 @@ mod tests {
             .collect();
         let items = ItemIndex::new();
         // Shared callee at 88 B (in 65..=96): admitted when caller shrinks (`120 -> 116`).
-        let sizes = BTreeMap::from([(f_name.clone(), 120), (g_name.clone(), 88)]);
+        let sizes = BTreeMap::from([(f_name, 120), (g_name.clone(), 88)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,
@@ -5043,7 +5047,7 @@ mod tests {
                     },
                 ),
             ]);
-            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let sizes = BTreeMap::from([(f_name, 200), (g_name, 120)]);
             let stats = run_with_config(
                 funcs,
                 &mut metadata,
@@ -5146,7 +5150,7 @@ mod tests {
                     },
                 ),
             ]);
-            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let sizes = BTreeMap::from([(f_name, 200), (g_name, 120)]);
             let stats = run_with_config(
                 funcs,
                 &mut metadata,
@@ -5217,7 +5221,7 @@ mod tests {
             .collect();
         // Shared callee (`sole_referrer = false`) priced at 120 bytes (> 96B SHARED_CALLEE_FOOTPRINT),
         // with +12B temporary caller growth (within <=16B trivial leaf slack) and 0 budget charge.
-        let sizes = BTreeMap::from([(f_name.clone(), 100), (g_name.clone(), 120)]);
+        let sizes = BTreeMap::from([(f_name, 100), (g_name.clone(), 120)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,
@@ -5312,7 +5316,7 @@ mod tests {
             .collect();
         // Make each intermediate site grow by +25B (>16B slack so single-site rejects when refs still contain g),
         // while batching all 3 sites yields 150 -> 180 (+30B) - 80B removed = -50B net!
-        let sizes = BTreeMap::from([(f_name.clone(), 150), (g_name.clone(), 80)]);
+        let sizes = BTreeMap::from([(f_name, 150), (g_name.clone(), 80)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,
@@ -5510,7 +5514,7 @@ mod tests {
                 },
             ),
         ]);
-        let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+        let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name, 120)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,
@@ -5784,9 +5788,9 @@ mod tests {
         // local-renaming noise (exceeding raw 23..35 B callee sizes, within the +96 B slack).
         let sizes = BTreeMap::from([
             (f_name.clone(), 40_000),
-            (id_name.clone(), 23),
-            (min_name.clone(), 35),
-            (len_name.clone(), 27),
+            (id_name, 23),
+            (min_name, 35),
+            (len_name, 27),
         ]);
         let stats = run_with_config(
             funcs,
@@ -6336,11 +6340,7 @@ mod tests {
                 },
             ),
         ]);
-        let sizes = BTreeMap::from([
-            (f_name.clone(), 400),
-            (idx_name.clone(), 90),
-            (res_name.clone(), 50),
-        ]);
+        let sizes = BTreeMap::from([(f_name.clone(), 400), (idx_name, 90), (res_name, 50)]);
         let stats = run_with_config(
             funcs,
             &mut metadata,

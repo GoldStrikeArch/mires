@@ -49,15 +49,18 @@ mod zero_offset;
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "re-exported public flat-ABI planner API")]
 pub use plan::{plan_excluding, AbiDecision, AbiPlan, CrossCrateEvidence};
 #[cfg(test)]
 pub use rewrite::rewrite_callee;
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "re-exported for linker and flat-ABI tests")]
 pub use rewrite::rewrite_calls;
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "re-exported for flat-ABI lowering callers")]
 pub(crate) use shapes::sentinel_result_shape;
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "re-exported flat-ABI shape types for callers and tests"
+)]
 pub use shapes::{
     ByteStrParam, FlatParam, FlatParamKind, FlatResult, FlatResultKind, FlatSig, LaneComponent,
     ParamAccess, ProductNode, RecursiveShape, SentinelResultShape, TaggedLane, TaggedShape,

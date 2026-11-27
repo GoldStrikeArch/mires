@@ -40,16 +40,64 @@ struct VecLenTracker {
     param_eq_slice_len: BTreeMap<ValueId, ValueId>,
 }
 
+fn is_immut_ref_ty(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        table.get(table.peeled(ty)).map(|d| &d.kind),
+        Some(TypeKind::Reference { mutable: false, .. })
+    )
+}
+
 impl VecLenTracker {
     /// Pre-scans local `Vec` cells, `VecRootKey` provenance, mutation sets, and `ParamSliceEqLen`
     /// equivalences before the RPO numbering pass.
     fn scan_vec_roots(doms: &Dominators, ctx: RangeInputs<'_>) -> Self {
         let func = ctx.func;
         let table = ctx.table;
+        let (cell_borrows, cell_len_mutated) = Self::scan_vec_cells(doms, ctx);
+        let val_vec_root = Self::scan_vec_root_keys(doms, func, table, &cell_borrows);
+        let root_len_mutated =
+            Self::collect_mutated_vec_roots(func, table, &cell_len_mutated, &val_vec_root);
+
+        // Map `ParamSliceEqLen` equivalence: canon slice param `pb` -> canon slice param `pa`.
+        let mut param_eq_slice_len: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+        if let Some(af) = ctx.arena_facts {
+            if let Some(eqs) = af.param_slice_eq_len.get(&func.item) {
+                for eq in eqs {
+                    if let (Some(&va), Some(&vb)) =
+                        (func.params.get(eq.param_a), func.params.get(eq.param_b))
+                    {
+                        param_eq_slice_len.insert(vb, va);
+                    }
+                }
+            }
+        }
+
+        Self {
+            vec_dyn_len: BTreeMap::new(),
+            vec_const_len: BTreeMap::new(),
+            vec_one_shl_len: BTreeMap::new(),
+            cell_dyn_len: BTreeMap::new(),
+            cell_const_len: BTreeMap::new(),
+            cell_one_shl_len: BTreeMap::new(),
+            cell_borrows,
+            cell_len_mutated,
+            val_vec_root,
+            root_len_mutated,
+            unmutated_root_len: BTreeMap::new(),
+            block_root_len: BTreeMap::new(),
+            param_eq_slice_len,
+        }
+    }
+
+    /// Pre-scans local `Vec` cells to identify whole-cell borrows and length-mutated cells.
+    fn scan_vec_cells(
+        doms: &Dominators,
+        ctx: RangeInputs<'_>,
+    ) -> (BTreeMap<ValueId, CellId>, BTreeSet<CellId>) {
+        let func = ctx.func;
+        let table = ctx.table;
         let interns = ctx.interns;
 
-        // Pre-scan local `Vec` cells: identify unmutated single-store cells (length fixed at init)
-        // and cells populated by a counted `0..N` unconditional push loop.
         let mut cell_borrows: BTreeMap<ValueId, CellId> = BTreeMap::new();
         let mut cell_store_val: BTreeMap<CellId, Option<ValueId>> = BTreeMap::new();
         let mut cell_len_mutated: BTreeSet<CellId> = BTreeSet::new();
@@ -116,12 +164,6 @@ impl VecLenTracker {
                 }
             }
         }
-        let is_immut_ref = |ty: TypeId| {
-            matches!(
-                table.get(table.peeled(ty)).map(|d| &d.kind),
-                Some(TypeKind::Reference { mutable: false, .. })
-            )
-        };
         // Any call/op on a borrow of a `Vec` cell other than length-preserving ops or immutable
         // `&Vec<T>` calls marks it length-mutated.
         for block in &func.blocks {
@@ -131,7 +173,7 @@ impl VecLenTracker {
                         for &a in args {
                             if let Some(&cid) = cell_borrows.get(&a) {
                                 if !is_vec_len_preserving_call(*semantic)
-                                    && !is_immut_ref(func.values[a.0 as usize].ty)
+                                    && !is_immut_ref_ty(table, func.values[a.0 as usize].ty)
                                 {
                                     cell_len_mutated.insert(cid);
                                 }
@@ -159,14 +201,16 @@ impl VecLenTracker {
                 }
             }
         }
+        (cell_borrows, cell_len_mutated)
+    }
 
-        // Track `VecRootKey` per SSA value (for same-Vec length unification) and length-mutated
-        // `VecRootKey`s across the whole function.
-        let mut root_len_mutated: BTreeSet<VecRootKey> = cell_len_mutated
-            .iter()
-            .copied()
-            .map(VecRootKey::Cell)
-            .collect();
+    /// Maps each SSA value to its canonical `VecRootKey` for same-`Vec` length unification.
+    fn scan_vec_root_keys(
+        doms: &Dominators,
+        func: &Func,
+        table: &TypeTable,
+        cell_borrows: &BTreeMap<ValueId, CellId>,
+    ) -> BTreeMap<ValueId, VecRootKey> {
         let mut val_vec_root: BTreeMap<ValueId, VecRootKey> = BTreeMap::new();
         for (pi, &pv) in func.params.iter().enumerate() {
             let pty = func.values[pv.0 as usize].ty;
@@ -178,7 +222,7 @@ impl VecLenTracker {
                 val_vec_root.insert(pv, VecRootKey::Param(pi));
             }
         }
-        for (&bv, &cid) in &cell_borrows {
+        for (&bv, &cid) in cell_borrows {
             val_vec_root.insert(bv, VecRootKey::Cell(cid));
         }
         for &b in &doms.rpo {
@@ -188,52 +232,61 @@ impl VecLenTracker {
                 }
             }
             for op in &func.blocks[b.0 as usize].ops {
-                if let Some(res) = op.result {
-                    match &op.kind {
-                        OpKind::Copy(s) | OpKind::Move(s) => {
-                            if let Some(&rk) = val_vec_root.get(s) {
+                let Some(res) = op.result else { continue };
+                match &op.kind {
+                    OpKind::Copy(s) | OpKind::Move(s) => {
+                        if let Some(&rk) = val_vec_root.get(s) {
+                            val_vec_root.insert(res, rk);
+                        }
+                    }
+                    OpKind::CellLoad(c) if is_global_vec_ty(table, func.cells[c.0 as usize].ty) => {
+                        val_vec_root.insert(res, VecRootKey::Cell(*c));
+                    }
+                    OpKind::Call { .. }
+                        if is_global_vec_ty(table, func.values[res.0 as usize].ty) =>
+                    {
+                        val_vec_root.insert(res, VecRootKey::Value(res));
+                    }
+                    OpKind::BorrowView { root, path, .. } => match (root, path.as_slice()) {
+                        (Root::Value(v), [Proj::Deref] | []) => {
+                            if let Some(&rk) = val_vec_root.get(v) {
                                 val_vec_root.insert(res, rk);
                             }
                         }
-                        OpKind::CellLoad(c)
-                            if is_global_vec_ty(table, func.cells[c.0 as usize].ty) =>
-                        {
-                            val_vec_root.insert(res, VecRootKey::Cell(*c));
+                        (
+                            Root::Value(v),
+                            [Proj::Deref, Proj::Field { field, ty }] | [Proj::Field { field, ty }],
+                        ) if is_global_vec_ty(table, *ty) => {
+                            if let Some(pi) = func.params.iter().position(|&p| p == *v) {
+                                val_vec_root.insert(res, VecRootKey::ParamField(pi, *field));
+                            }
                         }
-                        OpKind::Call { .. }
-                            if is_global_vec_ty(table, func.values[res.0 as usize].ty) =>
+                        (Root::Cell(c), [Proj::Field { field, ty }])
+                            if is_global_vec_ty(table, *ty) =>
                         {
-                            val_vec_root.insert(res, VecRootKey::Value(res));
+                            val_vec_root.insert(res, VecRootKey::CellField(*c, *field));
                         }
-                        OpKind::BorrowView { root, path, .. } => match (root, path.as_slice()) {
-                            (Root::Value(v), [Proj::Deref] | []) => {
-                                if let Some(&rk) = val_vec_root.get(v) {
-                                    val_vec_root.insert(res, rk);
-                                }
-                            }
-                            (
-                                Root::Value(v),
-                                [Proj::Deref, Proj::Field { field, ty }]
-                                | [Proj::Field { field, ty }],
-                            ) if is_global_vec_ty(table, *ty) => {
-                                if let Some(pi) = func.params.iter().position(|&p| p == *v) {
-                                    val_vec_root.insert(res, VecRootKey::ParamField(pi, *field));
-                                }
-                            }
-                            (Root::Cell(c), [Proj::Field { field, ty }])
-                                if is_global_vec_ty(table, *ty) =>
-                            {
-                                val_vec_root.insert(res, VecRootKey::CellField(*c, *field));
-                            }
-                            _ => {}
-                        },
                         _ => {}
-                    }
+                    },
+                    _ => {}
                 }
             }
         }
-        // Check if any `Param` / `ParamField` / `CellField` Vec root is ever passed to a
-        // potentially length-mutating call or raw-viewed.
+        val_vec_root
+    }
+
+    /// Collects every `VecRootKey` whose length may be mutated anywhere in `func`.
+    fn collect_mutated_vec_roots(
+        func: &Func,
+        table: &TypeTable,
+        cell_len_mutated: &BTreeSet<CellId>,
+        val_vec_root: &BTreeMap<ValueId, VecRootKey>,
+    ) -> BTreeSet<VecRootKey> {
+        let mut root_len_mutated: BTreeSet<VecRootKey> = cell_len_mutated
+            .iter()
+            .copied()
+            .map(VecRootKey::Cell)
+            .collect();
         for block in &func.blocks {
             for op in &block.ops {
                 match &op.kind {
@@ -241,7 +294,7 @@ impl VecLenTracker {
                         if !is_vec_len_preserving_call(*semantic) {
                             for &a in args {
                                 if let Some(&rk) = val_vec_root.get(&a) {
-                                    if !is_immut_ref(func.values[a.0 as usize].ty) {
+                                    if !is_immut_ref_ty(table, func.values[a.0 as usize].ty) {
                                         root_len_mutated.insert(rk);
                                     }
                                 }
@@ -291,36 +344,7 @@ impl VecLenTracker {
                 }
             }
         }
-
-        // Map `ParamSliceEqLen` equivalence: canon slice param `pb` -> canon slice param `pa`.
-        let mut param_eq_slice_len: BTreeMap<ValueId, ValueId> = BTreeMap::new();
-        if let Some(af) = ctx.arena_facts {
-            if let Some(eqs) = af.param_slice_eq_len.get(&func.item) {
-                for eq in eqs {
-                    if let (Some(&va), Some(&vb)) =
-                        (func.params.get(eq.param_a), func.params.get(eq.param_b))
-                    {
-                        param_eq_slice_len.insert(vb, va);
-                    }
-                }
-            }
-        }
-
-        Self {
-            vec_dyn_len: BTreeMap::new(),
-            vec_const_len: BTreeMap::new(),
-            vec_one_shl_len: BTreeMap::new(),
-            cell_dyn_len: BTreeMap::new(),
-            cell_const_len: BTreeMap::new(),
-            cell_one_shl_len: BTreeMap::new(),
-            cell_borrows,
-            cell_len_mutated,
-            val_vec_root,
-            root_len_mutated,
-            unmutated_root_len: BTreeMap::new(),
-            block_root_len: BTreeMap::new(),
-            param_eq_slice_len,
-        }
+        root_len_mutated
     }
 
     fn dyn_len(&self, v: ValueId, cv: ValueId) -> Option<ValueId> {

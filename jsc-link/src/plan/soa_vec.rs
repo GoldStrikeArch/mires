@@ -2128,6 +2128,10 @@ impl<V> SoaFuncAuditor<'_, V> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::item::{ItemMap, Linkage};
@@ -2157,7 +2161,10 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "test fixture fields retained for scenario variations"
+    )]
     struct Fixture {
         interns: Interns,
         t_unit: TypeId,
@@ -2970,7 +2977,7 @@ mod tests {
         size_opts.profile = Some(Profile::ReleaseSize);
         assert!(run_plan(func.clone(), f.interns.clone(), &size_opts, &heap, true).is_empty());
 
-        let mut disabled_heap = heap.clone();
+        let mut disabled_heap = heap;
         disabled_heap.native_vec_enabled = false;
         assert!(run_plan(func, f.interns, &speed_opts(), &disabled_heap, true).is_empty());
     }

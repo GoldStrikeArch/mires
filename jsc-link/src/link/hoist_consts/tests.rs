@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-item link fixtures inline"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{item_map, ItemKind, JsName, LinkItem, Linkage};

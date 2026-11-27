@@ -1,87 +1,56 @@
-# The wasm32-LLVM-vs-JS differential fuzzer
+# The wasm32-LLVM vs. JS differential fuzzer
 
-One generated Rust source, compiled twice — by the ordinary LLVM backend for
-`wasm32-unknown-unknown` and by `rustc_codegen_js` — and run twice. The two runs must print the
-same stdout and end the same way.
+This fuzzer generates a single `#![no_std]` Rust program per seed, compiles it twice—once with LLVM for `wasm32-unknown-unknown` and once with `rustc_codegen_mires`—and runs both builds. Both runs must produce the same stdout and finish with the same exit class (normal exit or abort).
 
 ```sh
-scripts/fuzz/run.sh 200                # seeds 0..199, all three families
-scripts/fuzz/run.sh 20 --seed 1000     # seeds 1000..1019
-scripts/fuzz/run.sh 10 --family c      # destructors and the required abort
-scripts/fuzz/run.sh 5 --keep           # keep build/fuzz/<seed>/ for every seed
-scripts/fuzz/run.sh 50 --lane jir --opt on   # the JIR lane, optimizer on
+scripts/fuzz/run.sh 200                  # seeds 0..199, all three families
+scripts/fuzz/run.sh 20 --seed 1000       # seeds 1000..1019
+scripts/fuzz/run.sh 10 --family c        # destructors and the required abort
+scripts/fuzz/run.sh 5 --keep             # keep build/fuzz/<seed>/ for every seed
+scripts/fuzz/run.sh 50 --opt on          # optimizer enabled
 ```
 
-`--lane baseline|jir` and `--opt off|report|on` compose the matching `js-lane=`/`js-opt=` backend
-options onto `$JS_EXTRA_ARGS`. `js-opt` is emit-affecting, so each `--opt` value keys its own
-sysroot: the run selects it, builds it if missing, and prints the key in its banner — the JS side
-never silently falls back to the default sysroot.
+`--opt off|report|on` appends `js-opt=` to `$JS_EXTRA_ARGS`. Because `js-opt` changes emitted items, each `--opt` setting uses its own keyed sysroot: `run.sh` selects that sysroot, builds it if it is missing, and prints the key in its banner so it never falls back silently to the default sysroot. (`--lane jir` is still accepted for script compatibility; JIR is the only backend lane in v5.)
 
-## Why this is worth having
+## Why differential fuzzing helps
 
-Every other suite in this checkout compares the compiler against an expectation someone wrote
-down. This one compares it against the reference implementation of what Rust means. LLVM decides
-what `i64::MIN.wrapping_neg()`, a saturating float cast, a `Drop` order or a `#[track_caller]`
-location is; the JS backend has to agree, and where it does not, the disagreement is a miscompile
-rather than a stale golden.
+Every other test suite in this repository checks compiler output against hand-maintained `.expected` files. The fuzzer checks against LLVM as a reference oracle for Rust semantics: `i64::MIN.wrapping_neg()`, saturating float casts, `Drop` order, and `#[track_caller]` locations are all decided by LLVM. When the JavaScript build disagrees, the mismatch points at a compiler bug instead of a stale golden file.
 
-That only holds if the program has ONE meaning, so `gen.mjs` never emits anything whose behaviour
-is undefined or unspecified: arithmetic is `wrapping_`/`checked_`/`saturating_`, shifts go through
-`wrapping_shl`/`wrapping_shr`, slices are indexed inside their bounds, division goes through
-`checked_div`, and nothing is read after a move. The one deliberate panic is the family `c` finale,
-where both sides must abort after printing the same lines.
+For that comparison to stay meaningful, every generated program must have a single defined behavior. `gen.mjs` avoids undefined or unspecified constructs: arithmetic uses `wrapping_`, `checked_`, and `saturating_` methods, shifts go through `wrapping_shl` and `wrapping_shr`, slice indices stay in bounds, division uses `checked_div`, and values are never read after a move. The single intentional panic is at the end of family `c`, where both builds must print identical lines and abort.
 
-## The three files
+## Files
 
-| file | what it is |
+| File | Role |
 | --- | --- |
-| `gen.mjs` | `node gen.mjs <seed> [--family a\|b\|c]` writes one program to stdout. Output is a pure function of the seed, so a reported mismatch is reproducible from the seed alone. |
-| `shim.mjs` | `node shim.mjs <program.wasm>` runs the LLVM build under `WebAssembly.instantiate`, supplying the same `js_log_*` imports `runtime/shim.js` installs on `__rt`. |
-| `run.sh` | the loop: generate, compile both ways, run both ways, compare, shrink a mismatch. |
+| `gen.mjs` | `node gen.mjs <seed> [--family a\|b\|c]` writes one program to stdout. Generation is a pure function of the seed, so any failure reproduces from the seed alone. |
+| `shim.mjs` | `node shim.mjs <program.wasm>` runs the LLVM build under `WebAssembly.instantiate`, providing the same `js_log_*` imports that `runtime/shim.js` attaches to `__rt`. |
+| `run.sh` | Runs the full loop: generate, compile with both backends, execute both builds, compare outputs, and shrink mismatches. |
 
-## The seed families
+## Seed families
 
-| family | what it covers |
+| Family | Coverage |
 | --- | --- |
-| `a` | integer arithmetic: wrapping/checked/saturating, `i64` and `u128`, shifts, rotates, bit counting, byte and bit reversal, integer and (saturating) float casts, comparisons. |
-| `b` | aggregates: structs, tuple structs, enums with payloads, `Option`/`Result` combinators, `?`, arrays, subslices, iterator chains (`map`/`filter`/`fold`/`zip`/`rev`/`enumerate`), `FnMut` closures, and one `dyn Trait` call. |
-| `c` | destructors: `Drop` guards that print, nested scopes, moves, a drop in a function that took a value, an early return past a live guard, and a `#[track_caller]` panic the program must abort on. |
+| `a` | Integer arithmetic: wrapping, checked, and saturating ops; `i64` and `u128`; shifts, rotates, bit counting, byte and bit reversal; integer and saturating float casts; comparisons. |
+| `b` | Aggregates: structs, tuple structs, payload enums, `Option`/`Result` combinators, `?`, arrays, subslices, iterator chains (`map`, `filter`, `fold`, `zip`, `rev`, `enumerate`), `FnMut` closures, and a `dyn Trait` call. |
+| `c` | Destructors: printing `Drop` guards, nested scopes, moves, drops inside callees that take values by move, early returns past live guards, and a final `#[track_caller]` panic. |
 
-A seed with no `--family` picks one from `seed % 3`, so a run of N seeds covers all three.
+When `--family` is omitted, the family is chosen by `seed % 3`, so a multi-seed run covers all three.
 
-## How the two sides are made to be comparable
+## Keeping both runs comparable
 
-* **One source.** The generated program declares the `extern "C"` print helpers
-  `examples/core-tests/prelude.rs` declares — `js_log_i32`, `js_log_i64`, `js_log_f64`,
-  `js_log_bool`, `js_log_str`, `js_abort` — which are exactly the members `runtime/shim.js`
-  installs. The JS backend lowers a foreign call to `__rt.<name>(...)`; the LLVM build turns the
-  same declarations into wasm imports (`-Clink-arg=--import-undefined`), which `shim.mjs` supplies.
-* **One printer.** Both sides end in `console.log`, so `shim.mjs` converts each wasm value to the
-  JavaScript value the JS backend would have passed: an `i64` is a `BigInt` printed with
-  `toString`, a `bool` arrives as `0`/`1` and is printed as a boolean, and a `&str` is read out of
-  the exported memory. The C ABI for `wasm32-unknown-unknown` passes `&str` *indirectly* — one
-  pointer to a `{ptr, len}` pair — and `shim.mjs` accepts that and the two-argument form.
-* **One set of paths.** Both compilations pass the same `--remap-path-prefix`, so the file name a
-  `#[track_caller]` panic prints is identical.
-* **Exit status as a class.** A panic reaches `js_abort`, which the JS shim raises as an exception
-  (node exits 1) and `shim.mjs` reports as exit 101. Both are "aborted"; the number is not
-  compared, because it says nothing about the compilers.
+- Both builds compile the same source file, which declares the `extern "C"` print helpers from `examples/core-tests/prelude.rs` (`js_log_i32`, `js_log_i64`, `js_log_f64`, `js_log_bool`, `js_log_str`, `js_abort`) matching `runtime/shim.js`. The JS backend lowers foreign calls to `__rt.<name>(...)`; the LLVM build turns them into wasm imports (`-Clink-arg=--import-undefined`) supplied by `shim.mjs`.
+- Both runtimes print through `console.log`. `shim.mjs` converts wasm values to the same JavaScript representations used by the JS backend: `i64` values become `BigInt` printed with `.toString()`, `bool` values arrive as `0`/`1` and print as booleans, and `&str` is read from exported wasm memory. Because the `wasm32-unknown-unknown` C ABI passes `&str` indirectly as a pointer to `{ptr, len}`, `shim.mjs` accepts both that form and the two-argument form.
+- Both compilations pass the same `--remap-path-prefix`, so `#[track_caller]` panic locations print identical file paths.
+- Exit status is compared by class (normal vs. aborted), because the exact non-zero exit code is a shim detail: `js_abort` throws in `runtime/shim.js` (Node exits 1) while `shim.mjs` exits 101.
 
-## What a failure looks like
+## Failures and shrinking
 
-A mismatching seed keeps `build/fuzz/<seed>/`: `prog.rs`, `prog.wasm`, `prog.js`, both outputs,
-both compile logs and `stdout.diff`. The line-drop shrinker then removes one line at a time,
-keeping a drop when both compilers still accept the program and the two still disagree, and writes
-the result to `build/fuzz/<seed>/shrunk.rs`. `SHRINK_BUDGET=<n>` caps the number of attempts
-(default 400).
+When a seed diverges, `run.sh` preserves `build/fuzz/<seed>/` containing `prog.rs`, `prog.wasm`, `prog.js`, both outputs, both compiler logs, and `stdout.diff`. A line-drop shrinker then removes one line at a time, keeping each deletion whenever both compilers still accept the program and their outputs still differ, and writes the reduced program to `build/fuzz/<seed>/shrunk.rs`. `SHRINK_BUDGET=<n>` caps shrink attempts (default 400).
 
-A seed neither side can compile is reported as `COMPILE ERROR` and kept too. That is a generator
-bug or an unimplemented construct rather than a miscompile, and it is counted separately for that
-reason.
+Seeds that fail to compile on either side are reported as `COMPILE ERROR` and preserved as well; they are counted separately from runtime mismatches because they indicate a generator bug or an unsupported construct.
 
 ## Prerequisites
 
-* `scripts/build.sh` — the backend dylib.
-* `scripts/build_sysroot.sh` — the default (no extra options) sysroot the JS side links against.
-* The `wasm32-unknown-unknown` target for the pinned nightly. `run.sh` installs it if it is
-  missing.
+- `scripts/build.sh` — builds the backend library and `jsc-link`.
+- `scripts/build_sysroot.sh` — builds the default sysroot for the JS build.
+- The `wasm32-unknown-unknown` target for the pinned nightly (`run.sh` installs it automatically if missing).

@@ -1993,6 +1993,10 @@ fn apply_decisions_to_table(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::item::{ItemMap, LinkJir, Linkage};
@@ -2239,7 +2243,7 @@ mod tests {
             f_exp.clone(),
             dummy_item("exported_fn", shared, t_exported_opt, true),
         );
-        let reachable = vec![f_int.clone(), f_exp.clone()];
+        let reachable = vec![f_int.clone(), f_exp];
 
         // Non-ReleaseSpeed makes zero decisions.
         let bal_opts = Opts {
@@ -3006,7 +3010,7 @@ mod tests {
 
         let reachable = vec![
             f_main.clone(),
-            f_closure.clone(),
+            f_closure,
             f_closure_drop.clone(),
             f_poll.clone(),
             f_panic.clone(),
@@ -3218,7 +3222,7 @@ mod tests {
         t_clash.insert(f_clash.clone(), dummy_item("$sn", shared, t_unit, false));
         let plan_clash = specialize_table(
             &mut t_clash,
-            &[f_int.clone(), f_exp.clone(), f_clash],
+            &[f_int.clone(), f_exp, f_clash],
             &reachable,
             &BTreeSet::new(),
             &spd_opts,

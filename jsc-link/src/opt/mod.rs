@@ -36,6 +36,6 @@ pub mod slice_iter;
 pub(crate) mod tx;
 pub mod witness;
 
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "re-exported for optimizer unit tests")]
 pub use pipeline::optimize;
 pub use pipeline::{observed_carriers, optimize_for_probe, optimize_with_facts, OptStats};

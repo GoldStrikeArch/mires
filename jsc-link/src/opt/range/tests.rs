@@ -1934,7 +1934,10 @@ mod corpus {
         }
     }
 
-    #[allow(clippy::option_option)]
+    #[allow(
+        clippy::option_option,
+        reason = "distinguishes agreement (None), inconclusive (Some(None)), and divergence (Some(Some(_)))"
+    )]
     fn compare(
         before: &Func,
         after: &Func,

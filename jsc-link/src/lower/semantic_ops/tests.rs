@@ -2,6 +2,11 @@
 //! spelling, the registry table, and the string and vec `Convert` adapters over a
 //! hand-built canonical `String`/`Vec` type tree.
 
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests construct full semantic-op type tables inline"
+)]
+
 use crate::item::JsName;
 use crate::jir::interns::Interns;
 use crate::jir::repr::Carrier;

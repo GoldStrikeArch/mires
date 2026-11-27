@@ -1581,7 +1581,7 @@ fn repr_slice_view_and_moves() {
         );
     }
     // A use of the moved-from array is rejected.
-    let mut broken = func.clone();
+    let mut broken = func;
     broken.blocks[0].ops.push(Op {
         result: None,
         origin: ORIGIN,
@@ -1686,7 +1686,7 @@ fn repr_loop_with_block_arguments() {
     assert!(error.message.contains("not dominated"), "{error}");
 
     // The step budget catches an endless loop.
-    let mut endless = func.clone();
+    let mut endless = func;
     endless.blocks[body_.0 as usize].term = RTerm::Goto(header, vec![acc2, i]);
     let hook = |_: &DirectItemRef, _: Vec<Value>| -> Result<Value, Trap> {
         Err(Trap::Hook(String::new()))

@@ -2155,21 +2155,18 @@ mod tests {
         assert!(invoke.is_protected_op(1));
 
         invoke.push_before_protected(op1.clone());
-        assert_eq!(
-            invoke.ops,
-            vec![op0.clone(), op1.clone(), protected_call.clone()]
-        );
+        assert_eq!(invoke.ops, vec![op0.clone(), op1, protected_call.clone()]);
         assert_eq!(invoke.protected_op_index(), Some(2));
         assert_eq!(invoke.protected_op(), Some(&protected_call));
 
         // Retaining with a predicate keeps only matching pre-ops plus the protected op.
         invoke.retain_ops_preserving_protected(|idx, _| idx == 0);
-        assert_eq!(invoke.ops, vec![op0.clone(), protected_call.clone()]);
+        assert_eq!(invoke.ops, vec![op0, protected_call.clone()]);
         assert_eq!(invoke.protected_op_index(), Some(1));
 
         // Even rejecting every op preserves the protected op.
         invoke.retain_ops_preserving_protected(|_, _| false);
-        assert_eq!(invoke.ops, vec![protected_call.clone()]);
+        assert_eq!(invoke.ops, vec![protected_call]);
         assert_eq!(invoke.protected_op_index(), Some(0));
     }
 

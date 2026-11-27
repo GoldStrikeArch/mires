@@ -2252,6 +2252,10 @@ fn check_op_no_throw(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block witness fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::jir::repr::FuncBuilder;
@@ -2535,7 +2539,7 @@ mod tests {
         .expect("witness must accept sound branching cleanup DAG");
 
         // 2. Cycle in cleanup DAG must be rejected.
-        let mut cyc = valid_func.clone();
+        let mut cyc = valid_func;
         cyc.blocks[u_a.0 as usize].term = RTerm::Goto(u_head, Vec::new());
         let err = check_invoke_pruning(
             &cyc,

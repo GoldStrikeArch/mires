@@ -381,7 +381,10 @@ pub struct Mapping {
 
 /// A JavaScript statement.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "ExprStmt mirrors JS grammar terminology"
+)]
 pub enum Stmt {
     /// An expression evaluated for its effect.
     ExprStmt(Expr),

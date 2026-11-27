@@ -2284,6 +2284,10 @@ fn is_ref_to(table: &TypeTable, reference: TypeId, pointee: TypeId) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block slice-iterator fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::jir::repr::{FuncBuilder, RAssertMessage};

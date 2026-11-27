@@ -11,7 +11,7 @@ use crate::{js_bindings, HostHandle, HostValue, JsValue};
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct JsString {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "opaque host handle lowered by backend")]
     handle: HostHandle,
 }
 
@@ -92,7 +92,7 @@ impl TryFrom<JsValue> for JsString {
 /// reinterpreting one native array as unrelated Rust element types.
 #[repr(transparent)]
 pub struct JsArray<T> {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "opaque host handle lowered by backend")]
     handle: HostHandle,
     marker: PhantomData<fn(T) -> T>,
 }

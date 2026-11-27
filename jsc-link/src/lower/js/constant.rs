@@ -1135,5 +1135,5 @@ pub(crate) fn resolve_location_field_keys(
 }
 
 /// The tag key, re-exported for the constant tests.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "re-exported for constant lowering tests")]
 pub const TAG_KEY: &str = TAG;

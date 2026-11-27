@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-op lowering fixtures inline"
+)]
+
 use std::collections::BTreeSet;
 
 use rcgjs_object::item::{Availability, ItemSummary, JsName, SemanticKey};
@@ -576,7 +581,10 @@ fn phase1b_lowers_packed_vec_monomorphic_ta_and_fast_vec_resize() {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper threads explicit fixture overrides"
+)]
 fn lower_func_bstr(
     interns: &Interns,
     func: &Func,

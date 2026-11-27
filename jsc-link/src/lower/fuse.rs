@@ -24,7 +24,10 @@
 //!
 //! The plan is deterministic: every map is a `BTreeMap`, every walk is in block and op order.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "planner exposes query methods consumed by tests and downstream lowering"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -651,7 +654,7 @@ impl<'a> Planner<'a> {
     fn decide_inline(&mut self) {
         // Blocks in reverse postorder, so a chain's head is decided before its tail and every
         // operand of a candidate has been classified when the candidate is.
-        let order = Dominators::of(self.func).rpo.clone();
+        let order = Dominators::of(self.func).rpo;
         for block_id in order {
             let block = &self.func.blocks[block_id.0 as usize];
             for (index, op) in block.ops.iter().enumerate() {
@@ -1975,7 +1978,7 @@ mod tests {
                 Some("$caught$2".to_owned()),
             )
         );
-        let mut straight = func.clone();
+        let mut straight = func;
         straight.blocks.truncate(1);
         straight.blocks[0].term = RTerm::Return(None);
         assert_eq!(

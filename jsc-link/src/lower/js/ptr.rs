@@ -62,7 +62,10 @@ impl StrPtrRepr {
 
 // The read/write/offset/copy helpers below are the seams W8's intrinsics (`read_via_copy`,
 // `offset`, `arith_offset`, `ptr_offset_from`, `copy_nonoverlapping`) lower through.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "raw pointer lowering helpers exposed for unit tests and intrinsic callers"
+)]
 impl<'a> JsCx<'a> {
     /// The value behind `pointer`, a **raw** pointer to `pointee` (`ptr.rs::deref_read`).
     pub fn deref_read(&self, pointee: TypeId, pointer: Expr) -> Expr {

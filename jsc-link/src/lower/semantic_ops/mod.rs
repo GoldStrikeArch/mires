@@ -2,7 +2,10 @@
 //! `BTreeMap*`) plus compact standard-operation effect summaries for `analysis/effects.rs` and
 //! `analysis/callgraph.rs`.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "semantic-op adapters expose helpers used selectively across lowering and tests"
+)]
 
 pub mod drop;
 pub mod fmt_kernel;

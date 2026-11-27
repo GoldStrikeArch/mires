@@ -30,7 +30,7 @@ use crate::HostHandle;
 #[derive(Clone, Copy)]
 pub(crate) struct RawMap {
     /// Never read by Rust code; see the type docs.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "opaque host Map handle lowered by backend")]
     handle: HostHandle,
 }
 
@@ -93,7 +93,10 @@ pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
 /// * Every entry stored in `map` under a key of `Q`'s class must have been stored as `V`.
 /// * No mutable reference to the returned entry may exist, and `map` must not mutate or remove
 ///   that entry, for the lifetime `'a`.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
+)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_get")]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a V> {
@@ -109,7 +112,10 @@ pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Opti
 /// * The caller must hold exclusive access to `map` for the lifetime `'a` so no other reference to
 ///   the returned entry exists, and the entry must not be removed or overwritten while the
 ///   returned reference is live.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
+)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_getmut")]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a mut V> {
@@ -129,7 +135,10 @@ pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> 
 /// * Every key stored in `map` must have the host snapshot representation `S`.
 /// * `'a` must be bounded by the caller's borrow of the map owning `map` (and any lifetime carried
 ///   by `S`).
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
+)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.keys")]
 #[inline(never)]
 pub(crate) unsafe fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
@@ -144,7 +153,10 @@ pub(crate) unsafe fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
 /// * Every value stored in `map` must have been stored as `V`.
 /// * No mutable reference to any entry in `map` may exist, and `map` must not be mutated for the
 ///   lifetime `'a`.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
+)]
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.values")]
 #[inline(never)]
 pub(crate) unsafe fn map_values<'a, V>(map: RawMap) -> &'a [&'a V] {

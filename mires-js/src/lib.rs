@@ -33,7 +33,9 @@ extern crate alloc;
 /// outer type's `PinnedBoundary::Host` identity.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub(crate) struct HostHandle(#[allow(dead_code)] u32);
+pub(crate) struct HostHandle(
+    #[allow(dead_code, reason = "opaque host-side handle populated by JS lowering")] u32,
+);
 
 #[cfg(test)]
 impl HostHandle {

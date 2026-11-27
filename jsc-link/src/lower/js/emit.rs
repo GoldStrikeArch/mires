@@ -3554,7 +3554,7 @@ impl<'a> JsCx<'a> {
                         let spill = jsast::id(spill_name_of(self.spills, 1));
                         jsast::seq(vec![
                             jsast::assign(spill, value::field_expr(self.interns, v.clone(), key)),
-                            se.clone(),
+                            se,
                         ])
                     }
                     None => se,
@@ -3958,10 +3958,14 @@ fn snapshot_scratch(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, expr: Expr) -> Expr {
 }
 
 /// Keeps `EnumRepr` in scope for the documentation of the tag rules above.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "keeps EnumRepr in scope for rustdoc links")]
 fn _repr(_: EnumRepr) {}
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block sentinel lowering fixtures inline"
+)]
 mod sentinel_tests {
     use rcgjs_object::item::JsName;
     use rcgjs_object::jir::interns::Interns;

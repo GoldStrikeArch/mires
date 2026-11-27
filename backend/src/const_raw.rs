@@ -110,7 +110,7 @@ pub(crate) enum TagError {
     /// The tag's bytes could not be read, or they hold a pointer that names no variant.
     Unreadable,
     /// The tag was read, and names no variant.
-    NoSuchVariant(#[allow(dead_code)] u128),
+    NoSuchVariant(#[allow(dead_code, reason = "diagnostic payload shown by Debug")] u128),
 }
 
 /// Which variant of `def` the bytes at `offset` hold.

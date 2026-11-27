@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block ByteStr fixtures inline"
+)]
+
 use super::convert::{make_link_item, ConvCx, ConvTarget, Mode};
 use super::opt::{
     elide_ascii_only_bstr_in, elide_known_ascii_bstr_out, elide_proven_bstr_sub,

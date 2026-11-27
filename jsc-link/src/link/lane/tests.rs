@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-item lane fixtures inline"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 

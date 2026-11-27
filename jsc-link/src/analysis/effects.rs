@@ -2023,6 +2023,10 @@ mod tests {
 /// `Escape::No` parameter never aliases the return value. A construct the interpreter does not
 /// model is skipped, not counted.
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-item effect-analysis fixtures inline"
+)]
 mod corpus {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -2309,7 +2313,7 @@ mod corpus {
         let outcome = {
             let mut interpreter =
                 ReprInterpreter::new(func, table, interns, &hooks, &mut heap).with_callees(callees);
-            interpreter.run(args.clone())
+            interpreter.run(args)
         };
         let mut violate = |what: String| {
             counts

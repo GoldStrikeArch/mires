@@ -183,7 +183,10 @@ pub struct Plan {
 
 /// The structurizer's output for one function.
 #[derive(Debug)]
-#[allow(dead_code)] // `stats` is report-only until the lane report reads it.
+#[allow(
+    dead_code,
+    reason = "stats field is report-only until the lane report reads it"
+)]
 pub struct Structured {
     pub region: structurizer::Region<BlockPayload, RScrut>,
     pub stats: structurizer::StructureStats,

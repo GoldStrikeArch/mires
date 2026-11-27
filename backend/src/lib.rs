@@ -28,7 +28,10 @@ extern crate rustc_type_ir;
 
 // Linking against rustc_driver prevents duplicating functions and statics that are already part of
 // the host rustc process (cg_clif src/lib.rs:29-31).
-#[allow(unused_extern_crates)]
+#[allow(
+    unused_extern_crates,
+    reason = "links against rustc_driver in the host rustc process"
+)]
 extern crate rustc_driver;
 
 use std::any::Any;
@@ -180,7 +183,10 @@ impl CodegenBackend for JsCodegenBackend {
 
 /// Entry point for the hot-plugged backend (`-Zcodegen-backend=<this dylib>`).
 // The single exported symbol rustc loads; the attribute is the only unsafe in the crate.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "rustc loads this unmangled entry point via dlsym"
+)]
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(JsCodegenBackend)

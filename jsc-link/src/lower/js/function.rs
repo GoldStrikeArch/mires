@@ -18,11 +18,17 @@ use super::super::{LowerInput, LoweredItem};
 use super::{decline, emit, fn_opt, value, JsCx, ProgramPlans};
 
 pub(crate) use super::fn_opt::fold_bstr_in_bytes_decl;
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "re-exported for crate-internal and test callers"
+)]
 pub(crate) use super::fn_opt::fold_bstr_in_bytes_stmts;
 #[cfg(test)]
 pub(super) use super::fn_opt::fuse_local_bytes_str;
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "re-exported for sibling lowering modules and tests"
+)]
 pub(super) use super::fn_opt::{
     cse_slice_loads, fold_offset_slot_derefs, fold_sfp_deref_only, fold_zero_offset_arith,
     fuse_local_bytes_str_with,
@@ -42,7 +48,10 @@ struct LoweredBody {
 }
 
 /// Lowers a function body whose SSA form, plan and region tree are in hand.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "public lowering entrypoint used by unit tests and probes"
+)]
 pub fn lower(
     input: &LowerInput<'_>,
     func: &Func,

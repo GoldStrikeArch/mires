@@ -1,6 +1,6 @@
 //! Building graphs and rendering the regions they structure into.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "shared integration-test helper module")]
 
 use structurizer::{structure, Block, BlockId, Cfg, Options, Region, Scrut, Term, Test};
 

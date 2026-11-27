@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-function flat-ABI fixtures inline"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::param_use::ParamUse;
@@ -432,7 +437,7 @@ fn economic_groups_couple_shared_callers_and_subset_the_executable_plan() {
     let mut plan = AbiPlan::default();
     for (id, name) in [
         (item(1), one.clone()),
-        (item(2), two.clone()),
+        (item(2), two),
         (item(3), three.clone()),
     ] {
         plan.flat.insert(id, FlatSig::default());
@@ -2853,10 +2858,7 @@ fn sentinel_result_plans_recursive_needs_drop_invoke_and_escaping_callers() {
             make_link_item("entry", entry_id, entry_func.sig.clone(), true, &["eval"]),
         ),
     ]);
-    let funcs = BTreeMap::from([
-        (eval_name.clone(), Ok(eval_func)),
-        (entry_name, Ok(entry_func)),
-    ]);
+    let funcs = BTreeMap::from([(eval_name, Ok(eval_func)), (entry_name, Ok(entry_func))]);
 
     let speed_opts = Opts {
         optimizer: crate::opts::OptimizerMode::On,

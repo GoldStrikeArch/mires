@@ -252,7 +252,7 @@ impl JsCx<'_> {
             vec![
                 jsast::assign_stmt(tmp.clone(), jsast::index(ab.clone(), l.clone())),
                 jsast::assign_stmt(
-                    jsast::index(ab.clone(), l.clone()),
+                    jsast::index(ab, l.clone()),
                     jsast::index(bb.clone(), r.clone()),
                 ),
                 jsast::assign_stmt(jsast::index(bb, r.clone()), tmp),

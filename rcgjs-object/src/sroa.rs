@@ -803,7 +803,7 @@ fn split_locals(decl: Stmt, allow_extended: bool) -> Stmt {
     let taken: BTreeSet<String> = identifiers(&body);
     let shapes = split_shapes(&uses, allow_extended);
     let mut split: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    let mut allocated = taken.clone();
+    let mut allocated = taken;
     for (local, fields) in shapes {
         if fields.is_empty() {
             continue;

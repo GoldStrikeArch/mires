@@ -1136,6 +1136,10 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::item::{item_map, LinkJir, Linkage};

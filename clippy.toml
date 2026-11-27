@@ -1,0 +1,8 @@
+# Keep production functions focused and decomposed; enforced workspace-wide
+# via `clippy::too_many_lines` in Cargo.toml.
+too-many-lines-threshold = 250
+
+# Cap parameter counts and boolean flags so multi-state options become sum
+# types or context structs instead of long positional lists.
+too-many-arguments-threshold = 7
+max-fn-params-bools = 3

@@ -3420,6 +3420,10 @@ fn substitute(func: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use super::*;
     use crate::jir::repr::FuncBuilder;
@@ -6517,7 +6521,10 @@ mod corpus {
     }
 
     /// `None` when the two runs agree, `Some(None)` when the comparison says nothing.
-    #[allow(clippy::option_option)]
+    #[allow(
+        clippy::option_option,
+        reason = "distinguishes agreement (None), inconclusive (Some(None)), and divergence (Some(Some(_)))"
+    )]
     fn compare(
         before: &Func,
         after: &Func,

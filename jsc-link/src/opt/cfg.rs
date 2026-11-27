@@ -186,7 +186,10 @@ impl Cfg {
     }
 
     /// Whether the CFG contains any directed cycle.
-    #[allow(dead_code)] // Phase 2 shared CFG API for downstream passes.
+    #[allow(
+        dead_code,
+        reason = "shared CFG query API for optimizer passes and tests"
+    )]
     pub(crate) fn has_cycle(&self) -> bool {
         self.looping_blocks().into_iter().any(|in_cycle| in_cycle)
     }

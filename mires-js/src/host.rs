@@ -110,7 +110,7 @@ impl HostValue for &str {
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct JsValue {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "opaque host value handle lowered by backend")]
     handle: crate::HostHandle,
 }
 

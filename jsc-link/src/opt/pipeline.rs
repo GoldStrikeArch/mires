@@ -152,7 +152,13 @@ struct PipelineCx<'a> {
 /// and the rewritten clone is dropped — including when it fails to verify, which is reported as
 /// "would not have applied" rather than declining the item, since a decline would be a
 /// difference `off` does not have.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "default-facts optimizer wrapper used by unit tests"
+    )
+)]
 pub fn optimize(
     func: &mut Func,
     table: &TypeTable,

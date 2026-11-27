@@ -69,9 +69,12 @@ impl<T: MapKey> HashSet<T> {
     /// Over a snapshot of the keys, with zero per-entry map lookups.
     #[must_use]
     pub fn iter(&self) -> SetIter<'_, T> {
+        #[allow(
+            unsafe_code,
+            reason = "calls host JS Map FFI seam; invariants documented in SAFETY comment below"
+        )]
         // SAFETY: Every key inserted into `self.raw` snapshots as `T::Snapshot`, and the returned
         // slice is tied to `&self`.
-        #[allow(unsafe_code)]
         let keys = unsafe { raw::map_keys::<T::Snapshot>(self.raw) };
         SetIter {
             keys,

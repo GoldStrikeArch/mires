@@ -4539,6 +4539,10 @@ mod unit {
 /// reports that it found nothing and passes — unless `RCGJS_SSA_FIXTURES_REQUIRED=1` says the
 /// corpus must be there.
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-block JIR fixtures inline"
+)]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};

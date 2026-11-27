@@ -200,7 +200,10 @@ pub struct OptimizationMiss {
     pub source: Option<String>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "constructor reserved for optimizer report emitters"
+)]
 impl OptimizationMiss {
     pub fn new(pass: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
@@ -799,7 +802,7 @@ pub struct FlatZombie {
     pub message: String,
     /// Round trips through the object file so that a report can group by cause, which the
     /// zombie-report golden test in a later milestone needs.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "retained for serialized zombie diagnostics")]
     pub kind: ZombieKind,
 }
 

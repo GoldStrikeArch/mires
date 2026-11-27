@@ -65,7 +65,10 @@ pub fn is_async_marker(marker: &str) -> bool {
 }
 
 /// Whether a `Callee::Direct` link name is one of the marker functions W9 intercepts.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "predicate exposed for host lowering tests and diagnostics"
+)]
 pub fn is_marker_name(name: &str) -> bool {
     name.starts_with(HOST_PREFIX) || name.starts_with(MAP_PREFIX)
 }

@@ -928,7 +928,10 @@ pub fn size_of(table: &TypeTable, ty: TypeId) -> Option<u64> {
 }
 
 /// The alignment of `ty` in bytes (a W8 seam: `min_align_of`).
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "alignment helper exposed for intrinsic lowering tests"
+)]
 pub fn align_of(table: &TypeTable, ty: TypeId) -> Option<u64> {
     table.get(ty)?.layout.align
 }

@@ -160,7 +160,10 @@ pub fn unpack_bigint_exprs(src: Expr) -> (Expr, Expr) {
 }
 
 /// Emits statements unpacking a canonical `BigInt` expression `src` into `(dst_lo, dst_hi)`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "i64 pair unpacking helper retained for lowering tests and extensions"
+)]
 pub fn emit_unpack_bigint(
     cx: &JsCx<'_>,
     stmts: &mut Vec<Stmt>,
@@ -995,7 +998,10 @@ pub fn three_way_ordering(
 }
 
 /// Computes `-1 | 0 | 1` three-way ordering on two 64-bit `(lo, hi)` pairs.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "i64 three-way ordering helper retained for lowering tests and extensions"
+)]
 pub fn three_way_sign_expr(
     cx: &JsCx<'_>,
     stmts: &mut Vec<Stmt>,
@@ -2183,7 +2189,13 @@ fn float_conv_helpers(name: &'static str) -> Option<LinkItem> {
 }
 
 /// Concatenated JS text of all helper items, for standalone unit-test harnesses.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "standalone helper preamble used by unit-test harnesses"
+    )
+)]
 pub fn helper_preamble_js() -> String {
     let all: BTreeSet<JsName> = HELPER_NAMES
         .iter()

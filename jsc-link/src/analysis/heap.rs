@@ -2359,6 +2359,10 @@ fn scan_func_for_boxes(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "unit tests build multi-item heap-plan fixtures inline"
+)]
 mod tests {
     use super::*;
     use rcgjs_object::jir::origin::OriginId;

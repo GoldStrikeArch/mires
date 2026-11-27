@@ -19,7 +19,10 @@
 //! `structurizer::structure` fails only for a graph it cannot read; v1 retried once with
 //! `force_dispatch`, and so does this. A second failure is a `Decline` (never a panic).
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "structure module exposes diagnostic helpers consumed by unit tests"
+)]
 
 use std::collections::BTreeSet;
 
