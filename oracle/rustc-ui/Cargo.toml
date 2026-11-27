@@ -1,0 +1,8 @@
+[workspace]
+
+[package]
+name = "mires-oracle-rustc-ui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Curated rustc/tests/ui-style run-pass differential test suite for Mires"

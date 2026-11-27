@@ -14,6 +14,9 @@ use std::process::{Command, ExitCode};
 use crate::cli::PanicMode;
 
 pub const ENV_WRAPPER_ACTIVE: &str = "MIRES_RUSTC_WRAPPER";
+pub const ENV_LINK_WRAPPER: &str = "MIRES_LINK_WRAPPER";
+pub const ENV_REAL_JSC_LINK: &str = "MIRES_REAL_JSC_LINK";
+pub const ENV_TEST_CRATE_NAME: &str = "MIRES_TEST_CRATE_NAME";
 pub const ENV_MODE: &str = "MIRES_WRAPPER_MODE";
 pub const ENV_TARGET: &str = "MIRES_WRAPPER_TARGET";
 pub const ENV_TARGET_NAME: &str = "MIRES_WRAPPER_TARGET_NAME";
@@ -27,6 +30,9 @@ pub const ENV_LINK_ARGS: &str = "MIRES_WRAPPER_LINK_ARGS";
 pub const ENV_JSC_LINK: &str = "MIRES_WRAPPER_JSC_LINK";
 pub const ENV_RECORD_FILE: &str = "MIRES_WRAPPER_RECORD";
 pub const ENV_VERBOSE: &str = "MIRES_WRAPPER_VERBOSE";
+
+/// Placeholder `js-root` rewritten by `run_link_wrapper` to the test binary's `main` JS symbol.
+const TEST_MAIN_ROOT_SENTINEL: &str = "__MIRES_TEST_MAIN__";
 
 /// Conflicting `-C <opt>` keys stripped from Cargo's arguments before injecting Mires flags.
 const CONFLICTING_CODEGEN_KEYS: [&str; 6] = [
@@ -43,6 +49,7 @@ const CONFLICTING_CODEGEN_KEYS: [&str; 6] = [
 pub enum WrapperMode {
     Build,
     Check,
+    Test,
 }
 
 /// Configuration passed from `cargo-mires` parent process to the wrapper via environment variables.
@@ -123,8 +130,27 @@ pub fn run() -> ExitCode {
 
     let mut cmd = Command::new(&rustc_exe);
     cmd.args(&rewritten.args);
+    cmd.env_remove(ENV_WRAPPER_ACTIVE);
     if rewritten.set_jsc_link {
-        cmd.env("JSC_LINK_BIN", &cfg.jsc_link);
+        let use_test_link_wrapper = cfg.mode == WrapperMode::Test && has_test_flag(&args);
+        if use_test_link_wrapper {
+            match env::current_exe() {
+                Ok(self_exe) => {
+                    cmd.env("JSC_LINK_BIN", &self_exe)
+                        .env(ENV_LINK_WRAPPER, "1")
+                        .env(ENV_REAL_JSC_LINK, &cfg.jsc_link);
+                    if let Some(crate_name) = extract_crate_name(&args) {
+                        cmd.env(ENV_TEST_CRATE_NAME, crate_name);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("cargo-mires (wrapper): failed to locate self exe: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            cmd.env("JSC_LINK_BIN", &cfg.jsc_link);
+        }
     }
 
     let status = match cmd.status() {
@@ -158,6 +184,7 @@ impl WrapperConfig {
         let mode = match env::var(ENV_MODE).as_deref() {
             Ok("build") => WrapperMode::Build,
             Ok("check") => WrapperMode::Check,
+            Ok("test") => WrapperMode::Test,
             Ok(other) => return Err(format!("invalid `{ENV_MODE}`: `{other}`")),
             Err(_) => return Err(format!("missing `{ENV_MODE}`")),
         };
@@ -169,15 +196,16 @@ impl WrapperConfig {
         let panic = PanicMode::parse(&panic_raw)
             .ok_or_else(|| format!("invalid `{ENV_PANIC}`: `{panic_raw}`"))?;
 
-        let (backend, producer, jsc_link) = if mode == WrapperMode::Build {
-            (
-                PathBuf::from(required_env(ENV_BACKEND)?),
-                required_env(ENV_PRODUCER)?,
-                PathBuf::from(required_env(ENV_JSC_LINK)?),
-            )
-        } else {
-            (PathBuf::new(), String::new(), PathBuf::new())
-        };
+        let (backend, producer, jsc_link) =
+            if matches!(mode, WrapperMode::Build | WrapperMode::Test) {
+                (
+                    PathBuf::from(required_env(ENV_BACKEND)?),
+                    required_env(ENV_PRODUCER)?,
+                    PathBuf::from(required_env(ENV_JSC_LINK)?),
+                )
+            } else {
+                (PathBuf::new(), String::new(), PathBuf::new())
+            };
 
         let emit_args = parse_lines_env(ENV_EMIT_ARGS);
         let link_args = parse_lines_env(ENV_LINK_ARGS);
@@ -270,7 +298,9 @@ pub fn rewrite_args(args: &[String], cfg: &WrapperConfig) -> RewrittenInvocation
         }
         InvocationKind::Target { is_program } => match cfg.mode {
             WrapperMode::Check => rewrite_check_target(args, cfg, kind),
-            WrapperMode::Build => rewrite_build_target(args, cfg, kind, is_program),
+            WrapperMode::Build | WrapperMode::Test => {
+                rewrite_build_target(args, cfg, kind, is_program)
+            }
         },
     }
 }
@@ -341,6 +371,9 @@ fn rewrite_build_target(
         for link_arg in &cfg.link_args {
             out.push(format!("-Cllvm-args={link_arg}"));
         }
+        if cfg.mode == WrapperMode::Test && has_test_flag(args) {
+            out.push(format!("-Cllvm-args=js-root={TEST_MAIN_ROOT_SENTINEL}"));
+        }
     }
 
     RewrittenInvocation {
@@ -404,10 +437,17 @@ fn inspect_probe_flags(args: &[String]) -> (bool, bool) {
     (is_probe, prints_cfg)
 }
 
+fn has_test_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--test")
+}
+
 fn is_program_crate(args: &[String]) -> bool {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
+        if arg == "--test" {
+            return true;
+        }
         let kind = if let Some(value) = arg.strip_prefix("--crate-type=") {
             Some(value)
         } else if arg == "--crate-type" {
@@ -426,6 +466,321 @@ fn is_program_crate(args: &[String]) -> bool {
         index += 1;
     }
     false
+}
+
+fn extract_crate_name(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if let Some(name) = arg.strip_prefix("--crate-name=") {
+            return Some(name);
+        }
+        if arg == "--crate-name" {
+            return args.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Entry point when `rustc_codegen_mires` invokes us as `JSC_LINK_BIN` for a test binary.
+///
+/// Resolves the test harness `main` symbol in the compiled CGU object, patches the
+/// sentinel `js-root` inside the `jsc-link` manifest, invokes the real `jsc-link`,
+/// and appends `export function main()` so Node.js can execute the test ESM module.
+pub fn run_link_wrapper() -> ExitCode {
+    let args: Vec<String> = env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let Ok(real_jsc_link) = env::var(ENV_REAL_JSC_LINK) else {
+        eprintln!("cargo-mires (link-wrapper): missing `{ENV_REAL_JSC_LINK}`");
+        return ExitCode::from(2);
+    };
+
+    let manifest_path = find_manifest_arg(&args);
+    let crate_name = env::var(ENV_TEST_CRATE_NAME).ok();
+
+    let linked_target = if let Some(ref mp) = manifest_path {
+        match prepare_test_manifest(Path::new(&real_jsc_link), mp, crate_name.as_deref()) {
+            Ok(target) => target,
+            Err(err) => {
+                eprintln!("cargo-mires (link-wrapper): {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut cmd = Command::new(&real_jsc_link);
+    cmd.args(&args)
+        .env_remove(ENV_LINK_WRAPPER)
+        .env_remove(ENV_WRAPPER_ACTIVE);
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!("cargo-mires (link-wrapper): failed to execute `{real_jsc_link}`: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if !status.success() {
+        return match status.code() {
+            Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            None => ExitCode::FAILURE,
+        };
+    }
+
+    if let Some((out_file, main_sym)) = linked_target {
+        if let Err(err) = append_test_main_export(&out_file, &main_sym) {
+            eprintln!("cargo-mires (link-wrapper): {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn find_manifest_arg(args: &[String]) -> Option<PathBuf> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--manifest" {
+            return args.get(index + 1).map(PathBuf::from);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn prepare_test_manifest(
+    real_jsc_link: &Path,
+    manifest_path: &Path,
+    crate_name: Option<&str>,
+) -> Result<Option<(PathBuf, String)>, String> {
+    let printed = Command::new(real_jsc_link)
+        .arg("--print-manifest")
+        .arg(manifest_path)
+        .env_remove(ENV_LINK_WRAPPER)
+        .env_remove(ENV_WRAPPER_ACTIVE)
+        .output()
+        .map_err(|err| format!("failed to run `jsc-link --print-manifest`: {err}"))?;
+    if !printed.status.success() {
+        return Err(format!(
+            "`jsc-link --print-manifest` failed with {}",
+            printed.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&printed.stdout);
+    let objects = parse_manifest_objects(&text);
+    let out_file = parse_manifest_output(&text);
+
+    let main_sym = find_main_symbol_in_objects(&objects, crate_name).ok_or_else(|| {
+        format!(
+            "failed to locate test `main` symbol in CGU objects ({})",
+            objects
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let raw = fs::read(manifest_path)
+        .map_err(|err| format!("failed to read `{}`: {err}", manifest_path.display()))?;
+    let patched = replace_postcard_string(&raw, TEST_MAIN_ROOT_SENTINEL, &main_sym)
+        .ok_or_else(|| "test root sentinel not found in `jsc-link` manifest".to_owned())?;
+    fs::write(manifest_path, patched)
+        .map_err(|err| format!("failed to write patched manifest: {err}"))?;
+
+    Ok(out_file.map(|path| (path, main_sym)))
+}
+
+fn parse_manifest_objects(printed: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(start) = printed.find("objects: [") else {
+        return out;
+    };
+    let rest = &printed[start + "objects: [".len()..];
+    let Some(end) = rest.find(']') else {
+        return out;
+    };
+    for line in rest[..end].lines() {
+        let trimmed = line.trim().trim_end_matches(',');
+        if let Some(unquoted) = parse_debug_string(trimmed) {
+            out.push(PathBuf::from(unquoted));
+        }
+    }
+    out
+}
+
+fn parse_manifest_output(printed: &str) -> Option<PathBuf> {
+    let idx = printed.find("output: Some(")?;
+    let rest = &printed[idx + "output: Some(".len()..];
+    let end = rest.find(')')?;
+    let inner = rest[..end].trim().trim_end_matches(',').trim();
+    parse_debug_string(inner).map(PathBuf::from)
+}
+
+fn parse_debug_string(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next()? {
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
+}
+
+fn find_main_symbol_in_objects(objects: &[PathBuf], crate_name: Option<&str>) -> Option<String> {
+    let expected_prefix = crate_name.map(|name| format!("{name}$main$h"));
+    let mut fallback: Option<String> = None;
+
+    for path in objects {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for candidate in scan_function_main_symbols(&text) {
+            if let Some(ref prefix) = expected_prefix {
+                if candidate.starts_with(prefix) {
+                    return Some(candidate);
+                }
+            }
+            if fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+    }
+    fallback
+}
+
+/// Scans raw CGU object text for top-level `function <crate>$main$h<16hex>(` declarations.
+pub fn scan_function_main_symbols(text: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let needle = "function ";
+    let mut offset = 0;
+    while let Some(pos) = text[offset..].find(needle) {
+        let start = offset + pos + needle.len();
+        let rest = &text[start..];
+        if let Some(paren) = rest.find('(') {
+            let ident = &rest[..paren];
+            if is_crate_main_symbol(ident) {
+                results.push(ident.to_owned());
+            }
+        }
+        offset = start;
+    }
+    results
+}
+
+fn is_crate_main_symbol(ident: &str) -> bool {
+    let Some((prefix, hash)) = ident.rsplit_once("$main$h") else {
+        return false;
+    };
+    !prefix.is_empty()
+        && !prefix.contains('$')
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && hash.len() == 16
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Replaces one postcard length-prefixed UTF-8 string inside raw manifest bytes.
+pub fn replace_postcard_string(bytes: &[u8], old: &str, new: &str) -> Option<Vec<u8>> {
+    let old_enc = encode_postcard_str(old);
+    let new_enc = encode_postcard_str(new);
+    let pos = bytes.windows(old_enc.len()).position(|w| w == old_enc)?;
+    let mut out = Vec::with_capacity(bytes.len() - old_enc.len() + new_enc.len());
+    out.extend_from_slice(&bytes[..pos]);
+    out.extend_from_slice(&new_enc);
+    out.extend_from_slice(&bytes[pos + old_enc.len()..]);
+    Some(out)
+}
+
+fn encode_postcard_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 5);
+    let mut n = s.len();
+    while n >= 0x80 {
+        out.push(((n & 0x7f) as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+fn append_test_main_export(out_file: &Path, main_sym: &str) -> Result<(), String> {
+    let text = fs::read_to_string(out_file)
+        .map_err(|err| format!("failed to read `{}`: {err}", out_file.display()))?;
+    if text.contains("export function main(") {
+        return Ok(());
+    }
+    let emitted_ident = resolve_emitted_main_ident(&text, main_sym).ok_or_else(|| {
+        format!(
+            "failed to resolve emitted `main` identifier (expected `{main_sym}` or caller of `__mires_test_main_static`) in `{}`",
+            out_file.display()
+        )
+    })?;
+    let mut updated = text;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&format!(
+        "export function main() {{ return {emitted_ident}(); }}\n"
+    ));
+    fs::write(out_file, updated.as_bytes())
+        .map_err(|err| format!("failed to write `{}`: {err}", out_file.display()))
+}
+
+/// Resolves the final emitted JS identifier for `main` (handling both unminified and
+/// `js-minify=on` release outputs where `main_sym` was shortened).
+pub fn resolve_emitted_main_ident(js: &str, main_sym: &str) -> Option<String> {
+    if js.contains(&format!("function {main_sym}(")) {
+        return Some(main_sym.to_owned());
+    }
+    // Under `js-minify=on`, `main_sym` is shortened, but `__mires_test_main_static`
+    // is `#[no_mangle]` so its call site inside `main` preserves its exact name.
+    let call_needle = "__mires_test_main_static(";
+    let mut search_from = 0;
+    while let Some(rel) = js[search_from..].find(call_needle) {
+        let abs = search_from + rel;
+        let is_def = js[..abs].ends_with("function ");
+        if !is_def {
+            if let Some(fn_pos) = js[..abs].rfind("function ") {
+                let after_kw = &js[fn_pos + "function ".len()..abs];
+                if let Some(paren) = after_kw.find("()") {
+                    let ident = after_kw[..paren].trim();
+                    if is_js_ident(ident) && ident != "__mires_test_main_static" {
+                        return Some(ident.to_owned());
+                    }
+                }
+            }
+        }
+        search_from = abs + call_needle.len();
+    }
+    None
+}
+
+fn is_js_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let valid_start = first.is_ascii_alphabetic() || first == '_' || first == '$';
+    valid_start && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Remove conflicting `-C` flags (both `-Ckey=val` and `-C key=val`) and synthetic
@@ -798,6 +1153,87 @@ mod tests {
                     "/ws/target/mires32-unwind/release/deps/my_app-99aa.wasm"
                 ),
             })
+        );
+    }
+
+    #[test]
+    fn test_mode_marks_dash_dash_test_as_program_and_injects_sentinel_root() {
+        let cfg = sample_config(WrapperMode::Test);
+        let args = strs(&[
+            "--crate-name",
+            "shared",
+            "--test",
+            "--target",
+            "/mires/targets/mires32-unwind.json",
+            "--out-dir",
+            "/ws/target/mires32-unwind/debug/deps",
+            "-C",
+            "extra-filename=-1122",
+            "src/lib.rs",
+        ]);
+        let res = rewrite_args(&args, &cfg);
+        assert_eq!(res.kind, InvocationKind::Target { is_program: true });
+        assert!(res
+            .args
+            .contains(&format!("-Cllvm-args=js-root={TEST_MAIN_ROOT_SENTINEL}")));
+    }
+
+    #[test]
+    fn scans_main_symbol_patches_postcard_and_resolves_minified_main() {
+        let raw_obj = "function other$foo$h0123456789abcdef() {}\n\
+                       function my_pkg$main$h0123456789abcdef() {}\n\
+                       function my_pkg$sub$main$hfedcba9876543210() {}\n";
+        assert_eq!(
+            scan_function_main_symbols(raw_obj),
+            vec!["my_pkg$main$h0123456789abcdef".to_owned()]
+        );
+
+        let mut manifest_bytes = vec![0x05, 0x00, 0x01];
+        manifest_bytes.extend_from_slice(&encode_postcard_str(TEST_MAIN_ROOT_SENTINEL));
+        manifest_bytes.extend_from_slice(&[0xaa, 0xbb]);
+        let patched = replace_postcard_string(
+            &manifest_bytes,
+            TEST_MAIN_ROOT_SENTINEL,
+            "my_pkg$main$h0123456789abcdef",
+        )
+        .unwrap();
+        let mut expected = vec![0x05, 0x00, 0x01];
+        expected.extend_from_slice(&encode_postcard_str("my_pkg$main$h0123456789abcdef"));
+        expected.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(patched, expected);
+
+        let unminified =
+            "function my_pkg$main$h0123456789abcdef() { __mires_test_main_static([]); }\n";
+        assert_eq!(
+            resolve_emitted_main_ident(unminified, "my_pkg$main$h0123456789abcdef").as_deref(),
+            Some("my_pkg$main$h0123456789abcdef")
+        );
+
+        let minified =
+            "function __mires_test_main_static(a){}\nfunction $q(){__mires_test_main_static(x);}\n";
+        assert_eq!(
+            resolve_emitted_main_ident(minified, "my_pkg$main$h0123456789abcdef").as_deref(),
+            Some("$q")
+        );
+
+        let printed_manifest = "\
+Manifest {\n\
+    mode: Program {\n\
+        output: Some(\n\
+            \"/tmp/shared-97a95c05a0a07541.wasm\",\n\
+        ),\n\
+    },\n\
+    objects: [\n\
+        \"/tmp/shared.cgu.0.rcgu.o\",\n\
+    ],\n\
+}\n";
+        assert_eq!(
+            parse_manifest_output(printed_manifest),
+            Some(PathBuf::from("/tmp/shared-97a95c05a0a07541.wasm"))
+        );
+        assert_eq!(
+            parse_manifest_objects(printed_manifest),
+            vec![PathBuf::from("/tmp/shared.cgu.0.rcgu.o")]
         );
     }
 

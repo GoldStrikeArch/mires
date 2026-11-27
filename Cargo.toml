@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["experiments", "experiments-pro", "recovery", "legacy", "mires-std"]
+exclude = ["experiments", "experiments-pro", "recovery", "legacy", "mires-std", "mires-test", "oracle"]
 members = [
     "backend",
     "rcgjs-object",

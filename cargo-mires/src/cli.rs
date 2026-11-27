@@ -189,6 +189,38 @@ pub struct BuildCliOptions {
     pub verbose: bool,
 }
 
+/// Explicit Cargo test target selection flags for `cargo mires test`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestTargetFilter {
+    pub lib: bool,
+    pub tests: bool,
+    pub bins: bool,
+    pub test_names: Vec<String>,
+    pub bin_names: Vec<String>,
+}
+
+/// CLI options for `cargo mires test`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestCliOptions {
+    pub package: Option<String>,
+    pub workspace: bool,
+    pub manifest_path: Option<PathBuf>,
+    pub release: bool,
+    pub profile: Option<Profile>,
+    pub panic: Option<PanicMode>,
+    pub mires_root: Option<PathBuf>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub target_dir: Option<PathBuf>,
+    pub targets: TestTargetFilter,
+    pub no_run: bool,
+    pub diff: bool,
+    pub verbose: bool,
+    pub filters: Vec<String>,
+    pub harness_args: Vec<String>,
+}
+
 /// CLI options for `cargo mires sysroot`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SysrootCliOptions {
@@ -253,6 +285,7 @@ pub enum ToolchainCliCommand {
 pub enum Command {
     Build(BuildCliOptions),
     Check(BuildCliOptions),
+    Test(TestCliOptions),
     Watch(BuildCliOptions),
     Sysroot(SysrootCliOptions),
     Setup(SetupCliOptions),
@@ -294,6 +327,10 @@ where
             ParsedSubcommand::Help => Command::Help(Some("check".to_owned())),
             ParsedSubcommand::Opts(opts) => Command::Check(opts),
         }),
+        "test" => parse_test(rest).map(|parsed| match parsed {
+            ParsedSubcommand::Help => Command::Help(Some("test".to_owned())),
+            ParsedSubcommand::Opts(opts) => Command::Test(opts),
+        }),
         "watch" => parse_build_like(rest).map(|parsed| match parsed {
             ParsedSubcommand::Help => Command::Help(Some("watch".to_owned())),
             ParsedSubcommand::Opts(opts) => Command::Watch(opts),
@@ -311,7 +348,7 @@ where
             ParsedSubcommand::Opts(cmd) => Command::Toolchain(cmd),
         }),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `build`, `check`, `watch`, `sysroot`, `setup`, or `toolchain`)"
+            "unknown subcommand `{other}` (expected `build`, `check`, `test`, `watch`, `sysroot`, `setup`, or `toolchain`)"
         )),
     }
 }
@@ -464,6 +501,135 @@ fn parse_build_like(args: &[String]) -> Result<ParsedSubcommand<BuildCliOptions>
             }
         }
         index += 1;
+    }
+
+    Ok(ParsedSubcommand::Opts(opts))
+}
+
+fn parse_test(args: &[String]) -> Result<ParsedSubcommand<TestCliOptions>, String> {
+    let mut opts = TestCliOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            opts.harness_args.extend(args[index + 1..].iter().cloned());
+            break;
+        }
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(ParsedSubcommand::Help);
+        }
+
+        let (flag, inline_value) = split_flag(arg);
+        match flag {
+            "-p" | "--package" => {
+                opts.package = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
+            "--workspace" => {
+                reject_value(flag, inline_value)?;
+                opts.workspace = true;
+            }
+            "--manifest-path" => {
+                opts.manifest_path = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "--release" => {
+                reject_value(flag, inline_value)?;
+                opts.release = true;
+            }
+            "--profile" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                let profile = Profile::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid value `{raw}` for `--profile` \
+                         (expected `dev`, `report`, `release-size`, `release-balanced`, or `release-speed`)"
+                    )
+                })?;
+                opts.profile = Some(profile);
+            }
+            "--panic" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                let panic = PanicMode::parse(&raw).ok_or_else(|| {
+                    format!("invalid value `{raw}` for `--panic` (expected `unwind` or `abort`)")
+                })?;
+                opts.panic = Some(panic);
+            }
+            "--mires-root" => {
+                opts.mires_root = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "-F" | "--features" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                opts.features.push(raw);
+            }
+            "--all-features" => {
+                reject_value(flag, inline_value)?;
+                opts.all_features = true;
+            }
+            "--no-default-features" => {
+                reject_value(flag, inline_value)?;
+                opts.no_default_features = true;
+            }
+            "--target-dir" => {
+                opts.target_dir = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?));
+            }
+            "--lib" => {
+                reject_value(flag, inline_value)?;
+                opts.targets.lib = true;
+            }
+            "--tests" => {
+                reject_value(flag, inline_value)?;
+                opts.targets.tests = true;
+            }
+            "--test" => {
+                let name = take_value(args, &mut index, flag, inline_value)?;
+                opts.targets.test_names.push(name);
+            }
+            "--bins" => {
+                reject_value(flag, inline_value)?;
+                opts.targets.bins = true;
+            }
+            "--bin" => {
+                let name = take_value(args, &mut index, flag, inline_value)?;
+                opts.targets.bin_names.push(name);
+            }
+            "--no-run" => {
+                reject_value(flag, inline_value)?;
+                opts.no_run = true;
+            }
+            "--diff" => {
+                reject_value(flag, inline_value)?;
+                opts.diff = true;
+            }
+            "-v" | "--verbose" => {
+                reject_value(flag, inline_value)?;
+                opts.verbose = true;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option `{other}` for `test`"));
+            }
+            positional => {
+                opts.filters.push(positional.to_owned());
+            }
+        }
+        index += 1;
+    }
+
+    if opts.workspace && opts.package.is_some() {
+        return Err("cannot pass both `--workspace` and `--package` to `test`".to_owned());
     }
 
     Ok(ParsedSubcommand::Opts(opts))
@@ -845,6 +1011,35 @@ Options:
   -h, --help                Print help
 "
         }
+        Some("test") => {
+            "\
+Compile and run Rust `#[test]` suites in Node.js via Mires
+
+Usage: cargo mires test [OPTIONS] [TESTNAME]... [-- <HARNESS_ARGS>...]
+
+Options:
+  -p, --package <NAME>        Package to test
+      --workspace             Test all packages in the workspace
+      --manifest-path <PATH>  Path to Cargo.toml
+      --lib                   Test only the package's library unit tests
+      --tests                 Test all integration test targets
+      --test <NAME>           Test only the named integration test target (repeatable)
+      --bins                  Test all binary targets
+      --bin <NAME>            Test only the named binary target (repeatable)
+      --release               Compile tests with release optimizations (release-balanced)
+      --profile <PROFILE>     Profile: dev|report|release-size|release-balanced|release-speed
+      --panic <MODE>          Panic strategy: unwind|abort (default: unwind)
+      --mires-root <PATH>     Path to the Mires toolchain checkout or installed bundle
+  -F, --features <LIST>       Space or comma separated Cargo features
+      --all-features          Activate all available features
+      --no-default-features   Do not activate the `default` feature
+      --target-dir <DIR>      Override Cargo target directory
+      --no-run                Compile test binaries to JS without executing them
+      --diff                  Also run native `cargo test` and verify identical outcomes
+  -v, --verbose               Print verbose compiler/wrapper logs
+  -h, --help                  Print help
+"
+        }
         Some("build" | "check" | "watch") => {
             "\
 Compile, typecheck, or watch a Cargo crate targeting JavaScript via Mires
@@ -884,6 +1079,7 @@ Usage: cargo mires <COMMAND> [OPTIONS]
 Commands:
   build      Compile a crate to JavaScript and publish artifacts
   check      Typecheck a crate against the Mires sysroot without codegen
+  test       Compile and run Rust `#[test]` suites in Node.js (with optional `--diff`)
   watch      Rebuild automatically whenever Rust sources or Cargo.toml change
   sysroot    Ensure or rebuild the cached Mires sysroot
   setup      Download and install a prebuilt Mires toolchain bundle
@@ -1127,6 +1323,75 @@ mod tests {
             parse_args(["cargo-mires", "toolchain", "--help"]).unwrap(),
             Command::Help(Some("toolchain".to_owned()))
         );
+    }
+
+    #[test]
+    fn parses_test_subcommand_flags_filters_and_harness_args() {
+        let cmd = parse_args([
+            "cargo-mires",
+            "mires",
+            "test",
+            "-p",
+            "shared",
+            "--manifest-path",
+            "examples/fullstack-workspace/Cargo.toml",
+            "--lib",
+            "--test",
+            "integ_a",
+            "--tests",
+            "--bin",
+            "cli",
+            "--release",
+            "--profile",
+            "release-balanced",
+            "--features",
+            "extra",
+            "--all-features",
+            "--no-default-features",
+            "--target-dir",
+            "tmp/t",
+            "--no-run",
+            "--diff",
+            "-v",
+            "my_filter",
+            "--",
+            "--exact",
+            "--ignored",
+        ])
+        .unwrap();
+
+        let Command::Test(opts) = cmd else {
+            panic!("expected Test command");
+        };
+        assert_eq!(opts.package.as_deref(), Some("shared"));
+        assert_eq!(
+            opts.manifest_path,
+            Some(PathBuf::from("examples/fullstack-workspace/Cargo.toml"))
+        );
+        assert!(opts.targets.lib);
+        assert!(opts.targets.tests);
+        assert_eq!(opts.targets.test_names, vec!["integ_a".to_owned()]);
+        assert_eq!(opts.targets.bin_names, vec!["cli".to_owned()]);
+        assert!(opts.release);
+        assert_eq!(opts.profile, Some(Profile::ReleaseBalanced));
+        assert_eq!(opts.features, vec!["extra".to_owned()]);
+        assert!(opts.all_features);
+        assert!(opts.no_default_features);
+        assert_eq!(opts.target_dir, Some(PathBuf::from("tmp/t")));
+        assert!(opts.no_run);
+        assert!(opts.diff);
+        assert!(opts.verbose);
+        assert_eq!(opts.filters, vec!["my_filter".to_owned()]);
+        assert_eq!(
+            opts.harness_args,
+            vec!["--exact".to_owned(), "--ignored".to_owned()]
+        );
+
+        assert_eq!(
+            parse_args(["cargo-mires", "test", "--help"]).unwrap(),
+            Command::Help(Some("test".to_owned()))
+        );
+        assert!(parse_args(["cargo-mires", "test", "--workspace", "-p", "foo"]).is_err());
     }
 
     #[test]

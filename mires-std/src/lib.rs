@@ -9,6 +9,7 @@
 #![allow(internal_features)]
 #![feature(
     alloc_error_handler,
+    allocator_api,
     const_eval_select,
     core_intrinsics,
     custom_test_frameworks,
@@ -16,7 +17,8 @@
     never_type,
     panic_internals,
     rustc_attrs,
-    test
+    test,
+    try_reserve_kind
 )]
 // Allow unused items across std APIs that exist for compatibility with upstream `std`.
 #![allow(dead_code)]
@@ -84,7 +86,6 @@ pub use core_crate::u8;
 pub use core_crate::usize;
 
 // Re-export `alloc` modules.
-pub use alloc_crate::alloc;
 pub use alloc_crate::borrow;
 pub use alloc_crate::boxed;
 pub use alloc_crate::fmt;
@@ -94,6 +95,86 @@ pub use alloc_crate::slice;
 pub use alloc_crate::str;
 pub use alloc_crate::string;
 pub use alloc_crate::vec;
+
+/// Memory allocation APIs, extending `alloc::alloc` with [`System`].
+pub mod alloc {
+    pub use alloc_crate::alloc::*;
+
+    use core_crate::ptr::NonNull;
+
+    /// The default system allocator backed by the Mires JS runtime heap.
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct System;
+
+    unsafe impl GlobalAlloc for System {
+        #[inline]
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { alloc_crate::alloc::alloc(layout) }
+        }
+
+        #[inline]
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { alloc_crate::alloc::alloc_zeroed(layout) }
+        }
+
+        #[inline]
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { alloc_crate::alloc::dealloc(ptr, layout) }
+        }
+
+        #[inline]
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { alloc_crate::alloc::realloc(ptr, layout, new_size) }
+        }
+    }
+
+    unsafe impl Allocator for System {
+        #[inline]
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            Global.allocate(layout)
+        }
+
+        #[inline]
+        fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            Global.allocate_zeroed(layout)
+        }
+
+        #[inline]
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            unsafe { Global.deallocate(ptr, layout) }
+        }
+
+        #[inline]
+        unsafe fn grow(
+            &self,
+            ptr: NonNull<u8>,
+            old_layout: Layout,
+            new_layout: Layout,
+        ) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { Global.grow(ptr, old_layout, new_layout) }
+        }
+
+        #[inline]
+        unsafe fn grow_zeroed(
+            &self,
+            ptr: NonNull<u8>,
+            old_layout: Layout,
+            new_layout: Layout,
+        ) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { Global.grow_zeroed(ptr, old_layout, new_layout) }
+        }
+
+        #[inline]
+        unsafe fn shrink(
+            &self,
+            ptr: NonNull<u8>,
+            old_layout: Layout,
+            new_layout: Layout,
+        ) -> Result<NonNull<[u8]>, AllocError> {
+            unsafe { Global.shrink(ptr, old_layout, new_layout) }
+        }
+    }
+}
 
 /// Constants and math methods for `f32`.
 pub mod f32 {
@@ -119,18 +200,22 @@ pub mod task {
 
 // Re-export standard macros at the crate root.
 pub use core_crate::{
-    assert, assert_eq, assert_ne, cfg, cfg_select, column, compile_error, concat, debug_assert,
-    debug_assert_eq, debug_assert_ne, env, file, format_args, include, include_bytes, include_str,
-    line, matches, module_path, option_env, stringify, todo, unimplemented, unreachable, write,
-    writeln,
+    assert, assert_eq, assert_matches, assert_ne, cfg, cfg_select, column, compile_error, concat,
+    debug_assert, debug_assert_eq, debug_assert_matches, debug_assert_ne, env, file, format_args,
+    include, include_bytes, include_str, line, matches, module_path, option_env, stringify, todo,
+    unimplemented, unreachable, write, writeln,
 };
 
 /// Default panic handler for `std` crates compiled by `mires`.
 ///
-/// Extracts a static string message when available so programs without runtime
-/// formatting do not pull `core::fmt` into the emitted JavaScript.
+/// Uses the static-string fast path when available and formats dynamic panic
+/// messages (such as `assert_eq!` or bounds checks) so `catch_unwind` and
+/// `#[should_panic(expected = "...")]` observe the exact message.
 #[panic_handler]
 fn panic_handler(info: &core_crate::panic::PanicInfo<'_>) -> ! {
-    let msg = info.message().as_str().unwrap_or("explicit panic");
-    panicking::panic_with_static_str(msg)
+    if let Some(msg) = info.message().as_str() {
+        panicking::panic_with_static_str(msg)
+    } else {
+        panicking::panic_with_fmt(format_args!("{}", info.message()))
+    }
 }

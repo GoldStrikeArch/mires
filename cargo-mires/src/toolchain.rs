@@ -1134,6 +1134,12 @@ pub fn package_toolchain(opts: &ToolchainPackageOptions) -> Result<PathBuf, Stri
         &checkout_root.join("mires-std"),
         &stage_dir.join("mires-std"),
     )?;
+    if checkout_root.join("mires-test").is_dir() {
+        copy_dir_filtered(
+            &checkout_root.join("mires-test"),
+            &stage_dir.join("mires-test"),
+        )?;
+    }
 
     let mut prebuilt_sysroots = BTreeMap::new();
     if !opts.no_sysroots {
@@ -1411,6 +1417,7 @@ mod tests {
         fs::write(sysroot_lib.join("libcompiler_builtins-1.rlib"), b"cb").unwrap();
         fs::write(sysroot_lib.join("liballoc-1.rlib"), b"alloc").unwrap();
         fs::write(sysroot_lib.join("libstd-1.rlib"), b"std").unwrap();
+        fs::write(sysroot_lib.join("libtest-1.rlib"), b"test").unwrap();
 
         let dylib_sha256 = sha256_file(&stage.join(&dylib_rel)).unwrap();
         let mut prebuilt = BTreeMap::new();

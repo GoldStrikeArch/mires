@@ -198,7 +198,8 @@ impl Toolchain {
         let rustc = rustc_identity(channel, &script)?;
         let backend_hash = sha256_file(&self.dylib)?;
         let patches_hash = patches_digest(&self.root.join("patches"))?;
-        let mires_std_hash = mires_std_digest(&self.root)?;
+        let mires_std_hash = mires_crate_digest(&self.root, "mires-std")?;
+        let mires_test_hash = mires_crate_digest(&self.root, "mires-test")?;
         let target = self.panic.target_name();
         let rust_opt = key.opt_level.map_or("default", RustOptLevel::as_str);
         let args = normalize_sysroot_emit_args(key.emit_args, self.panic);
@@ -208,6 +209,7 @@ impl Toolchain {
         let _ = writeln!(material, "backend={backend_hash}");
         let _ = writeln!(material, "patches={patches_hash}");
         let _ = writeln!(material, "mires-std={mires_std_hash}");
+        let _ = writeln!(material, "mires-test={mires_test_hash}");
         let _ = writeln!(material, "channel={channel}");
         let _ = writeln!(material, "rustc={rustc}");
         let _ = writeln!(material, "target={target}");
@@ -848,10 +850,10 @@ fn patches_digest(dir: &Path) -> Result<String> {
     Ok(sha256(material.as_bytes()))
 }
 
-/// Digest of `mires-std/Cargo.toml` and every `.rs` file under `mires-std/src/`, matching
-/// `jsc_mires_std_digest` in `scripts/sysroot-cache.sh`.
-fn mires_std_digest(root: &Path) -> Result<String> {
-    let dir = root.join("mires-std");
+/// Digest of `<dir_name>/Cargo.toml` and every `.rs` file under `<dir_name>/src/`, matching
+/// `jsc_mires_std_digest` / `jsc_mires_test_digest` in `scripts/sysroot-cache.sh`.
+fn mires_crate_digest(root: &Path, dir_name: &str) -> Result<String> {
+    let dir = root.join(dir_name);
     let mut material = String::new();
     let mut found = false;
 
@@ -878,6 +880,11 @@ fn mires_std_digest(root: &Path) -> Result<String> {
         material.push_str("none\n");
     }
     Ok(sha256(material.as_bytes()))
+}
+
+#[cfg(test)]
+fn mires_std_digest(root: &Path) -> Result<String> {
+    mires_crate_digest(root, "mires-std")
 }
 
 fn collect_rs_files(prefix: &str, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result {

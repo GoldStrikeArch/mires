@@ -1,6 +1,6 @@
 //! Runtime entry point (`#[lang = "start"]`) and panic forwarding hooks.
 
-pub use crate::panicking::{begin_panic, catch_unwind_message};
+pub use crate::panicking::{begin_panic, catch_unwind_message, panic_depth, take_panic_payload};
 pub use core_crate::panicking::{panic_display, panic_fmt};
 
 /// Unwind-capable static-message panic entry point (const-eval safe).

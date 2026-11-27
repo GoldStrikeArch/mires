@@ -68,6 +68,21 @@ pub(crate) fn panicking() -> bool {
     PANIC_STATE.depth.get() > 0
 }
 
+/// Returns the current panic nesting depth (internal hook for `mires-test`).
+#[doc(hidden)]
+#[inline]
+pub fn panic_depth() -> usize {
+    PANIC_STATE.depth.get()
+}
+
+/// Restores `PANIC_STATE.depth` and takes any stored panic payload left behind
+/// by a non-unwinding `core::panicking` abort boundary (internal hook for `mires-test`).
+#[doc(hidden)]
+pub fn take_panic_payload(restore_depth: usize) -> Option<Box<dyn Any + Send>> {
+    PANIC_STATE.depth.set(restore_depth);
+    take_payload().map(PanicPayload::into_any)
+}
+
 #[inline]
 fn set_payload(payload: PanicPayload) {
     // SAFETY: Single-threaded execution; no overlapping borrows of `PANIC_STATE.payload`.
