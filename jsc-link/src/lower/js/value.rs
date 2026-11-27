@@ -6,6 +6,8 @@
 //! masks, literals, tags, the structural clone — and that is what this module holds. See the
 //! baseline-carrier spec in `rcgjs-object/README.md` for the shapes.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::types::{
     EnumRepr, FieldKey, IntRepr, NominalForm, RepresentationCandidate, TypeId, TypeKind, TypeTable,
@@ -13,14 +15,19 @@ use rcgjs_object::jir::types::{
 };
 use rcgjs_object::jsast::{self, BinOp, Expr, UnOp};
 
+use crate::item::{item_map, ItemKind, JsItem, JsName, LinkItem, Linkage};
 use crate::plan::abi_flat::{LaneComponent, ProductNode, RecursiveShape, TaggedShape};
 
 /// The key an enum object carries its variant name under (`value.rs:211`).
 pub const TAG: &str = "TAG";
 
-/// The number of enum variants past which a copy stops being rebuilt variant by variant
-/// (`value.rs:592`).
+/// The number of enum variants past which a copy stops being rebuilt inline variant by variant
+/// and instead calls a deduplicated per-type clone helper function (`value.rs:592`).
 const MAX_CLONED_VARIANTS: usize = 8;
+
+/// Prefix of synthesized per-type deep-clone helpers for enums with more than
+/// [`MAX_CLONED_VARIANTS`] variants.
+const LARGE_ENUM_CLONE_PREFIX: &str = "$__mires_clone_";
 
 /// Strips redundant `>>> 0` and `| 0` wrappers from an integer `Number` expression that is about
 /// to be consumed by a JavaScript 32-bit bitwise operator (`&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`,
@@ -635,6 +642,27 @@ pub fn field_expr(interns: &Interns, base: Expr, key: FieldKey) -> Expr {
     }
 }
 
+/// `Object.defineProperty(base, "__proto__", { value, writable: true, enumerable: true, configurable: true })`.
+///
+/// Defining `"__proto__"` as an own data property avoids triggering `Object.prototype`'s
+/// prototype setter when writing into a fresh `{}` container or switching enum variants.
+pub fn define_proto_prop(base: Expr, value: Expr) -> Expr {
+    jsast::method_call(
+        jsast::id("Object"),
+        "defineProperty",
+        vec![
+            base,
+            jsast::string("__proto__"),
+            jsast::object_of(vec![
+                ("value", value),
+                ("writable", Expr::Bool(true)),
+                ("enumerable", Expr::Bool(true)),
+                ("configurable", Expr::Bool(true)),
+            ]),
+        ],
+    )
+}
+
 /// `Object.assign({}, value)`, a one level copy for a shape this module cannot take apart.
 fn shallow_clone(value: Expr) -> Expr {
     jsast::call(
@@ -826,7 +854,300 @@ fn clone_once(value: Expr, param: &str, build: impl FnOnce(Expr) -> Expr) -> Exp
 /// local.
 pub const CLONE_PARAM: &str = "$e";
 
-/// A copy of an enum value: `TAG === "A" ? { TAG: "A", _0: ... } : ...` (`value.rs:700-758`).
+fn nested_clone_mask(nested_clone: crate::lower::NestedClone) -> u8 {
+    u8::from(nested_clone.map)
+        | (u8::from(nested_clone.native_string) << 1)
+        | (u8::from(nested_clone.native_vec) << 2)
+}
+
+fn nested_clone_from_mask(mask: u8) -> Option<crate::lower::NestedClone> {
+    if mask > 7 {
+        return None;
+    }
+    Some(crate::lower::NestedClone {
+        map: (mask & 1) != 0,
+        native_string: (mask & 2) != 0,
+        native_vec: (mask & 4) != 0,
+    })
+}
+
+/// Deterministic link name of the deep-clone helper synthesized for a large enum `ty`.
+pub fn large_enum_clone_helper_name(ty: TypeId, nested_clone: crate::lower::NestedClone) -> String {
+    let mask = nested_clone_mask(nested_clone);
+    if mask == 0 {
+        format!("{LARGE_ENUM_CLONE_PREFIX}{:032x}", ty.0)
+    } else {
+        format!("{LARGE_ENUM_CLONE_PREFIX}{:032x}_m{mask}", ty.0)
+    }
+}
+
+fn parse_large_enum_clone_helper_name(name: &str) -> Option<(TypeId, crate::lower::NestedClone)> {
+    let rest = name.strip_prefix(LARGE_ENUM_CLONE_PREFIX)?;
+    let (hex, mask) = match rest.split_once("_m") {
+        Some((hex, mask_str)) => (hex, mask_str.parse::<u8>().ok()?),
+        None => (rest, 0),
+    };
+    if hex.len() != 32 {
+        return None;
+    }
+    let raw = u128::from_str_radix(hex, 16).ok()?;
+    let nested_clone = nested_clone_from_mask(mask)?;
+    Some((TypeId(raw), nested_clone))
+}
+
+fn enum_payload_needs_deep_or_proto_clone(
+    table: &TypeTable,
+    interns: &Interns,
+    variants: &[VariantDescriptor],
+) -> bool {
+    variants.iter().any(|variant| {
+        variant.fields.iter().any(|field| {
+            table.needs_clone(field.ty)
+                || key_name(interns, field.key).as_deref() == Some("__proto__")
+        })
+    })
+}
+
+/// Whether `ty` is an enum with more than [`MAX_CLONED_VARIANTS`] variants whose copy uses a
+/// synthesized deep-clone helper function.
+pub fn enum_needs_clone_helper(table: &TypeTable, interns: &Interns, ty: TypeId) -> bool {
+    let peeled = table.peeled(ty);
+    let Some(descriptor) = table.get(peeled) else {
+        return false;
+    };
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &descriptor.kind
+    else {
+        return false;
+    };
+    if variants.len() <= MAX_CLONED_VARIANTS {
+        return false;
+    }
+    if let Some(repr) = descriptor.js.enum_repr {
+        if repr.niche_variants().is_some()
+            || matches!(
+                repr,
+                EnumRepr::Tag { fieldless: true } | EnumRepr::IntTag { fieldless: true }
+            )
+        {
+            return false;
+        }
+    }
+    enum_payload_needs_deep_or_proto_clone(table, interns, variants)
+}
+
+/// Every synthesized large-enum clone helper name that lowerings over `work_table` may emit.
+pub fn all_large_enum_clone_helper_names(work_table: &BTreeMap<JsName, LinkItem>) -> Vec<JsName> {
+    let mut seen_tables: HashSet<(usize, usize)> = HashSet::new();
+    let mut seen_types: HashSet<TypeId> = HashSet::new();
+    let mut out = Vec::new();
+    for item in work_table.values() {
+        let Some(interns) = item.jir.interns() else {
+            continue;
+        };
+        let table = &interns.types;
+        let key = (
+            std::ptr::from_ref(interns) as usize,
+            table.descriptors().as_ptr() as usize,
+        );
+        if !seen_tables.insert(key) {
+            continue;
+        }
+        for desc in table.descriptors() {
+            if !seen_types.contains(&desc.id) && enum_needs_clone_helper(table, interns, desc.id) {
+                seen_types.insert(desc.id);
+                for mask in 0..8u8 {
+                    let nc = nested_clone_from_mask(mask).expect("mask 0..8 is valid");
+                    out.push(JsName::new(large_enum_clone_helper_name(desc.id, nc)));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_large_enum_clone_lowering(
+    name: &JsName,
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    nested_clone: crate::lower::NestedClone,
+) -> Option<crate::lower::LoweredItem> {
+    let peeled = table.peeled(ty);
+    let descriptor = table.get(peeled)?;
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &descriptor.kind
+    else {
+        return None;
+    };
+    let param = "$v";
+    let mut cases = Vec::new();
+    for (index, variant) in variants.iter().enumerate() {
+        let needs_explicit = variant.fields.iter().any(|field| {
+            table.needs_clone(field.ty)
+                || key_name(interns, field.key).as_deref() == Some("__proto__")
+        });
+        if !needs_explicit {
+            continue;
+        }
+        let tag = variant_tag(table, interns, peeled, index as u32)
+            .unwrap_or_else(|| tag_literal(interns, variant));
+        let mut entries = vec![(TAG.to_string(), tag.clone())];
+        for field in &variant.fields {
+            let key = key_name(interns, field.key).unwrap_or_default();
+            let read = jsast::member(jsast::id(param), key.clone());
+            let read = if table.needs_clone(field.ty) {
+                clone_expr_with(table, interns, field.ty, read, nested_clone)
+            } else {
+                read
+            };
+            entries.push((key, read));
+        }
+        cases.push(jsast::case(
+            vec![tag],
+            vec![jsast::ret(jsast::object(entries))],
+        ));
+    }
+    cases.push(jsast::default_case(vec![jsast::ret(shallow_clone(
+        jsast::id(param),
+    ))]));
+    let body = vec![jsast::switch(jsast::member(jsast::id(param), TAG), cases)];
+    let decl = jsast::function(name.as_str(), vec![param.to_owned()], body);
+    let refs = crate::link::lane::refs_of(&decl, name);
+    Some(crate::lower::LoweredItem {
+        decl,
+        refs,
+        names: Vec::new(),
+        loc: None,
+        dts: None,
+        zombies: Vec::new(),
+        js_alloc_origins: Vec::new(),
+        bigints: BTreeSet::new(),
+    })
+}
+
+/// Synthesizes [`crate::lower::LoweredItem`]s for every large-enum clone helper transitively
+/// referenced by `referenced` that is not already in `existing`.
+pub fn needed_enum_clone_lowerings(
+    work_table: &BTreeMap<JsName, LinkItem>,
+    referenced: &BTreeSet<JsName>,
+    existing: &BTreeSet<JsName>,
+) -> Vec<(JsName, crate::lower::LoweredItem)> {
+    let mut queue: VecDeque<JsName> = referenced
+        .iter()
+        .filter(|name| {
+            !existing.contains(*name) && name.as_str().starts_with(LARGE_ENUM_CLONE_PREFIX)
+        })
+        .cloned()
+        .collect();
+    if queue.is_empty() {
+        return Vec::new();
+    }
+    let mut type_sources: BTreeMap<TypeId, (&TypeTable, &Interns)> = BTreeMap::new();
+    let mut seen_tables: HashSet<(usize, usize)> = HashSet::new();
+    for item in work_table.values() {
+        let Some(interns) = item.jir.interns() else {
+            continue;
+        };
+        let table = &interns.types;
+        let key = (
+            std::ptr::from_ref(interns) as usize,
+            table.descriptors().as_ptr() as usize,
+        );
+        if !seen_tables.insert(key) {
+            continue;
+        }
+        for desc in table.descriptors() {
+            if enum_needs_clone_helper(table, interns, desc.id) {
+                type_sources.entry(desc.id).or_insert((table, interns));
+            }
+        }
+    }
+    let mut emitted: BTreeSet<JsName> = BTreeSet::new();
+    let mut out = Vec::new();
+    while let Some(name) = queue.pop_front() {
+        if existing.contains(&name) || !emitted.insert(name.clone()) {
+            continue;
+        }
+        let Some((ty, nested_clone)) = parse_large_enum_clone_helper_name(name.as_str()) else {
+            continue;
+        };
+        let Some(&(table, interns)) = type_sources.get(&ty) else {
+            continue;
+        };
+        let Some(lowering) =
+            build_large_enum_clone_lowering(&name, table, interns, ty, nested_clone)
+        else {
+            continue;
+        };
+        for r in &lowering.refs {
+            if !existing.contains(r)
+                && !emitted.contains(r)
+                && r.as_str().starts_with(LARGE_ENUM_CLONE_PREFIX)
+            {
+                queue.push_back(r.clone());
+            }
+        }
+        out.push((name, lowering));
+    }
+    out
+}
+
+/// Printed [`LinkItem`] variant of [`needed_enum_clone_lowerings`] for physical cost measurement.
+pub fn needed_enum_clone_items(
+    work_table: &BTreeMap<JsName, LinkItem>,
+    referenced: &BTreeSet<JsName>,
+    existing: &BTreeSet<JsName>,
+) -> Vec<LinkItem> {
+    needed_enum_clone_lowerings(work_table, referenced, existing)
+        .into_iter()
+        .map(|(name, lowering)| {
+            let printed = JsItem {
+                name: name.clone(),
+                kind: ItemKind::Fn,
+                decl: lowering.decl,
+                refs: lowering.refs.clone(),
+                zombies: Vec::new(),
+                linkage: Linkage::internal(),
+                debug_path: "large enum clone helper".to_owned(),
+                order: None,
+                loc: None,
+                names: Vec::new(),
+                dts: None,
+                optimization: Default::default(),
+                allocator_provider: Default::default(),
+                jir: Default::default(),
+            };
+            let (js, mappings) = printed.to_js_mapped(crate::opts::get().comments);
+            LinkItem {
+                name,
+                kind: ItemKind::Fn,
+                js,
+                refs: lowering.refs,
+                zombies: Vec::new(),
+                linkage: Linkage::internal(),
+                debug_path: "large enum clone helper".to_owned(),
+                crate_name: "generated".to_owned(),
+                order: None,
+                map: item_map(mappings),
+                dts: None,
+                optimization: Default::default(),
+                allocator_provider: Default::default(),
+                jir: Default::default(),
+            }
+        })
+        .collect()
+}
+
+/// A copy of an enum value: `TAG === "A" ? { TAG: "A", _0: ... } : ...` (`value.rs:700-758`),
+/// or a call to a deduplicated per-type deep-clone helper when the enum has more than
+/// [`MAX_CLONED_VARIANTS`] variants.
 fn clone_enum(
     table: &TypeTable,
     interns: &Interns,
@@ -835,14 +1156,12 @@ fn clone_enum(
     value: Expr,
     nested_clone: crate::lower::NestedClone,
 ) -> Expr {
-    let payload_needs_clone = variants.iter().any(|variant| {
-        variant
-            .fields
-            .iter()
-            .any(|field| table.needs_clone(field.ty))
-    });
-    if !payload_needs_clone || variants.len() > MAX_CLONED_VARIANTS {
+    if !enum_payload_needs_deep_or_proto_clone(table, interns, variants) {
         return shallow_clone(value);
+    }
+    if variants.len() > MAX_CLONED_VARIANTS {
+        let helper = large_enum_clone_helper_name(ty, nested_clone);
+        return jsast::call(jsast::id(helper), vec![value]);
     }
     let variant_copy = |index: usize, variant: &VariantDescriptor| {
         let tag = variant_tag(table, interns, ty, index as u32)

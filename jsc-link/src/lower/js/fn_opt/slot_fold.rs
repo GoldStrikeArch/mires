@@ -239,8 +239,12 @@ impl SlotDef {
     fn replacement(&self) -> Expr {
         match self {
             Self::Offset { base, op, idx } => jsast::index(
-                jsast::member(base.to_expr(), "buf"),
-                jsast::binary(*op, jsast::member(base.to_expr(), "off"), idx.to_expr()),
+                jsast::member(base.to_expr(), rcgjs_object::ptr::BUF),
+                jsast::binary(
+                    *op,
+                    jsast::member(base.to_expr(), rcgjs_object::ptr::OFF),
+                    idx.to_expr(),
+                ),
             ),
             Self::Direct { buf, off } => jsast::index(buf.to_expr(), off.to_expr()),
         }
@@ -314,8 +318,8 @@ fn match_slot_deref(expr: &Expr) -> Option<&str> {
     let Expr::Index(obj, idx) = expr else {
         return None;
     };
-    let b = is_v_member(obj, "buf")?;
-    let o = is_v_member(idx, "off")?;
+    let b = is_v_member(obj, rcgjs_object::ptr::BUF)?;
+    let o = is_v_member(idx, rcgjs_object::ptr::OFF)?;
     (b == o).then_some(b)
 }
 
@@ -323,13 +327,16 @@ fn match_offset_obj(expr: &Expr) -> Option<(BaseRef, jsast::BinOp, SimpleIdx)> {
     let Expr::Object(entries) = expr else {
         return None;
     };
-    if entries.len() != 2 || entries[0].0 != "buf" || entries[1].0 != "off" {
+    if entries.len() != 2
+        || entries[0].0 != rcgjs_object::ptr::BUF
+        || entries[1].0 != rcgjs_object::ptr::OFF
+    {
         return None;
     }
     let Expr::Member(b1, bp) = &entries[0].1 else {
         return None;
     };
-    if bp != "buf" {
+    if bp != rcgjs_object::ptr::BUF {
         return None;
     }
     let base1 = match_base_ref(b1)?;
@@ -339,7 +346,7 @@ fn match_offset_obj(expr: &Expr) -> Option<(BaseRef, jsast::BinOp, SimpleIdx)> {
     let Expr::Member(b2, op_prop) = lhs.as_ref() else {
         return None;
     };
-    if op_prop != "off" {
+    if op_prop != rcgjs_object::ptr::OFF {
         return None;
     }
     let base2 = match_base_ref(b2)?;
@@ -388,7 +395,10 @@ fn match_slot_def(target: &str, rhs: &Expr) -> Option<SlotDef> {
     }
     // Case 3: `{ buf: arr, off: k }`
     if let Expr::Object(entries) = rhs {
-        if entries.len() == 2 && entries[0].0 == "buf" && entries[1].0 == "off" {
+        if entries.len() == 2
+            && entries[0].0 == rcgjs_object::ptr::BUF
+            && entries[1].0 == rcgjs_object::ptr::OFF
+        {
             if let (Some(buf), Some(off)) = (
                 match_base_ref(&entries[0].1),
                 match_simple_idx(&entries[1].1),
@@ -445,10 +455,14 @@ fn lhs_writes_dep(lhs: &Expr, deps: &[SlotDep]) -> bool {
         Expr::Ident(n) => dep_matches_ident(deps, n),
         Expr::Member(obj, prop) => match obj.as_ref() {
             Expr::Ident(n) => deps.iter().any(|d| match d {
-                SlotDep::Ident(s) => s == n && (prop == "buf" || prop == "off"),
+                SlotDep::Ident(s) => {
+                    s == n && (prop == rcgjs_object::ptr::BUF || prop == rcgjs_object::ptr::OFF)
+                }
                 SlotDep::Member(s, p) => s == n && p == prop,
             }),
-            Expr::Member(inner, inner_prop) if prop == "buf" || prop == "off" => {
+            Expr::Member(inner, inner_prop)
+                if prop == rcgjs_object::ptr::BUF || prop == rcgjs_object::ptr::OFF =>
+            {
                 matches!(inner.as_ref(), Expr::Ident(n) if deps.iter().any(|d| {
                     matches!(d, SlotDep::Member(s, p) if s == n && p == inner_prop)
                 }))
@@ -666,7 +680,7 @@ impl LocalUsagePolicy for SfpUsagePolicy {
         if Self::try_match_assign_lhs(scanner, expr) {
             return true;
         }
-        if let Some(name) = is_v_member(expr, "len") {
+        if let Some(name) = is_v_member(expr, rcgjs_object::ptr::LEN) {
             if scanner.locals.contains(name) {
                 scanner.usage.entry(name.to_owned()).or_default().len_reads += 1;
                 return true;
@@ -677,7 +691,7 @@ impl LocalUsagePolicy for SfpUsagePolicy {
 
     fn try_match_assign_lhs(scanner: &mut LocalUsageScanner<'_, Self>, lhs: &Expr) -> bool {
         if let Expr::Index(obj, idx) = lhs {
-            if let Some(name) = is_v_member(obj, "buf") {
+            if let Some(name) = is_v_member(obj, rcgjs_object::ptr::BUF) {
                 if scanner.locals.contains(name) && is_v_off_index(idx, name) {
                     scanner.usage.entry(name.to_owned()).or_default().index_uses += 1;
                     if let Expr::Binary(_, _, r) = idx.as_ref() {
@@ -693,7 +707,9 @@ impl LocalUsagePolicy for SfpUsagePolicy {
 
 fn is_v_off_index(expr: &Expr, name: &str) -> bool {
     match expr {
-        Expr::Member(obj, p) if p == "off" => matches!(obj.as_ref(), Expr::Ident(n) if n == name),
+        Expr::Member(obj, p) if p == rcgjs_object::ptr::OFF => {
+            matches!(obj.as_ref(), Expr::Ident(n) if n == name)
+        }
         Expr::Binary(jsast::BinOp::Add | jsast::BinOp::Sub, l, r) => {
             is_v_off_index(l, name) && !ast_util::expr_mentions_ident(r, name)
         }
@@ -761,7 +777,7 @@ struct VLenReplacer<'a> {
 
 impl VisitMut for VLenReplacer<'_> {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        if is_v_member(expr, "len") == Some(self.var) {
+        if is_v_member(expr, rcgjs_object::ptr::LEN) == Some(self.var) {
             *expr = self.replacement.clone();
             self.count += 1;
             return;
@@ -1045,14 +1061,14 @@ mod tests {
                 Box::new(jsast::id(base)),
                 Box::new(Expr::Object(vec![
                     (
-                        "buf".to_owned(),
-                        Expr::Member(Box::new(jsast::id(base)), "buf".to_owned()),
+                        "$b".to_owned(),
+                        Expr::Member(Box::new(jsast::id(base)), "$b".to_owned()),
                     ),
                     (
-                        "off".to_owned(),
+                        "$o".to_owned(),
                         Expr::Binary(
                             jsast::BinOp::Add,
-                            Box::new(Expr::Member(Box::new(jsast::id(base)), "off".to_owned())),
+                            Box::new(Expr::Member(Box::new(jsast::id(base)), "$o".to_owned())),
                             Box::new(jsast::id(idx)),
                         ),
                     ),
@@ -1061,8 +1077,8 @@ mod tests {
         };
         let slot_deref = |slot: &str| {
             Expr::Index(
-                Box::new(Expr::Member(Box::new(jsast::id(slot)), "buf".to_owned())),
-                Box::new(Expr::Member(Box::new(jsast::id(slot)), "off".to_owned())),
+                Box::new(Expr::Member(Box::new(jsast::id(slot)), "$b".to_owned())),
+                Box::new(Expr::Member(Box::new(jsast::id(slot)), "$o".to_owned())),
             )
         };
         let locals: HashSet<String> = ["slot".to_owned(), "out".to_owned()].into_iter().collect();
@@ -1075,7 +1091,7 @@ mod tests {
         ];
         fold_offset_slot_derefs(&mut body, &locals);
         let printed = jsast::stmt_to_string(&Stmt::Block(body));
-        assert!(printed.contains("p.buf[p.off + i]"), "{printed}");
+        assert!(printed.contains("p.$b[p.$o + i]"), "{printed}");
         assert!(!printed.contains("slot ="), "{printed}");
 
         // Negative: mutating `i` between def and deref must prevent folding.
@@ -1088,7 +1104,7 @@ mod tests {
         fold_offset_slot_derefs(&mut mutated, &locals);
         let printed_mut = jsast::stmt_to_string(&Stmt::Block(mutated));
         assert!(printed_mut.contains("slot ="), "{printed_mut}");
-        assert!(printed_mut.contains("slot.buf[slot.off]"), "{printed_mut}");
+        assert!(printed_mut.contains("slot.$b[slot.$o]"), "{printed_mut}");
     }
 
     #[test]
@@ -1104,20 +1120,20 @@ mod tests {
             ],
         );
 
-        // Positive: `s = __rt.sfp(v.ptr, v.len); n = s.len; out = s.buf[s.off + i];`
+        // Positive: `s = __rt.sfp(v.ptr, v.len); n = s.$l; out = s.$b[s.$o + i];`
         let mut body = vec![
             jsast::assign_stmt(jsast::id("s"), sfp_rhs.clone()),
             jsast::assign_stmt(
                 jsast::id("n"),
-                Expr::Member(Box::new(jsast::id("s")), "len".to_owned()),
+                Expr::Member(Box::new(jsast::id("s")), "$l".to_owned()),
             ),
             jsast::assign_stmt(
                 jsast::id("out"),
                 Expr::Index(
-                    Box::new(Expr::Member(Box::new(jsast::id("s")), "buf".to_owned())),
+                    Box::new(Expr::Member(Box::new(jsast::id("s")), "$b".to_owned())),
                     Box::new(Expr::Binary(
                         jsast::BinOp::Add,
-                        Box::new(Expr::Member(Box::new(jsast::id("s")), "off".to_owned())),
+                        Box::new(Expr::Member(Box::new(jsast::id("s")), "$o".to_owned())),
                         Box::new(jsast::id("i")),
                     )),
                 ),
@@ -1139,7 +1155,7 @@ mod tests {
         let printed_esc = jsast::stmt_to_string(&Stmt::Block(escaped));
         assert!(printed_esc.contains("__rt.sfp"), "{printed_esc}");
 
-        // Positive with single-assignment alias (`_3 = s; n = _3.len; out = _3.buf[_3.off + i]`).
+        // Positive with single-assignment alias (`_3 = s; n = _3.$l; out = _3.$b[_3.$o + i]`).
         let locals_alias: HashSet<String> = [
             "s".to_owned(),
             "_3".to_owned(),
@@ -1153,15 +1169,15 @@ mod tests {
             jsast::assign_stmt(jsast::id("_3"), jsast::id("s")),
             jsast::assign_stmt(
                 jsast::id("n"),
-                Expr::Member(Box::new(jsast::id("_3")), "len".to_owned()),
+                Expr::Member(Box::new(jsast::id("_3")), "$l".to_owned()),
             ),
             jsast::assign_stmt(
                 jsast::id("out"),
                 Expr::Index(
-                    Box::new(Expr::Member(Box::new(jsast::id("_3")), "buf".to_owned())),
+                    Box::new(Expr::Member(Box::new(jsast::id("_3")), "$b".to_owned())),
                     Box::new(Expr::Binary(
                         jsast::BinOp::Add,
-                        Box::new(Expr::Member(Box::new(jsast::id("_3")), "off".to_owned())),
+                        Box::new(Expr::Member(Box::new(jsast::id("_3")), "$o".to_owned())),
                         Box::new(jsast::id("i")),
                     )),
                 ),

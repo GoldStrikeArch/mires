@@ -810,6 +810,9 @@ impl<'a> JsCx<'a> {
             || (is_raw && value::is_slot_pointee(self.table, pointee))
         {
             let key = self.static_step_key(*last)?;
+            if self.table.is_indirect(pointee) && matches!(*last, StaticStep::Field(_)) {
+                return Ok(ptr::owned_field_slot(parent, key));
+            }
             return Ok(ptr::slot(parent, key));
         }
         self.apply_static_step(parent, *last)

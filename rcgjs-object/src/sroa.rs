@@ -947,16 +947,19 @@ fn small_extended_shape(
     fields: &[String],
     uses: &BTreeMap<String, LocalUse>,
 ) -> bool {
-    let pointer_or_slice = fields.iter().any(|field| field == "buf")
-        && fields.iter().any(|field| field == "off")
-        && fields
-            .iter()
-            .all(|field| matches!(field.as_str(), "buf" | "off" | "len" | "sc"));
+    let pointer_or_slice = fields.iter().any(|field| field == crate::ptr::BUF)
+        && fields.iter().any(|field| field == crate::ptr::OFF)
+        && fields.iter().all(|field| {
+            matches!(
+                field.as_str(),
+                crate::ptr::BUF | crate::ptr::OFF | crate::ptr::LEN | crate::ptr::SCALE
+            )
+        });
     if pointer_or_slice {
-        // Two scaled byte-view pointers (`sc`) compared with `__rt.ptr_eq` can alias the same
-        // heap block through different JS buffers/scales (e.g. a raw `Uint8Array` with `sc:
-        // undefined` vs a retyped `typed` array with `sc: 8`). Rewriting `__rt.ptr_eq` into
-        // `buf === buf && off === off && sc === sc` returns `false` on equal pointers, so keep
+        // Two scaled byte-view pointers (`$s`) compared with `__rt.ptr_eq` can alias the same
+        // heap block through different JS buffers/scales (e.g. a raw `Uint8Array` with `$s:
+        // undefined` vs a retyped `typed` array with `$s: 8`). Rewriting `__rt.ptr_eq` into
+        // `$b === $b && $o === $o && $s === $s` returns `false` on equal pointers, so keep
         // scaled `ptr_eq` components whole and let `__rt.ptr_eq` resolve block identity.
         let has_pointer_eq = component
             .iter()
@@ -965,7 +968,7 @@ fn small_extended_shape(
             uses[name]
                 .written
                 .iter()
-                .any(|w| w.iter().any(|f| f == "sc"))
+                .any(|w| w.iter().any(|f| f == crate::ptr::SCALE))
         });
         if has_pointer_eq && written_has_sc {
             return false;
@@ -1056,8 +1059,11 @@ impl Visit for UseCollector<'_> {
                 if self.0.contains_key(left) && self.0.contains_key(right) {
                     for (name, peer) in [(left, right), (right, left)] {
                         let use_ = self.0.get_mut(name).expect("checked above");
-                        use_.fields
-                            .extend(["buf", "off", "sc"].into_iter().map(str::to_owned));
+                        use_.fields.extend(
+                            [crate::ptr::BUF, crate::ptr::OFF, crate::ptr::SCALE]
+                                .into_iter()
+                                .map(str::to_owned),
+                        );
                         use_.pointer_eq.insert(peer.to_owned());
                     }
                 } else {
@@ -1294,7 +1300,7 @@ impl VisitMut for SplitApplier<'_> {
             Expr::Call(callee, args) => {
                 if let Some((left, right)) = pointer_eq_args(callee, args) {
                     if self.0.contains_key(left) && self.0.contains_key(right) {
-                        *expr = ["buf", "off", "sc"]
+                        *expr = [crate::ptr::BUF, crate::ptr::OFF, crate::ptr::SCALE]
                             .into_iter()
                             .map(|field| {
                                 jsast::binary(
@@ -1996,8 +2002,8 @@ mod tests {
             jsast::assign_stmt(
                 jsast::id(name),
                 jsast::object(vec![
-                    ("buf".to_owned(), jsast::id("bytes")),
-                    ("off".to_owned(), off),
+                    ("$b".to_owned(), jsast::id("bytes")),
+                    ("$o".to_owned(), off),
                 ]),
             )
         };
@@ -2011,15 +2017,12 @@ mod tests {
                 jsast::assign_stmt(
                     jsast::id("cursor"),
                     jsast::object(vec![
+                        ("$b".to_owned(), jsast::member(jsast::id("snapshot"), "$b")),
                         (
-                            "buf".to_owned(),
-                            jsast::member(jsast::id("snapshot"), "buf"),
-                        ),
-                        (
-                            "off".to_owned(),
+                            "$o".to_owned(),
                             jsast::binary(
                                 BinOp::Add,
-                                jsast::member(jsast::id("snapshot"), "off"),
+                                jsast::member(jsast::id("snapshot"), "$o"),
                                 jsast::num(1.0),
                             ),
                         ),
@@ -2031,13 +2034,10 @@ mod tests {
                 ))),
             ],
         );
-        assert!(!printed.contains("{ buf:"), "{printed}");
+        assert!(!printed.contains("{ $b:"), "{printed}");
         assert!(!printed.contains("__rt.ptr_eq"), "{printed}");
-        assert!(printed.contains("snapshot$buf = cursor$buf"), "{printed}");
-        assert!(
-            printed.contains("cursor$off = snapshot$off + 1"),
-            "{printed}"
-        );
+        assert!(printed.contains("snapshot$$b = cursor$$b"), "{printed}");
+        assert!(printed.contains("cursor$$o = snapshot$$o + 1"), "{printed}");
     }
 
     #[test]
@@ -2049,29 +2049,29 @@ mod tests {
                 jsast::assign_stmt(
                     jsast::id("cursor"),
                     jsast::object(vec![
-                        ("buf".to_owned(), jsast::id("bytes")),
-                        ("off".to_owned(), jsast::num(0.0)),
+                        ("$b".to_owned(), jsast::id("bytes")),
+                        ("$o".to_owned(), jsast::num(0.0)),
                     ]),
                 ),
                 jsast::assign_stmt(
                     jsast::id("cursor"),
                     jsast::object(vec![
-                        ("buf".to_owned(), jsast::member(jsast::id("cursor"), "buf")),
+                        ("$b".to_owned(), jsast::member(jsast::id("cursor"), "$b")),
                         (
-                            "off".to_owned(),
+                            "$o".to_owned(),
                             jsast::binary(
                                 BinOp::Add,
-                                jsast::member(jsast::id("cursor"), "off"),
+                                jsast::member(jsast::id("cursor"), "$o"),
                                 jsast::num(1.0),
                             ),
                         ),
                     ]),
                 ),
-                Stmt::Return(Some(jsast::member(jsast::id("cursor"), "off"))),
+                Stmt::Return(Some(jsast::member(jsast::id("cursor"), "$o"))),
             ],
         );
-        assert!(!printed.contains("{ buf:"), "{printed}");
-        assert!(printed.contains("cursor$off = cursor$off + 1"), "{printed}");
+        assert!(!printed.contains("{ $b:"), "{printed}");
+        assert!(printed.contains("cursor$$o = cursor$$o + 1"), "{printed}");
     }
 
     #[test]
@@ -2215,8 +2215,8 @@ mod tests {
             jsast::assign_stmt(
                 jsast::id(name),
                 jsast::object(vec![
-                    ("buf".to_owned(), jsast::id("bytes")),
-                    ("off".to_owned(), jsast::num(off)),
+                    ("$b".to_owned(), jsast::id("bytes")),
+                    ("$o".to_owned(), jsast::num(off)),
                 ]),
             )
         };
@@ -2226,15 +2226,15 @@ mod tests {
             vec![
                 ptr("cursor", 0.0),
                 ptr("end", 4.0),
-                jsast::assign_stmt(jsast::member(jsast::id("cursor"), "off"), jsast::num(4.0)),
+                jsast::assign_stmt(jsast::member(jsast::id("cursor"), "$o"), jsast::num(4.0)),
                 Stmt::Return(Some(jsast::rt_call(
                     "ptr_eq",
                     vec![jsast::id("cursor"), jsast::id("end")],
                 ))),
             ],
         );
-        assert!(!printed.contains("{ buf:"), "{printed}");
-        assert!(printed.contains("cursor$off = 4;"), "{printed}");
+        assert!(!printed.contains("{ $b:"), "{printed}");
+        assert!(printed.contains("cursor$$o = 4;"), "{printed}");
     }
 
     #[test]
@@ -2243,16 +2243,16 @@ mod tests {
             jsast::assign_stmt(
                 jsast::id(name),
                 jsast::object(vec![
-                    ("buf".to_owned(), jsast::member(jsast::id(base), "buf")),
+                    ("$b".to_owned(), jsast::member(jsast::id(base), "$b")),
                     (
-                        "off".to_owned(),
+                        "$o".to_owned(),
                         jsast::binary(
                             BinOp::Add,
-                            jsast::member(jsast::id(base), "off"),
+                            jsast::member(jsast::id(base), "$o"),
                             jsast::num(8.0),
                         ),
                     ),
-                    ("sc".to_owned(), jsast::member(jsast::id(base), "sc")),
+                    ("$s".to_owned(), jsast::member(jsast::id(base), "$s")),
                 ]),
             )
         };

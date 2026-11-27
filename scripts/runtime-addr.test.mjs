@@ -81,7 +81,7 @@ test('a freed block keeps its address for dangling pointers, and the address is 
   const rt = runtime()
   const a = rt.alloc(24, 8)
   const address = nonNull(rt, a)
-  const element = rt.addr({ buf: a.buf, off: 3 }, 1)
+  const element = rt.addr({ $b: a.$b, $o: 3 }, 1)
   assert.equal(element, address + 3)
   rt.dealloc(a, 24, 8)
   assert.equal(rt.addr(a, 1), address, 'a dangling pointer answers the address it had')
@@ -107,7 +107,7 @@ test('a block realloc grows past its granule re-mints instead of overlapping its
   assert.notEqual(after, before)
   assert.equal(after % 128, 0)
   assert.ok(after + 100 <= next || after >= next + 16, 'no overlap with the live neighbour')
-  assert.equal(rt.addr({ buf: grown.buf, off: 99 }, 1), after + 99)
+  assert.equal(rt.addr({ $b: grown.$b, $o: 99 }, 1), after + 99)
   // The old granule is free again.
   assert.equal(nonNull(rt, rt.alloc(16, 1)), before)
 })
@@ -120,7 +120,7 @@ test('alignment follows the block size; elements stay multiples of their size', 
   }
   // A non-heap buffer (a stack array) is sized by its length and the element size asked.
   const words = [1, 2, 3, 4, 5, 6, 7, 8]
-  const at = rt.addr({ buf: words, off: 2 }, 8)
+  const at = rt.addr({ $b: words, $o: 2 }, 8)
   assert.equal((at - 16) % 64, 0)
   assert.equal(at % 8, 0)
 })

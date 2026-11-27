@@ -36,9 +36,9 @@ pub(super) fn try_fold_bstr_slice_roundtrip(expr: &Expr) -> Option<Expr> {
             Expr::Member(o, p) if p == prop && matches!(o.as_ref(), Expr::Ident(n) if n == h_name)
         )
     };
-    if !is_h_member(&bstr_of_args[0], "buf")
-        || !is_h_member(&bstr_of_args[1], "off")
-        || !is_h_member(&bstr_of_args[2], "len")
+    if !is_h_member(&bstr_of_args[0], rcgjs_object::ptr::BUF)
+        || !is_h_member(&bstr_of_args[1], rcgjs_object::ptr::OFF)
+        || !is_h_member(&bstr_of_args[2], rcgjs_object::ptr::LEN)
     {
         return None;
     }
@@ -156,10 +156,10 @@ fn is_buf_off_copy(expr: &Expr, var: &str) -> bool {
         return false;
     };
     entries.len() == 2
-        && entries[0].0 == "buf"
-        && matches!(&entries[0].1, Expr::Member(o, p) if p == "buf" && matches!(o.as_ref(), Expr::Ident(n) if n == var))
-        && entries[1].0 == "off"
-        && matches!(&entries[1].1, Expr::Member(o, p) if p == "off" && matches!(o.as_ref(), Expr::Ident(n) if n == var))
+        && entries[0].0 == rcgjs_object::ptr::BUF
+        && matches!(&entries[0].1, Expr::Member(o, p) if p == rcgjs_object::ptr::BUF && matches!(o.as_ref(), Expr::Ident(n) if n == var))
+        && entries[1].0 == rcgjs_object::ptr::OFF
+        && matches!(&entries[1].1, Expr::Member(o, p) if p == rcgjs_object::ptr::OFF && matches!(o.as_ref(), Expr::Ident(n) if n == var))
 }
 
 fn match_base_bstr_bytes(expr: &Expr) -> Option<(&Expr, Option<&str>)> {
@@ -218,24 +218,24 @@ fn match_offset_obj<'a>(expr: &'a Expr, base: &str) -> Option<&'a Expr> {
     if entries.len() < 2 || entries.len() > 3 {
         return None;
     }
-    if entries[0].0 != "buf"
-        || !matches!(&entries[0].1, Expr::Member(o, p) if p == "buf" && matches!(o.as_ref(), Expr::Ident(n) if n == base))
+    if entries[0].0 != rcgjs_object::ptr::BUF
+        || !matches!(&entries[0].1, Expr::Member(o, p) if p == rcgjs_object::ptr::BUF && matches!(o.as_ref(), Expr::Ident(n) if n == base))
     {
         return None;
     }
-    if entries[1].0 != "off" {
+    if entries[1].0 != rcgjs_object::ptr::OFF {
         return None;
     }
     let Expr::Binary(jsast::BinOp::Add, l, r) = &entries[1].1 else {
         return None;
     };
-    if !matches!(l.as_ref(), Expr::Member(o, p) if p == "off" && matches!(o.as_ref(), Expr::Ident(n) if n == base))
+    if !matches!(l.as_ref(), Expr::Member(o, p) if p == rcgjs_object::ptr::OFF && matches!(o.as_ref(), Expr::Ident(n) if n == base))
     {
         return None;
     }
     if entries.len() == 3
-        && (entries[2].0 != "sc"
-            || !matches!(&entries[2].1, Expr::Member(o, p) if p == "sc" && matches!(o.as_ref(), Expr::Ident(n) if n == base)))
+        && (entries[2].0 != rcgjs_object::ptr::SCALE
+            || !matches!(&entries[2].1, Expr::Member(o, p) if p == rcgjs_object::ptr::SCALE && matches!(o.as_ref(), Expr::Ident(n) if n == base)))
     {
         return None;
     }

@@ -176,7 +176,12 @@ impl<'a> JsCx<'a> {
     }
 
     /// Overwrites an indirect object value in place without rebinding any parent property/slot.
-    fn overwrite_indirect(&self, pointee: TypeId, target: Expr, value: Expr) -> Res<Vec<Stmt>> {
+    pub(super) fn overwrite_indirect(
+        &self,
+        pointee: TypeId,
+        target: Expr,
+        value: Expr,
+    ) -> Res<Vec<Stmt>> {
         let table = self.table;
         if table.is_zst(pointee) {
             return Ok(vec![jsast::expr_stmt(value)]);
@@ -231,9 +236,6 @@ impl<'a> JsCx<'a> {
                 jsast::rt_call(put_helper, vec![*base, *key, value])
             }
             Expr::Member(base, name) => {
-                if direct_plain_store {
-                    return Ok(vec![jsast::assign_stmt(Expr::Member(base, name), value)]);
-                }
                 jsast::rt_call(put_helper, vec![*base, jsast::string(name), value])
             }
             target => {
@@ -335,6 +337,9 @@ impl<'a> JsCx<'a> {
                     let Some(k) = value::key_name(self.interns, field.key) else {
                         return Err((target, value));
                     };
+                    if k == "__proto__" {
+                        return Err((target, value));
+                    }
                     keys.push(k);
                 }
                 if let Expr::Object(ref entries) = value {
@@ -384,6 +389,9 @@ impl<'a> JsCx<'a> {
                         let Some(k) = value::key_name(self.interns, field.key) else {
                             return Err((target, value));
                         };
+                        if k == "__proto__" {
+                            return Err((target, value));
+                        }
                         if !keys.contains(&k) {
                             keys.push(k);
                         }
@@ -734,13 +742,11 @@ impl<'a> JsCx<'a> {
                 && !heap.raw_alloc_reachable
                 && !heap.needs_box_tracking(self.table, pointee)
             {
-                let (setup, raw_ref) = self.reread(raw, &["ptr", "meta"]);
-                let ptr_slot = jsast::member(raw_ref.clone(), "ptr");
+                let (setup, raw_ref) = self.reread(raw, &[PTR, META]);
+                let ptr_slot = jsast::member(raw_ref.clone(), PTR);
                 let record = jsast::index(ptr::slot_buf(ptr_slot.clone()), ptr::slot_off(ptr_slot));
-                let fat = jsast::object_of(vec![
-                    ("ptr", record),
-                    ("meta", jsast::member(raw_ref, "meta")),
-                ]);
+                let fat =
+                    jsast::object_of(vec![(PTR, record), (META, jsast::member(raw_ref, META))]);
                 return sequenced(setup, fat);
             }
             return jsast::rt_call("tail_ref", vec![raw]);
@@ -1068,8 +1074,13 @@ impl<'a> JsCx<'a> {
         match value::kind(table, from) {
             Some(TypeKind::Str) => Ok(self.str_to_byte_ptr(value)),
             Some(TypeKind::Slice(element)) => self.cast_to_byte_ptr(*element, value, depth + 1),
-            Some(TypeKind::Array { element, .. }) => {
-                let unwindowed = jsast::rt_call("unwindow", vec![value]);
+            Some(TypeKind::Array { element, length }) => {
+                let args = if *length > 0 {
+                    vec![value, jsast::num(*length as f64)]
+                } else {
+                    vec![value]
+                };
+                let unwindowed = jsast::rt_call("unwindow", args);
                 self.cast_to_byte_ptr(*element, unwindowed, depth + 1)
             }
             _ => {
@@ -1467,6 +1478,14 @@ impl<'a> JsCx<'a> {
         let (Some(from_size), Some(to_size)) = (size_of(table, from), size_of(table, to)) else {
             return unsupported();
         };
+        let is_vec_alloc_hook = matches!(
+            self.items.get(&self.func.item).and_then(|e| e.standard),
+            Some(
+                rcgjs_object::jir::semantic::StandardOperation::TypedAlloc
+                    | rcgjs_object::jir::semantic::StandardOperation::TypedRealloc
+                    | rcgjs_object::jir::semantic::StandardOperation::TypedDealloc
+            )
+        );
         if let Some(TypeKind::Array { element, length }) = value::kind(table, to) {
             let to_element = *element;
             let element = table.peeled(to_element);
@@ -1474,7 +1493,11 @@ impl<'a> JsCx<'a> {
             let element_size = size_of(table, element);
             let keyed = if element == from {
                 Some(value.clone())
-            } else if from_size == 1 && !table.is_indirect(from) && element_size.is_some() {
+            } else if from_size == 1
+                && !table.is_indirect(from)
+                && element_size.is_some()
+                && !(is_vec_alloc_hook && !table.crosses_transparent_union(to_pointee))
+            {
                 let mut arguments = vec![
                     value.clone(),
                     jsast::num(element_size.unwrap_or(1) as f64),
@@ -1508,10 +1531,17 @@ impl<'a> JsCx<'a> {
                 return Ok(sequenced(setup, window));
             }
         }
-        if let Some(TypeKind::Array { element, .. }) = value::kind(table, from) {
-            let element = *element;
-            let unwindowed = jsast::rt_call("unwindow", vec![value]);
-            return self.cast_pointer_at(element, to, unwindowed, depth + 1);
+        if let Some(TypeKind::Array { element, length }) = value::kind(table, from) {
+            if !(is_vec_alloc_hook && !table.crosses_transparent_union(from_pointee)) {
+                let element = *element;
+                let args = if *length > 0 {
+                    vec![value, jsast::num(*length as f64)]
+                } else {
+                    vec![value]
+                };
+                let unwindowed = jsast::rt_call("unwindow", args);
+                return self.cast_pointer_at(element, to, unwindowed, depth + 1);
+            }
         }
         if from_size == 1 && to_size == 1 && !table.is_indirect(from) && !table.is_indirect(to) {
             if let Some(zero) = self.non_byte_zero_factory(to_pointee) {

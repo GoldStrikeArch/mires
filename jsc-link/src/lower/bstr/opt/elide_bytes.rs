@@ -30,15 +30,15 @@ fn match_var_index(expr: &Expr) -> Option<(&str, Option<&Expr>)> {
     let Expr::Index(obj, idx) = expr else {
         return None;
     };
-    let name = is_var_member(obj, "buf")?;
-    if is_var_member(idx, "off") == Some(name) {
+    let name = is_var_member(obj, rcgjs_object::ptr::BUF)?;
+    if is_var_member(idx, rcgjs_object::ptr::OFF) == Some(name) {
         return Some((name, None));
     }
     if let Expr::Binary(jsast::BinOp::Add, l, r) = idx.as_ref() {
-        if is_var_member(l, "off") == Some(name) {
+        if is_var_member(l, rcgjs_object::ptr::OFF) == Some(name) {
             return Some((name, Some(r.as_ref())));
         }
-        if is_var_member(r, "off") == Some(name) {
+        if is_var_member(r, rcgjs_object::ptr::OFF) == Some(name) {
             return Some((name, Some(l.as_ref())));
         }
     }
@@ -121,7 +121,7 @@ impl Visit for BytesScan<'_> {
                     return;
                 }
             }
-            if let Some(name) = is_var_member(expr, "len") {
+            if let Some(name) = is_var_member(expr, rcgjs_object::ptr::LEN) {
                 if self.locals.contains(name) {
                     self.usage.entry(name.to_owned()).or_default().safe_reads += 1;
                     return;
@@ -204,7 +204,7 @@ impl VisitMut for BytesRewriter<'_> {
                 return;
             }
         }
-        if let Some(name) = is_var_member(expr, "len") {
+        if let Some(name) = is_var_member(expr, rcgjs_object::ptr::LEN) {
             if self.0.contains(name) {
                 *expr = jsast::member(jsast::id(name.to_owned()), "length");
                 return;

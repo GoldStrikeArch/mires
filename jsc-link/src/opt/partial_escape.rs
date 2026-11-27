@@ -1860,10 +1860,10 @@ impl Analysis {
             ),
             OpKind::StoreThrough { ptr, v } => {
                 if let Some((node, field)) = view_field(*ptr) {
-                    single(
-                        *ptr,
-                        self.nodes[node].fields.get(field as usize) == Some(&shape_of(*v)),
-                    )
+                    let field_shape = self.nodes[node].fields.get(field as usize);
+                    let ok = field_shape == Some(&shape_of(*v))
+                        && field_shape.is_some_and(|s| !table.is_indirect(s.ty));
+                    single(*ptr, ok)
                 } else if let Some(&(target_node, None)) = self.view_of.get(ptr) {
                     if let Some(&src_node) = self.node_of.get(v) {
                         if self.nodes[target_node].enum_info.is_some()

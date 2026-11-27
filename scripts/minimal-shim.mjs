@@ -139,6 +139,7 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
   const elideBoxes = !needed.has("box") && !needed.has("tail_ref") && (!needed.has("tail_slice") || elideRc);
   const elideByteViews = !needed.has("_bv_enable");
   const elideElementViews = !needed.has("_element_view");
+  const elideFlattenViews = !needed.has("_flatten_view");
   const elideBlocks = !needed.has("_register");
   const errPrefixPattern = /new Error\((\s*)"rustc_codegen_js: /g;
   const rtRefPattern =
@@ -147,11 +148,12 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
     if (elideBoxes && name === "_boxes") return "const $rt__boxes = null;";
     if (elideByteViews && name === "_bv") return "const $rt__bv = null;";
     if (elideElementViews && name === "_element_view_of") return "const $rt__element_view_of = null;";
+    if (elideFlattenViews && name === "_flatten_view_of") return "const $rt__flatten_view_of = null;";
     if (elideRc && name === "tail_slice") {
-      return "let $rt_tail_slice = (record, key, len) => ({ buf: record[key], off: 0, len });";
+      return "let $rt_tail_slice = (record, key, len) => ({ $b: record[key], $o: 0, $l: len });";
     }
     if (elideRc && name === "tail_slice_raw") {
-      return "let $rt_tail_slice_raw = (p, key) => ({ buf: p.ptr.buf[p.ptr.off][key], off: 0, len: p.meta });";
+      return "let $rt_tail_slice_raw = (p, key) => ({ $b: p.$p.$b[p.$p.$o][key], $o: 0, $l: p.$m });";
     }
     if (elideBlocks && name === "_blocks") return "const $rt__blocks = null;";
     if (elideBlocks && name === "_blk_get") return "let $rt__blk_get = () => undefined;";

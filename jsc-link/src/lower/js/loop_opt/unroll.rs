@@ -1012,7 +1012,9 @@ fn is_known_smi_bound_expr(expr: &Expr, smi_bounds: &HashSet<String>) -> bool {
         return true;
     }
     match expr {
-        Expr::Member(_, prop) => prop == "length" || prop == "len",
+        Expr::Member(_, prop) => {
+            prop == "length" || prop == "len" || prop == rcgjs_object::ptr::LEN
+        }
         Expr::Ident(id) => smi_bounds.contains(id),
         Expr::Binary(BinOp::Sub, l, r) => {
             is_known_smi_bound_expr(l, smi_bounds) && exact_u32(r).is_some()

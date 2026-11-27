@@ -578,7 +578,7 @@ fn rewrites_str_case_helpers_and_catches_leftovers() {
 
 #[test]
 fn folds_bstr_slice_roundtrip_and_elides_readonly_bstr_bytes() {
-    // 1. `($t0 = __rt.sfp(__rt.bstr_bytes(s), b), __rt.bstr_of($t0.buf, $t0.off, $t0.len))` -> `s.slice(0, b)`.
+    // 1. `($t0 = __rt.sfp(__rt.bstr_bytes(s), b), __rt.bstr_of($t0.$b, $t0.$o, $t0.$l))` -> `s.slice(0, b)`.
     let mut roundtrip = jsast::ret(Expr::Seq(vec![
         Expr::Assign(
             Box::new(jsast::id("$t0")),
@@ -590,9 +590,9 @@ fn folds_bstr_slice_roundtrip_and_elides_readonly_bstr_bytes() {
         rt(
             "bytes_str",
             vec![
-                Expr::Member(Box::new(jsast::id("$t0")), "buf".to_owned()),
-                Expr::Member(Box::new(jsast::id("$t0")), "off".to_owned()),
-                Expr::Member(Box::new(jsast::id("$t0")), "len".to_owned()),
+                Expr::Member(Box::new(jsast::id("$t0")), "$b".to_owned()),
+                Expr::Member(Box::new(jsast::id("$t0")), "$o".to_owned()),
+                Expr::Member(Box::new(jsast::id("$t0")), "$l".to_owned()),
             ],
         ),
     ]));
@@ -601,15 +601,15 @@ fn folds_bstr_slice_roundtrip_and_elides_readonly_bstr_bytes() {
     assert!(printed.contains("s.slice(0, b)"), "{printed}");
     assert!(!printed.contains("bstr_bytes"), "{printed}");
 
-    // 2. Read-only `let bv; bv = __rt.bstr_bytes(s); return bv.buf[bv.off + i];` -> `bv = s; return bv.charCodeAt(i);`.
+    // 2. Read-only `let bv; bv = __rt.bstr_bytes(s); return bv.$b[bv.$o + i];` -> `bv = s; return bv.charCodeAt(i);`.
     let mut body = vec![
         Stmt::Let("bv".to_owned(), None),
         jsast::assign_stmt(jsast::id("bv"), rt("bstr_bytes", vec![jsast::id("s")])),
         Stmt::Return(Some(Expr::Index(
-            Box::new(Expr::Member(Box::new(jsast::id("bv")), "buf".to_owned())),
+            Box::new(Expr::Member(Box::new(jsast::id("bv")), "$b".to_owned())),
             Box::new(Expr::Binary(
                 jsast::BinOp::Add,
-                Box::new(Expr::Member(Box::new(jsast::id("bv")), "off".to_owned())),
+                Box::new(Expr::Member(Box::new(jsast::id("bv")), "$o".to_owned())),
                 Box::new(jsast::id("i")),
             )),
         ))),

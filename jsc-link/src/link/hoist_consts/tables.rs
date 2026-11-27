@@ -98,7 +98,8 @@ fn is_pure_const_slice_lit(expr: &Expr, allow_bigint: bool) -> Option<bool> {
         return None;
     }
     let ((k0, buf), (k1, off), (k2, len)) = (&entries[0], &entries[1], &entries[2]);
-    if k0 != "buf" || k1 != "off" || k2 != "len" {
+    if k0 != rcgjs_object::ptr::BUF || k1 != rcgjs_object::ptr::OFF || k2 != rcgjs_object::ptr::LEN
+    {
         return None;
     }
     if !matches!(off, Expr::Num(_) | Expr::RawNum(_))
@@ -177,17 +178,20 @@ fn is_derived_slice_expr(expr: &Expr, slice_aliases: &BTreeSet<String>) -> bool 
         Expr::Ident(name) => slice_aliases.contains(name),
         Expr::Object(entries) if entries.len() == 2 || entries.len() == 3 => {
             let has_buf = entries.iter().any(|(k, v)| {
-                k == "buf"
+                k == rcgjs_object::ptr::BUF
                     && matches!(
                         v,
                         Expr::Member(base, prop)
-                            if prop == "buf"
+                            if prop == rcgjs_object::ptr::BUF
                                 && matches!(base.as_ref(), Expr::Ident(n) if slice_aliases.contains(n))
                     )
             });
-            let keys_ok = entries
-                .iter()
-                .all(|(k, _)| matches!(k.as_str(), "buf" | "off" | "len"));
+            let keys_ok = entries.iter().all(|(k, _)| {
+                matches!(
+                    k.as_str(),
+                    rcgjs_object::ptr::BUF | rcgjs_object::ptr::OFF | rcgjs_object::ptr::LEN
+                )
+            });
             has_buf && keys_ok
         }
         _ => false,
@@ -212,7 +216,7 @@ fn elem_read_index<'a>(
         ReadOnlyKind::ConstSlice => matches!(
             obj.as_ref(),
             Expr::Member(base, prop)
-                if prop == "buf"
+                if prop == rcgjs_object::ptr::BUF
                     && matches!(base.as_ref(), Expr::Ident(n) if slice_aliases.contains(n))
         ),
     };
@@ -445,7 +449,7 @@ impl ReadOnlyUseVerifier<'_> {
     fn check_derived_slice(&mut self, expr: &Expr) {
         if let Expr::Object(entries) = expr {
             for (k, v) in entries {
-                if k == "buf" {
+                if k == rcgjs_object::ptr::BUF {
                     self.reads += 1;
                 } else {
                     self.expr(v, false);
@@ -553,7 +557,12 @@ impl ReadOnlyUseVerifier<'_> {
                     if matches!(self.kind, ReadOnlyKind::ConstSlice)
                         && self.slice_aliases.contains(name)
                     {
-                        if !is_lhs && matches!(prop.as_str(), "off" | "len") {
+                        if !is_lhs
+                            && matches!(
+                                prop.as_str(),
+                                rcgjs_object::ptr::OFF | rcgjs_object::ptr::LEN
+                            )
+                        {
                             self.reads += 1;
                             return;
                         }

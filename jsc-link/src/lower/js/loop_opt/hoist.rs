@@ -464,8 +464,8 @@ fn find_hoistable_props(
 
 fn slice_prop_prefix(prop: &str) -> &'static str {
     match prop {
-        "buf" => "$hb_",
-        "off" => "$ho_",
+        "buf" | rcgjs_object::ptr::BUF => "$hb_",
+        "off" | rcgjs_object::ptr::OFF => "$ho_",
         _ => "$hl_",
     }
 }
@@ -582,7 +582,15 @@ fn hoist_loop_props(
 }
 
 fn is_slice_prop(prop: &str) -> bool {
-    matches!(prop, "buf" | "off" | "len")
+    matches!(
+        prop,
+        "buf"
+            | "off"
+            | "len"
+            | rcgjs_object::ptr::BUF
+            | rcgjs_object::ptr::OFF
+            | rcgjs_object::ptr::LEN
+    )
 }
 
 fn is_guaranteed_non_null_rhs(expr: &Expr) -> bool {

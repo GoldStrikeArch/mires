@@ -335,8 +335,8 @@ impl JsCx<'_> {
                     jsast::rt_call(
                         "bstr_of",
                         vec![
-                            jsast::member(ptr.clone(), "buf"),
-                            jsast::member(ptr, "off"),
+                            jsast::member(ptr.clone(), rcgjs_object::ptr::BUF),
+                            jsast::member(ptr, rcgjs_object::ptr::OFF),
                             len,
                         ],
                     ),

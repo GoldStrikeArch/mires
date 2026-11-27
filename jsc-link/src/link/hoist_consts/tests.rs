@@ -1048,19 +1048,19 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
     let make_slice = || {
         Expr::Object(vec![
             (
-                "buf".to_owned(),
+                "$b".to_owned(),
                 Expr::Array(
                     (0..4)
                         .map(|i| Expr::Array(vec![Expr::Num(i as f64), Expr::Num((i * 10) as f64)]))
                         .collect(),
                 ),
             ),
-            ("off".to_owned(), Expr::Num(0.0)),
-            ("len".to_owned(), Expr::Num(4.0)),
+            ("$o".to_owned(), Expr::Num(0.0)),
+            ("$l".to_owned(), Expr::Num(4.0)),
         ])
     };
 
-    // Positive: `s = { buf: [[0,0], ...], off: 0, len: 4 }; return s.buf[s.off + i][0];`
+    // Positive: `s = { $b: [[0,0], ...], $o: 0, $l: 4 }; return s.$b[s.$o + i][0];`
     let fn_ro = jsast::function(
         "read_iota",
         vec!["i".to_owned()],
@@ -1074,13 +1074,13 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
                 Box::new(Expr::Index(
                     Box::new(Expr::Member(
                         Box::new(Expr::Ident("s".to_owned())),
-                        "buf".to_owned(),
+                        "$b".to_owned(),
                     )),
                     Box::new(Expr::Binary(
                         BinOp::Add,
                         Box::new(Expr::Member(
                             Box::new(Expr::Ident("s".to_owned())),
-                            "off".to_owned(),
+                            "$o".to_owned(),
                         )),
                         Box::new(Expr::Ident("i".to_owned())),
                     )),
@@ -1090,7 +1090,7 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
         ],
     );
 
-    // Negative: mutates `s.buf[0][0] = 99` -> MUST NOT hoist!
+    // Negative: mutates `s.$b[0][0] = 99` -> MUST NOT hoist!
     let fn_mut = jsast::function(
         "write_iota",
         vec![],
@@ -1105,7 +1105,7 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
                     Box::new(Expr::Index(
                         Box::new(Expr::Member(
                             Box::new(Expr::Ident("s".to_owned())),
-                            "buf".to_owned(),
+                            "$b".to_owned(),
                         )),
                         Box::new(Expr::Num(0.0)),
                     )),
@@ -1115,7 +1115,7 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
             )),
             Stmt::Return(Some(Expr::Member(
                 Box::new(Expr::Ident("s".to_owned())),
-                "len".to_owned(),
+                "$l".to_owned(),
             ))),
         ],
     );
@@ -1134,7 +1134,7 @@ fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
         "read-only nested const slice should hoist:\nconsts={consts:?}\nro={ro_js}"
     );
     assert!(
-        !mut_js.contains("$hc_") && mut_js.contains("buf:"),
+        !mut_js.contains("$hc_") && mut_js.contains("$b:"),
         "mutated nested slice must NOT hoist:\nmut={mut_js}"
     );
 }

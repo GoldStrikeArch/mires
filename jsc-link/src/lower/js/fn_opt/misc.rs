@@ -958,8 +958,8 @@ fn is_slot_deref_of(expr: &Expr, tmp: &str) -> bool {
     matches!(
         (buf.as_ref(), off.as_ref()),
         (Expr::Member(b_obj, b_prop), Expr::Member(o_obj, o_prop))
-            if b_prop == "buf"
-                && o_prop == "off"
+            if b_prop == rcgjs_object::ptr::BUF
+                && o_prop == rcgjs_object::ptr::OFF
                 && matches!(b_obj.as_ref(), Expr::Ident(a) if a == tmp)
                 && matches!(o_obj.as_ref(), Expr::Ident(b) if b == tmp)
     )
@@ -1331,11 +1331,11 @@ mod tests {
             ),
             jsast::assign_stmt(
                 jsast::id("o"),
-                jsast::object_of(vec![("buf", jsast::id("m")), ("off", jsast::num(0.0))]),
+                jsast::object_of(vec![("$b", jsast::id("m")), ("$o", jsast::num(0.0))]),
             ),
             jsast::assign_stmt(
                 jsast::id("p"),
-                jsast::object_of(vec![("buf", jsast::id("k")), ("off", jsast::num(0.0))]),
+                jsast::object_of(vec![("$b", jsast::id("k")), ("$o", jsast::num(0.0))]),
             ),
             Stmt::ExprStmt(jsast::cond(jsast::id("j"), jsast::id("o"), jsast::id("p"))),
             jsast::assign_stmt(
@@ -1355,8 +1355,8 @@ mod tests {
                 jsast::id("s"),
             ),
             Stmt::Return(Some(jsast::object_of(vec![
-                ("buf", jsast::id("esc")),
-                ("off", jsast::num(0.0)),
+                ("$b", jsast::id("esc")),
+                ("$o", jsast::num(0.0)),
             ]))),
         ];
         eliminate_dead_local_writes(&mut body, &local_names);
@@ -1386,8 +1386,8 @@ mod tests {
                 )),
             ),
             Expr::Index(
-                Box::new(jsast::member(jsast::id("f"), "buf")),
-                Box::new(jsast::member(jsast::id("f"), "off")),
+                Box::new(jsast::member(jsast::id("f"), "$b")),
+                Box::new(jsast::member(jsast::id("f"), "$o")),
             ),
         ]);
         let retained = Expr::Seq(vec![
@@ -1396,8 +1396,8 @@ mod tests {
                 Box::new(jsast::rt_call("box", vec![jsast::id("other")])),
             ),
             Expr::Index(
-                Box::new(jsast::member(jsast::id("kept"), "buf")),
-                Box::new(jsast::member(jsast::id("kept"), "off")),
+                Box::new(jsast::member(jsast::id("kept"), "$b")),
+                Box::new(jsast::member(jsast::id("kept"), "$o")),
             ),
         ]);
         let mut body = vec![

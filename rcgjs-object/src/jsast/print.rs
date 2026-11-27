@@ -535,7 +535,12 @@ impl Printer {
             if i > 0 {
                 self.separator();
             }
-            if is_plain_ident(key) {
+            if key == "__proto__" {
+                // Bare `__proto__:` or quoted `"__proto__":` in an object literal sets
+                // `[[Prototype]]` in JS instead of defining an own data property; computed
+                // property syntax creates a normal own property in ES2015+.
+                self.out.push_str("[\"__proto__\"]");
+            } else if is_plain_ident(key) {
                 self.out.push_str(key);
             } else {
                 write_js_string(&mut self.out, key);

@@ -116,6 +116,9 @@ pub struct Walk {
     /// Whether the final projection landed on a `heap.smi_u32_fields` struct field stored as
     /// signed `Int32`.
     pub smi_u32: bool,
+    /// Whether the last storage-selecting step was a non-transparent `Proj::Field` (struct, tuple,
+    /// or enum field, as opposed to an array/slice element).
+    pub field_slot: bool,
 }
 
 /// Mutable walk cursor threaded across projection steps in [`JsCx::walk_place`].
@@ -127,6 +130,7 @@ struct WalkState {
     carry: DerefCarry,
     object: bool,
     smi_u32: bool,
+    field_slot: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -156,6 +160,7 @@ impl<'a> JsCx<'a> {
             carry: DerefCarry::None,
             object,
             smi_u32: false,
+            field_slot: false,
         };
 
         for (step, proj) in path.iter().enumerate() {
@@ -164,6 +169,7 @@ impl<'a> JsCx<'a> {
             let carried = std::mem::replace(&mut state.carry, DerefCarry::None);
             // A downcast and a transparent field are the same place; every other step leaves it.
             state.object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
+            state.field_slot &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
             match proj {
                 Proj::Deref => self.step_deref(root, step, &mut state)?,
@@ -203,6 +209,7 @@ impl<'a> JsCx<'a> {
             object: state.object,
             str_kind,
             smi_u32: state.smi_u32,
+            field_slot: state.field_slot,
         })
     }
 
@@ -305,6 +312,7 @@ impl<'a> JsCx<'a> {
             object: false,
             str_kind: StrPlaceKind::None,
             smi_u32: false,
+            field_slot: false,
         }))
     }
 
@@ -472,10 +480,12 @@ impl<'a> JsCx<'a> {
             }
             state.ty = field_ty;
             state.variant = None;
+            state.field_slot = false;
             return Ok(());
         }
         if matches!(state.current, JsPlace::Unit(_)) {
             // Still no storage, and still the same address.
+            state.field_slot = false;
         } else if table.is_zst(field_ty)
             && matches!(
                 table.enum_repr(table.peeled(state.ty)),
@@ -487,6 +497,7 @@ impl<'a> JsCx<'a> {
             )
         {
             state.current = JsPlace::Unit(jsast::undefined());
+            state.field_slot = false;
         } else if matches!(key, FieldKey::Transparent) {
             state.carry = carried;
         } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
@@ -496,9 +507,11 @@ impl<'a> JsCx<'a> {
             };
             let base = self.read_place(&state.current);
             state.current = self.tail_place(base, key, field_ty, tail, raw_tail)?;
+            state.field_slot = false;
         } else {
             let base = self.read_place(&state.current);
             state.current = JsPlace::Var(field_expr(self.interns, base, key));
+            state.field_slot = true;
         }
         state.ty = field_ty;
         state.variant = None;
@@ -705,13 +718,13 @@ impl<'a> JsCx<'a> {
         let heap = self.heap();
         if heap.typed_heap_enabled && !heap.raw_alloc_reachable {
             if let Some(raw_ptr) = raw_tail {
-                let (setup, rp) = self.reread(raw_ptr, &["ptr", "meta"]);
-                let slot = jsast::member(rp.clone(), "ptr");
+                let (setup, rp) = self.reread(raw_ptr, &[ptr::PTR, ptr::META]);
+                let slot = jsast::member(rp.clone(), ptr::PTR);
                 let rec = jsast::index(ptr::slot_buf(slot.clone()), ptr::slot_off(slot));
                 let slice = ptr::fat_slice(
                     value::field_expr(self.interns, rec, key),
                     jsast::num(0),
-                    jsast::member(rp, "meta"),
+                    jsast::member(rp, ptr::META),
                 );
                 return Ok(JsPlace::Deref(super::ptr::sequenced(setup, slice)));
             }
@@ -898,6 +911,11 @@ impl<'a> JsCx<'a> {
     /// The statements that write `value` to a place of type `ty` (`place.rs::write_place`).
     pub fn write_place(&self, place: JsPlace, ty: TypeId, value: Expr) -> Res<Vec<Stmt>> {
         match place {
+            JsPlace::Var(Expr::Member(obj, key)) if key == "__proto__" => {
+                Ok(vec![jsast::expr_stmt(value::define_proto_prop(
+                    *obj, value,
+                ))])
+            }
             JsPlace::Var(target) => {
                 if !is_lvalue(&target) {
                     return Err(decline(
@@ -945,6 +963,21 @@ impl<'a> JsCx<'a> {
                 if indirect {
                     stmts.extend(self.write_indirect(ty, target, value)?);
                     Ok(stmts)
+                } else if let Expr::Member(obj, key) = target {
+                    if key == "__proto__" {
+                        stmts.push(jsast::expr_stmt(value::define_proto_prop(*obj, value)));
+                        Ok(stmts)
+                    } else {
+                        let target = Expr::Member(obj, key);
+                        if !is_lvalue(&target) {
+                            return Err(decline(
+                                OpClass::Place,
+                                "a write to a place whose expression is not assignable (an inlined value used as storage)",
+                            ));
+                        }
+                        stmts.push(jsast::assign_stmt(target, value));
+                        Ok(stmts)
+                    }
                 } else {
                     if !is_lvalue(&target) {
                         return Err(decline(
@@ -1146,6 +1179,17 @@ impl<'a> JsCx<'a> {
         // An aggregate held as a value: its box, whatever expression the value was read with.
         if walk.object {
             return Ok(jsast::rt_call("box", vec![self.read_place(&walk.place)]));
+        }
+        if walk.field_slot && self.table.is_indirect(walk.ty) {
+            match walk.place {
+                JsPlace::Var(Expr::Member(base, name)) => {
+                    return Ok(ptr::owned_field_slot(*base, jsast::string(name)));
+                }
+                JsPlace::Var(Expr::Index(base, key)) => {
+                    return Ok(ptr::owned_field_slot(*base, *key));
+                }
+                place => return self.slot_of(place, walk.ty),
+            }
         }
         self.slot_of(walk.place, walk.ty)
     }

@@ -493,6 +493,13 @@ fn is_fixed_blacklisted_prop(name: &str) -> bool {
             | "sc"
             | "ptr"
             | "meta"
+            | rcgjs_object::ptr::BUF
+            | rcgjs_object::ptr::OFF
+            | rcgjs_object::ptr::LEN
+            | rcgjs_object::ptr::SCALE
+            | rcgjs_object::ptr::WINDOW
+            | rcgjs_object::ptr::PTR
+            | rcgjs_object::ptr::META
     ) || name.ends_with("$lo")
         || name.ends_with("$hi")
 }

@@ -107,11 +107,11 @@ pub fn lower(
             if let Expr::Object(ref fields) = candidate {
                 let buf = fields
                     .iter()
-                    .find(|(k, _)| k == "buf")
+                    .find(|(k, _)| k == ptr::BUF)
                     .map(|(_, v)| v.clone());
                 let off = fields
                     .iter()
-                    .find(|(k, _)| k == "off")
+                    .find(|(k, _)| k == ptr::OFF)
                     .map(|(_, v)| v.clone());
                 match (buf, off) {
                     (Some(b), Some(o)) if fields.len() == 2 => Some((b, o)),
@@ -1803,8 +1803,8 @@ impl Intrinsic<'_, '_> {
                     body.push(bind);
                     id
                 };
-                let (b_bind, b) = cx.temp(jsast::member(slot.clone(), "buf"));
-                let (o_bind, o) = cx.temp(jsast::member(slot.clone(), "off"));
+                let (b_bind, b) = cx.temp(jsast::member(slot.clone(), ptr::BUF));
+                let (o_bind, o) = cx.temp(jsast::member(slot.clone(), ptr::OFF));
                 body.push(b_bind);
                 body.push(o_bind);
                 (b, o, slot)
@@ -2263,7 +2263,7 @@ fn unwrap_safe_slot(expr: &Expr) -> Option<(Expr, Expr)> {
             if then_fields.len() != 2
                 || !then_fields
                     .iter()
-                    .any(|(k, v)| k == "off" && matches!(v, Expr::Num(_) | Expr::RawNum(_)))
+                    .any(|(k, v)| k == ptr::OFF && matches!(v, Expr::Num(_) | Expr::RawNum(_)))
             {
                 return None;
             }
@@ -2279,11 +2279,11 @@ fn unwrap_safe_slot(expr: &Expr) -> Option<(Expr, Expr)> {
     }
     let buf = fields
         .iter()
-        .find(|(k, _)| k == "buf")
+        .find(|(k, _)| k == ptr::BUF)
         .map(|(_, v)| v.clone())?;
     let off = fields
         .iter()
-        .find(|(k, _)| k == "off")
+        .find(|(k, _)| k == ptr::OFF)
         .map(|(_, v)| v.clone())?;
     Some((buf, off))
 }

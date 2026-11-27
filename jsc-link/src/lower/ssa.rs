@@ -179,6 +179,13 @@ struct Analysis {
     /// The locals that are cells before any demotion, with whether each is boxed.
     cells: BTreeSet<LocalId>,
     boxed: BTreeSet<LocalId>,
+    /// Indirect `(local, variant, field)` places that are both borrowed (or have a sub-place
+    /// borrowed, or their enclosing local borrowed) and overwritten as a single field: must
+    /// overwrite in place instead of rebinding the JS property so synthetic addresses stay stable.
+    identity_preserved_fields: BTreeSet<(LocalId, Option<u32>, u32)>,
+    /// Indirect bare locals that are borrowed and assigned more than once: subsequent writes
+    /// overwrite in place so synthetic addresses stay stable.
+    identity_preserved_locals: BTreeSet<LocalId>,
     /// Where the locals assembled field by field need a fresh container.
     assembly: super::assembly::Assembly,
     /// `(pointee, mutable)` to a reference type in the table, for synthetic views. Built on first
@@ -190,10 +197,31 @@ struct Analysis {
     copy_nonoverlapping: std::cell::OnceCell<Option<StrId>>,
 }
 
+/// First non-`Deref` field projection `(downcast, field, field_ty)` on `place`, if any.
+fn leading_field(place: &Place) -> Option<(Option<u32>, u32, TypeId)> {
+    let mut downcast = None;
+    for projection in &place.projection {
+        match projection {
+            Projection::Downcast { variant } => downcast = Some(*variant),
+            Projection::OpaqueCast(_) | Projection::UnwrapUnsafeBinder(_) => {}
+            Projection::Field { field, ty } => return Some((downcast, *field, *ty)),
+            _ => return None,
+        }
+    }
+    None
+}
+
 impl Analysis {
     fn of(body: &Body, table: &TypeTable, interns: &Interns) -> Analysis {
         let mut uses = vec![LocalUse::default(); body.locals.len()];
-        let record_place = |uses: &mut Vec<LocalUse>, place: &Place, borrow: bool, write: bool| {
+        let mut borrowed_indirect_locals: BTreeSet<LocalId> = BTreeSet::new();
+        let mut borrowed_indirect_fields: BTreeSet<(LocalId, Option<u32>, u32)> = BTreeSet::new();
+        let mut written_single_indirect_fields: BTreeSet<(LocalId, Option<u32>, u32)> =
+            BTreeSet::new();
+        let mut record_place = |uses: &mut Vec<LocalUse>,
+                                place: &Place,
+                                borrow: bool,
+                                write: bool| {
             let Some(slot) = uses.get_mut(place.local.0 as usize) else {
                 return;
             };
@@ -202,10 +230,28 @@ impl Analysis {
                     slot.defs += 1;
                 } else if !matches!(place.projection.first(), Some(Projection::Deref)) {
                     slot.proj_defs += 1;
+                    let (downcast, field) = single_field(&place.projection);
+                    if let Some(field) = field {
+                        if table.is_indirect(place.ty) {
+                            written_single_indirect_fields.insert((place.local, downcast, field));
+                        }
+                    }
                 }
             }
-            if borrow && names_the_local(place, body, table) {
-                slot.bare_borrowed = true;
+            if borrow {
+                if names_the_local(place, body, table) {
+                    slot.bare_borrowed = true;
+                    if let Some(local) = body.locals.get(place.local.0 as usize) {
+                        if table.is_indirect(local.ty) {
+                            borrowed_indirect_locals.insert(place.local);
+                        }
+                    }
+                }
+                if let Some((downcast, field, field_ty)) = leading_field(place) {
+                    if table.is_indirect(field_ty) {
+                        borrowed_indirect_fields.insert((place.local, downcast, field));
+                    }
+                }
             }
         };
         for block in &body.blocks {
@@ -243,6 +289,34 @@ impl Analysis {
                 _ => {}
             }
         }
+        let identity_preserved_fields: BTreeSet<(LocalId, Option<u32>, u32)> =
+            written_single_indirect_fields
+                .into_iter()
+                .filter(|key| {
+                    borrowed_indirect_fields.contains(key)
+                        || borrowed_indirect_locals.contains(&key.0)
+                })
+                .collect();
+        let identity_preserved_locals: BTreeSet<LocalId> = borrowed_indirect_locals
+            .into_iter()
+            .filter(|local| {
+                let Some(decl) = body.locals.get(local.0 as usize) else {
+                    return false;
+                };
+                uses[local.0 as usize].defs > 1
+                    && !table.is_zst(decl.ty)
+                    && matches!(
+                        table.get(table.peeled(decl.ty)).map(|d| &d.kind),
+                        Some(
+                            TypeKind::Adt {
+                                form: NominalForm::Struct,
+                                ..
+                            } | TypeKind::Tuple(_)
+                                | TypeKind::Array { .. }
+                        )
+                    )
+            })
+            .collect();
         let mut cells = BTreeSet::new();
         let mut boxed = BTreeSet::new();
         // A local assembled in place needs its container made at points SSA values cannot
@@ -268,6 +342,8 @@ impl Analysis {
             uses,
             cells,
             boxed,
+            identity_preserved_fields,
+            identity_preserved_locals,
             assembly,
             references: std::cell::OnceCell::new(),
             location_ty,
@@ -481,6 +557,8 @@ struct Builder<'a> {
     /// The values that hold a whole local's definition, with the local (for `ValueDef::origin`):
     /// the first local a value defined, or the first with a user name.
     local_of_value: BTreeMap<ValueId, LocalId>,
+    /// Values created by `OpKind::Uninit` (may lower to `undefined`, unsafe to overwrite in place).
+    uninit_values: BTreeSet<ValueId>,
 }
 
 impl<'a> Builder<'a> {
@@ -566,6 +644,7 @@ impl<'a> Builder<'a> {
             origin: NO_ORIGIN,
             statement_base,
             local_of_value: BTreeMap::new(),
+            uninit_values: BTreeSet::new(),
         })
     }
 
@@ -606,8 +685,13 @@ impl<'a> Builder<'a> {
 
     /// Pushes an op defining a value of `ty` in the current block.
     fn op(&mut self, kind: OpKind, ty: TypeId) -> ValueId {
+        let is_unit = matches!(kind, OpKind::Const(ConstTree::Unit));
         let block = self.rblock();
-        self.fb.op(block, kind, ty, self.origin)
+        let v = self.fb.op(block, kind, ty, self.origin);
+        if is_unit {
+            self.uninit_values.insert(v);
+        }
+        v
     }
 
     fn effect(&mut self, kind: OpKind) {
@@ -1018,7 +1102,38 @@ impl<'a> Builder<'a> {
     fn write_bare_local(&mut self, local: LocalId, value: ValueId) {
         match self.kinds[local.0 as usize] {
             LocalKind::Cell(cell) => self.effect(OpKind::CellStore { cell, v: value }),
-            LocalKind::Value => self.write_local(local, self.block, value),
+            LocalKind::Value => {
+                if self.analysis.identity_preserved_locals.contains(&local)
+                    && !self.uninit_values.contains(&value)
+                {
+                    let prev = if self.sealed[self.block as usize] {
+                        self.read_variable(local, self.block)
+                    } else {
+                        self.current_def[local.0 as usize][self.block as usize]
+                    };
+                    if let Some(prev) = prev {
+                        if !self.uninit_values.contains(&prev) {
+                            let ty = self.local_ty(local);
+                            if let Ok(view_ty) = self.view_ty(ty, true) {
+                                let view = self.op(
+                                    OpKind::BorrowView {
+                                        root: Root::Value(prev),
+                                        path: Vec::new(),
+                                        mutable: true,
+                                    },
+                                    view_ty,
+                                );
+                                self.effect(OpKind::StoreThrough {
+                                    ptr: view,
+                                    v: value,
+                                });
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.write_local(local, self.block, value);
+            }
         }
     }
 
@@ -1243,14 +1358,59 @@ impl<'a> Builder<'a> {
         }
         let (downcast, field) = single_field(&place.projection);
         if let (true, Some(field)) = (value_root, field) {
-            let base = self.read_local(place.local);
-            self.effect(OpKind::SetField {
-                base,
-                variant: downcast,
-                field,
-                v: value,
-            });
-            return Ok(());
+            let preserve_identity = self.table.is_indirect(place.ty)
+                && self.analysis.identity_preserved_fields.contains(&(
+                    place.local,
+                    downcast,
+                    field,
+                ));
+            if !preserve_identity {
+                let base = self.read_local(place.local);
+                self.effect(OpKind::SetField {
+                    base,
+                    variant: downcast,
+                    field,
+                    v: value,
+                });
+                return Ok(());
+            }
+            if downcast.is_none()
+                && !self.table.crosses_transparent_union(place.ty)
+                && matches!(
+                    self.table.get(self.table.peeled(local_ty)).map(|d| &d.kind),
+                    Some(
+                        TypeKind::Adt {
+                            form: NominalForm::Struct,
+                            ..
+                        } | TypeKind::Tuple(_)
+                    )
+                )
+            {
+                let base = self.read_local(place.local);
+                let cur = self.op(
+                    OpKind::Field {
+                        base,
+                        variant: None,
+                        field,
+                    },
+                    place.ty,
+                );
+                if let Ok(view_ty) = self.view_ty(place.ty, true) {
+                    let view = self.op(
+                        OpKind::BorrowView {
+                            root: Root::Value(cur),
+                            path: Vec::new(),
+                            mutable: true,
+                        },
+                        view_ty,
+                    );
+                    self.effect(OpKind::StoreThrough {
+                        ptr: view,
+                        v: value,
+                    });
+                    return Ok(());
+                }
+            }
         }
         let root = self.root_of(place.local);
         let path = self.full_path(place);
@@ -1377,6 +1537,23 @@ impl<'a> Builder<'a> {
             }
             OperandKind::Move(place) => {
                 let value = self.read_place(place)?;
+                let preserved = if place.projection.is_empty() {
+                    self.analysis
+                        .identity_preserved_locals
+                        .contains(&place.local)
+                } else {
+                    let (downcast, field) = single_field(&place.projection);
+                    field.is_some_and(|field| {
+                        self.analysis.identity_preserved_fields.contains(&(
+                            place.local,
+                            downcast,
+                            field,
+                        ))
+                    })
+                };
+                if preserved && self.table.needs_clone(operand.ty) {
+                    return Ok(self.op(OpKind::Copy(value), operand.ty));
+                }
                 let bare_value = place.projection.is_empty()
                     && matches!(self.kinds[place.local.0 as usize], LocalKind::Value);
                 let movable = self.moves

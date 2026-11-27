@@ -7,19 +7,23 @@
 use crate::jsast::{self, Expr};
 
 /// The buffer half of a slot.
-pub const BUF: &str = "buf";
+pub const BUF: &str = "$b";
 /// The offset half of a slot, counted in units of the pointee type.
-pub const OFF: &str = "off";
+pub const OFF: &str = "$o";
 /// The element size a scaled slot's byte offset is measured against.
-pub const SCALE: &str = "sc";
+pub const SCALE: &str = "$s";
 /// The element count a window slot spans.
-pub const WINDOW: &str = "w";
+pub const WINDOW: &str = "$w";
 /// The length of a fat slice pointer.
-pub const LEN: &str = "len";
+pub const LEN: &str = "$l";
 /// The data half of a fat trait object pointer.
-pub const PTR: &str = "ptr";
+pub const PTR: &str = "$p";
 /// The vtable half of a fat trait object pointer.
-pub const META: &str = "meta";
+pub const META: &str = "$m";
+/// Marker on a struct/tuple/enum field slot whose pointee is an owned indirect aggregate (not a
+/// reference field), allowing `ptr_eq` and `addr` to reconcile `&raw const s.field` with
+/// `&s.field as *const Field` (`__rt.box(s.field)`) while keeping the slot live across overwrites.
+pub const FIELD_OWNED: &str = "$f";
 
 // ---------------------------------------------------------------------------------------------
 // Building and taking apart the records
@@ -28,6 +32,11 @@ pub const META: &str = "meta";
 /// `{ buf, off }`: a pointer to `buf[off]`.
 pub fn slot(buf: Expr, off: Expr) -> Expr {
     jsast::object_of(vec![(BUF, buf), (OFF, off)])
+}
+
+/// `{ buf, off, $f: 1 }`: a raw pointer to an owned indirect struct/tuple/enum field `buf[off]`.
+pub fn owned_field_slot(buf: Expr, off: Expr) -> Expr {
+    jsast::object_of(vec![(BUF, buf), (OFF, off), (FIELD_OWNED, jsast::num(1))])
 }
 
 /// `{ buf, off, sc }`: a byte offset view of a buffer whose elements are `scale` bytes wide.

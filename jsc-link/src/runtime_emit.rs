@@ -386,6 +386,7 @@ fn render_shim(
         && (!needed.contains("tail_slice") || elide_rc);
     let elide_byte_views = !needed.contains("_bv_enable");
     let elide_element_views = !needed.contains("_element_view");
+    let elide_flatten_views = !needed.contains("_flatten_view");
     let elide_blocks = !needed.contains("_register");
 
     let mut statements = Vec::with_capacity(names.len());
@@ -396,12 +397,15 @@ fn render_shim(
             "_element_view_of" if elide_element_views => {
                 "const $rt__element_view_of = null;".to_owned()
             }
+            "_flatten_view_of" if elide_flatten_views => {
+                "const $rt__flatten_view_of = null;".to_owned()
+            }
             "tail_slice" if elide_rc => {
-                "let $rt_tail_slice = (record, key, len) => ({ buf: record[key], off: 0, len });"
+                "let $rt_tail_slice = (record, key, len) => ({ $b: record[key], $o: 0, $l: len });"
                     .to_owned()
             }
             "tail_slice_raw" if elide_rc => {
-                "let $rt_tail_slice_raw = (p, key) => ({ buf: p.ptr.buf[p.ptr.off][key], off: 0, len: p.meta });"
+                "let $rt_tail_slice_raw = (p, key) => ({ $b: p.$p.$b[p.$p.$o][key], $o: 0, $l: p.$m });"
                     .to_owned()
             }
             "_blocks" if elide_blocks => "const $rt__blocks = null;".to_owned(),
@@ -769,11 +773,12 @@ mod tests {
         assert!(out.contains("const $rt__boxes = null;"), "{out}");
         assert!(out.contains("const $rt__bv = null;"), "{out}");
         assert!(out.contains("const $rt__element_view_of = null;"), "{out}");
+        assert!(!out.contains("$rt__flatten_view"), "{out}");
         assert!(out.contains("const $rt__blocks = null;"), "{out}");
         assert!(out.contains("let $rt__blk_get = () => undefined;"), "{out}");
         assert!(
             out.contains(
-                "let $rt_tail_slice = (record, key, len) => ({ buf: record[key], off: 0, len });"
+                "let $rt_tail_slice = (record, key, len) => ({ $b: record[key], $o: 0, $l: len });"
             ),
             "{out}"
         );

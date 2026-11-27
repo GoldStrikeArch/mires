@@ -695,9 +695,9 @@ fn try_lower_slice_sort(
     let call = jsast::rt_call(
         "slice_sort",
         vec![
-            jsast::member(jsast::id("_v"), "buf"),
-            jsast::member(jsast::id("_v"), "off"),
-            jsast::member(jsast::id("_v"), "len"),
+            jsast::member(jsast::id("_v"), rcgjs_object::ptr::BUF),
+            jsast::member(jsast::id("_v"), rcgjs_object::ptr::OFF),
+            jsast::member(jsast::id("_v"), rcgjs_object::ptr::LEN),
             jsast::id("_is_less"),
             jsast::id(cmp_name),
             jsast::boolean(is_indirect),

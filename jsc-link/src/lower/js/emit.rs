@@ -22,7 +22,7 @@ use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::origin::SourceFactId;
 use rcgjs_object::jir::repr::{CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId};
 use rcgjs_object::jir::semantic::{BinaryOp, CoroutineDesugaring, CoroutineKind, TypeId};
-use rcgjs_object::jir::types::{EnumRepr, IntRepr, PointerForm, TypeKind};
+use rcgjs_object::jir::types::{EnumRepr, IntRepr, NominalForm, PointerForm, TypeKind};
 use rcgjs_object::jsast::{self, BinOp, Expr, Loc, Stmt};
 use rcgjs_object::ptr;
 use structurizer::{Label, Region, Scrut, Test, TmpId};
@@ -1071,10 +1071,10 @@ impl<'a> JsCx<'a> {
                         if self.plan.physical_slots.contains(&value) {
                             let src = if let Some(bv) = self.byte_view(value) {
                                 match copy.src {
-                                    CopyOperand::Value(v) => jsast::object_of(vec![
-                                        ("buf", self.byte_view_base_expr(bv, value)?),
-                                        ("off", self.byte_view_off_expr(v)?),
-                                    ]),
+                                    CopyOperand::Value(v) => rcgjs_object::ptr::slot(
+                                        self.byte_view_base_expr(bv, value)?,
+                                        self.byte_view_off_expr(v)?,
+                                    ),
                                     CopyOperand::Temp(_) => {
                                         jsast::id(self.copy_operand_name(copy.src)?)
                                     }
@@ -1586,10 +1586,7 @@ impl<'a> JsCx<'a> {
                     }
                     _ => self.op_expr(op, result)?,
                 };
-                let value = jsast::object_of(vec![
-                    ("buf", self.byte_view_base_expr(bv, result)?),
-                    ("off", off),
-                ]);
+                let value = rcgjs_object::ptr::slot(self.byte_view_base_expr(bv, result)?, off);
                 self.record_allocation_origin(result, &value);
                 return self.assign_physical_slot(result, value).map(Some);
             }
@@ -1947,7 +1944,7 @@ impl<'a> JsCx<'a> {
                 .byte_view(base_id)
                 .is_some_and(|base_bv| base_bv.mode == super::ByteViewMode::VarSlice)
             {
-                return Ok(Self::member_or_field(base, "buf"));
+                return Ok(Self::member_or_field(base, rcgjs_object::ptr::BUF));
             }
             return Ok(base);
         }
@@ -1955,7 +1952,10 @@ impl<'a> JsCx<'a> {
             return self.expr_of(v);
         }
         if bv.mode == super::ByteViewMode::VarSlice {
-            return Ok(Self::member_or_field(self.expr_of(v)?, "buf"));
+            return Ok(Self::member_or_field(
+                self.expr_of(v)?,
+                rcgjs_object::ptr::BUF,
+            ));
         }
         if let Some(slice_id) = bv.borrow_slice {
             if let Some(sbv) = self.byte_view(slice_id) {
@@ -1975,10 +1975,16 @@ impl<'a> JsCx<'a> {
         };
         match bv.mode {
             super::ByteViewMode::FullSlice => Ok(jsast::num(0)),
-            super::ByteViewMode::VarSlice => Ok(Self::member_or_field(self.expr_of(v)?, "off")),
+            super::ByteViewMode::VarSlice => Ok(Self::member_or_field(
+                self.expr_of(v)?,
+                rcgjs_object::ptr::OFF,
+            )),
             super::ByteViewMode::ThinPtr => {
                 if self.plan.physical_slots.contains(&v) {
-                    Ok(Self::member_or_field(self.expr_of(v)?, "off"))
+                    Ok(Self::member_or_field(
+                        self.expr_of(v)?,
+                        rcgjs_object::ptr::OFF,
+                    ))
                 } else {
                     self.expr_of(v)
                 }
@@ -1993,12 +1999,18 @@ impl<'a> JsCx<'a> {
         match bv.mode {
             super::ByteViewMode::FullSlice => {
                 if self.plan.physical_slices.contains(&v) {
-                    Ok(Self::member_or_field(self.expr_of(v)?, "len"))
+                    Ok(Self::member_or_field(
+                        self.expr_of(v)?,
+                        rcgjs_object::ptr::LEN,
+                    ))
                 } else {
                     Ok(jsast::member(self.expr_of(v)?, "length"))
                 }
             }
-            super::ByteViewMode::VarSlice => Ok(Self::member_or_field(self.expr_of(v)?, "len")),
+            super::ByteViewMode::VarSlice => Ok(Self::member_or_field(
+                self.expr_of(v)?,
+                rcgjs_object::ptr::LEN,
+            )),
             super::ByteViewMode::ThinPtr => Ok(jsast::num(0)),
         }
     }
@@ -2269,11 +2281,11 @@ impl<'a> JsCx<'a> {
         let len = s.chars().count();
         Some(match mode {
             super::ByteViewMode::FullSlice => jsast::string(s),
-            super::ByteViewMode::VarSlice => jsast::object_of(vec![
-                ("buf", jsast::string(s)),
-                ("off", jsast::num(0)),
-                ("len", jsast::num(len as f64)),
-            ]),
+            super::ByteViewMode::VarSlice => rcgjs_object::ptr::fat_slice(
+                jsast::string(s),
+                jsast::num(0),
+                jsast::num(len as f64),
+            ),
             super::ByteViewMode::ThinPtr => jsast::num(0),
         })
     }
@@ -2411,7 +2423,7 @@ impl<'a> JsCx<'a> {
                 } else {
                     jsast::num(to.saturating_sub(*from) as f64)
                 };
-                jsast::object_of(vec![("buf", base), ("off", new_off), ("len", new_len)])
+                rcgjs_object::ptr::fat_slice(base, new_off, new_len)
             }
             _ => return Ok(None),
         };
@@ -2435,11 +2447,7 @@ impl<'a> JsCx<'a> {
         } else {
             let off = self.byte_view_off_expr(ptr)?;
             let len_expr = self.expr_of(len)?;
-            Ok(jsast::object_of(vec![
-                ("buf", base),
-                ("off", off),
-                ("len", len_expr),
-            ]))
+            Ok(rcgjs_object::ptr::fat_slice(base, off, len_expr))
         }
     }
 
@@ -2564,11 +2572,7 @@ impl<'a> JsCx<'a> {
                     } else {
                         jsast::member(base.clone(), "length")
                     };
-                    Ok(jsast::object_of(vec![
-                        ("buf", base),
-                        ("off", jsast::num(0)),
-                        ("len", len),
-                    ]))
+                    Ok(rcgjs_object::ptr::fat_slice(base, jsast::num(0), len))
                 }
             }
             super::ByteViewMode::ThinPtr => self.byte_view_off_expr(src),
@@ -3052,7 +3056,18 @@ impl<'a> JsCx<'a> {
                         return Ok(vec![jsast::assign_stmt(name, jsast::array(vec![value]))]);
                     }
                 }
-                Ok(vec![jsast::assign_stmt(self.cell_expr(*cell)?, value)])
+                let cell_expr = self.cell_expr(*cell)?;
+                let cell_ty = self.cell_ty(*cell)?;
+                if !self.cell_boxed(*cell) && self.cell_preserves_identity(*cell, cell_ty) {
+                    let overwrite =
+                        self.overwrite_indirect(cell_ty, cell_expr.clone(), value.clone())?;
+                    return Ok(vec![jsast::if_else(
+                        jsast::binary(BinOp::StrictNe, cell_expr.clone(), jsast::undefined()),
+                        overwrite,
+                        vec![jsast::assign_stmt(cell_expr, value)],
+                    )]);
+                }
+                Ok(vec![jsast::assign_stmt(cell_expr, value)])
             }
             OpKind::StoreThrough { ptr: pointer, v } => {
                 // The store-back idiom an in-place mutation leaves behind
@@ -3066,6 +3081,18 @@ impl<'a> JsCx<'a> {
                 {
                     return Ok(Vec::new());
                 }
+                let inline_whole_indirect_borrow = self.is_inline(*pointer)
+                    && matches!(
+                        self.def_of(*pointer),
+                        Some(Op {
+                            kind: OpKind::BorrowView {
+                                root: Root::Value(_),
+                                path,
+                                ..
+                            },
+                            ..
+                        }) if path.is_empty()
+                    );
                 let walk = self.pointee_place(*pointer)?;
                 let value = self.expr_of(*v)?;
                 let value = if (walk.smi_u32 || self.is_smi_u32_ptr(*pointer))
@@ -3075,6 +3102,11 @@ impl<'a> JsCx<'a> {
                 } else {
                     value
                 };
+                if inline_whole_indirect_borrow && self.table.is_indirect(walk.ty) {
+                    if let super::place::JsPlace::Var(target) = walk.place {
+                        return self.overwrite_indirect(walk.ty, target, value);
+                    }
+                }
                 self.write_place(walk.place, walk.ty, value)
             }
             OpKind::Assert {
@@ -3655,6 +3687,79 @@ impl<'a> JsCx<'a> {
         false
     }
 
+    /// Whether an unboxed indirect cell holds a struct/tuple/array that is both borrowed and
+    /// overwritten multiple times, so subsequent stores must overwrite the existing JS object in
+    /// place to keep synthetic addresses stable.
+    fn cell_preserves_identity(&self, cell: CellId, cell_ty: TypeId) -> bool {
+        if !self.table.is_indirect(cell_ty)
+            || self.table.is_zst(cell_ty)
+            || self.table.crosses_transparent_union(cell_ty)
+            || !matches!(
+                self.table.get(self.table.peeled(cell_ty)).map(|d| &d.kind),
+                Some(
+                    TypeKind::Adt {
+                        form: NominalForm::Struct,
+                        ..
+                    } | TypeKind::Tuple(_)
+                        | TypeKind::Array { .. }
+                )
+            )
+        {
+            return false;
+        }
+        let mut stores = 0usize;
+        let mut loaded = std::collections::BTreeSet::new();
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    OpKind::CellStore { cell: c, .. } if *c == cell => stores += 1,
+                    OpKind::CellLoad(c) if *c == cell => {
+                        if let Some(res) = op.result {
+                            loaded.insert(res);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if stores <= 1 {
+            return false;
+        }
+        // Include direct Move/Copy/Field chains off loaded values so `&cell.field` also counts.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &self.func.blocks {
+                for op in &block.ops {
+                    let Some(res) = op.result else { continue };
+                    if loaded.contains(&res) {
+                        continue;
+                    }
+                    if matches!(
+                        op.kind,
+                        OpKind::Move(src) | OpKind::Copy(src) if loaded.contains(&src)
+                    ) {
+                        loaded.insert(res);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    OpKind::BorrowView { root, .. } | OpKind::RawView { root, .. } => match root {
+                        Root::Cell(c) if *c == cell => return true,
+                        Root::Value(v) if loaded.contains(v) => return true,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
     fn value_has_set_field(&self, v: ValueId) -> bool {
         let mut target = v;
         for _ in 0..8 {
@@ -3688,6 +3793,7 @@ impl<'a> JsCx<'a> {
                 object: false,
                 str_kind: super::place::StrPlaceKind::None,
                 smi_u32: false,
+                field_slot: false,
             });
         }
         if let Some((buf, off)) = self.soa_refs.borrow().get(&pointer).cloned() {
@@ -3700,6 +3806,7 @@ impl<'a> JsCx<'a> {
                 object: false,
                 str_kind: super::place::StrPlaceKind::None,
                 smi_u32: false,
+                field_slot: false,
             });
         }
         if self.is_inline(pointer) {
@@ -3722,6 +3829,7 @@ impl<'a> JsCx<'a> {
                     object: super::place::is_object(self.table, pointee),
                     str_kind: super::place::StrPlaceKind::None,
                     smi_u32: false,
+                    field_slot: false,
                 });
             }
         }

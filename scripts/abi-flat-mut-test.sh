@@ -216,9 +216,9 @@ if (/TAG\s*:/.test(code314)) {
 if (/__rt\.overwrite/.test(code314)) {
   throw new Error(`314 still contains __rt.overwrite:\n${code314}`);
 }
-// No `{ buf: <id>, off: 0 }` inside bench_enum_state or step_state (core panic cold paths excluded if any)
+// No `{ $b: <id>, $o: 0 }` inside bench_enum_state or step_state (core panic cold paths excluded if any)
 const fnBench = code314.slice(code314.indexOf('function bench_enum_state'));
-if (/\{buf:[^,]+,off:0\}/.test(fnBench.replace(/core\$panicking[^}]+/g, ''))) {
+if (/\{\$b:[^,]+,\$o:0\}/.test(fnBench.replace(/core\$panicking[^}]+/g, ''))) {
   // Check more precisely per-function: bench_enum_state's step call & step_state
   const stepCallLine = code314.match(/function bench_enum_state\([^)]*\)\{[^\n]+\}/)?.[0] || '';
   if (/step_state|__rt\.overwrite|TAG:/.test(stepCallLine)) {

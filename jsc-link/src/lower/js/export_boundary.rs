@@ -1275,29 +1275,36 @@ impl<'a> MarshalEmitter<'a> {
         let vec_expr = if use_native_vec {
             let buf_expr = if self.cx.bstr {
                 // `bstr_bytes_mut` already returns a fresh `Uint8Array`.
-                jsast::member(b_id.clone(), "buf")
+                jsast::member(b_id.clone(), rcgjs_object::ptr::BUF)
             } else {
                 // `str_bytes_mut` returns a fresh plain JS `Array`; native `Vec<u8>` uses `Uint8Array`.
                 jsast::new(
                     jsast::id("Uint8Array"),
-                    vec![jsast::member(b_id.clone(), "buf")],
+                    vec![jsast::member(b_id.clone(), rcgjs_object::ptr::BUF)],
                 )
             };
-            jsast::object_of(vec![("buf", buf_expr), ("len", jsast::member(b_id, "len"))])
+            jsast::object_of(vec![
+                ("buf", buf_expr),
+                ("len", jsast::member(b_id, rcgjs_object::ptr::LEN)),
+            ])
         } else {
             let layout = vec_ty_opt.map_or_else(
                 || raw_vec_layout(self.cx.table, self.cx.interns, str_ty),
                 |vt| raw_vec_layout(self.cx.table, self.cx.interns, vt),
             );
-            let len_expr = jsast::member(b_id.clone(), "len");
+            let len_expr = jsast::member(b_id.clone(), rcgjs_object::ptr::LEN);
             let buf_expr = if self.cx.bstr && !self.cx.heap.typed_heap_enabled {
                 // RawVec debug `realloc` sets `active.length`, which requires a plain JS `Array`.
-                jsast::method_call(jsast::id("Array"), "from", vec![jsast::member(b_id, "buf")])
+                jsast::method_call(
+                    jsast::id("Array"),
+                    "from",
+                    vec![jsast::member(b_id, rcgjs_object::ptr::BUF)],
+                )
             } else {
-                jsast::member(b_id, "buf")
+                jsast::member(b_id, rcgjs_object::ptr::BUF)
             };
             let non_empty_ptr = if self.cx.heap.typed_heap_enabled {
-                jsast::object_of(vec![("buf", buf_expr), ("off", jsast::num(0))])
+                rcgjs_object::ptr::slot(buf_expr, jsast::num(0))
             } else {
                 jsast::rt_call(
                     "_register",
@@ -1364,8 +1371,8 @@ impl<'a> MarshalEmitter<'a> {
                     jsast::arrow(
                         vec![p_name],
                         decode(
-                            jsast::member(p_id.clone(), "buf"),
-                            jsast::member(p_id, "off"),
+                            jsast::member(p_id.clone(), rcgjs_object::ptr::BUF),
+                            jsast::member(p_id, rcgjs_object::ptr::OFF),
                             len.clone(),
                         ),
                     ),
@@ -1471,7 +1478,7 @@ impl<'a> MarshalEmitter<'a> {
         if self.cx.heap.typed_heap_enabled {
             init_stmts.push(jsast::assign_stmt(
                 p_id.clone(),
-                jsast::object_of(vec![("buf", b_id), ("off", jsast::num(0))]),
+                rcgjs_object::ptr::slot(b_id, jsast::num(0)),
             ));
         } else {
             let total_bytes = if elem_size == 1 {
@@ -1596,8 +1603,8 @@ impl<'a> MarshalEmitter<'a> {
             let p_id = jsast::id(p_name.clone());
             stmts.push(jsast::const_(p_name, ptr));
             (
-                jsast::member(p_id.clone(), "buf"),
-                Some(jsast::member(p_id, "off")),
+                jsast::member(p_id.clone(), rcgjs_object::ptr::BUF),
+                Some(jsast::member(p_id, rcgjs_object::ptr::OFF)),
             )
         } else {
             (jsast::member(v_id, "buf"), None)
@@ -1772,8 +1779,8 @@ impl<'a> MarshalEmitter<'a> {
             let p_id = jsast::id(p_name.clone());
             stmts.push(jsast::const_(p_name, ptr));
             (
-                jsast::member(p_id.clone(), "buf"),
-                Some(jsast::member(p_id, "off")),
+                jsast::member(p_id.clone(), rcgjs_object::ptr::BUF),
+                Some(jsast::member(p_id, rcgjs_object::ptr::OFF)),
             )
         } else {
             (jsast::member(v_id, "buf"), None)
@@ -2077,7 +2084,7 @@ impl<'a> MarshalEmitter<'a> {
             } else {
                 a
             };
-            jsast::object_of(vec![("buf", buf), ("off", jsast::num(0)), ("len", len)])
+            rcgjs_object::ptr::fat_slice(buf, jsast::num(0), len)
         })
     }
 
@@ -2093,14 +2100,17 @@ impl<'a> MarshalEmitter<'a> {
             return jsast::call(
                 jsast::arrow(
                     vec![s_name],
-                    jsast::new(jsast::id("Array"), vec![jsast::member(s_id, "len")]),
+                    jsast::new(
+                        jsast::id("Array"),
+                        vec![jsast::member(s_id, rcgjs_object::ptr::LEN)],
+                    ),
                 ),
                 vec![expr],
             );
         }
 
         let mut stmts = vec![
-            jsast::const_(n_name, jsast::member(s_id.clone(), "len")),
+            jsast::const_(n_name, jsast::member(s_id.clone(), rcgjs_object::ptr::LEN)),
             jsast::if_(
                 jsast::binary(BinOp::StrictEq, n_id.clone(), jsast::num(0)),
                 vec![jsast::ret(jsast::array(Vec::new()))],
@@ -2109,8 +2119,8 @@ impl<'a> MarshalEmitter<'a> {
 
         if !elem_needs {
             let sliced = self.slice_identity_array(
-                jsast::member(s_id.clone(), "buf"),
-                Some(jsast::member(s_id, "off")),
+                jsast::member(s_id.clone(), rcgjs_object::ptr::BUF),
+                Some(jsast::member(s_id, rcgjs_object::ptr::OFF)),
                 n_id,
                 false,
             );
@@ -2126,8 +2136,14 @@ impl<'a> MarshalEmitter<'a> {
         let out_id = jsast::id(out_name.clone());
         let i_name = self.fresh("i");
         let i_id = jsast::id(i_name.clone());
-        stmts.push(jsast::const_(b_name, jsast::member(s_id.clone(), "buf")));
-        stmts.push(jsast::const_(off_name, jsast::member(s_id, "off")));
+        stmts.push(jsast::const_(
+            b_name,
+            jsast::member(s_id.clone(), rcgjs_object::ptr::BUF),
+        ));
+        stmts.push(jsast::const_(
+            off_name,
+            jsast::member(s_id, rcgjs_object::ptr::OFF),
+        ));
         stmts.push(jsast::const_(
             out_name,
             jsast::new(jsast::id("Array"), vec![n_id.clone()]),
@@ -3951,10 +3967,10 @@ mod tests {
         let f_slice = dummy_func(vec![slice_i32], i32_ty);
         let mut b_slice = vec![jsast::ret(jsast::binary(
             jsast::BinOp::Add,
-            jsast::member(jsast::id("xs"), "len"),
+            jsast::member(jsast::id("xs"), "$l"),
             jsast::index(
-                jsast::member(jsast::id("xs"), "buf"),
-                jsast::member(jsast::id("xs"), "off"),
+                jsast::member(jsast::id("xs"), "$b"),
+                jsast::member(jsast::id("xs"), "$o"),
             ),
         ))];
         let reassigned = wrap_js_export(&cx_slice, &f_slice, &["xs".to_owned()], &mut b_slice);
@@ -4445,8 +4461,8 @@ mod tests {
              const mkNStr = (s) => {{ const b = __rt.bstr_in(s); return {{ s: b, cap: b.length }}; }};\n\
              const mkRawStr = (s) => {{\n\
                const b = __rt.str_bytes_mut(s);\n\
-               const ptr = b.len === 0 ? 1 : __rt._register(b.buf, b.len, false);\n\
-               return {{ vec: {{ buf: {{ inner: {{ ptr, cap: b.len, alloc: undefined }}, _marker: undefined }}, len: b.len }} }};\n\
+               const ptr = b.$l === 0 ? 1 : __rt._register(b.$b, b.$l, false);\n\
+               return {{ vec: {{ buf: {{ inner: {{ ptr, cap: b.$l, alloc: undefined }}, _marker: undefined }}, len: b.$l }} }};\n\
              }};\n\
              // JsMapEntries<String, i32> from plain object, JS Map, and null\n\
              const vObj = in_str_map_native({{ a: 1, 'café': 2 }});\n\
@@ -4462,7 +4478,7 @@ mod tests {
              assert.strictEqual(in_str_map_native(undefined).len, 0);\n\
              const vRaw = in_str_map_raw({{ hi: 7 }});\n\
              assert.strictEqual(vRaw.len, 1);\n\
-             const rEntry = vRaw.buf.inner.ptr.buf[vRaw.buf.inner.ptr.off];\n\
+             const rEntry = vRaw.buf.inner.ptr.$b[vRaw.buf.inner.ptr.$o];\n\
              assert.strictEqual(rEntry[1], 7);\n\
              // JsBTreeMapEntries<i32, String> from JS Map and entries array\n\
              const bMap = in_i32_map(new Map([[10, 'ten'], [20, 'twenty']]));\n\
@@ -4499,7 +4515,7 @@ mod tests {
                {{ TAG: 2, hash: 2n, key: 9, value: mkRawStr('nine') }},\n\
              ];\n\
              const outMap = out_hm_i32_raw({{\n\
-               slots: {{ buf: {{ inner: {{ ptr: {{ buf: rawSlots, off: 0 }}, cap: 4, alloc: undefined }}, _marker: undefined }}, len: 4 }},\n\
+               slots: {{ buf: {{ inner: {{ ptr: {{ $b: rawSlots, $o: 0 }}, cap: 4, alloc: undefined }}, _marker: undefined }}, len: 4 }},\n\
                len: 2, tombstones: 1, hash_builder: undefined\n\
              }});\n\
              assert.ok(outMap instanceof Map);\n\

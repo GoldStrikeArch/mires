@@ -600,8 +600,8 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         ))
         .trim_end(),
         r#"function f($native0) {
-  const $nativeBox = $native0.buf[$native0.off];
-  pointee_drop($nativeBox.buf[$nativeBox.off]);
+  const $nativeBox = $native0.$b[$native0.$o];
+  pointee_drop($nativeBox.$b[$nativeBox.$o]);
   return;
 }"#
     );

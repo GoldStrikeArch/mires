@@ -2346,7 +2346,7 @@ fn pointer_bump_and_nth_match_the_14_pointers_golden() {
     let js = lower(&interns, "bump", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function bump(target, by) {\n  target.buf[target.off] = target.buf[target.off] + by | 0;\n}\n"
+        "function bump(target, by) {\n  target.$b[target.$o] = target.$b[target.$o] + by | 0;\n}\n"
     );
 
     // `nth(base: *const i32, index: usize) -> i32 { *base.add(index) }`
@@ -2372,7 +2372,7 @@ fn pointer_bump_and_nth_match_the_14_pointers_golden() {
     let js = lower(&interns, "nth", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function nth(base, index) {\n  return base.buf[base.off + index];\n}\n"
+        "function nth(base, index) {\n  return base.$b[base.$o + index];\n}\n"
     );
 }
 
@@ -2599,7 +2599,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
     );
     assert_eq!(
         js,
-        "function rust_entry() {\n  let _10, base, value = [];\n  value[0] = 1;\n  x14_pointers$bump$h2b40639afb54a27c({ buf: value, off: 0 }, 41);\n  x14_pointers$mini_core$print_i32$hf678a2c85ecff833(value[0]);\n  _10 = 0;\n  if (!(_10 < 4)) {\n    __rt.js_abort(\"index out of bounds\");\n  }\n  base = { buf: [10, 20, 30, 40], off: _10 };\n}\n"
+        "function rust_entry() {\n  let _10, base, value = [];\n  value[0] = 1;\n  x14_pointers$bump$h2b40639afb54a27c({ $b: value, $o: 0 }, 41);\n  x14_pointers$mini_core$print_i32$hf678a2c85ecff833(value[0]);\n  _10 = 0;\n  if (!(_10 < 4)) {\n    __rt.js_abort(\"index out of bounds\");\n  }\n  base = { $b: [10, 20, 30, 40], $o: _10 };\n}\n"
     );
 }
 
@@ -2859,7 +2859,7 @@ fn a_shared_view_into_an_aggregate_is_rooted_at_the_aggregate() {
     assert!(!plan.inline.contains(&q));
     assert_eq!(
         js,
-        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { x: $v0, y: $v1 };\n  put({ buf: $v2, off: \"x\" }, 5);\n  return $v0;\n}\n"
+        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { x: $v0, y: $v1 };\n  put({ $b: $v2, $o: \"x\" }, 5);\n  return $v0;\n}\n"
     );
 }
 
@@ -3103,7 +3103,7 @@ fn set_field_and_write_through_a_reference() {
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function f(p, arr, s) {\n  p.x = 5;\n  __rt.overwrite(p, { x: 1, y: 2 });\n  arr[1] = 2;\n  s.buf[s.off] = 3;\n}\n"
+        "function f(p, arr, s) {\n  p.x = 5;\n  __rt.overwrite(p, { x: 1, y: 2 });\n  arr[1] = 2;\n  s.$b[s.$o] = 3;\n}\n"
     );
 }
 
@@ -3149,7 +3149,7 @@ fn slices_from_arrays_and_subslices() {
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function f(a) {\n  let w;\n  w = { buf: a, off: 0, len: 4 };\n  return { buf: w.buf, off: w.off + 1, len: w.len - 1 };\n}\n"
+        "function f(a) {\n  let w;\n  w = { $b: a, $o: 0, $l: 4 };\n  return { $b: w.$b, $o: w.$o + 1, $l: w.$l - 1 };\n}\n"
     );
 }
 
@@ -3225,7 +3225,7 @@ fn constants_spell_enums_strings_slices_and_hoisted_names() {
     assert_eq!(
         js,
         format!(
-            "function f() {{\n  let t, h, s, p, i;\n  t = \"hi\";\n  h = {key};\n  s = {{ buf: [1, 2], off: 0, len: 2 }};\n  p = {{ x: 1, y: 2 }};\n  i = {{ buf: [9], off: 0 }};\n  return {{ TAG: \"Some\", _0: 7 }};\n}}\n"
+            "function f() {{\n  let t, h, s, p, i;\n  t = \"hi\";\n  h = {key};\n  s = {{ $b: [1, 2], $o: 0, $l: 2 }};\n  p = {{ x: 1, y: 2 }};\n  i = {{ $b: [9], $o: 0 }};\n  return {{ TAG: \"Some\", _0: 7 }};\n}}\n"
         )
     );
     // Without the hoisted constant among the item's references the literal is inline.
@@ -3682,7 +3682,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
         jsast::stmt_to_string(&lowered.decl),
-        "function f(p) {\n  if (p.meta[0] !== null) {\n    p.meta[0](p.ptr);\n  }\n}\n"
+        "function f(p) {\n  if (p.$m[0] !== null) {\n    p.$m[0](p.$p);\n  }\n}\n"
     );
 }
 
@@ -3835,7 +3835,7 @@ fn a_call_returning_a_slot_is_materialized_before_dereference() {
     );
     assert_eq!(
         js,
-        "function f() {\n  let $v0;\n  $v0 = next_value_pointer();\n  return $v0.buf[$v0.off];\n}\n"
+        "function f() {\n  let $v0;\n  $v0 = next_value_pointer();\n  return $v0.$b[$v0.$o];\n}\n"
     );
 }
 
@@ -3985,7 +3985,7 @@ fn a_virtual_call_dispatches_through_the_receivers_vtable_slot() {
     let plan = plan_of(&func, &[(0, "s")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
-    assert_eq!(js, "function f(s) {\n  return s.meta[3](s.ptr);\n}\n");
+    assert_eq!(js, "function f(s) {\n  return s.$m[3](s.$p);\n}\n");
 }
 
 #[test]
@@ -4056,7 +4056,7 @@ fn an_unsized_virtual_receiver_keeps_its_fat_pointer_identity() {
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function f(receiver) {\n  return receiver.meta[3](__rt.unref(receiver.ptr));\n}\n"
+        "function f(receiver) {\n  return receiver.$m[3](__rt.unref(receiver.$p));\n}\n"
     );
 }
 
@@ -4834,7 +4834,7 @@ fn a_zero_sized_element_is_a_place_with_no_storage() {
         assert_eq!(js.matches("index()").count(), 1, "{js}");
         if zero_sized {
             let address = if base_ty == REF_UNIT_SLICE {
-                "$v0.buf"
+                "$v0.$b"
             } else {
                 "$v0"
             };
@@ -4842,7 +4842,7 @@ fn a_zero_sized_element_is_a_place_with_no_storage() {
             assert!(js.contains(&format!("drop_unit({address});")), "{js}");
             assert!(!js.contains("["), "{js}");
         } else {
-            assert!(js.contains(".off + index()"), "{js}");
+            assert!(js.contains(".$o + index()"), "{js}");
         }
     }
 }
@@ -5029,7 +5029,7 @@ fn a_reference_read_out_of_a_place_is_a_raw_pointer_to_its_pointee() {
     );
     assert_eq!(
         js,
-        "function f($v0, $v1, $v2, $v3) {\n  let $cell = [];\n  same(__rt.box($v0.r), __rt.box($v1));\n  same(__rt.box($v2[1]), { buf: $v0, off: \"r\" });\n  $cell[0] = $v1;\n  same(__rt.box($cell[0]), $v3);\n}\n"
+        "function f($v0, $v1, $v2, $v3) {\n  let $cell = [];\n  same(__rt.box($v0.r), __rt.box($v1));\n  same(__rt.box($v2[1]), { $b: $v0, $o: \"r\" });\n  $cell[0] = $v1;\n  same(__rt.box($cell[0]), $v3);\n}\n"
     );
 }
 
@@ -5296,7 +5296,7 @@ fn a_raw_view_boxes_a_held_object_until_a_step_reaches_storage() {
     );
     assert_eq!(
         js,
-        "function f($v0, $v1) {\n  let $v12;\n  same(__rt.box($v0.w), __rt.box($v0.s));\n  same({ buf: $v0.h, off: \"p\" }, { buf: $v0.xs, off: $v1 });\n  $v12 = $v0.pt;\n  same({ buf: $v0.s, off: \"_0\" }, __rt.box($v12));\n}\n"
+        "function f($v0, $v1) {\n  let $v12;\n  same(__rt.box($v0.w), __rt.box($v0.s));\n  same({ $b: $v0.h, $o: \"p\", $f: 1 }, { $b: $v0.xs, $o: $v1 });\n  $v12 = $v0.pt;\n  same({ $b: $v0.s, $o: \"_0\" }, __rt.box($v12));\n}\n"
     );
 }
 
@@ -5716,8 +5716,8 @@ fn ptr_str_len_folding_bytes_str_fusion_and_single_eval_byte_ptr() {
         "str_bytes must be evaluated once:\n{js1}"
     );
     assert!(
-        js1.contains(".off") && !js1.contains("off: 0"),
-        "str_to_byte_ptr must preserve sb.off:\n{js1}"
+        js1.contains(".$o") && !js1.contains("$o: 0"),
+        "str_to_byte_ptr must preserve sb.$o:\n{js1}"
     );
     assert_eq!(
         js1.matches("next_ptr(").count(),
@@ -5839,8 +5839,8 @@ fn fuse_local_bytes_str_eliminates_roundtrip_local() {
         "expected fuse_local_bytes_str to eliminate bytes_str/str_len/str_bytes roundtrip:\n{js}"
     );
     assert!(
-        js.contains(".len"),
-        "expected direct .len read after fusion:\n{js}"
+        js.contains(".$l"),
+        "expected direct .$l read after fusion:\n{js}"
     );
 }
 
@@ -6040,7 +6040,7 @@ fn fuse_local_bytes_str_rejects_aliased_mutations_non_dominance_and_inner_fn() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !call_len_js.contains("__rt.bytes_str") && call_len_js.contains("x.len"),
+        !call_len_js.contains("__rt.bytes_str") && call_len_js.contains("x.$l"),
         "call before str_len should still fuse scalar len:\n{call_len_js}"
     );
 
@@ -7060,7 +7060,7 @@ fn transmute_between_ref_and_raw_aggregate_converts_slot_form() {
     let p2 = plan_of(&f2, &[(0, "p")]);
     let body2 = body_of(BodyKind::Function, f2.sig.clone());
     let js2 = lower(&interns, "to_ref", &[], &body2, &f2, &p2, straight(&f2));
-    assert_eq!(js2, "function to_ref(p) {\n  return p.buf[p.off];\n}\n");
+    assert_eq!(js2, "function to_ref(p) {\n  return p.$b[p.$o];\n}\n");
 }
 
 #[test]
@@ -7243,7 +7243,7 @@ fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() 
         "expected single evaluation of __rt.thin: {js2}"
     );
     assert!(js2.contains("$t0 = __rt.thin(p, 8)"), "{js2}");
-    assert!(js2.contains("$t0.buf[$t0.off]"), "{js2}");
+    assert!(js2.contains("$t0.$b[$t0.$o]"), "{js2}");
 }
 
 #[test]
@@ -7544,7 +7544,7 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
             concrete: fn_def_ty,
             vtable: vt_fn,
         },
-        "{ ptr: undefined, meta: vt_fn }",
+        "{ $p: undefined, $m: vt_fn }",
     );
     check(
         ConstTree::Dyn {
@@ -7555,7 +7555,7 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
             concrete: U32,
             vtable: vt_u32,
         },
-        "{ ptr: { buf: [4], off: 0 }, meta: vt_u32 }",
+        "{ $p: { $b: [4], $o: 0 }, $m: vt_u32 }",
     );
     check(
         ConstTree::Dyn {
@@ -7569,7 +7569,7 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
             concrete: U32,
             vtable: vt_u32,
         },
-        "{ ptr: { buf: S_U32, off: 0 }, meta: vt_u32 }",
+        "{ $p: { $b: S_U32, $o: 0 }, $m: vt_u32 }",
     );
     check(
         ConstTree::Dyn {
@@ -7583,7 +7583,7 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
             concrete: pair_ty,
             vtable: vt_pair,
         },
-        "{ ptr: S_PAIR, meta: vt_pair }",
+        "{ $p: S_PAIR, $m: vt_pair }",
     );
     check(
         ConstTree::Dyn {
@@ -7591,7 +7591,7 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
             concrete: fn_def_ty,
             vtable: vt_fn,
         },
-        "{ ptr: 1, meta: vt_fn }",
+        "{ $p: 1, $m: vt_fn }",
     );
 }
 
@@ -7662,11 +7662,11 @@ fn const_slice_address_lowers_zst_dangling_and_bare_slices() {
         assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
     };
 
-    check(RAW_SLICE_Z, 1, 3, "{ buf: 1, off: 0, len: 3 }");
-    check(RAW_SLICE_Z, 0x1000, 100, "{ buf: 4096, off: 0, len: 100 }");
+    check(RAW_SLICE_Z, 1, 3, "{ $b: 1, $o: 0, $l: 3 }");
+    check(RAW_SLICE_Z, 0x1000, 100, "{ $b: 4096, $o: 0, $l: 100 }");
     check(RAW_SLICE_U32, 4, 0, "__rt.slice_from_parts(4, 0)");
-    check(RAW_SLICE_U32, 0x1000, 5, "{ buf: 4096, off: 0, len: 5 }");
-    check(RAW_SLICE_U32, 0, 0, "{ buf: 0, off: 0, len: 0 }");
+    check(RAW_SLICE_U32, 0x1000, 5, "{ $b: 4096, $o: 0, $l: 5 }");
+    check(RAW_SLICE_U32, 0, 0, "{ $b: 0, $o: 0, $l: 0 }");
     check(RAW_WRAP_U32_SLICE, 4, 0, "__rt.slice_from_parts(4, 0)");
 }
 
@@ -7743,14 +7743,14 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
         assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
     };
 
-    // Direct primitive field: `&P.first_word` and `*const u32` -> `{ buf: P, off: "first_word" }`
+    // Direct primitive field: `&P.first_word` and `*const u32` -> `{ $b: P, $o: "first_word" }`
     check(
         REF_U32,
         ConstTree::StaticField {
             target: target_p,
             path: vec![StaticStep::Field(f_first)],
         },
-        "{ buf: P, off: \"first_word\" }",
+        "{ $b: P, $o: \"first_word\" }",
     );
     check(
         RAW_U32,
@@ -7758,7 +7758,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             target: target_p,
             path: vec![StaticStep::Field(f_first)],
         },
-        "{ buf: P, off: \"first_word\" }",
+        "{ $b: P, $o: \"first_word\" }",
     );
 
     // Nested direct field: `&OUTER.arr[1].first_word`
@@ -7772,10 +7772,10 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
                 StaticStep::Field(f_first),
             ],
         },
-        "{ buf: OUTER.arr[1], off: \"first_word\" }",
+        "{ $b: OUTER.arr[1], $o: \"first_word\" }",
     );
 
-    // Indirect aggregate field: `&OUTER.inner` -> `OUTER.inner`, `*const Pair` -> `{ buf: OUTER, off: "inner" }`
+    // Indirect aggregate field: `&OUTER.inner` -> `OUTER.inner`, `*const Pair` -> `{ $b: OUTER, $o: "inner", $f: 1 }`
     check(
         REF_PAIR,
         ConstTree::StaticField {
@@ -7790,7 +7790,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             target: target_outer,
             path: vec![StaticStep::Field(f_inner)],
         },
-        "{ buf: OUTER, off: \"inner\" }",
+        "{ $b: OUTER, $o: \"inner\", $f: 1 }",
     );
 
     // Nested indirect array element: `&OUTER.arr[1]` vs `*const Pair`
@@ -7808,7 +7808,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             target: target_outer,
             path: vec![StaticStep::Field(f_arr), StaticStep::Index(1)],
         },
-        "{ buf: OUTER.arr, off: 1 }",
+        "{ $b: OUTER.arr, $o: 1 }",
     );
 
     // Non-identifier field name uses safe bracket indexing via jsast::member
@@ -7832,7 +7832,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             concrete: U32,
             vtable: vt_u32,
         },
-        "{ ptr: { buf: P, off: \"first_word\" }, meta: vt_u32 }",
+        "{ $p: { $b: P, $o: \"first_word\" }, $m: vt_u32 }",
     );
     check(
         REF_DYN,
@@ -7844,7 +7844,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             concrete: PAIR_TY,
             vtable: vt_pair,
         },
-        "{ ptr: OUTER.inner, meta: vt_pair }",
+        "{ $p: OUTER.inner, $m: vt_pair }",
     );
 
     // Wide slice pointers into root static array and nested static array field
@@ -7856,7 +7856,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             start: 1,
             length: 2,
         },
-        "{ buf: P, off: 1, len: 2 }",
+        "{ $b: P, $o: 1, $l: 2 }",
     );
     check(
         REF_PAIR,
@@ -7866,7 +7866,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
             start: 0,
             length: 4,
         },
-        "{ buf: OUTER.arr, off: 0, len: 4 }",
+        "{ $b: OUTER.arr, $o: 0, $l: 4 }",
     );
 
     // Empty path declines cleanly instead of mislowering
@@ -7966,7 +7966,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
     assert_eq!(js1.matches("__rt.unwindow(").count(), 1, "{js1}");
     assert!(
-        js1.contains("($t0 = __rt.unwindow(p), $t0.buf)[$t0.off + i] = v;"),
+        js1.contains("($t0 = __rt.unwindow(p), $t0.$b)[$t0.$o + i] = v;"),
         "{js1}"
     );
 
@@ -8005,7 +8005,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
     assert_eq!(js2.matches("__rt.unwindow(").count(), 1, "{js2}");
     assert!(
-        js2.contains("($t0 = __rt.unwindow(p), $t0.buf)[$t0.off + 3]"),
+        js2.contains("($t0 = __rt.unwindow(p), $t0.$b)[$t0.$o + 3]"),
         "{js2}"
     );
 
@@ -8037,7 +8037,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
     assert_eq!(js3.matches("__rt.unwindow(").count(), 1, "{js3}");
     assert!(
-        js3.contains("{ buf: ($t0 = __rt.unwindow(p), $t0.buf), off: $t0.off + i }"),
+        js3.contains("{ $b: ($t0 = __rt.unwindow(p), $t0.$b), $o: $t0.$o + i }"),
         "{js3}"
     );
 
@@ -8078,7 +8078,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
         assert_eq!(js4.matches("__rt.unwindow(").count(), 1, "{js4}");
         assert!(
             js4.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(p), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
+                "__rt.array_ref(($t0 = __rt.unwindow(p), { $b: $t0.$b, $o: $t0.$o + 1, $w: 2 }), 2, 4)"
             ),
             "{js4}"
         );
@@ -8284,7 +8284,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
     assert_eq!(
         js8,
-        "function addr_of_transparent_through_window(win, i) {\n  let $t0;\n  return ($t0 = __rt.unwindow(win), $t0.buf)[$t0.off + i];\n}\n"
+        "function addr_of_transparent_through_window(win, i) {\n  let $t0;\n  return ($t0 = __rt.unwindow(win), $t0.$b)[$t0.$o + i];\n}\n"
     );
 
     let mut b9 = FuncBuilder::new(item(10), signature(vec![RAW_I32], REF_U8));
@@ -8531,7 +8531,7 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "as_mut_ptr", &[], &body, &f, &p, straight(&f)),
-        "function as_mut_ptr(s) {\n  return { buf: s.buf, off: s.off };\n}\n"
+        "function as_mut_ptr(s) {\n  return { $b: s.$b, $o: s.$o };\n}\n"
     );
 
     // 4. Reborrow &*s on s: &mut str decodes via __rt.bytes_str.
@@ -8553,7 +8553,7 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "reborrow_const", &[], &body, &f, &p, straight(&f)),
-        "function reborrow_const(s) {\n  return __rt.bytes_str(s.buf, s.off, s.len);\n}\n"
+        "function reborrow_const(s) {\n  return __rt.bytes_str(s.$b, s.$o, s.$l);\n}\n"
     );
 
     // 5. PtrMetadata(*mut str) reads .len directly.
@@ -8575,7 +8575,7 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "mut_str_len", &[], &body, &f, &p, straight(&f)),
-        "function mut_str_len(s) {\n  return s.len;\n}\n"
+        "function mut_str_len(s) {\n  return s.$l;\n}\n"
     );
 
     // 6. *mut str == *mut str uses __rt.slice_ptr_eq.
@@ -8848,7 +8848,7 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "box_deref", &[], &body, &f, &pl, straight(&f)),
-        "function box_deref(b) {\n  return __rt.bytes_str(b.buf, b.off, b.len);\n}\n"
+        "function box_deref(b) {\n  return __rt.bytes_str(b.$b, b.$o, b.$l);\n}\n"
     );
 
     // 4. NonNull<str> -> *mut u8 cast detaches memoized `&str` views while preserving live heap
@@ -8872,7 +8872,7 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "nn_to_u8", &[], &body, &f, &pl, straight(&f)),
-        "function nn_to_u8(nn) {\n  let $t0;\n  return $t0 = __rt.detach_str_memo(nn), { buf: $t0.buf, off: $t0.off };\n}\n"
+        "function nn_to_u8(nn) {\n  let $t0;\n  return $t0 = __rt.detach_str_memo(nn), { $b: $t0.$b, $o: $t0.$o };\n}\n"
     );
 
     // 5. Elaborated Box<str> `&raw mut (*p)` on `p: *const str` guards against memoized `&str`
@@ -8988,7 +8988,7 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "box_as_bytes", &[], &body, &f, &pl, straight(&f)),
-        "function box_as_bytes(b) {\n  return __rt.byte_slice_ref({ buf: b.buf, off: b.off, len: b.len });\n}\n"
+        "function box_as_bytes(b) {\n  return __rt.byte_slice_ref({ $b: b.$b, $o: b.$o, $l: b.$l });\n}\n"
     );
 }
 
@@ -9434,7 +9434,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
         );
         assert!(
             js.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { $b: $t0.$b, $o: $t0.$o + 1, $w: 2 }), 2, 4)"
             ),
             "{js}"
         );
@@ -9472,7 +9472,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
     );
     assert!(
         js2.contains(
-            "__rt.array_ref(($t0 = __rt.unwindow(arr), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
+            "__rt.array_ref(($t0 = __rt.unwindow(arr), { $b: $t0.$b, $o: $t0.$o + 1, $w: 2 }), 2, 4)"
         ),
         "{js2}"
     );
@@ -9511,7 +9511,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
         straight(&f3),
     );
     assert!(
-        js3.contains("return $t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 };"),
+        js3.contains("return $t0 = __rt.unwindow(a), { $b: $t0.$b, $o: $t0.$o + 1, $w: 2 };"),
         "{js3}"
     );
     assert!(!js3.contains("__rt.box("), "{js3}");
@@ -9563,7 +9563,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
         );
         assert!(
             js4.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 2, w: 0 }), 0, 4)"
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { $b: $t0.$b, $o: $t0.$o + 2, $w: 0 }), 0, 4)"
             ),
             "{js4}"
         );
@@ -9605,7 +9605,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
     );
     assert!(
         js5.contains(
-            "__rt.read_array(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2).slice()"
+            "__rt.read_array(($t0 = __rt.unwindow(a), { $b: $t0.$b, $o: $t0.$o + 1, $w: 2 }), 2).slice()"
         ),
         "{js5}"
     );
@@ -10115,7 +10115,7 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
     assert!(js.contains("new Array(cap)"), "{js}");
     assert!(!js.contains("rcgjs_typed_"), "{js}");
     assert!(!js.contains("t_dealloc"), "{js}");
-    assert!(js.contains("{ buf: [{ x: cap }], off: 0 }"), "{js}");
+    assert!(js.contains("{ $b: [{ x: cap }], $o: 0 }"), "{js}");
 
     // 2. Dynamic `ptr_add` guards `n === 0` when returned, and folds directly to `_put_plain(p.buf, p.off + n, v)` on write.
     let mut b2 = FuncBuilder::new(
@@ -10163,11 +10163,11 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
     let pl2 = plan_of(&f2, &[(0, "p"), (1, "n"), (2, "v")]);
     let js2 = lower_with("put_and_offset", &f2, &pl2, straight(&f2), &tier_a);
     assert!(
-        js2.contains("p.buf[p.off + n] = v;"),
+        js2.contains("p.$b[p.$o + n] = v;"),
         "write through dynamic offset on untracked ADT must fold to direct store without slot allocation:\n{js2}"
     );
     assert!(
-        js2.contains("n === 0 ? p : { buf: p.buf, off: p.off + n }"),
+        js2.contains("n === 0 ? p : { $b: p.$b, $o: p.$o + n }"),
         "returned dynamic offset must guard zero count for dangling pointers:\n{js2}"
     );
 }
@@ -10395,7 +10395,7 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
     let pl2 = plan_of(&f2, &[(0, "s"), (1, "d")]);
     let js2 = lower_tier_a("copy_one", &f2, &pl2, straight(&f2));
     assert!(!js2.contains("copy_nonoverlapping"), "{js2}");
-    assert!(js2.contains("d.buf[d.off] = s.buf[s.off];"), "{js2}");
+    assert!(js2.contains("d.$b[d.$o] = s.$b[s.$o];"), "{js2}");
 
     // 3. Tier A `Aggregate(RawPtr)` slice construction uses `__rt.sfp` and `PtrMetadata` folds to `len`.
     let mut b3 = FuncBuilder::new(item(102), signature(vec![ptr_u32, USIZE], USIZE));

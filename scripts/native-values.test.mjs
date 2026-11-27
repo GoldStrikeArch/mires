@@ -12,39 +12,39 @@ const rt = globalThis.__rt;
 test("empty slices preserve the identity and address of their dangling pointer", () => {
   const first = rt.slice_from_parts(1, 0);
   const second = rt.slice_from_parts(1, 0);
-  assert.equal(first.len, 0);
+  assert.equal(first.$l, 0);
   assert.equal(rt.ptr_eq(first, second), true);
   assert.equal(rt.addr(first, 1), 1);
 });
 
 test("heap byte slices retain bytes, partial tails, and aliases after growth", () => {
   let pointer = rt.alloc(33, 1);
-  pointer.buf.fill(0x61);
+  pointer.$b.fill(0x61);
   const bytes = rt.byte_slice_ref(rt.slice_from_parts(pointer, 33));
   const words = rt.unscale_scalar(bytes, 4, () => 0, "u32");
-  assert.equal(words.buf[0], 0x61616161);
-  assert.equal(bytes.buf.length, 33);
-  assert.equal(bytes.buf[32], 0x61);
-  words.buf[1] = 0x12345678;
-  assert.deepEqual(bytes.buf.slice(4, 8), [0x78, 0x56, 0x34, 0x12]);
+  assert.equal(words.$b[0], 0x61616161);
+  assert.equal(bytes.$b.length, 33);
+  assert.equal(bytes.$b[32], 0x61);
+  words.$b[1] = 0x12345678;
+  assert.deepEqual(bytes.$b.slice(4, 8), [0x78, 0x56, 0x34, 0x12]);
   assert.equal(rt.addr(words, 4), rt.addr(bytes, 1));
-  assert.equal(rt.addr({ buf: words.buf, off: 1 }, 4), rt.addr({ buf: bytes.buf, off: 4 }, 1));
+  assert.equal(rt.addr({ $b: words.$b, $o: 1 }, 4), rt.addr({ $b: bytes.$b, $o: 4 }, 1));
   assert.throws(() => rt.unscale(bytes, 4, () => ({})), /already holds 1-byte elements/);
 
   pointer = rt.realloc(pointer, 33, 1, 58);
-  pointer.buf.fill(0x62, 33);
+  pointer.$b.fill(0x62, 33);
   const grown = rt.unscale_scalar(rt.byte_slice_ref(rt.slice_from_parts(pointer, 58)), 4, () => 0, "u32");
-  assert.equal(grown.buf, words.buf);
-  assert.equal(grown.buf[13], 0x62626262);
-  assert.equal(pointer.buf[57], 0x62);
+  assert.equal(grown.$b, words.$b);
+  assert.equal(grown.$b[13], 0x62626262);
+  assert.equal(pointer.$b[57], 0x62);
   rt.dealloc(pointer, 58, 1);
   assert.throws(() => rt.unscale_scalar(pointer, 4, () => 0, "u32"), /freed/);
 
   const fresh = rt.alloc_zeroed(12, 4);
   rt.slice_from_parts(fresh, 12);
   const integers = rt.unscale_scalar(fresh, 4, () => 0, "u32");
-  assert.equal(integers.buf.length, 3);
-  assert.deepEqual(integers.buf, [0, 0, 0]);
+  assert.equal(integers.$b.length, 3);
+  assert.deepEqual(integers.$b, [0, 0, 0]);
   rt.dealloc(integers, 12, 4);
 });
 
@@ -52,50 +52,50 @@ test("zero-offset aggregate projection is reversible but standalone values are n
   const leaf = { len: 0 };
   const internal = { data: leaf, edges: [] };
   const allocation = [internal];
-  const projected = rt.prefix({ buf: allocation, off: 0 }, "data", 24);
+  const projected = rt.prefix({ $b: allocation, $o: 0 }, "data", 24);
   const restored = rt.unproject(projected, "data");
 
-  assert.equal(restored.buf[restored.off], internal);
+  assert.equal(restored.$b[restored.$o], internal);
   assert.throws(
-    () => rt.unproject({ buf: [leaf], off: 0 }, "data"),
+    () => rt.unproject({ $b: [leaf], $o: 0 }, "data"),
     /does not name the required zero-offset aggregate field/,
   );
 });
 
 test("scalar byte views alias storage and aggregate byte punning still refuses", () => {
   const bytes = [0x78, 0x56, 0x34, 0x12, 0xff, 0xff, 0xff, 0xff];
-  const pointer = { buf: bytes, off: 0 };
+  const pointer = { $b: bytes, $o: 0 };
   const words = rt.unscale_scalar(pointer, 4, () => 0, "u32");
 
-  assert.equal(words.buf[words.off], 0x12345678);
-  assert.equal(words.buf[words.off + 1], 0xffffffff);
-  words.buf[words.off] = 0x89abcdef;
+  assert.equal(words.$b[words.$o], 0x12345678);
+  assert.equal(words.$b[words.$o + 1], 0xffffffff);
+  words.$b[words.$o] = 0x89abcdef;
   assert.deepEqual(bytes.slice(0, 4), [0xef, 0xcd, 0xab, 0x89]);
   assert.deepEqual(rt.scale(words, 4), pointer);
   assert.equal(rt.addr(words, 4), rt.addr(pointer, 1));
-  assert.equal(rt.unscale_scalar(pointer, 4, () => 0, "u32").buf, words.buf);
+  assert.equal(rt.unscale_scalar(pointer, 4, () => 0, "u32").$b, words.$b);
 
   const signed = rt.unscale_scalar(pointer, 4, () => 0, "i32");
-  assert.equal(signed.buf[signed.off], -1985229329);
+  assert.equal(signed.$b[signed.$o], -1985229329);
   assert.throws(
     () => rt.unscale(pointer, 4, () => ({ value: 0 }), null),
     /is not a byte view of 4-byte elements/,
   );
   // An unaligned word is the bytes at its offset (MIRES-018), in the view of its own phase.
-  const odd = rt.unscale_scalar({ buf: bytes, off: 1 }, 4, () => 0, "u32");
-  assert.equal(odd.buf[odd.off], 0xff89abcd);
-  assert.notEqual(odd.buf, words.buf);
-  assert.equal(rt.unscale_scalar({ buf: bytes, off: 1 }, 4, () => 0, "u32").buf, odd.buf);
-  assert.deepEqual(rt.scale(odd, 4), { buf: bytes, off: 1 });
+  const odd = rt.unscale_scalar({ $b: bytes, $o: 1 }, 4, () => 0, "u32");
+  assert.equal(odd.$b[odd.$o], 0xff89abcd);
+  assert.notEqual(odd.$b, words.$b);
+  assert.equal(rt.unscale_scalar({ $b: bytes, $o: 1 }, 4, () => 0, "u32").$b, odd.$b);
+  assert.deepEqual(rt.scale(odd, 4), { $b: bytes, $o: 1 });
   assert.equal(rt.addr(odd, 4), rt.addr(pointer, 1) + 1);
-  odd.buf[odd.off] = 0x01020304;
+  odd.$b[odd.$o] = 0x01020304;
   assert.deepEqual(bytes.slice(0, 6), [0xef, 0x04, 0x03, 0x02, 0x01, 0xff]);
-  assert.equal(words.buf[words.off], 0x020304ef);
-  const half = rt.unscale_scalar({ buf: bytes, off: 3 }, 2, () => 0, "u16");
-  assert.equal(half.buf[half.off], 0x0102);
-  assert.equal(half.buf[half.off + 1], 0xffff);
+  assert.equal(words.$b[words.$o], 0x020304ef);
+  const half = rt.unscale_scalar({ $b: bytes, $o: 3 }, 2, () => 0, "u16");
+  assert.equal(half.$b[half.$o], 0x0102);
+  assert.equal(half.$b[half.$o + 1], 0xffff);
   assert.throws(
-    () => rt.unscale_scalar({ buf: bytes, off: 1 }, 2, () => 0, "u32"),
+    () => rt.unscale_scalar({ $b: bytes, $o: 1 }, 2, () => 0, "u32"),
     /cannot form a u32 scalar view/,
   );
 });
@@ -178,102 +178,102 @@ test("host float fixed/f32-shortest and integer hex/dec formatters match Rust", 
 
 test("wider scalar byte views alias little-endian bytes and non-scalar storage refuses", () => {
   const words = [0x0102, 0x0304];
-  const ptr = { buf: words, off: 0 };
+  const ptr = { $b: words, $o: 0 };
   const bytes = rt.scale_scalar(ptr, 2, "u16");
-  assert.deepEqual(Array.prototype.slice.call(bytes.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
-  assert.equal(rt.scale_scalar(ptr, 2, "u16").buf, bytes.buf);
+  assert.deepEqual(Array.prototype.slice.call(bytes.$b, 0, 4), [0x02, 0x01, 0x04, 0x03]);
+  assert.equal(rt.scale_scalar(ptr, 2, "u16").$b, bytes.$b);
   assert.equal(rt.addr(bytes, 1), rt.addr(ptr, 2));
-  assert.equal(rt.addr({ buf: bytes.buf, off: 2 }, 1), rt.addr({ buf: words, off: 1 }, 2));
+  assert.equal(rt.addr({ $b: bytes.$b, $o: 2 }, 1), rt.addr({ $b: words, $o: 1 }, 2));
   assert.equal(rt.ptr_eq(bytes, ptr), true);
-  assert.equal(rt.ptr_eq({ buf: bytes.buf, off: 2 }, { buf: words, off: 1 }), true);
-  assert.equal(rt.ptr_eq({ buf: bytes.buf, off: 1 }, { buf: words, off: 1 }), false);
+  assert.equal(rt.ptr_eq({ $b: bytes.$b, $o: 2 }, { $b: words, $o: 1 }), true);
+  assert.equal(rt.ptr_eq({ $b: bytes.$b, $o: 1 }, { $b: words, $o: 1 }), false);
 
   // Live two-way mutation (u16 and signed i16).
-  bytes.buf[1] = 0xfe;
+  bytes.$b[1] = 0xfe;
   assert.equal(words[0], 0xfe02);
   words[1] = 0xabcd;
-  assert.deepEqual([bytes.buf[2], bytes.buf[3]], [0xcd, 0xab]);
+  assert.deepEqual([bytes.$b[2], bytes.$b[3]], [0xcd, 0xab]);
 
   const signed16 = [0];
-  const sb = rt.scale_scalar({ buf: signed16, off: 0 }, 2, "i16");
-  sb.buf[0] = 0xff;
-  sb.buf[1] = 0xff;
+  const sb = rt.scale_scalar({ $b: signed16, $o: 0 }, 2, "i16");
+  sb.$b[0] = 0xff;
+  sb.$b[1] = 0xff;
   assert.equal(signed16[0], -1);
 
   // Signed i8 byte view over u16 storage.
-  const i8bytes = rt.scale_scalar({ buf: [0xfe02], off: 0 }, 2, "u16", true);
-  assert.deepEqual([i8bytes.buf[0], i8bytes.buf[1]], [2, -2]);
+  const i8bytes = rt.scale_scalar({ $b: [0xfe02], $o: 0 }, 2, "u16", true);
+  assert.deepEqual([i8bytes.$b[0], i8bytes.$b[1]], [2, -2]);
 
   // Round-trip back to original buffer via unscale_scalar and thin.
-  const back = rt.unscale_scalar({ buf: bytes.buf, off: 2 }, 2, () => 0, "u16");
-  assert.equal(back.buf, words);
-  assert.equal(back.off, 1);
-  const thinBack = rt.thin({ buf: bytes.buf, off: 2 }, 2);
-  assert.equal(thinBack.buf, words);
-  assert.equal(thinBack.off, 1);
-  assert.throws(() => rt.thin({ buf: bytes.buf, off: 1 }, 2), /not a multiple of 2/);
+  const back = rt.unscale_scalar({ $b: bytes.$b, $o: 2 }, 2, () => 0, "u16");
+  assert.equal(back.$b, words);
+  assert.equal(back.$o, 1);
+  const thinBack = rt.thin({ $b: bytes.$b, $o: 2 }, 2);
+  assert.equal(thinBack.$b, words);
+  assert.equal(thinBack.$o, 1);
+  assert.throws(() => rt.thin({ $b: bytes.$b, $o: 1 }, 2), /not a multiple of 2/);
 
   // BigInt (i64) and float (f64) read/write.
   const big = [0n];
-  const bb = rt.scale_scalar({ buf: big, off: 0 }, 8, "i64");
-  bb.buf[7] = 0x80;
+  const bb = rt.scale_scalar({ $b: big, $o: 0 }, 8, "i64");
+  bb.$b[7] = 0x80;
   assert.equal(big[0], -9223372036854775808n);
-  assert.equal(bb.buf[7], 0x80);
+  assert.equal(bb.$b[7], 0x80);
 
   const flt = [1.5];
-  const fb = rt.scale_scalar({ buf: flt, off: 0 }, 8, "f64");
-  fb.buf[7] |= 0x80;
+  const fb = rt.scale_scalar({ $b: flt, $o: 0 }, 8, "f64");
+  fb.$b[7] |= 0x80;
   assert.equal(flt[0], -1.5);
 
   // Heap block retyped via unscale_scalar records kind for GVN-folded raw pointers without eager Proxy.
   const allocPtr = rt.alloc(4, 2);
-  assert.equal(types.isProxy(allocPtr.buf), false);
+  assert.equal(types.isProxy(allocPtr.$b), false);
   const typed = rt.unscale_scalar(allocPtr, 2, () => 0, "u16");
-  assert.equal(types.isProxy(allocPtr.buf), false);
-  assert.equal(types.isProxy(typed.buf), false);
-  assert.notEqual(allocPtr.buf, typed.buf);
-  assert.equal(allocPtr.buf.length, 0);
-  typed.buf[0] = 0x0102;
-  typed.buf[1] = 0x0304;
+  assert.equal(types.isProxy(allocPtr.$b), false);
+  assert.equal(types.isProxy(typed.$b), false);
+  assert.notEqual(allocPtr.$b, typed.$b);
+  assert.equal(allocPtr.$b.length, 0);
+  typed.$b[0] = 0x0102;
+  typed.$b[1] = 0x0304;
   // Direct GVN-folded byte reads/writes, offset slice, copy, write_bytes, realloc.
   assert.deepEqual(
-    [0, 1, 2, 3].map((k) => rt.read_byte({ buf: allocPtr.buf, off: k })),
+    [0, 1, 2, 3].map((k) => rt.read_byte({ $b: allocPtr.$b, $o: k })),
     [0x02, 0x01, 0x04, 0x03],
   );
   const gvnSlice = rt.byte_slice_ref(rt.slice_from_parts(allocPtr, 4, 1));
-  assert.deepEqual(Array.prototype.slice.call(gvnSlice.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
-  const gvnOffSlice = rt.byte_slice_ref(rt.slice_from_parts({ buf: allocPtr.buf, off: 1 }, 2, 1));
-  assert.deepEqual([gvnOffSlice.buf[gvnOffSlice.off], gvnOffSlice.buf[gvnOffSlice.off + 1]], [0x01, 0x04]);
-  assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 2 }, { buf: typed.buf, off: 1 }), true);
-  assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 1 }, { buf: typed.buf, off: 1 }), false);
+  assert.deepEqual(Array.prototype.slice.call(gvnSlice.$b, 0, 4), [0x02, 0x01, 0x04, 0x03]);
+  const gvnOffSlice = rt.byte_slice_ref(rt.slice_from_parts({ $b: allocPtr.$b, $o: 1 }, 2, 1));
+  assert.deepEqual([gvnOffSlice.$b[gvnOffSlice.$o], gvnOffSlice.$b[gvnOffSlice.$o + 1]], [0x01, 0x04]);
+  assert.equal(rt.ptr_eq({ $b: allocPtr.$b, $o: 2 }, { $b: typed.$b, $o: 1 }), true);
+  assert.equal(rt.ptr_eq({ $b: allocPtr.$b, $o: 1 }, { $b: typed.$b, $o: 1 }), false);
   const grown = rt.realloc(allocPtr, 4, 2, 8);
-  assert.equal(grown.buf, allocPtr.buf);
-  assert.equal(types.isProxy(grown.buf), false);
-  typed.buf[2] = 0x0506;
+  assert.equal(grown.$b, allocPtr.$b);
+  assert.equal(types.isProxy(grown.$b), false);
+  typed.$b[2] = 0x0506;
   assert.deepEqual(
-    [rt.read_byte({ buf: grown.buf, off: 4 }), rt.read_byte({ buf: grown.buf, off: 5 })],
+    [rt.read_byte({ $b: grown.$b, $o: 4 }), rt.read_byte({ $b: grown.$b, $o: 5 })],
     [0x06, 0x05],
   );
   rt.write_bytes(grown, 0x5a, 4);
-  assert.deepEqual([typed.buf[0], typed.buf[1]], [0x5a5a, 0x5a5a]);
+  assert.deepEqual([typed.$b[0], typed.$b[1]], [0x5a5a, 0x5a5a]);
   rt.dealloc(rt.scale_scalar(typed, 2, "u16"), 8, 2);
 
   // Erased pointer round-trip through thin(p, 1, signed?).
   const erWords = [0xfe02, 0x7f01];
-  const erased = rt.erase({ buf: erWords, off: 0 }, 2, "u16");
+  const erased = rt.erase({ $b: erWords, $o: 0 }, 2, "u16");
   const thinU8 = rt.thin(erased, 1);
   const thinI8 = rt.thin(erased, 1, true);
-  assert.deepEqual([thinU8.buf[0], thinU8.buf[1]], [2, 254]);
-  assert.deepEqual([thinI8.buf[0], thinI8.buf[1]], [2, -2]);
+  assert.deepEqual([thinU8.$b[0], thinU8.$b[1]], [2, 254]);
+  assert.deepEqual([thinI8.$b[0], thinI8.$b[1]], [2, -2]);
 
   // Layered _scalar_view over _byte_view preserves addr() and ptr_eq().
   const layeredWords = [0x0102, 0x0304, 0x0506, 0x0708];
-  const lp = { buf: layeredWords, off: 0 };
+  const lp = { $b: layeredWords, $o: 0 };
   const lbp = rt.scale_scalar(lp, 2, "u16");
-  const unal = rt.unscale_scalar({ buf: lbp.buf, off: 1 }, 2, () => 0, "u16");
-  assert.equal(unal.buf[unal.off], 0x0401);
+  const unal = rt.unscale_scalar({ $b: lbp.$b, $o: 1 }, 2, () => 0, "u16");
+  assert.equal(unal.$b[unal.$o], 0x0401);
   assert.equal(rt.addr(unal, 2), rt.addr(lp, 2) + 1);
-  assert.equal(rt.ptr_eq(unal, { buf: lbp.buf, off: 1 }), true);
+  assert.equal(rt.ptr_eq(unal, { $b: lbp.$b, $o: 1 }), true);
   const cross32 = rt.unscale_scalar(lbp, 4, () => 0, "u32");
   assert.equal(rt.addr(cross32, 4), rt.addr(lp, 2));
   assert.equal(rt.ptr_eq(cross32, lp), true);
@@ -282,18 +282,18 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
 
   // Out-of-bounds byte slice / index on scalar storage fails closed (e.g. nested [[u16; 2]; 2]).
   const inner = [0x0102, 0x0304];
-  const innerBv = rt.scale_scalar({ buf: inner, off: 0 }, 2, "u16");
+  const innerBv = rt.scale_scalar({ $b: inner, $o: 0 }, 2, "u16");
   assert.throws(
     () => rt.slice_from_parts(innerBv, 8, 1),
     (err) => rt.is_abort(err) && /exceeds 4-byte/.test(err.message),
   );
   assert.throws(
-    () => innerBv.buf[4],
+    () => innerBv.$b[4],
     (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
   );
   assert.throws(
     () => {
-      innerBv.buf[4] = 1;
+      innerBv.$b[4] = 1;
     },
     (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
   );
@@ -303,20 +303,20 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   const pw = rt.box(wrap);
   const pa = rt.prefix(pw, "a", 8);
   const pb = rt.scale_scalar(pa, 4, "u32");
-  assert.deepEqual([pb.buf[0], pb.buf[1], pb.buf[2], pb.buf[3]], [0x44, 0x33, 0x22, 0x11]);
+  assert.deepEqual([pb.$b[0], pb.$b[1], pb.$b[2], pb.$b[3]], [0x44, 0x33, 0x22, 0x11]);
   assert.equal(rt.addr(pb, 1), rt.addr(pw, 8));
-  assert.equal(rt.addr({ buf: pb.buf, off: 3 }, 1), rt.addr(pw, 8) + 3);
+  assert.equal(rt.addr({ $b: pb.$b, $o: 3 }, 1), rt.addr(pw, 8) + 3);
   assert.equal(rt.ptr_eq(pb, pw), true);
   assert.throws(
-    () => pb.buf[4],
+    () => pb.$b[4],
     (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
   );
   assert.equal(rt.unproject(rt.unscale_scalar(pb, 4, () => 0, "u32"), "a"), pw);
 
   // Non-scalar aggregate storage fails closed loudly on both slice and single-byte deref without Proxy.
   const pairs = [{ a: 1, b: 2 }];
-  const scaledPair = rt.scale({ buf: pairs, off: 0 }, 8);
-  assert.equal(types.isProxy(scaledPair.buf), false);
+  const scaledPair = rt.scale({ $b: pairs, $o: 0 }, 8);
+  assert.equal(types.isProxy(scaledPair.$b), false);
   assert.throws(
     () => rt.read_byte(scaledPair),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
@@ -325,7 +325,7 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
     () => rt.write_byte(scaledPair, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
-  assert.equal(rt.unscale(scaledPair, 8).buf, pairs);
+  assert.equal(rt.unscale(scaledPair, 8).$b, pairs);
   assert.throws(
     () => rt.slice_from_parts(scaledPair, 8, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
@@ -333,7 +333,7 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   const pairHeap = rt.alloc(8, 4);
   const pairTyped = rt.unscale(pairHeap, 8, () => ({ a: 0, b: 0 }));
   const rawPairSlice = rt.slice_from_parts(pairHeap, 8, 1);
-  assert.equal(types.isProxy(rawPairSlice.buf), false);
+  assert.equal(types.isProxy(rawPairSlice.$b), false);
   assert.throws(
     () => rt.byte_slice_ref(rawPairSlice),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
@@ -346,7 +346,7 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
     () => rt.write_byte(rawPairSlice, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
-  assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairTyped.buf);
+  assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).$b, pairTyped.$b);
   rt.dealloc(rawPairSlice, 8, 4);
 });
 
@@ -357,37 +357,37 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   const clonePair = ($e) => ({ a: $e.a, b: $e.b });
   const a = rt.alloc(32, 4);
   const p = rt.unscale(a, 8, () => ({ a: 0, b: 0 }), clonePair);
-  rt._put(p.buf, 0, { a: 10, b: 11 }, true);
-  rt._put(p.buf, 1, { a: 20, b: 21 }, true);
-  rt._put(p.buf, 2, { a: 30, b: 31 }, true);
-  const a1 = { buf: a.buf, off: 8 };
+  rt._put(p.$b, 0, { a: 10, b: 11 }, true);
+  rt._put(p.$b, 1, { a: 20, b: 21 }, true);
+  rt._put(p.$b, 2, { a: 30, b: 31 }, true);
+  const a1 = { $b: a.$b, $o: 8 };
   const p1 = rt.unscale(a1, 8, () => ({ a: 0, b: 0 }), clonePair);
-  assert.equal(p1.buf, p.buf);
-  assert.equal(p1.off, 1);
-  assert.equal(rt.ptr_eq(a1, p.buf[1]), true);
-  assert.equal(rt.addr(p.buf[1], 1), rt.addr(a1, 1));
+  assert.equal(p1.$b, p.$b);
+  assert.equal(p1.$o, 1);
+  assert.equal(rt.ptr_eq(a1, p.$b[1]), true);
+  assert.equal(rt.addr(p.$b[1], 1), rt.addr(a1, 1));
   assert.throws(
-    () => rt.unscale({ buf: a.buf, off: 4 }, 8, () => ({ a: 0, b: 0 }), clonePair),
+    () => rt.unscale({ $b: a.$b, $o: 4 }, 8, () => ({ a: 0, b: 0 }), clonePair),
     (err) => rt.is_abort(err) && /not a multiple of 8/.test(err.message),
   );
 
   // Aligned whole-element byte copy clones owned aggregates independently (including fresh dst
   // retype for MIR-GVN-folded Vec::with_capacity) and aborts on misaligned/partial copies.
   const b = rt.alloc(32, 4);
-  rt.copy_nonoverlapping({ buf: b.buf, off: 16 }, a1, 8);
+  rt.copy_nonoverlapping({ $b: b.$b, $o: 16 }, a1, 8);
   const pb = rt.unscale(b, 8, () => ({ a: 0, b: 0 }), clonePair);
-  assert.deepEqual(pb.buf[2], { a: 20, b: 21 });
-  pb.buf[2].a = 999;
-  assert.equal(p.buf[1].a, 20);
-  rt.copy({ buf: a.buf, off: 16 }, a1, 16);
-  p.buf[2].a = 888;
-  assert.equal(p.buf[1].a, 20);
+  assert.deepEqual(pb.$b[2], { a: 20, b: 21 });
+  pb.$b[2].a = 999;
+  assert.equal(p.$b[1].a, 20);
+  rt.copy({ $b: a.$b, $o: 16 }, a1, 16);
+  p.$b[2].a = 888;
+  assert.equal(p.$b[1].a, 20);
   assert.throws(
-    () => rt.copy_nonoverlapping({ buf: b.buf, off: 4 }, a1, 8),
+    () => rt.copy_nonoverlapping({ $b: b.$b, $o: 4 }, a1, 8),
     (err) => rt.is_abort(err),
   );
   assert.throws(
-    () => rt.copy_nonoverlapping({ buf: b.buf, off: 0 }, a1, 4),
+    () => rt.copy_nonoverlapping({ $b: b.$b, $o: 0 }, a1, 4),
     (err) => rt.is_abort(err),
   );
 
@@ -397,15 +397,15 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   const dummyP = { a: 7, b: 8 };
   const rSrc = rt.alloc(8, 4);
   const rSrcP = rt.unscale(rSrc, 4, null);
-  rSrcP.buf[0] = localP;
-  rSrcP.buf[1] = localP;
+  rSrcP.$b[0] = localP;
+  rSrcP.$b[1] = localP;
   const rDst = rt.alloc(8, 4);
   rt.copy_nonoverlapping(rDst, rSrc, 8);
   const rDstP = rt.unscale(rDst, 4, null);
-  assert.equal(rDstP.buf[0], localP);
+  assert.equal(rDstP.$b[0], localP);
   assert.equal(rt.ptr_eq(localP, rDst), false);
   const stackRefs = [dummyP, dummyP];
-  rt.copy_nonoverlapping(rt.scale({ buf: stackRefs, off: 0 }, 4), rSrc, 8);
+  rt.copy_nonoverlapping(rt.scale({ $b: stackRefs, $o: 0 }, 4), rSrc, 8);
   assert.equal(stackRefs[0], localP);
   assert.equal(dummyP.a, 7);
   rt.dealloc(rSrc, 8, 4);
@@ -415,13 +415,13 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   // while non-indirect write_array (e.g. Vec<&Pair>) never registers borrowed referents.
   const wa = rt.alloc(16, 4);
   const wp = rt.unscale(wa, 8, () => ({ a: 0, b: 0 }), clonePair);
-  rt.write_array({ buf: wp.buf, off: 0, w: 2 }, [{ a: 1, b: 2 }, { a: 3, b: 4 }], true);
-  assert.equal(rt.ptr_eq({ buf: wa.buf, off: 8 }, wp.buf[1]), true);
-  assert.equal(rt.addr(wp.buf[1], 1), rt.addr({ buf: wa.buf, off: 8 }, 1));
+  rt.write_array({ $b: wp.$b, $o: 0, $w: 2 }, [{ a: 1, b: 2 }, { a: 3, b: 4 }], true);
+  assert.equal(rt.ptr_eq({ $b: wa.$b, $o: 8 }, wp.$b[1]), true);
+  assert.equal(rt.addr(wp.$b[1], 1), rt.addr({ $b: wa.$b, $o: 8 }, 1));
   const borrowed = { a: 42, b: 43 };
   const ra = rt.alloc(8, 4);
   const rp = rt.unscale(ra, 4, () => 0);
-  rt.write_array({ buf: rp.buf, off: 0, w: 2 }, [borrowed, borrowed]);
+  rt.write_array({ $b: rp.$b, $o: 0, $w: 2 }, [borrowed, borrowed]);
   assert.equal(rt.ptr_eq(borrowed, rp), false);
   rt.dealloc(wa, 16, 4);
   rt.dealloc(ra, 8, 4);
@@ -432,7 +432,7 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.throws(
-    () => rt.write_bytes({ buf: rt.scale(p, 8, clonePair).buf, off: 8, sc: 8 }, 0, 8),
+    () => rt.write_bytes({ $b: rt.scale(p, 8, clonePair).$b, $o: 8, $s: 8 }, 0, 8),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   rt.dealloc(a, 32, 4);
@@ -441,15 +441,15 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   // 2. Non-fresh scalar retype guard fires at both offset 0 and non-zero offsets on fromAlloc.
   const sa = rt.alloc(8, 2);
   const sp = rt.unscale_scalar(sa, 2, () => 0, "u16");
-  sp.buf[0] = 11;
-  sp.buf[1] = 22;
-  assert.equal(rt.unscale_scalar({ buf: sa.buf, off: 2 }, 2, () => 0, "u16").off, 1);
+  sp.$b[0] = 11;
+  sp.$b[1] = 22;
+  assert.equal(rt.unscale_scalar({ $b: sa.$b, $o: 2 }, 2, () => 0, "u16").$o, 1);
   assert.throws(
-    () => rt.unscale_scalar({ buf: sa.buf, off: 0 }, 4, () => 0, "u32"),
+    () => rt.unscale_scalar({ $b: sa.$b, $o: 0 }, 4, () => 0, "u32"),
     (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
   );
   assert.throws(
-    () => rt.unscale_scalar({ buf: sa.buf, off: 2 }, 4, () => 0, "u32"),
+    () => rt.unscale_scalar({ $b: sa.$b, $o: 2 }, 4, () => 0, "u32"),
     (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
   );
   rt.dealloc(sa, 8, 2);
@@ -457,71 +457,71 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   // 3. align == 1 retyped allocations: byte offsets, ptr_eq on erased pointers, and thin offset-0 guard.
   const a1u16 = rt.alloc(8, 1);
   const p1u16 = rt.unscale_scalar(a1u16, 2, () => 0, "u16");
-  p1u16.buf[0] = 11;
-  p1u16.buf[1] = 22;
-  p1u16.buf[2] = 33;
-  assert.equal(rt.unscale_scalar({ buf: a1u16.buf, off: 2 }, 2, () => 0, "u16").off, 1);
-  assert.equal(rt.ptr_eq({ buf: a1u16.buf, off: 2 }, rt.erase({ buf: p1u16.buf, off: 1 }, 2, "u16")), true);
+  p1u16.$b[0] = 11;
+  p1u16.$b[1] = 22;
+  p1u16.$b[2] = 33;
+  assert.equal(rt.unscale_scalar({ $b: a1u16.$b, $o: 2 }, 2, () => 0, "u16").$o, 1);
+  assert.equal(rt.ptr_eq({ $b: a1u16.$b, $o: 2 }, rt.erase({ $b: p1u16.$b, $o: 1 }, 2, "u16")), true);
   assert.throws(
-    () => rt.thin({ buf: a1u16.buf, off: 0 }, 4),
+    () => rt.thin({ $b: a1u16.$b, $o: 0 }, 4),
     (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
   );
-  const s1u16 = rt.byte_slice_ref(rt.slice_from_parts({ buf: a1u16.buf, off: 2 }, 4, 1));
-  assert.deepEqual([s1u16.buf[2], s1u16.buf[3], s1u16.buf[4], s1u16.buf[5]], [22, 0, 33, 0]);
-  rt.write_bytes({ buf: a1u16.buf, off: 2 }, 0xab, 2);
-  assert.equal(p1u16.buf[1], 0xabab);
+  const s1u16 = rt.byte_slice_ref(rt.slice_from_parts({ $b: a1u16.$b, $o: 2 }, 4, 1));
+  assert.deepEqual([s1u16.$b[2], s1u16.$b[3], s1u16.$b[4], s1u16.$b[5]], [22, 0, 33, 0]);
+  rt.write_bytes({ $b: a1u16.$b, $o: 2 }, 0xab, 2);
+  assert.equal(p1u16.$b[1], 0xabab);
   rt.dealloc(a1u16, 8, 1);
 
   // 4. Nested prefix retains outermost stride in _unwrap_view & ptr_cmp.
   const arr = [{ inner: { x: 1, y: 2 }, z: 3n }, { inner: { x: 0x11223344, y: 5 }, z: 9n }];
-  const po = { buf: arr, off: 1 };
+  const po = { $b: arr, $o: 1 };
   const pi = rt.prefix(po, "inner", 16);
   const px = rt.prefix(pi, "x", 8);
   const pbx = rt.scale_scalar(px, 4, "u32");
   assert.equal(rt.addr(pbx, 1), rt.addr(po, 16));
   assert.equal(rt.addr(pbx, 1), rt.addr(px, 4));
   assert.equal(rt.ptr_eq(pbx, px), true);
-  assert.equal(rt.ptr_cmp(rt.prefix(rt.prefix({ buf: arr, off: 0 }, "inner", 16), "x", 8), px, 4), -1);
+  assert.equal(rt.ptr_cmp(rt.prefix(rt.prefix({ $b: arr, $o: 0 }, "inner", 16), "x", 8), px, 4), -1);
 
   // 5. Prefix byte view cache does not mutate direct field byte view entry.
   const w = { a: 0xdeadbeef, b: 0x12345678 };
-  const pf = rt.scale_scalar({ buf: w, off: "a" }, 4, "u32");
+  const pf = rt.scale_scalar({ $b: w, $o: "a" }, 4, "u32");
   const addrBefore = rt.addr(pf, 1);
   const pp = rt.scale_scalar(rt.prefix(rt.box(w), "a", 8), 4, "u32");
   assert.equal(rt.addr(pf, 1), addrBefore);
   assert.equal(rt.addr(pp, 1), rt.addr(rt.box(w), 8));
-  assert.notEqual(pf.buf, pp.buf);
+  assert.notEqual(pf.$b, pp.$b);
 
-  // 6. ptr_eq on empty slice built from scaled non-scalar pointer preserves sc and equality.
+  // 6. ptr_eq on empty slice built from scaled non-scalar pointer preserves $s and equality.
   const nsBuf = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
-  const nsScaled = rt.scale({ buf: nsBuf, off: 1 }, 8);
+  const nsScaled = rt.scale({ $b: nsBuf, $o: 1 }, 8);
   const nsSlice = rt.slice_from_parts(nsScaled, 0, 1);
   assert.equal(rt.ptr_eq(nsScaled, nsSlice), true);
-  assert.equal(rt.ptr_eq(nsScaled, { buf: nsBuf, off: 1 }), true);
+  assert.equal(rt.ptr_eq(nsScaled, { $b: nsBuf, $o: 1 }), true);
 
   // 7. ptr_eq + thin roundtrip for wider scalars (stack, heap align > 1, heap align == 1).
   const stk32 = [10, 20, 30, 40];
-  const sp1 = { buf: stk32, off: 1 };
+  const sp1 = { $b: stk32, $o: 1 };
   const sp1Rt = rt.thin(rt.erase(sp1, 4, "u32"), 4);
-  assert.equal(sp1Rt.es, undefined);
+  assert.equal(sp1Rt.$es, undefined);
   assert.equal(rt.ptr_eq(sp1, sp1Rt), true);
   assert.equal(rt.ptr_eq(sp1, rt.erase(sp1, 4, "u32")), true);
   const hp16 = rt.alloc(8, 2);
   const hp16T = rt.unscale_scalar(hp16, 2, () => 0, "u16");
-  const hp16One = { buf: hp16T.buf, off: 1 };
+  const hp16One = { $b: hp16T.$b, $o: 1 };
   assert.equal(rt.ptr_eq(hp16One, rt.thin(rt.erase(hp16One, 2, "u16"), 2)), true);
   assert.equal(rt.ptr_eq(hp16One, rt.erase(hp16One, 2, "u16")), true);
   rt.dealloc(hp16, 8, 2);
   const hp16A1 = rt.alloc(8, 1);
   const hp16A1T = rt.unscale_scalar(hp16A1, 2, () => 0, "u16");
-  const hp16A1One = { buf: hp16A1T.buf, off: 1 };
+  const hp16A1One = { $b: hp16A1T.$b, $o: 1 };
   assert.equal(rt.ptr_eq(hp16A1One, rt.thin(rt.erase(hp16A1One, 2, "u16"), 2)), true);
   rt.dealloc(hp16A1, 8, 1);
 
-  // 8. Prefix byte-copy fails closed both directly (pv present) and after .add(0) (pv dropped).
-  const prefScaled = rt.scale(rt.prefix({ buf: arr, off: 0 }, "inner", 16), 8, clonePair);
-  const prefDropPv = { buf: prefScaled.buf, off: 0, sc: prefScaled.sc };
-  const dstInner = rt.scale({ buf: [{ x: 0, y: 0 }], off: 0 }, 8, clonePair);
+  // 8. Prefix byte-copy fails closed both directly ($pv present) and after .add(0) ($pv dropped).
+  const prefScaled = rt.scale(rt.prefix({ $b: arr, $o: 0 }, "inner", 16), 8, clonePair);
+  const prefDropPv = { $b: prefScaled.$b, $o: 0, $s: prefScaled.$s };
+  const dstInner = rt.scale({ $b: [{ x: 0, y: 0 }], $o: 0 }, 8, clonePair);
   assert.throws(
     () => rt.copy_nonoverlapping(dstInner, prefScaled, 8),
     (err) => rt.is_abort(err) && /prefix/.test(err.message),
@@ -533,12 +533,12 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
 
   // 9. _uninit_blocks source (GVN-folded unscale_uninit) copies cleanly into non-scalar byte view.
   const rawMu = new Array(16);
-  const pMu = rt.unscale_uninit({ buf: rawMu, off: 0 }, 8, () => ({ a: 0, b: 0 }), clonePair);
-  pMu.buf[0] = { a: 31, b: 32 };
+  const pMu = rt.unscale_uninit({ $b: rawMu, $o: 0 }, 8, () => ({ a: 0, b: 0 }), clonePair);
+  pMu.$b[0] = { a: 31, b: 32 };
   const dstMuArr = [undefined, undefined];
-  rt.copy_nonoverlapping(rt.scale({ buf: dstMuArr, off: 0 }, 8, clonePair), { buf: rawMu, off: 0 }, 16);
+  rt.copy_nonoverlapping(rt.scale({ $b: dstMuArr, $o: 0 }, 8, clonePair), { $b: rawMu, $o: 0 }, 16);
   dstMuArr[0].a = 666;
-  assert.equal(pMu.buf[0].a, 31);
+  assert.equal(pMu.$b[0].a, 31);
   assert.equal(dstMuArr[1], undefined);
 });
 
@@ -551,7 +551,7 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   assert.equal(rt.ptr_eq(dangling, 8), false);
 
   const custom = rt.slice_from_parts(4096, 5);
-  assert.deepEqual(custom, { buf: 4096, off: 0, len: 5 });
+  assert.deepEqual(custom, { $b: 4096, $o: 0, $l: 5 });
   assert.equal(rt.addr(custom, 4), 4096);
   assert.equal(rt.addr(rt.offset(custom, 2, 4), 4), 4104);
   assert.equal(rt.ptr_is_null(custom, 4), false);
@@ -560,7 +560,7 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   assert.equal(rt.ptr_eq(custom, 8192), false);
 
   const nul = rt.slice_from_parts(0, 0);
-  assert.deepEqual(nul, { buf: 0, off: 0, len: 0 });
+  assert.deepEqual(nul, { $b: 0, $o: 0, $l: 0 });
   assert.equal(rt.addr(nul, 4), 0);
   assert.equal(rt.ptr_is_null(nul, 4), true);
   assert.equal(rt.ptr_eq(nul, 0), true);
@@ -568,12 +568,12 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
 
   // `unwindow_slice` on bare dangling/custom addresses (`Box::<[T]>::default()` unsizing).
   const unwDangling = rt.unwindow_slice(4, 0);
-  assert.equal(unwDangling.len, 0);
+  assert.equal(unwDangling.$l, 0);
   assert.equal(rt.addr(unwDangling, 4), 4);
   assert.equal(rt.ptr_eq(unwDangling, dangling), true);
   assert.equal(rt.ptr_eq(unwDangling, 4), true);
   const unwCustom = rt.unwindow_slice(4096, 0);
-  assert.deepEqual(unwCustom, { buf: 4096, off: 0, len: 0 });
+  assert.deepEqual(unwCustom, { $b: 4096, $o: 0, $l: 0 });
 
   // `scale_scalar` / `scale` / `thin` / `offset` / `unscale` / `slice_from_parts` on bare-address
   // and dangling slices return bare numeric addresses and agree across `ptr_eq`, `ptr_cmp`, `addr`.
@@ -582,7 +582,7 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   assert.equal(rt.addr(scaledCustom, 1), 4096);
   assert.equal(rt.ptr_is_null(scaledCustom, 1), false);
   assert.equal(rt.ptr_eq(scaledCustom, custom), true);
-  assert.deepEqual(rt.slice_from_parts(scaledCustom, 5, 1), { buf: 4096, off: 0, len: 5 });
+  assert.deepEqual(rt.slice_from_parts(scaledCustom, 5, 1), { $b: 4096, $o: 0, $l: 5 });
   assert.equal(rt.unscale(scaledCustom, 4, null), 4096);
   assert.equal(rt.unscale_scalar(scaledCustom, 4, null, "u32"), 4096);
   assert.equal(rt.unscale_scalar(custom, 4, null, "u32"), 4096);
@@ -595,20 +595,20 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   assert.equal(rt.thin(rt.erase(custom, 4, "u32"), 1, false), 4096);
   assert.equal(rt.thin(rt.erase(custom, 8), 1, false), 4096);
   assert.deepEqual(rt.slice_from_parts(rt.erase(custom, 4, "u32"), 0, 1), {
-    buf: 4096,
-    off: 0,
-    len: 0,
+    $b: 4096,
+    $o: 0,
+    $l: 0,
   });
 
   // Dangling byte views (`scale_scalar` / `scale` over `_dangling`) compare equal to bare numbers
-  // and bare ZST slice objects `{ buf: 4, off: 0, len: 0 }`.
+  // and bare ZST slice objects `{ $b: 4, $o: 0, $l: 0 }`.
   const danglingU8 = rt.scale_scalar(dangling, 4, "u32", false);
   assert.equal(rt.addr(danglingU8, 1), 4);
   assert.equal(rt.ptr_eq(danglingU8, 4), true);
   assert.equal(rt.ptr_eq(4, danglingU8), true);
   assert.equal(rt.ptr_eq(danglingU8, dangling), true);
-  assert.equal(rt.ptr_eq({ buf: 4, off: 0, len: 0 }, dangling), true);
-  assert.equal(rt.ptr_eq({ buf: 4, off: 0, len: 0 }, danglingU8), true);
+  assert.equal(rt.ptr_eq({ $b: 4, $o: 0, $l: 0 }, dangling), true);
+  assert.equal(rt.ptr_eq({ $b: 4, $o: 0, $l: 0 }, danglingU8), true);
   assert.equal(rt.ptr_eq(rt.scale(dangling, 8), 4), true);
 
   // Offset bare-address slices preserve exact 32-bit addresses, `ptr_eq`, and `ptr_cmp` ordering.
@@ -617,7 +617,7 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   assert.equal(rt.ptr_eq(customOff2, 4104), true);
   assert.equal(rt.ptr_eq(customOff2, rt.slice_from_parts(4104, 3)), true);
   assert.equal(rt.ptr_cmp(rt.offset(custom, 1, 4), rt.offset(scaledCustom, 2, 1), 1), 1);
-  assert.equal(rt.ptr_cmp({ buf: 4096, off: 1, es: 4 }, { buf: 4096, off: 2, sc: 4 }, 1), 1);
+  assert.equal(rt.ptr_cmp({ $b: 4096, $o: 1, $es: 4 }, { $b: 4096, $o: 2, $s: 4 }, 1), 1);
   const huge = rt.slice_from_parts(0xfffffff0, 0);
   assert.equal(rt.addr(huge, 1), 0xfffffff0);
   assert.equal(rt.ptr_cmp(huge, 4096, 1), 1);
@@ -628,11 +628,11 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
 
   // Poisoned offset-from-address records still throw in ptr_eq even when compared to a number.
   assert.throws(
-    () => rt.ptr_eq({ buf: undefined, off: NaN }, 4),
+    () => rt.ptr_eq({ $b: undefined, $o: NaN }, 4),
     (err) => rt.is_abort(err),
   );
   assert.throws(
-    () => rt.ptr_eq(4, { buf: undefined, off: NaN }),
+    () => rt.ptr_eq(4, { $b: undefined, $o: NaN }),
     (err) => rt.is_abort(err),
   );
 });
@@ -648,10 +648,10 @@ test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by
 
   // 2. Non-ZST slices: equal addr + unequal len, unequal addr + reversed len.
   const arr = [10, 20, 30, 40];
-  const s01 = { buf: arr, off: 0, len: 1 };
-  const s02 = { buf: arr, off: 0, len: 2 };
-  const s11 = { buf: arr, off: 1, len: 1 };
-  const s03 = { buf: arr, off: 0, len: 3 };
+  const s01 = { $b: arr, $o: 0, $l: 1 };
+  const s02 = { $b: arr, $o: 0, $l: 2 };
+  const s11 = { $b: arr, $o: 1, $l: 1 };
+  const s03 = { $b: arr, $o: 0, $l: 3 };
   assert.equal(rt.slice_ptr_cmp(s01, s02, 4), -1);
   assert.equal(rt.slice_ptr_cmp(s02, s01, 4), 1);
   assert.equal(rt.slice_ptr_cmp(s11, s03, 4), 1);
@@ -664,9 +664,9 @@ test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by
 
   // 3. `*const str` / `*mut str` byte slices (elem size 1).
   const bytes = new Uint8Array([104, 101, 108, 108, 111]);
-  const strShort = { buf: bytes, off: 0, len: 2 };
-  const strLong = { buf: bytes, off: 0, len: 4 };
-  const strTail = { buf: bytes, off: 1, len: 1 };
+  const strShort = { $b: bytes, $o: 0, $l: 2 };
+  const strLong = { $b: bytes, $o: 0, $l: 4 };
+  const strTail = { $b: bytes, $o: 1, $l: 1 };
   assert.equal(rt.slice_ptr_cmp(strShort, strLong, 1), -1);
   assert.equal(rt.slice_ptr_cmp(strLong, strShort, 1), 1);
   assert.equal(rt.slice_ptr_cmp(strTail, strLong, 1), 1);
@@ -678,12 +678,12 @@ test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by
   const vtable1 = [() => {}, 4, 4, () => 1];
   const vtable2 = [() => {}, 4, 4, () => 2];
   const dynList = [
-    { ptr: objA, meta: vtable1 },
-    { ptr: objA, meta: vtable2 },
-    { ptr: objB, meta: vtable1 },
-    { ptr: objB, meta: vtable2 },
-    { ptr: undefined, meta: vtable1 },
-    { ptr: undefined, meta: vtable2 },
+    { $p: objA, $m: vtable1 },
+    { $p: objA, $m: vtable2 },
+    { $p: objB, $m: vtable1 },
+    { $p: objB, $m: vtable2 },
+    { $p: undefined, $m: vtable1 },
+    { $p: undefined, $m: vtable2 },
   ];
   for (let i = 0; i < dynList.length; i++) {
     assert.equal(rt.fat_ptr_cmp(dynList[i], dynList[i], 1), 0);
@@ -697,13 +697,13 @@ test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by
     }
   }
 
-  // 5. Unsized struct tail `{ ptr, meta: len }`.
-  const slot = { buf: [{ hdr: 1 }], off: 0 };
-  const tail1 = { ptr: slot, meta: 1 };
-  const tail3 = { ptr: slot, meta: 3 };
+  // 5. Unsized struct tail `{ $p, $m: len }`.
+  const slot = { $b: [{ hdr: 1 }], $o: 0 };
+  const tail1 = { $p: slot, $m: 1 };
+  const tail3 = { $p: slot, $m: 3 };
   assert.equal(rt.fat_ptr_cmp(tail1, tail3, 1), -1);
   assert.equal(rt.fat_ptr_cmp(tail3, tail1, 1), 1);
-  assert.equal(rt.fat_ptr_cmp(tail1, { ptr: slot, meta: 1 }, 1), 0);
+  assert.equal(rt.fat_ptr_cmp(tail1, { $p: slot, $m: 1 }, 1), 0);
 });
 
 test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-view machinery", () => {
@@ -715,21 +715,21 @@ test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-vie
     [8, 1, 2, "u16"],
   ]) {
     const a = rt.alloc(size, align);
-    assert.equal(types.isProxy(a.buf), false);
+    assert.equal(types.isProxy(a.$b), false);
     const addrBefore = rt.addr(a, 1);
     const sRaw = rt.slice_from_parts(a, size, 1);
-    assert.equal(types.isProxy(sRaw.buf), false);
+    assert.equal(types.isProxy(sRaw.$b), false);
     const p = kind ? rt.unscale_scalar(a, es, () => 0, kind) : rt.unscale(a, es, () => ({ x: 0 }));
-    assert.equal(types.isProxy(p.buf), false);
+    assert.equal(types.isProxy(p.$b), false);
     assert.equal(rt.addr(p, es), addrBefore);
     assert.equal(rt.addr(a, 1), addrBefore);
     assert.equal(rt.ptr_eq(a, p), true);
     const g = rt.realloc(a, size, align, size * 2);
-    assert.equal(types.isProxy(g.buf), false);
+    assert.equal(types.isProxy(g.$b), false);
     const gRaw = rt.slice_from_parts(g, size * 2, 1);
-    assert.equal(types.isProxy(gRaw.buf), false);
-    assert.equal(rt._byte_view_of.has(a.buf), false);
-    assert.equal(rt._byte_view_of.has(p.buf), false);
+    assert.equal(types.isProxy(gRaw.$b), false);
+    assert.equal(rt._byte_view_of.has(a.$b), false);
+    assert.equal(rt._byte_view_of.has(p.$b), false);
     rt.dealloc(g, size * 2, align);
     assert.throws(() => rt.read_byte(a), (err) => rt.is_abort(err) && /freed/.test(err.message));
   }
@@ -789,36 +789,36 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
 
   // _scalar_view_of: [u8]::align_to::<u32>() scalar view vs underlying byte buffer
   const bytes = [1, 2, 3, 4, 5, 6, 7, 8];
-  const sv = mrt.unscale_scalar({ buf: bytes, off: 0 }, 4, () => 0, "u32");
-  assert.equal(mrt.ptr_eq({ buf: bytes, off: 0 }, sv), true);
-  assert.equal(mrt.ptr_eq({ buf: bytes, off: 4 }, { buf: sv.buf, off: 1 }), true);
-  assert.equal(mrt.ptr_eq({ buf: bytes, off: 1 }, sv), false);
+  const sv = mrt.unscale_scalar({ $b: bytes, $o: 0 }, 4, () => 0, "u32");
+  assert.equal(mrt.ptr_eq({ $b: bytes, $o: 0 }, sv), true);
+  assert.equal(mrt.ptr_eq({ $b: bytes, $o: 4 }, { $b: sv.$b, $o: 1 }), true);
+  assert.equal(mrt.ptr_eq({ $b: bytes, $o: 1 }, sv), false);
 
   // In-place retype when _bv === null: zero-allocation unscale + _bytes compare_bytes + realloc + dealloc
   const raw = mrt.alloc(16, 4);
   const typed = mrt.unscale_scalar(raw, 4, () => 0, "u32");
   assert.equal(typed, raw, "in-place retype when _bv === null must return the same slot");
   assert.equal(mrt.unscale(raw, 4), raw, "subsequent unscale when _bv === null must not allocate");
-  assert.equal(typed.buf.length, 4);
-  typed.buf[0] = 10; typed.buf[1] = 20; typed.buf[2] = 30; typed.buf[3] = 40;
+  assert.equal(typed.$b.length, 4);
+  typed.$b[0] = 10; typed.$b[1] = 20; typed.$b[2] = 30; typed.$b[3] = 40;
   assert.equal(mrt.ptr_eq(raw, typed), true);
-  assert.equal(mrt.ptr_eq({ buf: typed.buf, off: 4, sc: 4 }, { buf: typed.buf, off: 1 }), true);
-  assert.equal(mrt.ptr_eq({ buf: typed.buf, off: 2, sc: 4 }, typed), false);
-  // GVN-folded RawVecInner pointer (`raw`, no `.sc`) compared against a scaled slice of u32s
-  const scaledOther = mrt.scale({ buf: [10, 20, 30, 40], off: 0 }, 4);
+  assert.equal(mrt.ptr_eq({ $b: typed.$b, $o: 4, $s: 4 }, { $b: typed.$b, $o: 1 }), true);
+  assert.equal(mrt.ptr_eq({ $b: typed.$b, $o: 2, $s: 4 }, typed), false);
+  // GVN-folded RawVecInner pointer (`raw`, no `.$s`) compared against a scaled slice of u32s
+  const scaledOther = mrt.scale({ $b: [10, 20, 30, 40], $o: 0 }, 4);
   assert.equal(mrt.compare_bytes(raw, scaledOther, 16), 0);
-  const scaledDiff = mrt.scale({ buf: [10, 20, 99, 40], off: 0 }, 4);
+  const scaledDiff = mrt.scale({ $b: [10, 20, 99, 40], $o: 0 }, 4);
   assert.notEqual(mrt.compare_bytes(raw, scaledDiff, 16), 0);
   // Scaled realloc under _bv === null keeps single in-place array
   const grownMin = mrt.realloc(mrt.scale(typed, 4), 16, 4, 32);
-  assert.equal(grownMin.buf, typed.buf);
-  assert.equal(grownMin.buf.length, 8);
+  assert.equal(grownMin.$b, typed.$b);
+  assert.equal(grownMin.$b.length, 8);
   assert.equal(mrt.unscale(grownMin, 4), grownMin);
   mrt.dealloc(grownMin, 32, 4);
   assert.throws(() => mrt.unscale(grownMin, 4), (err) => mrt.is_abort(err));
   // slice_sort fast paths: len=2, len=16, len=40 (stability + panic safety)
   const s2 = [9, 2];
-  mrt.slice_sort(s2, 0, 2, null, (_c, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  mrt.slice_sort(s2, 0, 2, null, (_c, a, b) => a.$b[a.$o] < b.$b[b.$o], false);
   assert.deepEqual(s2, [2, 9]);
   const s40 = Array.from({ length: 40 }, (_, i) => ({ k: (40 - i) % 7, id: i }));
   mrt.slice_sort(s40, 0, 40, null, (_c, a, b) => a.k < b.k, true);
@@ -832,22 +832,22 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   // 1b. Full shim (_bv !== null): two-array raw vs typed block ptr_eq
   const fullRaw = rt.alloc(16, 4);
   const fullTyped = rt.unscale_scalar(fullRaw, 4, () => 0, "u32");
-  assert.notEqual(fullRaw.buf, fullTyped.buf);
+  assert.notEqual(fullRaw.$b, fullTyped.$b);
   assert.equal(rt.ptr_eq(fullRaw, fullTyped), true);
-  assert.equal(rt.ptr_eq({ buf: fullRaw.buf, off: 4 }, { buf: fullTyped.buf, off: 1 }), true);
-  assert.equal(rt.ptr_eq({ buf: fullRaw.buf, off: 2 }, fullTyped), false);
+  assert.equal(rt.ptr_eq({ $b: fullRaw.$b, $o: 4 }, { $b: fullTyped.$b, $o: 1 }), true);
+  assert.equal(rt.ptr_eq({ $b: fullRaw.$b, $o: 2 }, fullTyped), false);
   rt.dealloc(fullRaw, 16, 4);
 
-  // 2. Full shim: realloc on a scaled non-scalar pointer MUST preserve `.sc` so reading/slicing
+  // 2. Full shim: realloc on a scaled non-scalar pointer MUST preserve `.$s` so reading/slicing
   //    or writing bytes through the grown pointer still aborts fail-closed.
   const nsRaw = rt.alloc(8, 4);
   const nsTyped = rt.unscale(nsRaw, 8, () => ({ a: 0, b: 0 }));
-  nsTyped.buf[0] = { a: 11, b: 22 };
+  nsTyped.$b[0] = { a: 11, b: 22 };
   const scaled = rt.scale(nsTyped, 8);
-  assert.equal(scaled.sc, 8);
+  assert.equal(scaled.$s, 8);
   const grown = rt.realloc(scaled, 8, 4, 16);
   assert.equal(rt.ptr_eq(grown, nsTyped), true);
-  assert.equal(types.isProxy(rt.slice_from_parts(grown, 16, 1).buf), false);
+  assert.equal(types.isProxy(rt.slice_from_parts(grown, 16, 1).$b), false);
   assert.throws(
     () => rt.read_byte(grown),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
@@ -866,21 +866,21 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   //    byte_slice_ref materializes the aliasing byte view (and aborts on non-scalar raw).
   const scRaw = rt.alloc(8, 4);
   const scTyped = rt.unscale_scalar(scRaw, 4, () => 0, "u32");
-  scTyped.buf[0] = 0x11223344;
+  scTyped.$b[0] = 0x11223344;
   const rawSlice = rt.slice_from_parts(scRaw, 4, 1);
-  assert.equal(types.isProxy(rawSlice.buf), false);
+  assert.equal(types.isProxy(rawSlice.$b), false);
   const refSlice = rt.byte_slice_ref(rawSlice);
-  assert.equal(refSlice.buf[refSlice.off], 0x44);
-  assert.equal(refSlice.buf[refSlice.off + 1], 0x33);
-  refSlice.buf[refSlice.off + 1] = 0x99;
-  assert.equal(scTyped.buf[0], 0x11229944);
+  assert.equal(refSlice.$b[refSlice.$o], 0x44);
+  assert.equal(refSlice.$b[refSlice.$o + 1], 0x33);
+  refSlice.$b[refSlice.$o + 1] = 0x99;
+  assert.equal(scTyped.$b[0], 0x11229944);
   rt.dealloc(scRaw, 8, 4);
 });
 
 test("slice_sort is spec-stable, updates _boxes on heap blocks, preserves buf on throw, and handles _bsub_* propagation + bstr case mapping", () => {
   // 1. Stability & subslice offset on direct elements
   const direct = [99, 3, 1, 2, 1, 0, -5];
-  rt.slice_sort(direct, 1, 5, undefined, (_ctx, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  rt.slice_sort(direct, 1, 5, undefined, (_ctx, a, b) => a.$b[a.$o] < b.$b[b.$o], false);
   assert.deepEqual(direct, [99, 0, 1, 1, 2, 3, -5]);
 
   // 2. Stability & _boxes tracking on indirect heap block objects
@@ -893,15 +893,15 @@ test("slice_sort is spec-stable, updates _boxes on heap blocks, preserves buf on
     { k: 0, id: 4 },
   ];
   for (let i = 0; i < 4; i++) {
-    typed.buf[i] = objs[i];
-    rt._boxes.set(objs[i], { buf: typed.buf, off: i });
+    typed.$b[i] = objs[i];
+    rt._boxes.set(objs[i], { $b: typed.$b, $o: i });
   }
-  rt.slice_sort(typed.buf, 0, 4, undefined, (_ctx, a, b) => a.k < b.k, true);
-  assert.deepEqual(typed.buf.map((o) => o.id), [4, 2, 1, 3]);
+  rt.slice_sort(typed.$b, 0, 4, undefined, (_ctx, a, b) => a.k < b.k, true);
+  assert.deepEqual(typed.$b.map((o) => o.id), [4, 2, 1, 3]);
   for (let i = 0; i < 4; i++) {
-    const slot = rt._boxes.get(typed.buf[i]);
-    assert.equal(slot.buf, typed.buf);
-    assert.equal(slot.off, i);
+    const slot = rt._boxes.get(typed.$b[i]);
+    assert.equal(slot.$b, typed.$b);
+    assert.equal(slot.$o, i);
   }
   rt.dealloc(raw, 32, 8);
 
@@ -932,19 +932,19 @@ test("slice_sort is spec-stable, updates _boxes on heap blocks, preserves buf on
   const baseView = rt.bstr_bytes(base);
   const tail1 = rt.bstr_get_from(base, 17);
   const view1 = rt.bstr_bytes(tail1);
-  assert.equal(view1.buf, baseView.buf);
-  assert.equal(view1.off, 17);
-  assert.equal(view1.len, 183);
+  assert.equal(view1.$b, baseView.$b);
+  assert.equal(view1.$o, 17);
+  assert.equal(view1.$l, 183);
   const mid = rt.bstr_get(tail1, 10, 120);
   const view2 = rt.bstr_bytes(mid);
-  assert.equal(view2.buf, baseView.buf);
-  assert.equal(view2.off, 27);
-  assert.equal(view2.len, 110);
+  assert.equal(view2.$b, baseView.$b);
+  assert.equal(view2.$o, 27);
+  assert.equal(view2.$l, 110);
   const head = rt.bstr_get_to(mid, 90);
   const view3 = rt.bstr_bytes(head);
-  assert.equal(view3.buf, baseView.buf);
-  assert.equal(view3.off, 27);
-  assert.equal(view3.len, 90);
+  assert.equal(view3.$b, baseView.$b);
+  assert.equal(view3.$o, 27);
+  assert.equal(view3.$l, 90);
 
   // 5. minimal-shim tree-shaking: bstr_get alone does NOT pull _bstr_memo
   const shimSrc = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
@@ -973,35 +973,35 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   const b = mrt.alloc(16, 4);
   mrt.unscale_scalar(a, 4, () => 0, "u32");
   mrt.unscale_scalar(b, 4, () => 0, "u32");
-  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 1 }, { buf: a.buf, off: 1 }), true);
-  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 1 }, { buf: a.buf, off: 2 }), false);
-  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 0 }, { buf: b.buf, off: 0 }), false);
+  assert.equal(mrt.ptr_eq({ $b: a.$b, $o: 1 }, { $b: a.$b, $o: 1 }), true);
+  assert.equal(mrt.ptr_eq({ $b: a.$b, $o: 1 }, { $b: a.$b, $o: 2 }), false);
+  assert.equal(mrt.ptr_eq({ $b: a.$b, $o: 0 }, { $b: b.$b, $o: 0 }), false);
   // Alternating lookups hit 2-slot _blk_get cache without corruption
-  assert.equal(mrt.offset_from({ buf: a.buf, off: 3 }, { buf: a.buf, off: 1 }, 4), 2);
-  assert.equal(mrt.offset_from({ buf: b.buf, off: 2 }, { buf: b.buf, off: 0 }, 4), 2);
+  assert.equal(mrt.offset_from({ $b: a.$b, $o: 3 }, { $b: a.$b, $o: 1 }, 4), 2);
+  assert.equal(mrt.offset_from({ $b: b.$b, $o: 2 }, { $b: b.$b, $o: 0 }, 4), 2);
   mrt.dealloc(a, 16, 4);
   mrt.dealloc(b, 16, 4);
 
   // 2. offset_from / copy / write_bytes on TypedArray buffers
   const dstBuf = new Uint8Array([1, 1, 2, 2, 2, 9, 8, 5, 6]);
-  assert.equal(rt.offset_from({ buf: dstBuf, off: 5 }, { buf: dstBuf, off: 2 }, 1), 3);
+  assert.equal(rt.offset_from({ $b: dstBuf, $o: 5 }, { $b: dstBuf, $o: 2 }, 1), 3);
   const dst2 = new Uint8Array(4);
-  rt.copy({ buf: dst2, off: 0 }, { buf: dstBuf, off: 5 }, 4);
+  rt.copy({ $b: dst2, $o: 0 }, { $b: dstBuf, $o: 5 }, 4);
   assert.deepEqual(Array.from(dst2), [9, 8, 5, 6]);
-  rt.copy({ buf: dst2, off: 1 }, { buf: dst2, off: 0 }, 3);
+  rt.copy({ $b: dst2, $o: 1 }, { $b: dst2, $o: 0 }, 3);
   assert.deepEqual(Array.from(dst2), [9, 9, 8, 5]);
-  rt.write_bytes({ buf: dst2, off: 1 }, 0xab, 2);
+  rt.write_bytes({ $b: dst2, $o: 1 }, 0xab, 2);
   assert.deepEqual(Array.from(dst2), [9, 0xab, 0xab, 5]);
 
   // 3. Wave 4 runtime helpers: map_values, u8array_into_bytes fast path
   const m = new Map([["a", [10]], ["b", [20]]]);
-  assert.deepEqual(rt.map_values(m), { buf: [[10], [20]], off: 0, len: 2 });
+  assert.deepEqual(rt.map_values(m), { $b: [[10], [20]], $o: 0, $l: 2 });
   const sub = new Uint8Array([9, 1, 2, 3, 9]).subarray(1, 4);
   const taDst = new Uint8Array([0, 0, 0, 0, 0]);
-  rt.u8array_into_bytes(sub, { buf: taDst, off: 1, len: 3 });
+  rt.u8array_into_bytes(sub, { $b: taDst, $o: 1, $l: 3 });
   assert.deepEqual(Array.from(taDst), [0, 1, 2, 3, 0]);
   const arrDst = [0, 0, 0, 0, 0];
-  rt.u8array_into_bytes(sub, { buf: arrDst, off: 1, len: 3 });
+  rt.u8array_into_bytes(sub, { $b: arrDst, $o: 1, $l: 3 });
   assert.deepEqual(arrDst, [0, 1, 2, 3, 0]);
 });
 
@@ -1100,8 +1100,8 @@ test("Phase 1B monomorphic TypedArray helpers, packed zeroed arrays, 32-elem cop
   assert.equal(Object.isFrozen(zafp0.buf), false);
 
   const zaftp = rt.nv_zeroed_arr_fn_tracked_p(2, 100, () => ({ v: 2 }));
-  assert.equal(rt._boxes.get(zaftp.buf[0]).buf, zaftp.buf);
-  assert.equal(rt._boxes.get(zaftp.buf[1]).off, 1);
+  assert.equal(rt._boxes.get(zaftp.buf[0]).$b, zaftp.buf);
+  assert.equal(rt._boxes.get(zaftp.buf[1]).$o, 1);
 
   // 3. copy & copy_nonoverlapping across <= 32 loop and > 32 subarray thresholds
   for (const n of [1, 8, 20, 32, 33, 64]) {
@@ -1109,8 +1109,8 @@ test("Phase 1B monomorphic TypedArray helpers, packed zeroed arrays, 32-elem cop
     for (let i = 0; i < src.length; i++) src[i] = (i * 13 + 5) & 255;
     const d1 = new Uint8Array(n + 4);
     const d2 = new Uint8Array(n + 4);
-    rt.copy_nonoverlapping({ buf: d1, off: 2 }, { buf: src, off: 1 }, n);
-    rt.copy({ buf: d2, off: 2 }, { buf: src, off: 1 }, n);
+    rt.copy_nonoverlapping({ $b: d1, $o: 2 }, { $b: src, $o: 1 }, n);
+    rt.copy({ $b: d2, $o: 2 }, { $b: src, $o: 1 }, n);
     assert.deepEqual(Array.from(d1.subarray(2, 2 + n)), Array.from(src.subarray(1, 1 + n)));
     assert.deepEqual(Array.from(d2.subarray(2, 2 + n)), Array.from(src.subarray(1, 1 + n)));
   }
@@ -1211,10 +1211,10 @@ test("slice_sort direct-value sort preserves stability, panic safety, and _boxes
 
   // 2. Direct scalar slices (isIndirect = false) with subslice offset and already-sorted fast path.
   const nums = [99, 5, 1, 4, 2, 3, 88];
-  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.$b[a.$o] < b.$b[b.$o], false);
   assert.deepEqual(nums, [99, 1, 2, 3, 4, 5, 88]);
   // Already-sorted re-run leaves buffer untouched.
-  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  rt.slice_sort(nums, 1, 5, null, (_, a, b) => a.$b[a.$o] < b.$b[b.$o], false);
   assert.deepEqual(nums, [99, 1, 2, 3, 4, 5, 88]);
 
   // 3. Exception safety: comparator throwing midway must not partially mutate `buf`.
@@ -1251,10 +1251,10 @@ test("slice_sort direct-value sort preserves stability, panic safety, and _boxes
     { k: 20, id: 2 },
     { k: 10, id: 3 },
   ];
-  for (let i = 0; i < 4; i++) rt._put(typed.buf, i, objs[i], true);
-  rt.slice_sort(typed.buf, 0, 4, null, (_, a, b) => a.k < b.k, true);
+  for (let i = 0; i < 4; i++) rt._put(typed.$b, i, objs[i], true);
+  rt.slice_sort(typed.$b, 0, 4, null, (_, a, b) => a.k < b.k, true);
   assert.deepEqual(
-    typed.buf.slice(0, 4).map((o) => [o.k, o.id]),
+    typed.$b.slice(0, 4).map((o) => [o.k, o.id]),
     [
       [10, 1],
       [10, 3],
@@ -1263,7 +1263,79 @@ test("slice_sort direct-value sort preserves stability, panic safety, and _boxes
     ],
   );
   for (let i = 0; i < 4; i++) {
-    assert.equal(rt.ptr_eq(typed.buf[i], { buf: typed.buf, off: i }), true);
+    assert.equal(rt.ptr_eq(typed.$b[i], { $b: typed.$b, $o: i }), true);
   }
   rt.dealloc(raw, 32, 4);
+});
+
+test("safe-Rust runtime regressions: slot key hygiene, flattened array views, __proto__ writes, and boxed aggregate addr", () => {
+  // 1. User structs with fields matching historical slot metadata names never collide with slot duck-typing.
+  const fc1 = { buf: 1, off: 2, len: 3, pr: 4, ps: 5, sc: 6, es: 7, w: 8, ptr: 9, meta: 10 };
+  const fc2 = { buf: 1, off: 2, len: 3, pr: 4, ps: 5, sc: 6, es: 7, w: 8, ptr: 9, meta: 10 };
+  const a1 = rt.addr(fc1, 1);
+  const a2 = rt.addr(fc2, 1);
+  assert.notEqual(a1, 0);
+  assert.notEqual(a2, 0);
+  assert.notEqual(a1, a2);
+  assert.equal(rt.addr(rt.box(fc1), 1), a1);
+  assert.equal(rt.ptr_eq(fc1, fc1), true);
+  assert.equal(rt.ptr_eq(fc1, rt.box(fc1)), true);
+  assert.equal(rt.ptr_eq(fc1, fc2), false);
+  assert.equal(rt.ptr_cmp(fc1, fc1, 1), 0);
+  assert.equal(rt.unref(fc1), rt.box(fc1));
+  assert.equal(rt.unref(fc1).$b[0], fc1);
+
+  // 2. Flattened multi-element array view (`unwindow(slot, width)`) supports reads, writes,
+  //    subslice offsets, nested 3D arrays, addr/ptr_eq, copyWithin, and fill.
+  const mat = [[10, 20], [30, 40], [50, 60]];
+  const flat = rt.unwindow({ $b: mat, $o: 0 }, 2);
+  assert.equal(flat.$o, 0);
+  assert.equal(flat.$b.length, 6);
+  assert.deepEqual([flat.$b[0], flat.$b[1], flat.$b[2], flat.$b[3], flat.$b[4], flat.$b[5]], [10, 20, 30, 40, 50, 60]);
+  flat.$b[3] = 400;
+  assert.equal(mat[1][1], 400);
+  const sub = rt.unwindow({ $b: mat, $o: 1 }, 2);
+  assert.equal(sub.$b, flat.$b);
+  assert.equal(sub.$o, 2);
+  assert.equal(sub.$b[sub.$o], 30);
+  assert.equal(sub.$b[sub.$o + 1], 400);
+  assert.equal(rt.ptr_eq(flat, { $b: mat, $o: 0 }), true);
+  assert.equal(rt.ptr_eq(sub, { $b: mat, $o: 1 }), true);
+  assert.equal(rt.addr(sub, 4), rt.addr({ $b: mat, $o: 1 }, 8));
+  flat.$b.fill(7, 4, 6);
+  assert.deepEqual(mat[2], [7, 7]);
+  flat.$b.copyWithin(0, 2, 4);
+  assert.deepEqual(mat[0], [30, 400]);
+
+  const cube = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
+  const f2 = rt.unwindow({ $b: cube, $o: 0 }, 2);
+  const f3 = rt.unwindow(f2, 2);
+  assert.deepEqual(Array.from(f3.$b), [1, 2, 3, 4, 5, 6, 7, 8]);
+  f3.$b[7] = 88;
+  assert.equal(cube[1][1][1], 88);
+
+  // Single boxed local fast path stays unwrapped (no Proxy).
+  const singleArr = [9, 8];
+  const singleUnw = rt.unwindow(rt.box(singleArr), 2);
+  assert.equal(singleUnw.$b, singleArr);
+  assert.equal(singleUnw.$o, 0);
+
+  // 3. `overwrite` and `_put` define own `"__proto__"` data properties without mutating prototype.
+  const target = { ["__proto__"]: 1, x: 2 };
+  rt.overwrite(target, { ["__proto__"]: 99, x: 100 });
+  assert.equal(Object.getPrototypeOf(target), Object.prototype);
+  assert.equal(Object.prototype.hasOwnProperty.call(target, "__proto__"), true);
+  assert.equal(target.__proto__, 99);
+  assert.equal(target.x, 100);
+  rt.overwrite(target, { TAG: "None" });
+  assert.equal(Object.prototype.hasOwnProperty.call(target, "__proto__"), false);
+  assert.equal(Object.getPrototypeOf(target), Object.prototype);
+  rt._put(target, "__proto__", 77);
+  assert.equal(Object.prototype.hasOwnProperty.call(target, "__proto__"), true);
+  assert.equal(target.__proto__, 77);
+  assert.equal(Object.getPrototypeOf(target), Object.prototype);
+
+  // 4. Boxed local aggregate and its first-field slot share the same synthetic address.
+  const held = { head: 11 };
+  assert.equal(rt.addr(rt.box(held), 1), rt.addr({ $b: held, $o: "head" }, 1));
 });

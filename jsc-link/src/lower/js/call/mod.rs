@@ -594,7 +594,7 @@ impl JsCx<'_> {
                 "a virtual call takes at least a receiver",
             ));
         };
-        let (setup, receiver) = self.reread(receiver.clone(), &["meta", "ptr"]);
+        let (setup, receiver) = self.reread(receiver.clone(), &[ptr::META, ptr::PTR]);
         let data = jsast::member(receiver.clone(), ptr::PTR);
         let data = if owned_virtual_receiver {
             jsast::rt_call("unref", vec![data])
@@ -795,7 +795,7 @@ impl JsCx<'_> {
             // pointer and skipped when the slot is null (`abi.rs::codegen_dyn_drop`).
             DropGlue::Dynamic => {
                 let value = self.borrow_view(root, path, true)?;
-                let (setup, receiver) = self.reread(value, &["meta", "ptr"]);
+                let (setup, receiver) = self.reread(value, &[ptr::META, ptr::PTR]);
                 let slot = vtable_slot(receiver.clone(), VTABLE_DROP_SLOT);
                 let mut out: Vec<Stmt> = setup.map(jsast::expr_stmt).into_iter().collect();
                 out.push(jsast::if_(

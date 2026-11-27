@@ -266,7 +266,10 @@ impl JsCx<'_> {
         } else {
             ptr::slot(jsast::array(vec![record]), jsast::num(0))
         };
-        let fat = jsast::object_of(vec![("ptr", slot), ("meta", len_ref)]);
+        let fat = jsast::object_of(vec![
+            (rcgjs_object::ptr::PTR, slot),
+            (rcgjs_object::ptr::META, len_ref),
+        ]);
         Ok(Some(Lowered::value(sequenced(setup, fat))))
     }
 }

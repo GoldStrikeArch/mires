@@ -919,7 +919,11 @@ impl JsCx<'_> {
                         .find(|(ek, _)| ek == k)
                         .map(|(_, ev)| ev.clone())
                 };
-                if let (Some(b), Some(o), Some(l)) = (field("buf"), field("off"), field("len")) {
+                if let (Some(b), Some(o), Some(l)) = (
+                    field(rcgjs_object::ptr::BUF),
+                    field(rcgjs_object::ptr::OFF),
+                    field(rcgjs_object::ptr::LEN),
+                ) {
                     let b = self.bind_atom(b, prelude);
                     let o = self.bind_atom(o, prelude);
                     let l = self.bind_atom(l, prelude);
@@ -927,9 +931,9 @@ impl JsCx<'_> {
                 }
             }
             let held = self.bind_atom(expr, prelude);
-            let b = self.bind_atom(jsast::member(held.clone(), "buf"), prelude);
-            let o = self.bind_atom(jsast::member(held.clone(), "off"), prelude);
-            let l = self.bind_atom(jsast::member(held, "len"), prelude);
+            let b = self.bind_atom(jsast::member(held.clone(), rcgjs_object::ptr::BUF), prelude);
+            let o = self.bind_atom(jsast::member(held.clone(), rcgjs_object::ptr::OFF), prelude);
+            let l = self.bind_atom(jsast::member(held, rcgjs_object::ptr::LEN), prelude);
             return Ok((b, o, l));
         }
         let base = self.bind_atom(self.byte_view_base_expr(bv, v)?, prelude);

@@ -8,7 +8,9 @@ use crate::analysis::arena::ProgramBoundsFacts;
 use crate::analysis::byte_views::ByteViewPlan;
 use crate::analysis::heap::HeapPlan;
 use crate::diag::Sink;
-use crate::item::{item_map, prologue, write_program, JsItem, JsName, LinkItem};
+use crate::item::{
+    item_map, prologue, write_program, ItemKind, ItemMap, JsItem, JsName, LinkItem, Linkage,
+};
 use crate::jir::decline::{Decline, LowerDecline, OpClass};
 use crate::jir::repr::Func;
 use crate::jir::semantic::BodySemantic;
@@ -211,6 +213,7 @@ impl<'a> LaneDriver<'a> {
         let mut result = self.lower_with_retry(&mut stage_a, &mut stage_b1, &mut stage_b2, &synth);
         let added_items = self.install_synthesized_items(
             &mut result.lowered,
+            &stage_b1.work_table,
             &stage_b2.plan,
             &stage_a.enum_plan,
             &stage_b2.abi_clone_names,
@@ -579,6 +582,12 @@ impl<'a> LaneDriver<'a> {
                 self.live.insert(helper_name);
             }
         }
+        for helper in crate::lower::js::value::all_large_enum_clone_helper_names(work_table) {
+            if !self.table.contains_key(&helper) {
+                self.defined.insert(helper.clone());
+                self.live.insert(helper);
+            }
+        }
         let mut bstr_const_items = Vec::new();
         if crate::lower::bstr::enabled() {
             for (name, item) in self.table.iter_mut() {
@@ -801,7 +810,8 @@ impl<'a> LaneDriver<'a> {
     /// byte-string constant items into `self.table`.
     fn install_synthesized_items(
         &mut self,
-        lowered: &mut [Lowered],
+        lowered: &mut Vec<Lowered>,
+        work_table: &BTreeMap<JsName, LinkItem>,
         plan: &AbiPlan,
         enum_plan: &EnumReprPlan,
         abi_clone_names: &BTreeSet<JsName>,
@@ -812,6 +822,47 @@ impl<'a> LaneDriver<'a> {
         let spills = plan.spill_items();
         let mut added_items =
             !spills.is_empty() || enum_plan.sentinel_none.is_some() || !abi_clone_names.is_empty();
+        // Synthesize deduplicated deep-clone helpers for large enums BEFORE `hoist_consts::run`
+        // so internal tag encoding and BigInt hoisting process them in lockstep with callers.
+        let mut clone_referenced: BTreeSet<JsName> = lowered
+            .iter()
+            .filter_map(|(_, res, _, _)| res.as_ref().ok())
+            .flat_map(|lowering| lowering.refs.iter().cloned())
+            .collect();
+        for item in self.table.values() {
+            clone_referenced.extend(item.refs.iter().cloned());
+        }
+        let existing_names: BTreeSet<JsName> = self.table.keys().cloned().collect();
+        for (helper_name, helper_lowering) in crate::lower::js::value::needed_enum_clone_lowerings(
+            work_table,
+            &clone_referenced,
+            &existing_names,
+        ) {
+            self.defined.insert(helper_name.clone());
+            self.live.insert(helper_name.clone());
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.table.entry(helper_name.clone())
+            {
+                slot.insert(LinkItem {
+                    name: helper_name.clone(),
+                    kind: ItemKind::Fn,
+                    js: String::new(),
+                    refs: helper_lowering.refs.clone(),
+                    zombies: Vec::new(),
+                    linkage: Linkage::internal(),
+                    debug_path: "large enum clone helper".to_owned(),
+                    crate_name: "generated".to_owned(),
+                    order: None,
+                    map: ItemMap::default(),
+                    dts: None,
+                    optimization: Default::default(),
+                    allocator_provider: Default::default(),
+                    jir: Default::default(),
+                });
+                lowered.push((helper_name, Ok(helper_lowering), OptStats::default(), None));
+                added_items = true;
+            }
+        }
         if self.opts.optimizer == OptimizerMode::On {
             added_items |= crate::link::hoist_consts::run(
                 self.table,
@@ -1321,7 +1372,14 @@ fn physical_program_metrics(
         .flat_map(|item| item.refs.iter().cloned())
         .collect();
     let existing: BTreeSet<JsName> = table.keys().cloned().collect();
-    for helper in crate::lower::js::i64_pair::needed_helper_items(&referenced, &existing) {
+    for helper in crate::lower::js::i64_pair::needed_helper_items(&referenced, &existing)
+        .into_iter()
+        .chain(crate::lower::js::value::needed_enum_clone_items(
+            &table,
+            &referenced,
+            &existing,
+        ))
+    {
         if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(helper.name.clone()) {
             slot.insert(helper);
         }

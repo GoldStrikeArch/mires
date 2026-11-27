@@ -600,7 +600,9 @@ impl<'a> JsCx<'a> {
                             .find(|(ek, _)| ek == k)
                             .map(|(_, ev)| ev.clone())
                     };
-                    if let (Some(b), Some(o), Some(l)) = (find("buf"), find("off"), find("len")) {
+                    if let (Some(b), Some(o), Some(l)) =
+                        (find(ptr::BUF), find(ptr::OFF), find(ptr::LEN))
+                    {
                         (b, o, l)
                     } else {
                         let (bs, s) = self.temp(slice_expr);

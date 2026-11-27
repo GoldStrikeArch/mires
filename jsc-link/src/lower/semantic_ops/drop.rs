@@ -128,8 +128,8 @@ pub(super) fn box_drop(
     let argument = slot_type(cx.sig, SignatureSlot::Argument(0))?;
     let boxed = match type_get(cx.table, argument)?.kind {
         TypeKind::Reference { .. } => jsast::index(
-            jsast::member(jsast::id("$native0"), "buf"),
-            jsast::member(jsast::id("$native0"), "off"),
+            jsast::member(jsast::id("$native0"), rcgjs_object::ptr::BUF),
+            jsast::member(jsast::id("$native0"), rcgjs_object::ptr::OFF),
         ),
         _ => jsast::id("$native0"),
     };
@@ -138,8 +138,8 @@ pub(super) fn box_drop(
         jsast::expr_stmt(jsast::call(
             jsast::id(glue.as_str()),
             vec![jsast::index(
-                jsast::member(jsast::id("$nativeBox"), "buf"),
-                jsast::member(jsast::id("$nativeBox"), "off"),
+                jsast::member(jsast::id("$nativeBox"), rcgjs_object::ptr::BUF),
+                jsast::member(jsast::id("$nativeBox"), rcgjs_object::ptr::OFF),
             )],
         )),
         jsast::ret_void(),

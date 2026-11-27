@@ -24,7 +24,7 @@ const cloneP = (e) => ({ x: e.x, y: e.y })
 // union is direct.
 function ptrSwap(rt, x, y, clone) {
   const tmp = [undefined]
-  const t = { buf: tmp, off: 0 }
+  const t = { $b: tmp, $o: 0 }
   rt.copy_nonoverlapping(t, x, 1, clone)
   rt.copy(x, y, 1, clone)
   rt.copy_nonoverlapping(y, t, 1, clone)
@@ -35,7 +35,7 @@ test('swapping two references to aggregates exchanges the references and leaves 
   const h = P(1)
   const h2 = P(2)
   const refs = [h, h2]
-  ptrSwap(rt, { buf: refs, off: 0 }, { buf: refs, off: 1 })
+  ptrSwap(rt, { $b: refs, $o: 0 }, { $b: refs, $o: 1 })
   assert.equal(refs[0], h2)
   assert.equal(refs[1], h)
   assert.deepEqual([h.x, h.y, h2.x, h2.y], [1, 2, 2, 3])
@@ -46,11 +46,11 @@ test('copying a reference into another buffer rebinds the element instead of ove
   const h = P(1)
   const h2 = P(2)
   const dst = [h]
-  rt.copy_nonoverlapping({ buf: dst, off: 0 }, { buf: [h2], off: 0 }, 1)
+  rt.copy_nonoverlapping({ $b: dst, $o: 0 }, { $b: [h2], $o: 0 }, 1)
   assert.equal(dst[0], h2)
   assert.deepEqual(h, { x: 1, y: 2 })
   const dst2 = [h, h2]
-  rt.copy({ buf: dst2, off: 0 }, { buf: [h2, h], off: 0 }, 2)
+  rt.copy({ $b: dst2, $o: 0 }, { $b: [h2, h], $o: 0 }, 2)
   assert.equal(dst2[0], h2)
   assert.equal(dst2[1], h)
   assert.deepEqual([h.x, h2.x], [1, 2])
@@ -58,18 +58,18 @@ test('copying a reference into another buffer rebinds the element instead of ove
 
 test('raw pointers and boxes are slot records: a move stores the record and never mutates the old one', () => {
   const rt = runtime()
-  const a = { buf: [P(1)], off: 0 }
-  const b = { buf: [P(2)], off: 0 }
+  const a = { $b: [P(1)], $o: 0 }
+  const b = { $b: [P(2)], $o: 0 }
   const raws = [a, b]
-  ptrSwap(rt, { buf: raws, off: 0 }, { buf: raws, off: 1 })
+  ptrSwap(rt, { $b: raws, $o: 0 }, { $b: raws, $o: 1 })
   assert.equal(raws[0], b)
   assert.equal(raws[1], a)
-  assert.equal(a.buf[0].x, 1)
-  assert.equal(b.buf[0].x, 2)
+  assert.equal(a.$b[0].x, 1)
+  assert.equal(b.$b[0].x, 2)
   const held = [a]
-  rt.copy({ buf: held, off: 0 }, { buf: [b], off: 0 }, 1)
+  rt.copy({ $b: held, $o: 0 }, { $b: [b], $o: 0 }, 1)
   assert.equal(held[0], b)
-  assert.equal(a.buf[0].x, 1, 'the record the element held is not rewritten into the new one')
+  assert.equal(a.$b[0].x, 1, 'the record the element held is not rewritten into the new one')
 })
 
 test('an aggregate held by value is written into the object in its place, and the source is not aliased', () => {
@@ -79,12 +79,12 @@ test('an aggregate held by value is written into the object in its place, and th
   const arr = [first, second]
   // An alias of the place's object -- the reference `&mut arr[0]` is that object.
   const alias = arr[0]
-  ptrSwap(rt, { buf: arr, off: 0 }, { buf: arr, off: 1 }, cloneP)
+  ptrSwap(rt, { $b: arr, $o: 0 }, { $b: arr, $o: 1 }, cloneP)
   assert.equal(arr[0], first, 'each place keeps its object')
   assert.equal(arr[1], second)
   assert.deepEqual([alias.x, arr[1].x], [2, 1])
   const src = [P(7)]
-  rt.copy_nonoverlapping({ buf: arr, off: 0 }, { buf: src, off: 0 }, 1, cloneP)
+  rt.copy_nonoverlapping({ $b: arr, $o: 0 }, { $b: src, $o: 0 }, 1, cloneP)
   assert.equal(arr[0].x, 7)
   assert.notEqual(arr[0], src[0])
   src[0].x = 8
@@ -96,20 +96,20 @@ test('a `__rt.box` buffer is the place of a local: a move into it is written thr
   // A value held by value that the compiler has no clone for, like a coroutine.
   const local = { TAG: 0, n: 1 }
   const p = rt.box(local)
-  rt.copy_nonoverlapping(p, { buf: [{ TAG: 3, n: 2 }], off: 0 }, 1)
-  assert.equal(p.buf[0], local)
+  rt.copy_nonoverlapping(p, { $b: [{ TAG: 3, n: 2 }], $o: 0 }, 1)
+  assert.equal(p.$b[0], local)
   assert.deepEqual({ ...local }, { TAG: 3, n: 2 })
-  rt.copy(p, { buf: [{ TAG: 1, n: 3 }], off: 0 }, 1)
-  assert.equal(p.buf[0], local)
+  rt.copy(p, { $b: [{ TAG: 1, n: 3 }], $o: 0 }, 1)
+  assert.equal(p.$b[0], local)
   assert.equal(local.n, 3)
 })
 
 test('a byte view does not describe its elements, so a byte copy over one keeps writing through', () => {
   const rt = runtime()
   const target = P(1)
-  const dst = { buf: [target], off: 0, sc: 8 }
-  rt.copy_nonoverlapping(dst, { buf: [P(5)], off: 0, sc: 8 }, 8)
-  assert.equal(dst.buf[0], target)
+  const dst = { $b: [target], $o: 0, $s: 8 }
+  rt.copy_nonoverlapping(dst, { $b: [P(5)], $o: 0, $s: 8 }, 8)
+  assert.equal(dst.$b[0], target)
   assert.equal(target.x, 5)
 })
 
@@ -118,14 +118,14 @@ test('a move into an empty place stores the value, and an overlapping move insid
   const h = P(1)
   const fresh = []
   fresh.length = 2
-  rt.copy_nonoverlapping({ buf: fresh, off: 0 }, { buf: [h, h], off: 0 }, 2, cloneP)
+  rt.copy_nonoverlapping({ $b: fresh, $o: 0 }, { $b: [h, h], $o: 0 }, 2, cloneP)
   assert.deepEqual(fresh.map((e) => e.x), [1, 1])
   assert.notEqual(fresh[0], h)
   const refs = [P(1), P(2), P(3), P(4)]
   const [r0, r1, r2] = refs
   // A non-array buffer cannot take `copyWithin`, so the loop has to pick its direction.
   const view = { 0: r0, 1: r1, 2: r2, 3: refs[3], length: 4 }
-  rt.copy({ buf: view, off: 1 }, { buf: view, off: 0 }, 3)
+  rt.copy({ $b: view, $o: 1 }, { $b: view, $o: 0 }, 3)
   assert.deepEqual([view[0], view[1], view[2], view[3]], [r0, r0, r1, r2])
   assert.deepEqual([r0.x, r1.x, r2.x], [1, 2, 3])
 })

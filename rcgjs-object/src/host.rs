@@ -337,7 +337,7 @@ Object.defineProperty(target, 'call', {{get() {{ throw sentinel; }} }});
 const callable = new Proxy(target, {{apply(fn, receiver, args) {{
   trace.push('called'); return globalThis.Reflect.apply(fn, receiver, args);
 }} }});
-const pack = {{buf: ['skip', 1, sentinel, 'skip'], off: 1, len: 2}};
+const pack = {{$b: ['skip', 1, sentinel, 'skip'], $o: 1, $l: 2}};
 for (const receiver of [null, undefined, 4, 'text', sentinel]) {{
   values = [callable, receiver, pack]; trace = [];
   const result = invoke();

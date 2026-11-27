@@ -471,7 +471,7 @@ fn protected_drop_runs_each_loop_iteration_and_rethrows_its_error() {
 const assert = require('node:assert/strict');
 let trace, failAt, thrown;
 function drop_value(slot) {
-  const n = slot.buf[slot.off]; trace.push(n); if (n === failAt) throw thrown;
+  const n = slot.$b[slot.$o]; trace.push(n); if (n === failAt) throw thrown;
 }
 function outer() { trace.push('outer'); }
 for (thrown of [undefined, Symbol('drop')]) for (failAt of [0, 1, 2, 3]) {
@@ -764,13 +764,13 @@ function step(index, value) {
   trace.push(['step', index, value]); if (index === failAt) throw thrown; return value + index;
 }
 function cleanup(index, value) { trace.push(['cleanup', index, value]); if (cleanupThrows) throw replacement; }
-function drop_value(slot) { cleanup(failAt, slot.buf[slot.off]); }
+function drop_value(slot) { cleanup(failAt, slot.$b[slot.$o]); }
 function outer() { trace.push('outer'); if (outerThrows) throw replacement; }
 let checks = 0;
 for (const skip of [false, true]) for (thrown of errors) for (replacement of [{}, abort]) {
   for (failAt of [0, 1, 2, 3]) for (cleanupThrows of [false, true]) for (outerThrows of [false, true]) {
     trace = []; let value, caught = false;
-    try { value = entry(skip, {buf: [7], off: 0}); } catch (error) { value = error; caught = true; }
+    try { value = entry(skip, {$b: [7], $o: 0}); } catch (error) { value = error; caught = true; }
     const fails = !skip && failAt !== 0;
     assert.equal(caught, fails);
     assert.ok(Object.is(value, !fails ? skip ? 7 : 13 : thrown === abort ? abort :
@@ -912,12 +912,12 @@ let abort; try { __rt.js_abort('abort'); } catch (e) { abort = e; }
 let trace, failAt, thrown, replacement, dropThrows;
 function make() { trace.push('make'); if (failAt === 1) throw thrown; return 41; }
 function step() { trace.push('step'); if (failAt === 2) throw thrown; }
-function drop_value(slot) { assert.equal(slot.buf[slot.off], 41); trace.push('drop'); if (dropThrows) throw replacement; }
+function drop_value(slot) { assert.equal(slot.$b[slot.$o], 41); trace.push('drop'); if (dropThrows) throw replacement; }
 let checks = 0;
 for (thrown of [undefined, null, {}, Symbol('error'), new Error('error'), abort]) {
   for (replacement of [{}, abort]) for (failAt of [0, 1, 2]) for (dropThrows of [false, true]) {
     trace = []; let caught = false, value;
-    try { value = entry(false, {buf: [0], off: 0}); } catch (error) { caught = true; value = error; }
+    try { value = entry(false, {$b: [0], $o: 0}); } catch (error) { caught = true; value = error; }
     const drops = failAt !== 1 && !(failAt === 2 && thrown === abort);
     assert.equal(caught, failAt !== 0 || dropThrows);
     assert.ok(Object.is(value, drops && dropThrows ? replacement : failAt === 0 ? 0 : thrown));
@@ -1066,7 +1066,7 @@ function outer() { trace.push('outer'); }
 let checks = 0;
 for (thrown of [undefined, null, {}, Symbol('error'), new Error('error'), abort]) for (fail of [false, true]) {
   trace = []; let value, caught = false;
-  try { entry(false, {buf: [7], off: 0}); } catch (error) { value = error; caught = true; }
+  try { entry(false, {$b: [7], $o: 0}); } catch (error) { value = error; caught = true; }
   assert.equal(caught, true);
   if (fail) assert.ok(Object.is(value, thrown));
   else { assert.equal(value.message, 'rustc_codegen_js: entered unreachable code'); assert.equal(__rt.is_abort(value), true); }
@@ -1141,7 +1141,7 @@ function outer() { trace.push('outer'); }
 let checks = 0;
 for (thrown of [undefined, null, {}, Symbol('error'), new Error('error'), abort]) for (failAt of [0, 1, 2, 3]) {
   trace = []; let value, caught = false;
-  try { value = entry(false, {buf: [7], off: 0}); } catch (error) { value = error; caught = true; }
+  try { value = entry(false, {$b: [7], $o: 0}); } catch (error) { value = error; caught = true; }
   const fails = failAt !== 0;
   assert.equal(caught, fails);
   assert.ok(Object.is(value, fails ? thrown : 13));

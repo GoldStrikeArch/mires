@@ -80,7 +80,7 @@ for (const receiver of [undefined, null, 42, 'text', sentinel]) {
   assert.equal(result.receiver, receiver);
   assert.deepEqual(result.args, [sentinel, 7]);
   assert.deepEqual(trace, [0, 1, 2, 3]);
-  assert.deepEqual(api.dynamic(callable, receiver, { buf: [0, sentinel, 7, 0], off: 1, len: 2 }), result);
+  assert.deepEqual(api.dynamic(callable, receiver, { $b: [0, sentinel, 7, 0], $o: 1, $l: 2 }), result);
 }
 function Constructor(...args) { this.args = args; this.target = new.target; }
 inputs = [Constructor, sentinel, 8]; trace = [];
@@ -215,7 +215,7 @@ if (path.basename(program).startsWith('jir-')) {
     assert.equal(item.host_args.would_lower, path.basename(program) === 'jir-off.mjs' ? 0 : 1);
     if (optimized) {
       const body = source.split(`function ${name}()`)[1].split('\nfunction ')[0];
-      assert.doesNotMatch(body, /\.slice\(|\.buf|\.off|\.len/);
+      assert.doesNotMatch(body, /\.slice\(|\.\$b|\.\$o|\.\$l/);
     }
   }
   const dynamic = report.items.find(item => item.name === 'dynamic');

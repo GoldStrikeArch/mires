@@ -19,7 +19,7 @@ function verify(rt) {
       assert.equal(rt.bytes_str(input, 2, bytes.length), text, 'warm decoder must preserve the same text')
     }
     const encoded = rt.str_bytes(text)
-    assert.equal(rt.bytes_str(encoded.buf, encoded.off, encoded.len), text, 'Rust string byte-view round trip')
+    assert.equal(rt.bytes_str(encoded.$b, encoded.$o, encoded.$l), text, 'Rust string byte-view round trip')
   }
   assert.equal(rt.bytes_str(undefined, 0, 0), '')
 }
@@ -42,7 +42,7 @@ const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'u
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
 const utf8 = (text) => Array.from(encoder.encode(text))
-const view = (record) => Array.from(record.buf).slice(record.off, record.off + record.len)
+const view = (record) => Array.from(record.$b).slice(record.$o, record.$o + record.$l)
 const label = (text) => JSON.stringify(text.slice(0, 12))
 // A runtime whose microtasks are collected rather than run, so a test decides when the stack
 // "unwinds".
@@ -69,12 +69,12 @@ test('str_bytes and str_len agree with TextEncoder on every width, BOMs, lone su
   for (const text of encodings) {
     const want = utf8(text)
     const record = rt.str_bytes(text)
-    assert.equal(record.off, 0)
-    assert.equal(record.len, want.length, `len of ${label(text)}`)
-    assert.ok(Array.isArray(record.buf), 'the byte view is a plain array, the kind every [u8] is')
+    assert.equal(record.$o, 0)
+    assert.equal(record.$l, want.length, `len of ${label(text)}`)
+    assert.ok(Array.isArray(record.$b), 'the byte view is a plain array, the kind every [u8] is')
     assert.deepEqual(view(record), want, `bytes of ${label(text)}`)
     assert.equal(rt.str_len(text), want.length, `str_len of ${label(text)}`)
-    assert.equal(rt.bytes_str(record.buf, record.off, record.len), decoder.decode(encoder.encode(text)))
+    assert.equal(rt.bytes_str(record.$b, record.$o, record.$l), decoder.decode(encoder.encode(text)))
   }
   // str_len never needs the memo: a fresh runtime answers before any str_bytes.
   const fresh = scheduled().rt
@@ -148,11 +148,11 @@ test('the memo is bounded by bytes beyond its capacity, and a huge string surviv
   for (let i = 0; i < 200; i++) {
     const text = chunk + String(i).padStart(8, '0')
     const record = rt.str_bytes(text)
-    assert.equal(record.len, text.length)
-    assert.equal(record.buf[record.len - 1], text.charCodeAt(text.length - 1))
+    assert.equal(record.$l, text.length)
+    assert.equal(record.$b[record.$l - 1], text.charCodeAt(text.length - 1))
     assert.ok(memo.bytes <= budget, `held ${memo.bytes} bytes`)
     let total = 0
-    for (const [key, value] of memo.map) if (!memo.huge.includes(key)) total += value.len
+    for (const [key, value] of memo.map) if (!memo.huge.includes(key)) total += value.$l
     assert.equal(total, memo.bytes, 'the byte count is exact')
   }
   // A document larger than budget / 4 is held apart: churning more than the whole budget through
@@ -186,9 +186,9 @@ test('a mutable byte view (as_bytes_mut) is fresh, so a write through it never r
   const shared = rt.str_bytes(text)
   const mutable = rt.str_bytes_mut(text)
   assert.notEqual(mutable, shared)
-  assert.notEqual(mutable.buf, shared.buf)
+  assert.notEqual(mutable.$b, shared.$b)
   assert.deepEqual(view(mutable), utf8(text))
-  for (let i = 0; i < mutable.len; i++) mutable.buf[i] |= 0x20
+  for (let i = 0; i < mutable.$l; i++) mutable.$b[i] |= 0x20
   assert.deepEqual(view(rt.str_bytes(text)), utf8(text), 'the shared view is untouched')
   assert.equal(rt.str_len(text), 11)
   assert.notEqual(rt.str_bytes_mut(text), mutable, 'never memoized')
@@ -241,11 +241,11 @@ test('pure-JS UTF-8 fallback without TextEncoder/TextDecoder matches native code
   for (const text of [...texts, ...encodings]) {
     const want = utf8(text)
     const rec = rt.str_bytes(text)
-    assert.equal(rec.off, 0)
-    assert.equal(rec.len, want.length, `no-codec len of ${label(text)}`)
+    assert.equal(rec.$o, 0)
+    assert.equal(rec.$l, want.length, `no-codec len of ${label(text)}`)
     assert.deepEqual(view(rec), want, `no-codec bytes of ${label(text)}`)
     assert.equal(rt.str_len(text), want.length)
-    assert.equal(rt.bytes_str(rec.buf, rec.off, rec.len), decoder.decode(encoder.encode(text)))
+    assert.equal(rt.bytes_str(rec.$b, rec.$o, rec.$l), decoder.decode(encoder.encode(text)))
     const encoded = rt._encoder.encode(text)
     assert.ok(encoded instanceof Uint8Array)
     assert.deepEqual(Array.from(encoded), want)
@@ -301,44 +301,44 @@ test('ASCII source tracking and 4-slot subslice ring make bytes_str -> str_bytes
   const { rt, jobs, unwind } = scheduled()
   const doc = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!!'
   const rec = rt.str_bytes(doc)
-  assert.deepEqual(Object.getOwnPropertySymbols(rec.buf), [])
-  assert.equal(Object.keys(rec.buf).length, doc.length)
-  assert.equal(rt.bytes_str(rec.buf, 0, doc.length), doc)
+  assert.deepEqual(Object.getOwnPropertySymbols(rec.$b), [])
+  assert.equal(Object.keys(rec.$b).length, doc.length)
+  assert.equal(rt.bytes_str(rec.$b, 0, doc.length), doc)
 
   // Up to 4 subslices share the parent buffer with non-zero offsets without touching _str_memo.
-  const s1 = rt.bytes_str(rec.buf, 4, 20)
-  const s2 = rt.bytes_str(rec.buf, 10, 22)
-  const s3 = rt.bytes_str(rec.buf, 20, 24)
-  const s4 = rt.bytes_str(rec.buf, 30, 18)
+  const s1 = rt.bytes_str(rec.$b, 4, 20)
+  const s2 = rt.bytes_str(rec.$b, 10, 22)
+  const s3 = rt.bytes_str(rec.$b, 20, 24)
+  const s4 = rt.bytes_str(rec.$b, 30, 18)
   const r1 = rt.str_bytes(s1)
   const r2 = rt.str_bytes(s2)
-  assert.equal(r1.buf, rec.buf)
-  assert.equal(r1.off, 4)
-  assert.equal(r1.len, 20)
-  assert.equal(r2.buf, rec.buf)
-  assert.equal(r2.off, 10)
+  assert.equal(r1.$b, rec.$b)
+  assert.equal(r1.$o, 4)
+  assert.equal(r1.$l, 20)
+  assert.equal(r2.$b, rec.$b)
+  assert.equal(r2.$o, 10)
   assert.equal(rt.str_len(s1), 20)
   assert.equal(rt.str_len(s3), 24)
   assert.equal(rt._str_memo.map.has(s1), false)
   assert.equal(rt._str_memo.bytes, doc.length)
 
   // Nested subslice preserves parent buffer provenance and offset arithmetic.
-  const nested = rt.bytes_str(r1.buf, r1.off + 2, 17)
+  const nested = rt.bytes_str(r1.$b, r1.$o + 2, 17)
   const rn = rt.str_bytes(nested)
-  assert.equal(rn.buf, rec.buf)
-  assert.equal(rn.off, 6)
-  assert.equal(rn.len, 17)
+  assert.equal(rn.$b, rec.$b)
+  assert.equal(rn.$o, 6)
+  assert.equal(rn.$l, 17)
   assert.equal(rt.str_len(nested), 17)
 
   // Unwinding clears the subslice ring; turn 2 bytes_str re-arms queueMicrotask.
   unwind()
   assert.equal(rt._str_memo.map.size, 0)
-  const turn2 = rt.bytes_str(rec.buf, 3, 19)
+  const turn2 = rt.bytes_str(rec.$b, 3, 19)
   assert.equal(jobs.length, 1)
-  assert.equal(rt.str_bytes(turn2).buf, rec.buf)
-  assert.equal(rt.str_bytes(turn2).off, 3)
+  assert.equal(rt.str_bytes(turn2).$b, rec.$b)
+  assert.equal(rt.str_bytes(turn2).$o, 3)
   unwind()
-  assert.equal(rt.str_bytes(turn2).off, 0)
+  assert.equal(rt.str_bytes(turn2).$o, 0)
 
   // Huge eviction and budget overflow reset the subslice ring.
   const hugeA = 'A'.repeat(2 * 1024 * 1024)
@@ -346,25 +346,25 @@ test('ASCII source tracking and 4-slot subslice ring make bytes_str -> str_bytes
   const hugeC = 'C'.repeat(2 * 1024 * 1024)
   const ha = rt.str_bytes(hugeA)
   rt.str_bytes(hugeB)
-  const hSub = rt.bytes_str(ha.buf, 5, 20)
-  assert.equal(rt.str_bytes(hSub).buf, ha.buf)
+  const hSub = rt.bytes_str(ha.$b, 5, 20)
+  assert.equal(rt.str_bytes(hSub).$b, ha.$b)
   rt.str_bytes(hugeC) // evicts hugeA and resets subslice ring
-  assert.notEqual(rt.str_bytes(hSub).buf, ha.buf)
+  assert.notEqual(rt.str_bytes(hSub).$b, ha.$b)
 
   // Mutable and non-ASCII/lone-surrogate strings never enter _ascii_src.
   const mut = rt.str_bytes_mut(doc)
-  mut.buf[0] = 0x58
-  assert.equal(rt.bytes_str(mut.buf, 0, doc.length), 'X' + doc.slice(1))
+  mut.$b[0] = 0x58
+  assert.equal(rt.bytes_str(mut.$b, 0, doc.length), 'X' + doc.slice(1))
   const lone = '\ud800abcdefghijklmnop'
   const loneRec = rt.str_bytes(lone)
-  assert.notEqual(loneRec.buf.length, lone.length)
-  assert.equal(rt.bytes_str(loneRec.buf, 3, 16), 'abcdefghijklmnop')
-  assert.notEqual(rt.str_bytes('abcdefghijklmnop').buf, loneRec.buf)
+  assert.notEqual(loneRec.$b.length, lone.length)
+  assert.equal(rt.bytes_str(loneRec.$b, 3, 16), 'abcdefghijklmnop')
+  assert.notEqual(rt.str_bytes('abcdefghijklmnop').$b, loneRec.$b)
 
   // Long (> 4096B) ASCII slice roundtrips without Uint8Array copy.
   const bigAscii = 'abcdefgh'.repeat(700)
   const bigRec = rt.str_bytes(bigAscii)
-  assert.equal(rt.bytes_str(bigRec.buf, 100, 5000), bigAscii.slice(100, 5100))
+  assert.equal(rt.bytes_str(bigRec.$b, 100, 5000), bigAscii.slice(100, 5100))
 })
 
 test('detach_str_memo detaches memoized str_bytes/bstr_bytes views and preserves live heap/stack buffers', () => {
@@ -372,26 +372,26 @@ test('detach_str_memo detaches memoized str_bytes/bstr_bytes views and preserves
   // 1. Short UTF-16 memoized view + subslice
   const rec = rt.str_bytes('immutable-target')
   const detached = rt.detach_str_memo(rec)
-  assert.notEqual(detached.buf, rec.buf)
-  detached.buf[0] = 0x58 // 'X'
-  assert.equal(rt.str_bytes('immutable-target').buf[0], 0x69) // 'i'
-  assert.equal(rt.bytes_str(rec.buf, rec.off, rec.len), 'immutable-target')
+  assert.notEqual(detached.$b, rec.$b)
+  detached.$b[0] = 0x58 // 'X'
+  assert.equal(rt.str_bytes('immutable-target').$b[0], 0x69) // 'i'
+  assert.equal(rt.bytes_str(rec.$b, rec.$o, rec.$l), 'immutable-target')
 
-  const sub = { buf: rec.buf, off: 2, len: 5 }
+  const sub = { $b: rec.$b, $o: 2, $l: 5 }
   const subDet = rt.detach_str_memo(sub)
-  assert.notEqual(subDet.buf, rec.buf)
-  assert.equal(subDet.off, 0)
-  assert.equal(subDet.len, 5)
-  subDet.buf[0] = 0x59
-  assert.equal(rec.buf[2], 0x6d) // 'm'
+  assert.notEqual(subDet.$b, rec.$b)
+  assert.equal(subDet.$o, 0)
+  assert.equal(subDet.$l, 5)
+  subDet.$b[0] = 0x59
+  assert.equal(rec.$b[2], 0x6d) // 'm'
 
   // 2. Long (>64B) js-str=bytes memoized view
   const longBstr = 'a'.repeat(80)
   const brec = rt.bstr_bytes(longBstr)
   const bdet = rt.detach_str_memo(brec)
-  assert.notEqual(bdet.buf, brec.buf)
-  bdet.buf[0] = 0x5a // 'Z'
-  assert.equal(rt.bstr_bytes(longBstr).buf[0], 0x61) // 'a'
+  assert.notEqual(bdet.$b, brec.$b)
+  bdet.$b[0] = 0x5a // 'Z'
+  assert.equal(rt.bstr_bytes(longBstr).$b[0], 0x61) // 'a'
 
   // 3. Live heap block (`Box<str>`) and plain stack buffer pass through unchanged (`===`).
   const heap = rt.alloc(4, 1)
@@ -399,6 +399,6 @@ test('detach_str_memo detaches memoized str_bytes/bstr_bytes views and preserves
   assert.equal(rt.detach_str_memo(heapSlice), heapSlice)
   rt.dealloc(heap, 4, 1)
 
-  const stackSlice = { buf: [97, 98, 99], off: 0, len: 3 }
+  const stackSlice = { $b: [97, 98, 99], $o: 0, $l: 3 }
   assert.equal(rt.detach_str_memo(stackSlice), stackSlice)
 })

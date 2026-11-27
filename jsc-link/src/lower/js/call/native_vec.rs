@@ -613,11 +613,7 @@ impl JsCx<'_> {
                 } else {
                     jsast::member(v.clone(), "buf")
                 };
-                let slice = jsast::object_of(vec![
-                    ("buf", buf),
-                    ("off", jsast::num(0)),
-                    ("len", jsast::member(v, "len")),
-                ]);
+                let slice = ptr::fat_slice(buf, jsast::num(0), jsast::member(v, "len"));
                 Ok(Some(Lowered::Value(setup, slice)))
             }
             _ => unreachable!("matched in lower_native_vec_call"),
@@ -1156,11 +1152,11 @@ impl JsCx<'_> {
         if info.is_zst {
             return Ok(Some(Lowered::Value(
                 setup,
-                jsast::object_of(vec![
-                    ("buf", jsast::num(info.align as f64)),
-                    ("off", jsast::num(0)),
-                    ("len", jsast::member(v, "len")),
-                ]),
+                ptr::fat_slice(
+                    jsast::num(info.align as f64),
+                    jsast::num(0),
+                    jsast::member(v, "len"),
+                ),
             )));
         }
         let (bl, l) = self.temp(jsast::member(v.clone(), "len"));
@@ -1216,7 +1212,7 @@ impl JsCx<'_> {
         };
         Ok(Some(Lowered::Value(
             setup,
-            jsast::object_of(vec![("buf", buf), ("off", jsast::num(0)), ("len", l)]),
+            ptr::fat_slice(buf, jsast::num(0), l),
         )))
     }
 }

@@ -1686,3 +1686,28 @@ fn visit_block_mut_and_try_visit_cover_nested_blocks_and_short_circuit() {
     assert_eq!(CompoundOp::try_from(BinOp::StrictEq), Err(()));
     assert_eq!(BinOp::from(CompoundOp::UShr), BinOp::UShr);
 }
+
+#[test]
+fn object_literal_proto_key_uses_computed_property_syntax() {
+    let expr = object_of(vec![("__proto__", num(5)), ("other", num(6))]);
+    let readable = expr_to_string_styled_for_target(&expr, Style::Readable, EcmaTarget::Es2018);
+    let compact = expr_to_string_styled_for_target(&expr, Style::Compact, EcmaTarget::Es2018);
+    assert_eq!(readable, "{ [\"__proto__\"]: 5, other: 6 }");
+    assert_eq!(compact, "{[\"__proto__\"]:5,other:6}");
+
+    let script = format!(
+        "const assert = require('node:assert/strict');\n\
+         for (const o of [{readable}, {compact}]) {{\n\
+           assert.equal(Object.prototype.hasOwnProperty.call(o, '__proto__'), true);\n\
+           assert.equal(o.__proto__, 5);\n\
+           assert.equal(o.other, 6);\n\
+           assert.equal(Object.getPrototypeOf(o), Object.prototype);\n\
+         }}\n"
+    );
+    let out = test_node::run(test_node::Node::Stdin(&script)).expect("node required");
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

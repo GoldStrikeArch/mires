@@ -43,6 +43,6 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-pub(super) use driver::refs_of;
+pub(crate) use driver::refs_of;
 pub(crate) use driver::run;
 pub(crate) use report::{write_sidecar, LaneOutcome, LaneRun, ReprBlock, ReprDecision};

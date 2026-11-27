@@ -186,12 +186,13 @@ impl VisitMut for ZeroOffsetExprFolder<'_> {
                 for (_, val) in entries.iter_mut() {
                     self.visit_expr_mut(val);
                 }
-                let is_slot_or_slice =
-                    (entries.len() == 2 && entries[0].0 == "buf" && entries[1].0 == "off")
-                        || (entries.len() == 3
-                            && entries[0].0 == "buf"
-                            && entries[1].0 == "off"
-                            && entries[2].0 == "len");
+                let is_slot_or_slice = (entries.len() == 2
+                    && entries[0].0 == rcgjs_object::ptr::BUF
+                    && entries[1].0 == rcgjs_object::ptr::OFF)
+                    || (entries.len() == 3
+                        && entries[0].0 == rcgjs_object::ptr::BUF
+                        && entries[1].0 == rcgjs_object::ptr::OFF
+                        && entries[2].0 == rcgjs_object::ptr::LEN);
                 if is_slot_or_slice {
                     simplify_offset(&mut entries[1].1);
                 }
@@ -835,13 +836,13 @@ mod tests {
                     ),
                 ),
             ),
-            // `p = { buf: a, off: 0 + i };` -> `p = { buf: a, off: i };`
+            // `p = { $b: a, $o: 0 + i };` -> `p = { $b: a, $o: i };`
             jsast::assign_stmt(
                 jsast::id("p"),
                 jsast::object_of(vec![
-                    ("buf", jsast::id("a")),
+                    ("$b", jsast::id("a")),
                     (
-                        "off",
+                        "$o",
                         jsast::binary(jsast::BinOp::Add, jsast::num(0.0), jsast::id("i")),
                     ),
                 ]),
@@ -876,7 +877,7 @@ mod tests {
         assert!(printed.contains("b = buf[branch_off + i];"), "{printed}");
         assert!(printed.contains("x = a[i];"), "{printed}");
         assert!(printed.contains("y = a[idx[k]];"), "{printed}");
-        assert!(printed.contains("p = { buf: a, off: i };"), "{printed}");
+        assert!(printed.contains("p = { $b: a, $o: i };"), "{printed}");
         assert!(printed.contains("z = 0 + s;"), "{printed}");
     }
 }

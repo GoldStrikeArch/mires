@@ -264,13 +264,14 @@ pub(crate) fn print_order<'a>(
 }
 
 /// One cycle of bindings, printed so that it initializes: every member declared as an empty
-/// object or array, then every member's literal copied onto it.
+/// object or array, any sub-objects/sub-arrays projected out of cycle members pre-allocated on
+/// their parent paths, then every pre-allocated sub-container and member literal copied onto it.
 ///
 /// The result has one item per member, in the members' order, each keeping its member's name,
 /// linkage, references and type signature, so the export clause, the `.d.ts` and the rename see
 /// the members they always saw. The declarations are the members' own texts with the literal
-/// emptied; the copies follow the last declaration, inside the last member's item, because none of
-/// them may run before every member exists.
+/// emptied; the pre-allocations and copies follow the last declaration, inside the last member's
+/// item, because none of them may run before every member exists.
 ///
 /// A member this module cannot split (see the module docs) is reported, and the cycle is returned
 /// as it was, which the reported error keeps from ever being written.
@@ -279,23 +280,7 @@ fn initialize(dcx: &Sink, members: &[&LinkItem]) -> Vec<LinkItem> {
     let mut split = Vec::with_capacity(members.len());
     for member in members {
         match Declaration::of(member) {
-            Ok(declaration) => {
-                if reads_cycle_member_property(declaration.literal, &cycle_names) {
-                    let names: Vec<&str> = members
-                        .iter()
-                        .map(|member| member.debug_path.as_str())
-                        .collect();
-                    dcx.err(format!(
-                        "rustc_codegen_js: the statics `{}` refer to each other, and `{}` reads a \
-                         sub-field or element of a cycle member during initialization, so the \
-                         cycle cannot be initialized in two steps",
-                        names.join("`, `"),
-                        member.debug_path,
-                    ));
-                    return members.iter().map(|member| (*member).clone()).collect();
-                }
-                split.push(declaration);
-            }
+            Ok(declaration) => split.push(declaration),
             Err(reason) => {
                 let names: Vec<&str> = members
                     .iter()
@@ -313,6 +298,80 @@ fn initialize(dcx: &Sink, members: &[&LinkItem]) -> Vec<LinkItem> {
         }
     }
 
+    // Collect every sub-field / element path read off a cycle member across all cycle initializers.
+    let member_index_by_name: HashMap<&str, usize> = members
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| (member.name.as_str(), idx))
+        .collect();
+    let mut projected_paths: BTreeMap<usize, BTreeSet<Vec<PathStep>>> = BTreeMap::new();
+    let mut bad_reader: Option<&str> = None;
+    for (member, declaration) in members.iter().zip(&split) {
+        match collect_cycle_projections(declaration.literal, &cycle_names) {
+            Ok(paths) => {
+                for (target_name, target_paths) in paths {
+                    if let Some(&target_idx) = member_index_by_name.get(target_name.as_str()) {
+                        projected_paths
+                            .entry(target_idx)
+                            .or_default()
+                            .extend(target_paths);
+                    }
+                }
+            }
+            Err(()) => {
+                bad_reader = Some(member.debug_path.as_str());
+                break;
+            }
+        }
+    }
+
+    // Resolve each projected path to a direct `{...}` or `[...]` sub-literal in its target member.
+    let mut resolved: BTreeMap<(usize, Vec<PathStep>), ResolvedSub> = BTreeMap::new();
+    if bad_reader.is_none() {
+        'resolve: for (&target_idx, paths) in &projected_paths {
+            let literal = split[target_idx].literal;
+            for path in paths {
+                match resolve_sub_container(literal, path) {
+                    Ok(sub) => {
+                        resolved.insert((target_idx, path.clone()), sub);
+                    }
+                    Err(()) => {
+                        // Report the member that reads this unresolvable projection (or the target).
+                        bad_reader = members
+                            .iter()
+                            .zip(&split)
+                            .find_map(|(m, decl)| {
+                                collect_cycle_projections(decl.literal, &cycle_names)
+                                    .ok()
+                                    .and_then(|map| {
+                                        map.get(members[target_idx].name.as_str())
+                                            .is_some_and(|set| set.contains(path))
+                                            .then_some(m.debug_path.as_str())
+                                    })
+                            })
+                            .or(Some(members[target_idx].debug_path.as_str()));
+                        break 'resolve;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(reader) = bad_reader {
+        let names: Vec<&str> = members
+            .iter()
+            .map(|member| member.debug_path.as_str())
+            .collect();
+        dcx.err(format!(
+            "rustc_codegen_js: the statics `{}` refer to each other, and `{}` reads a \
+             sub-field or element of a cycle member during initialization, so the \
+             cycle cannot be initialized in two steps",
+            names.join("`, `"),
+            reader,
+        ));
+        return members.iter().map(|member| (*member).clone()).collect();
+    }
+
     let mut out: Vec<LinkItem> = Vec::with_capacity(members.len());
     for (member, declaration) in members.iter().zip(&split) {
         let mut item = (*member).clone();
@@ -321,25 +380,89 @@ fn initialize(dcx: &Sink, members: &[&LinkItem]) -> Vec<LinkItem> {
         out.push(item);
     }
     let last = out.last_mut().expect("a cycle has a member");
-    for (member, declaration) in members.iter().zip(&split) {
-        let fill = declaration.fill();
-        // Each line of a member's fill maps where its declaration did, so a source-mapped program
-        // still maps every line it prints, and a debugger stepping through module initialization
-        // lands on the `static` being filled.
-        if let Some(origin) = declaration.origin(&member.map) {
-            let first = last.js.matches('\n').count() as u32;
-            let lines = fill.matches('\n').count() as u32;
-            let source = intern(&mut last.map.sources, origin.source);
-            let name = origin
-                .name
-                .map_or(-1, |name| intern(&mut last.map.names, name) as i32);
-            for line in first..first + lines {
-                last.map
-                    .segments
-                    .push((line, 0, source, origin.line, origin.column, name));
+    let append_mapped =
+        |last: &mut LinkItem, member: &LinkItem, declaration: &Declaration<'_>, stmt: &str| {
+            if let Some(origin) = declaration.origin(&member.map) {
+                let first = last.js.matches('\n').count() as u32;
+                let lines = stmt.matches('\n').count() as u32;
+                let source = intern(&mut last.map.sources, origin.source);
+                let name = origin
+                    .name
+                    .map_or(-1, |name| intern(&mut last.map.names, name) as i32);
+                for line in first..first + lines {
+                    last.map
+                        .segments
+                        .push((line, 0, source, origin.line, origin.column, name));
+                }
             }
+            last.js.push_str(stmt);
+        };
+
+    if resolved.is_empty() {
+        for (member, declaration) in members.iter().zip(&split) {
+            let fill = declaration.fill();
+            append_mapped(last, member, declaration, &fill);
         }
-        last.js.push_str(&fill);
+        return out;
+    }
+
+    // Step 2: pre-allocate every referenced sub-container shallow-to-deep on its parent path.
+    let mut prealloc_order: Vec<(usize, &Vec<PathStep>, ResolvedSub)> = resolved
+        .iter()
+        .map(|((idx, path), &sub)| (*idx, path, sub))
+        .collect();
+    prealloc_order.sort_by(|a, b| {
+        a.1.len()
+            .cmp(&b.1.len())
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(b.1))
+    });
+    for &(idx, path, sub) in &prealloc_order {
+        let target_expr = format_path_expr(split[idx].name, path);
+        let empty = match sub.kind {
+            ContainerKind::Array => "[]",
+            ContainerKind::Object => "{}",
+        };
+        let stmt = if split[idx].compact {
+            format!("{target_expr}={empty};\n")
+        } else {
+            format!("{target_expr} = {empty};\n")
+        };
+        append_mapped(last, members[idx], &split[idx], &stmt);
+    }
+
+    // Step 3a: fill each pre-allocated sub-container (deepest-first), substituting any
+    // pre-allocated direct children with their path expressions to preserve identity.
+    for &(idx, path, sub) in prealloc_order.iter().rev() {
+        let target_expr = format_path_expr(split[idx].name, path);
+        let rewritten = rewrite_container_literal(
+            split[idx].name,
+            split[idx].literal,
+            sub.span,
+            path,
+            idx,
+            &resolved,
+        );
+        let stmt = format_assign(&target_expr, &rewritten, split[idx].compact);
+        append_mapped(last, members[idx], &split[idx], &stmt);
+    }
+
+    // Step 3b: fill each root cycle member, substituting any pre-allocated top-level children.
+    for (idx, (member, declaration)) in members.iter().zip(&split).enumerate() {
+        let root_span = Span {
+            start: 0,
+            end: declaration.literal.len(),
+        };
+        let rewritten = rewrite_container_literal(
+            declaration.name,
+            declaration.literal,
+            root_span,
+            &[],
+            idx,
+            &resolved,
+        );
+        let stmt = format_assign(declaration.name, &rewritten, declaration.compact);
+        append_mapped(last, member, declaration, &stmt);
     }
     out
 }
@@ -488,13 +611,23 @@ enum LiteralToken<'a> {
 
 struct LiteralTokenCtx<'a> {
     token: LiteralToken<'a>,
+    before_previous: u8,
     previous: u8,
     next: Option<u8>,
+    next_after_one: Option<u8>,
 }
 
 impl LiteralTokenCtx<'_> {
     fn is_object_key(&self) -> bool {
         matches!(self.previous, b'{' | b',') && self.next == Some(b':')
+    }
+
+    fn is_computed_proto_key(&self) -> bool {
+        matches!(self.token, LiteralToken::String("\"__proto__\""))
+            && self.previous == b'['
+            && matches!(self.before_previous, b'{' | b',')
+            && self.next == Some(b']')
+            && self.next_after_one == Some(b':')
     }
 }
 
@@ -503,12 +636,23 @@ impl LiteralTokenCtx<'_> {
 /// Returns `true` on the first token for which `predicate` returns `true`.
 fn any_literal_token(text: &str, mut predicate: impl FnMut(LiteralTokenCtx<'_>) -> bool) -> bool {
     let bytes = text.as_bytes();
-    let next_significant = |mut at: usize| {
+    let next_significant_pair = |mut at: usize| {
         while at < bytes.len() && bytes[at].is_ascii_whitespace() {
             at += 1;
         }
-        bytes.get(at).copied()
+        let first = bytes.get(at).copied();
+        let second = if first.is_some() {
+            at += 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            bytes.get(at).copied()
+        } else {
+            None
+        };
+        (first, second)
     };
+    let mut before_previous = 0u8;
     let mut previous = 0u8;
     let mut at = 0;
     while at < bytes.len() {
@@ -527,13 +671,17 @@ fn any_literal_token(text: &str, mut predicate: impl FnMut(LiteralTokenCtx<'_>) 
                     }
                 }
                 at = at.min(bytes.len());
+                let (next, next_after_one) = next_significant_pair(at);
                 if predicate(LiteralTokenCtx {
                     token: LiteralToken::String(&text[start..at]),
+                    before_previous,
                     previous,
-                    next: next_significant(at),
+                    next,
+                    next_after_one,
                 }) {
                     return true;
                 }
+                before_previous = previous;
                 previous = b'"';
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
@@ -542,17 +690,22 @@ fn any_literal_token(text: &str, mut predicate: impl FnMut(LiteralTokenCtx<'_>) 
                 {
                     at += 1;
                 }
+                let (next, next_after_one) = next_significant_pair(at);
                 if predicate(LiteralTokenCtx {
                     token: LiteralToken::Ident(&text[start..at]),
+                    before_previous,
                     previous,
-                    next: next_significant(at),
+                    next,
+                    next_after_one,
                 }) {
                     return true;
                 }
+                before_previous = previous;
                 previous = bytes[at - 1];
             }
             byte if byte.is_ascii_whitespace() => at += 1,
             byte => {
+                before_previous = previous;
                 previous = byte;
                 at += 1;
             }
@@ -562,41 +715,509 @@ fn any_literal_token(text: &str, mut predicate: impl FnMut(LiteralTokenCtx<'_>) 
 }
 
 /// Whether `text`, a literal [`literal_len`] accepted, has a `__proto__` key anywhere: the bare
-/// name or the string `"__proto__"` directly after `{` or `,` and directly before `:`.
+/// name, the string `"__proto__"`, or the computed key `["__proto__"]` directly after `{` or `,`
+/// and directly before `:`.
 ///
-/// In an object literal that one key sets the object's prototype instead of creating a property,
-/// so `Object.assign` (which copies own properties) would drop it. A Rust field named `__proto__`
-/// prints as exactly that key. The scan is the printer's token shape: double quoted strings are
-/// skipped as tokens (the only quotes [`literal_len`] lets through), and a name after `.` is a
-/// property read, not a key.
+/// `Object.assign` copies own properties via `[[Set]]`, which invokes `Object.prototype`'s
+/// `__proto__` setter on an empty `{}` target instead of creating an own data property.
 fn has_proto_key(text: &str) -> bool {
     any_literal_token(text, |tok| {
-        tok.is_object_key()
-            && matches!(
-                tok.token,
-                LiteralToken::String("\"__proto__\"") | LiteralToken::Ident("__proto__")
-            )
+        tok.is_computed_proto_key()
+            || (tok.is_object_key()
+                && matches!(
+                    tok.token,
+                    LiteralToken::String("\"__proto__\"") | LiteralToken::Ident("__proto__")
+                ))
     })
 }
 
-/// Whether `text`, a literal [`literal_len`] accepted, reads a property or element (`.` or `[`)
-/// off any identifier in `cycle_names`.
-///
-/// During two-step cycle initialization (`let A = {}; let B = {}; Object.assign(A, <litA>);`),
-/// every cycle member starts as an empty object or array. Capturing a cycle member by reference
-/// (`next: B`, `{ buf: B, off: "x" }`, `{ buf: B, off: 0, len: 3 }`) is sound because no property
-/// of `B` is read yet; reading a nested property or element (`B.inner`, `S.inner`, `S.arr`,
-/// `B[0]`) would evaluate to `undefined` before `B`/`S` is populated.
-fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool {
-    any_literal_token(text, |tok| match tok.token {
-        LiteralToken::Ident(ident) => {
-            tok.previous != b'.'
-                && !tok.is_object_key()
-                && cycle_names.contains(ident)
-                && matches!(tok.next, Some(b'.' | b'['))
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PathStep {
+    Prop(String),
+    Index(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerKind {
+    Object,
+    Array,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedSub {
+    span: Span,
+    kind: ContainerKind,
+}
+
+fn format_assign(target: &str, literal: &str, compact: bool) -> String {
+    if compact {
+        format!("Object.assign({target},{literal});\n")
+    } else {
+        format!("Object.assign({target}, {literal});\n")
+    }
+}
+
+fn format_path_expr(root: &str, path: &[PathStep]) -> String {
+    let mut out = String::from(root);
+    for step in path {
+        match step {
+            PathStep::Prop(key) if rcgjs_object::jsast::is_plain_ident(key) => {
+                out.push('.');
+                out.push_str(key);
+            }
+            PathStep::Prop(key) => {
+                out.push('[');
+                write_quoted_js_string(&mut out, key);
+                out.push(']');
+            }
+            PathStep::Index(index) => {
+                use std::fmt::Write;
+                let _ = write!(out, "[{index}]");
+            }
         }
-        LiteralToken::String(_) => false,
-    })
+    }
+    out
+}
+
+fn write_quoted_js_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn skip_ws(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    at
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+fn is_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$')
+}
+
+/// Parses a JS double-quoted string literal starting at `bytes[start] == b'"'`, returning the
+/// unescaped string value and the byte index right after the closing quote.
+fn parse_js_string(text: &str, start: usize) -> Result<(String, usize), ()> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return Err(());
+    }
+    let mut out = String::new();
+    let mut at = start + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => return Ok((out, at + 1)),
+            b'\\' => {
+                at += 1;
+                if at >= bytes.len() {
+                    return Err(());
+                }
+                match bytes[at] {
+                    b'"' => {
+                        out.push('"');
+                        at += 1;
+                    }
+                    b'\\' => {
+                        out.push('\\');
+                        at += 1;
+                    }
+                    b'n' => {
+                        out.push('\n');
+                        at += 1;
+                    }
+                    b'r' => {
+                        out.push('\r');
+                        at += 1;
+                    }
+                    b't' => {
+                        out.push('\t');
+                        at += 1;
+                    }
+                    b'0' => {
+                        out.push('\0');
+                        at += 1;
+                    }
+                    b'u' => {
+                        if at + 5 > bytes.len() {
+                            return Err(());
+                        }
+                        let hex = &text[at + 1..at + 5];
+                        let code = u32::from_str_radix(hex, 16).map_err(|_| ())?;
+                        let ch = char::from_u32(code).ok_or(())?;
+                        out.push(ch);
+                        at += 5;
+                    }
+                    b'x' => {
+                        if at + 3 > bytes.len() {
+                            return Err(());
+                        }
+                        let hex = &text[at + 1..at + 3];
+                        let code = u32::from_str_radix(hex, 16).map_err(|_| ())?;
+                        let ch = char::from_u32(code).ok_or(())?;
+                        out.push(ch);
+                        at += 3;
+                    }
+                    _ => return Err(()),
+                }
+            }
+            _ => {
+                let ch = text[at..].chars().next().ok_or(())?;
+                out.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+    Err(())
+}
+
+/// Scans `text` for every property/element projection chain read off any identifier in
+/// `cycle_names`, collecting every non-empty prefix per target member. Returns `Err(())` if a
+/// cycle member is indexed dynamically (e.g., `B[i]`) or with malformed projection syntax.
+fn collect_cycle_projections(
+    text: &str,
+    cycle_names: &HashSet<&str>,
+) -> Result<BTreeMap<String, BTreeSet<Vec<PathStep>>>, ()> {
+    let bytes = text.as_bytes();
+    let mut out: BTreeMap<String, BTreeSet<Vec<PathStep>>> = BTreeMap::new();
+    let mut previous = 0u8;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at += 2,
+                        b'"' => {
+                            at += 1;
+                            break;
+                        }
+                        _ => at += 1,
+                    }
+                }
+                at = at.min(bytes.len());
+                previous = b'"';
+            }
+            byte if is_ident_start(byte) => {
+                let start = at;
+                while at < bytes.len() && is_ident_cont(bytes[at]) {
+                    at += 1;
+                }
+                let ident = &text[start..at];
+                let next_idx = skip_ws(bytes, at);
+                let next = bytes.get(next_idx).copied();
+                let is_key = matches!(previous, b'{' | b',') && next == Some(b':');
+                if previous != b'.'
+                    && !is_key
+                    && cycle_names.contains(ident)
+                    && matches!(next, Some(b'.' | b'['))
+                {
+                    let mut steps = Vec::new();
+                    let mut cur = next_idx;
+                    while let Some(&ch) = bytes.get(cur) {
+                        match ch {
+                            b'.' => {
+                                cur = skip_ws(bytes, cur + 1);
+                                let pstart = cur;
+                                if cur >= bytes.len() || !is_ident_start(bytes[cur]) {
+                                    return Err(());
+                                }
+                                while cur < bytes.len() && is_ident_cont(bytes[cur]) {
+                                    cur += 1;
+                                }
+                                steps.push(PathStep::Prop(text[pstart..cur].to_owned()));
+                                cur = skip_ws(bytes, cur);
+                            }
+                            b'[' => {
+                                cur = skip_ws(bytes, cur + 1);
+                                if cur >= bytes.len() {
+                                    return Err(());
+                                }
+                                if bytes[cur] == b'"' {
+                                    let (key, after) = parse_js_string(text, cur)?;
+                                    cur = skip_ws(bytes, after);
+                                    if bytes.get(cur) != Some(&b']') {
+                                        return Err(());
+                                    }
+                                    cur = skip_ws(bytes, cur + 1);
+                                    steps.push(PathStep::Prop(key));
+                                } else if bytes[cur].is_ascii_digit() {
+                                    let dstart = cur;
+                                    while cur < bytes.len() && bytes[cur].is_ascii_digit() {
+                                        cur += 1;
+                                    }
+                                    let index: usize = text[dstart..cur].parse().map_err(|_| ())?;
+                                    cur = skip_ws(bytes, cur);
+                                    if bytes.get(cur) != Some(&b']') {
+                                        return Err(());
+                                    }
+                                    cur = skip_ws(bytes, cur + 1);
+                                    steps.push(PathStep::Index(index));
+                                } else {
+                                    return Err(());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if steps.is_empty() {
+                        return Err(());
+                    }
+                    let entry = out.entry(ident.to_owned()).or_default();
+                    for len in 1..=steps.len() {
+                        entry.insert(steps[..len].to_vec());
+                    }
+                    at = cur;
+                    previous = b']';
+                } else {
+                    previous = bytes[at - 1];
+                }
+            }
+            byte if byte.is_ascii_whitespace() => at += 1,
+            byte => {
+                previous = byte;
+                at += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Scans a single top-level expression inside an object or array literal starting at `start` up
+/// to the matching delimiter (`','`, `'}'`, or `']'`) at depth 0, returning the trimmed value span
+/// and the byte index of the delimiter.
+fn scan_value_span(text: &str, start: usize, close: u8) -> Result<(Span, usize), ()> {
+    let bytes = text.as_bytes();
+    let vstart = skip_ws(bytes, start);
+    let mut at = vstart;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while at < bytes.len() {
+        let b = bytes[at];
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                if depth == 0 {
+                    if b == close {
+                        break;
+                    }
+                    return Err(());
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => break,
+            _ => {}
+        }
+        at += 1;
+    }
+    if in_string || depth != 0 || at >= bytes.len() {
+        return Err(());
+    }
+    let mut vend = at;
+    while vend > vstart && bytes[vend - 1].is_ascii_whitespace() {
+        vend -= 1;
+    }
+    if vend == vstart {
+        return Err(());
+    }
+    Ok((
+        Span {
+            start: vstart,
+            end: vend,
+        },
+        at,
+    ))
+}
+
+fn parse_object_entries(text: &str, span: Span) -> Result<Vec<(String, Span)>, ()> {
+    let bytes = text.as_bytes();
+    if bytes.get(span.start) != Some(&b'{')
+        || bytes.get(span.end.checked_sub(1).ok_or(())?) != Some(&b'}')
+    {
+        return Err(());
+    }
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut at = skip_ws(bytes, span.start + 1);
+    let end = span.end - 1;
+    while at < end {
+        let (key, after_key) = match bytes[at] {
+            b'"' => parse_js_string(text, at)?,
+            b'[' => {
+                let inner = skip_ws(bytes, at + 1);
+                let (key, after_str) = parse_js_string(text, inner)?;
+                let close = skip_ws(bytes, after_str);
+                if bytes.get(close) != Some(&b']') {
+                    return Err(());
+                }
+                (key, close + 1)
+            }
+            b if is_ident_start(b) => {
+                let kstart = at;
+                let mut kend = at + 1;
+                while kend < end && is_ident_cont(bytes[kend]) {
+                    kend += 1;
+                }
+                (text[kstart..kend].to_owned(), kend)
+            }
+            b if b.is_ascii_digit() => {
+                let kstart = at;
+                let mut kend = at + 1;
+                while kend < end && bytes[kend].is_ascii_digit() {
+                    kend += 1;
+                }
+                (text[kstart..kend].to_owned(), kend)
+            }
+            _ => return Err(()),
+        };
+        if !seen.insert(key.clone()) {
+            return Err(());
+        }
+        let colon = skip_ws(bytes, after_key);
+        if bytes.get(colon) != Some(&b':') {
+            return Err(());
+        }
+        let (val_span, delim) = scan_value_span(text, colon + 1, b'}')?;
+        if delim > end {
+            return Err(());
+        }
+        entries.push((key, val_span));
+        if bytes[delim] == b',' {
+            at = skip_ws(bytes, delim + 1);
+        } else {
+            at = delim;
+        }
+    }
+    Ok(entries)
+}
+
+fn parse_array_elements(text: &str, span: Span) -> Result<Vec<Span>, ()> {
+    let bytes = text.as_bytes();
+    if bytes.get(span.start) != Some(&b'[')
+        || bytes.get(span.end.checked_sub(1).ok_or(())?) != Some(&b']')
+    {
+        return Err(());
+    }
+    let mut elems = Vec::new();
+    let mut at = skip_ws(bytes, span.start + 1);
+    let end = span.end - 1;
+    while at < end {
+        let (val_span, delim) = scan_value_span(text, at, b']')?;
+        if delim > end || text[val_span.start..val_span.end].starts_with("...") {
+            return Err(());
+        }
+        elems.push(val_span);
+        if bytes[delim] == b',' {
+            at = skip_ws(bytes, delim + 1);
+        } else {
+            at = delim;
+        }
+    }
+    Ok(elems)
+}
+
+fn resolve_sub_container(literal: &str, path: &[PathStep]) -> Result<ResolvedSub, ()> {
+    let mut span = Span {
+        start: 0,
+        end: literal.len(),
+    };
+    for step in path {
+        match step {
+            PathStep::Prop(key) => {
+                let entries = parse_object_entries(literal, span)?;
+                let Some((_, next)) = entries.into_iter().find(|(k, _)| k == key) else {
+                    return Err(());
+                };
+                span = next;
+            }
+            PathStep::Index(index) => {
+                let elems = parse_array_elements(literal, span)?;
+                span = *elems.get(*index).ok_or(())?;
+            }
+        }
+    }
+    let slice = &literal[span.start..span.end];
+    let kind = match slice.as_bytes().first() {
+        Some(b'{') => ContainerKind::Object,
+        Some(b'[') => ContainerKind::Array,
+        _ => return Err(()),
+    };
+    if literal_len(slice) != Some(slice.len()) {
+        return Err(());
+    }
+    Ok(ResolvedSub { span, kind })
+}
+
+fn rewrite_container_literal(
+    root_name: &str,
+    literal: &str,
+    span: Span,
+    parent_path: &[PathStep],
+    member_idx: usize,
+    resolved: &BTreeMap<(usize, Vec<PathStep>), ResolvedSub>,
+) -> String {
+    let mut replacements: Vec<(Span, String)> = resolved
+        .iter()
+        .filter_map(|((idx, path), sub)| {
+            if *idx == member_idx
+                && path.len() == parent_path.len() + 1
+                && path[..parent_path.len()] == *parent_path
+            {
+                Some((sub.span, format_path_expr(root_name, path)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if replacements.is_empty() {
+        return literal[span.start..span.end].to_owned();
+    }
+    replacements.sort_by_key(|(child_span, _)| child_span.start);
+    let mut out = String::with_capacity(span.end - span.start);
+    let mut cursor = span.start;
+    for (child_span, expr) in replacements {
+        out.push_str(&literal[cursor..child_span.start]);
+        out.push_str(&expr);
+        cursor = child_span.end;
+    }
+    out.push_str(&literal[cursor..span.end]);
+    out
 }
 
 /// The byte length of the object or array literal `text` starts with, or `None` if it is not
@@ -1033,13 +1654,19 @@ mod tests {
             "{__proto__:a}",
             "{ id: 1, __proto__: b }",
             "{\"__proto__\": b}",
+            "{[\"__proto__\"]:a}",
+            "{ id: 1, [\"__proto__\"]: b }",
             "{ a: [{ x: 1 }, { __proto__ : 2 }] }",
+            "{ a: [{ x: 1 }, { [\"__proto__\"]: 2 }] }",
         ] {
             assert!(has_proto_key(text), "{text}");
         }
         for text in [
             "{ a: x.__proto__ }",
             "{ a: \"__proto__\" }",
+            "{ a: [\"__proto__\"] }",
+            "[[\"__proto__\"]]",
+            "{ a: x[\"__proto__\"] }",
             "[__proto__, 1]",
             "{ a: \"{__proto__:1}\" }",
             "{ __proto: 1, proto__: 2 }",
@@ -1186,92 +1813,111 @@ mod tests {
         assert!(matches!(steps.as_slice(), [Placed::Item(item)] if item.name.as_str() == "a"));
     }
 
-    /// A cycle whose initializer reads a property or element off any cycle member is refused,
-    /// while 1-step primitive slots (`{ buf: b, off: "x" }`) and non-member property accesses
-    /// stay allowed.
+    /// A cycle reading nested object/array sub-containers off cycle members initializes via
+    /// three-step skeleton pre-allocation, while reading a scalar or unresolvable property off
+    /// a cycle member stays refused.
     #[test]
-    fn a_cycle_reading_member_subfields_is_refused_while_slot_refs_succeed() {
-        let check_errors = |items: Vec<LinkItem>| -> u32 {
-            let table = table(items);
-            let names: Vec<&JsName> = table.keys().collect();
-            let members: HashSet<&JsName> = names.iter().copied().collect();
-            let placed = layout(&table, &members, &names);
-            let dcx = Sink::new();
-            let _ = initialize_cycles(&dcx, &placed);
-            dcx.errors()
-        };
+    fn a_cycle_reading_member_subfields_preallocates_containers_and_refuses_scalars() {
+        let check = |items: Vec<LinkItem>| -> (String, usize) { printed(&table(items)) };
 
-        // Allowed: 1-step primitive field cycle (`{ buf: b, off: "x" }`), string/key/non-cycle dot.
+        // 1-step primitive field cycle (`{ buf: b, off: "x" }`), string/key/non-cycle dot.
+        let (_, errs) = check(vec![
+            binding(
+                "a",
+                "let a = { x: 11, next: { buf: b, off: \"x\" }, b: 1, tag: \"b.inner\", ext: x.b.val };\n",
+                &["b"],
+            ),
+            binding(
+                "b",
+                "let b = { x: 22, next: { buf: a, off: \"x\" } };\n",
+                &["a"],
+            ),
+        ]);
+        assert_eq!(errs, 0);
+
+        // Mutual aggregate sub-field cycle (`other: b.inner`).
+        let (text, errs) = check(vec![
+            binding(
+                "a",
+                "let a = { inner: { v: 1 }, other: b.inner };\n",
+                &["b"],
+            ),
+            binding(
+                "b",
+                "let b = { inner: { v: 2 }, other: a.inner };\n",
+                &["a"],
+            ),
+        ]);
+        assert_eq!(errs, 0);
         assert_eq!(
-            check_errors(vec![
-                binding(
-                    "a",
-                    "let a = { x: 11, next: { buf: b, off: \"x\" }, b: 1, tag: \"b.inner\", ext: x.b.val };\n",
-                    &["b"],
-                ),
-                binding(
-                    "b",
-                    "let b = { x: 22, next: { buf: a, off: \"x\" } };\n",
-                    &["a"],
-                ),
-            ]),
-            0
+            text,
+            "let a = {};\n\
+             let b = {};\n\
+             a.inner = {};\n\
+             b.inner = {};\n\
+             Object.assign(b.inner, { v: 2 });\n\
+             Object.assign(a.inner, { v: 1 });\n\
+             Object.assign(a, { inner: a.inner, other: b.inner });\n\
+             Object.assign(b, { inner: b.inner, other: a.inner });\n"
         );
 
-        // Refused: mutual aggregate sub-field cycle (`other: b.inner`).
+        // Self-referential aggregate sub-field (`ptr: s.inner`).
+        let (text, errs) = check(vec![binding(
+            "s",
+            "let s = { inner: { v: 42 }, ptr: s.inner };\n",
+            &[],
+        )]);
+        assert_eq!(errs, 0);
         assert_eq!(
-            check_errors(vec![
-                binding(
-                    "a",
-                    "let a = { inner: { v: 1 }, other: b.inner };\n",
-                    &["b"]
-                ),
-                binding(
-                    "b",
-                    "let b = { inner: { v: 2 }, other: a.inner };\n",
-                    &["a"]
-                ),
-            ]),
-            1
+            text,
+            "let s = {};\n\
+             s.inner = {};\n\
+             Object.assign(s.inner, { v: 42 });\n\
+             Object.assign(s, { inner: s.inner, ptr: s.inner });\n"
         );
 
-        // Refused: self-referential aggregate sub-field (`ptr: s.inner`).
-        assert_eq!(
-            check_errors(vec![binding(
-                "s",
-                "let s = { inner: { v: 42 }, ptr: s.inner };\n",
-                &[],
-            )]),
-            1
-        );
+        // Self-referential nested primitive slot (`{ buf: s.inner, off: "val" }`).
+        let (text, errs) = check(vec![binding(
+            "s",
+            "let s = { inner: { val: 42 }, ptr: { buf: s.inner, off: \"val\" } };\n",
+            &[],
+        )]);
+        assert_eq!(errs, 0);
+        assert!(text.contains("s.inner = {};\n"));
+        assert!(text.contains("Object.assign(s.inner, { val: 42 });\n"));
 
-        // Refused: self-referential nested primitive slot (`{ buf: s.inner, off: "val" }`).
-        assert_eq!(
-            check_errors(vec![binding(
-                "s",
-                "let s = { inner: { val: 42 }, ptr: { buf: s.inner, off: \"val\" } };\n",
-                &[],
-            )]),
-            1
-        );
+        // Self-referential nested slice (`{ buf: s.arr, off: 0, len: 3 }`).
+        let (text, errs) = check(vec![binding(
+            "s",
+            "let s = { arr: [10, 20, 30], sl: { buf: s.arr, off: 0, len: 3 } };\n",
+            &[],
+        )]);
+        assert_eq!(errs, 0);
+        assert!(text.contains("s.arr = [];\n"));
+        assert!(text.contains("Object.assign(s.arr, [10, 20, 30]);\n"));
 
-        // Refused: self-referential nested slice (`{ buf: s.arr, off: 0, len: 3 }`).
-        assert_eq!(
-            check_errors(vec![binding(
-                "s",
-                "let s = { arr: [10, 20, 30], sl: { buf: s.arr, off: 0, len: 3 } };\n",
-                &[],
-            )]),
-            1
-        );
+        // Bracket element read (`other: b[0]`).
+        let (text, errs) = check(vec![
+            binding("a", "let a = [{ v: 1 }, b[0]];\n", &["b"]),
+            binding("b", "let b = [{ v: 2 }, a[0]];\n", &["a"]),
+        ]);
+        assert_eq!(errs, 0);
+        assert!(text.contains("a[0] = {};\n"));
+        assert!(text.contains("b[0] = {};\n"));
+        assert!(text.contains("Object.assign(a, [a[0], b[0]]);\n"));
 
-        // Refused: bracket element read (`other: b[0]`).
-        assert_eq!(
-            check_errors(vec![
-                binding("a", "let a = [{ v: 1 }, b[0]];\n", &["b"]),
-                binding("b", "let b = [{ v: 2 }, a[0]];\n", &["a"]),
-            ]),
-            1
-        );
+        // Refused: reading a scalar property off a cycle member (`other: b.scalar`).
+        let (_, errs) = check(vec![
+            binding("a", "let a = { scalar: 1, other: b.scalar };\n", &["b"]),
+            binding("b", "let b = { scalar: 2, other: a.scalar };\n", &["a"]),
+        ]);
+        assert_eq!(errs, 1);
+
+        // Refused: reading a missing property off a cycle member.
+        let (_, errs) = check(vec![
+            binding("a", "let a = { x: 1, other: b.missing };\n", &["b"]),
+            binding("b", "let b = { x: 2, other: a };\n", &["a"]),
+        ]);
+        assert_eq!(errs, 1);
     }
 }

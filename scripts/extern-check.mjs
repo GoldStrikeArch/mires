@@ -313,15 +313,15 @@ for (const length of [0, 1, 7, 65536]) {
 // behind a zero length, and an offset into a typed buffer.
 {
   exact("bytes: runtime copy of a plain array at an offset",
-    () => rt.u8array_from_bytes({ buf: [5, 6, 7, 8, 9], off: 1, len: 3 }), [6, 7, 8]);
+    () => rt.u8array_from_bytes({ $b: [5, 6, 7, 8, 9], $o: 1, $l: 3 }), [6, 7, 8]);
   exact("bytes: runtime copy of i8 values",
-    () => rt.u8array_from_bytes({ buf: [-128, -1, 0, 127], off: 0, len: 4 }), [128, 255, 0, 127]);
+    () => rt.u8array_from_bytes({ $b: [-128, -1, 0, 127], $o: 0, $l: 4 }), [128, 255, 0, 127]);
   exact("bytes: runtime copy of Uint8Array storage at an offset",
-    () => rt.u8array_from_bytes({ buf: Uint8Array.from([1, 2, 3, 4]), off: 2, len: 2 }), [3, 4]);
+    () => rt.u8array_from_bytes({ $b: Uint8Array.from([1, 2, 3, 4]), $o: 2, $l: 2 }), [3, 4]);
   exact("bytes: runtime copy of Int8Array storage",
-    () => rt.u8array_from_bytes({ buf: Int8Array.from([-1, -128, 5]), off: 0, len: 3 }), [255, 128, 5]);
+    () => rt.u8array_from_bytes({ $b: Int8Array.from([-1, -128, 5]), $o: 0, $l: 3 }), [255, 128, 5]);
   exact("bytes: runtime copy of an absent zero-length buffer",
-    () => rt.u8array_from_bytes({ buf: undefined, off: undefined, len: 0 }), []);
+    () => rt.u8array_from_bytes({ $b: undefined, $o: undefined, $l: 0 }), []);
   exact("bytes: runtime copy of the frozen dangling buffer",
     () => rt.u8array_from_bytes(rt.slice_from_parts(1, 0)), []);
   // Typed storage is sliced with the captured `subarray`, never the instance's own property.
@@ -331,17 +331,17 @@ for (const length of [0, 1, 7, 65536]) {
     return view;
   };
   exact("bytes: runtime copy ignores a typed buffer's own subarray that answers other bytes",
-    () => rt.u8array_from_bytes({ buf: ownSubarray(() => Uint8Array.from([9, 9, 9])), off: 1, len: 3 }), [2, 3, 4]);
+    () => rt.u8array_from_bytes({ $b: ownSubarray(() => Uint8Array.from([9, 9, 9])), $o: 1, $l: 3 }), [2, 3, 4]);
   exact("bytes: runtime copy ignores a typed buffer's own subarray that throws",
-    () => rt.u8array_from_bytes({ buf: ownSubarray(() => { throw new Error("own subarray ran"); }), off: 0, len: 2 }), [1, 2]);
+    () => rt.u8array_from_bytes({ $b: ownSubarray(() => { throw new Error("own subarray ran"); }), $o: 0, $l: 2 }), [1, 2]);
   const storage = Uint8Array.from([1, 2, 3]);
-  const copied = rt.u8array_from_bytes({ buf: storage, off: 0, len: 3 });
+  const copied = rt.u8array_from_bytes({ $b: storage, $o: 0, $l: 3 });
   copied[0] = 99;
   check("bytes: runtime copy of typed storage does not alias it", storage[0] === 1 && copied.buffer !== storage.buffer);
-  const destination = { buf: [0, 0, 0, 0, 0], off: 1, len: 3 };
+  const destination = { $b: [0, 0, 0, 0, 0], $o: 1, $l: 3 };
   rt.u8array_into_bytes(Uint8Array.from([255, 0, 128]), destination);
-  check("bytes: runtime import writes exactly dst.len bytes at dst.off",
-    JSON.stringify(destination.buf) === JSON.stringify([0, 255, 0, 128, 0]), JSON.stringify(destination.buf));
+  check("bytes: runtime import writes exactly dst.$l bytes at dst.$o",
+    JSON.stringify(destination.$b) === JSON.stringify([0, 255, 0, 128, 0]), JSON.stringify(destination.$b));
 }
 // The export and the length read are classified as unable to throw (`HostOperation::may_throw`),
 // so whatever they are handed, the only exception allowed out is a registered compiler abort.
@@ -360,30 +360,30 @@ const aborts = (label, run) => {
 };
 {
   const hostile = new Proxy({}, { get() { throw new Error("host getter ran"); } });
-  aborts("bytes: a host record with a negative length aborts", () => bytes.bytes_from_host_record({ len: -1 }));
-  aborts("bytes: a host record with a fractional length aborts", () => bytes.bytes_from_host_record({ buf: [1, 2], off: 0, len: 1.5 }));
+  aborts("bytes: a host record with a negative length aborts", () => bytes.bytes_from_host_record({ $l: -1 }));
+  aborts("bytes: a host record with a fractional length aborts", () => bytes.bytes_from_host_record({ $b: [1, 2], $o: 0, $l: 1.5 }));
   aborts("bytes: a host record whose getter throws aborts", () => bytes.bytes_from_host_record(hostile));
-  aborts("bytes: a host record whose range overruns its buffer aborts", () => bytes.bytes_from_host_record({ buf: [1, 2], off: 1, len: 2 }));
-  aborts("bytes: a host record with a field-key offset aborts", () => bytes.bytes_from_host_record({ buf: { b: 1 }, off: "b", len: 1 }));
+  aborts("bytes: a host record whose range overruns its buffer aborts", () => bytes.bytes_from_host_record({ $b: [1, 2], $o: 1, $l: 2 }));
+  aborts("bytes: a host record with a field-key offset aborts", () => bytes.bytes_from_host_record({ $b: { b: 1 }, $o: "b", $l: 1 }));
   // The offset is checked for itself, over an array buffer whose range check alone would pass.
-  aborts("bytes: an array record with a fractional offset aborts", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: 0.5, len: 2 }));
-  aborts("bytes: an array record with a negative offset aborts", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: -1, len: 2 }));
-  aborts("bytes: an array record with a string offset aborts", () => bytes.bytes_from_host_record({ buf: [5, 6, 7], off: "0", len: 1 }));
+  aborts("bytes: an array record with a fractional offset aborts", () => bytes.bytes_from_host_record({ $b: [1, 2, 3], $o: 0.5, $l: 2 }));
+  aborts("bytes: an array record with a negative offset aborts", () => bytes.bytes_from_host_record({ $b: [1, 2, 3], $o: -1, $l: 2 }));
+  aborts("bytes: an array record with a string offset aborts", () => bytes.bytes_from_host_record({ $b: [5, 6, 7], $o: "0", $l: 1 }));
   // Typed storage is range-checked by its built-in length: `subarray` would clamp silently.
   aborts("bytes: a typed record whose range passes the end of its buffer aborts",
-    () => bytes.bytes_from_host_record({ buf: Uint8Array.from([1, 2, 3]), off: 2, len: 4 }));
-  aborts("bytes: a host record over a DataView aborts", () => bytes.bytes_from_host_record({ buf: new DataView(new ArrayBuffer(4)), off: 0, len: 2 }));
-  aborts("bytes: a host record over BigInt storage aborts", () => bytes.bytes_from_host_record({ buf: [1n, 2n], off: 0, len: 2 }));
-  aborts("bytes: a host record over a BigInt64Array aborts", () => bytes.bytes_from_host_record({ buf: new BigInt64Array(2), off: 0, len: 2 }));
-  aborts("bytes: a length no Uint8Array can have aborts", () => bytes.bytes_from_host_record({ buf: [], off: 0, len: 2 ** 53 }));
-  exact("bytes: a well-formed host record is copied", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: 1, len: 2 }), [2, 3]);
+    () => bytes.bytes_from_host_record({ $b: Uint8Array.from([1, 2, 3]), $o: 2, $l: 4 }));
+  aborts("bytes: a host record over a DataView aborts", () => bytes.bytes_from_host_record({ $b: new DataView(new ArrayBuffer(4)), $o: 0, $l: 2 }));
+  aborts("bytes: a host record over BigInt storage aborts", () => bytes.bytes_from_host_record({ $b: [1n, 2n], $o: 0, $l: 2 }));
+  aborts("bytes: a host record over a BigInt64Array aborts", () => bytes.bytes_from_host_record({ $b: new BigInt64Array(2), $o: 0, $l: 2 }));
+  aborts("bytes: a length no Uint8Array can have aborts", () => bytes.bytes_from_host_record({ $b: [], $o: 0, $l: 2 ** 53 }));
+  exact("bytes: a well-formed host record is copied", () => bytes.bytes_from_host_record({ $b: [1, 2, 3], $o: 1, $l: 2 }), [2, 3]);
   aborts("bytes: u64 storage viewed as bytes aborts", () => bytes.bytes_from_words());
   aborts("bytes: host values viewed as bytes abort when valueOf throws",
     () => bytes.bytes_from_values({ valueOf() { throw new Error("host valueOf ran"); } }));
   aborts("bytes: runtime export of undefined aborts", () => rt.u8array_from_bytes(undefined));
-  const target = { buf: [7, 7, 7], off: 0, len: 3 };
+  const target = { $b: [7, 7, 7], $o: 0, $l: 3 };
   aborts("bytes: runtime import into a destination of another length aborts", () => rt.u8array_into_bytes(Uint8Array.from([1, 2]), target));
-  check("bytes: the aborted import wrote nothing", target.buf.every((byte) => byte === 7), JSON.stringify(target.buf));
+  check("bytes: the aborted import wrote nothing", target.$b.every((byte) => byte === 7), JSON.stringify(target.$b));
 }
 // The length read is classified as able to throw: a view that is not a `Uint8Array` is refused with
 // the ordinary `TypeError` a mismatched host read raises, so cleanup runs, and no host code runs.

@@ -14,8 +14,8 @@ function _RNvCs1lVxXr9ZvqQ_7___rustc35___rust_no_alloc_shim_is_unstable_v2() {}
 function rust_entry() {
   let boxed = [];
   boxed[0] = alloc$boxed$impl_0_new$h3034cc737def7e04(41);
-  x17_alloc_shim$prelude$print_i32$h993aa2e4c78a8d46(boxed[0].buf[boxed[0].off] + 1 | 0);
-  core$ptr$drop_glue$hb63dc3eb78685891({ buf: boxed, off: 0 });
+  x17_alloc_shim$prelude$print_i32$h993aa2e4c78a8d46(boxed[0].$b[boxed[0].$o] + 1 | 0);
+  core$ptr$drop_glue$hb63dc3eb78685891({ $b: boxed, $o: 0 });
 }
 function core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51() {
   throw new Error("rustc_codegen_js: `core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51` was never codegenned; the monomorphization collector proved every call to it unreachable");

@@ -135,7 +135,7 @@ test("module mode emits lexical ESM bindings, elides unused _boxes, and deduplic
   const withBox = minimalShim(["__rt._put(b, 0, v); __rt.box(v);"], fullShim, { module: true });
   parse(withBox.source, { ecmaVersion: 2018, sourceType: "module" });
   assert.match(withBox.source, /let \$rt__boxes = new WeakMap\(\);/);
-  assert.match(withBox.source, /\$rt__boxes\.set\(value, \{ buf, off \}\);/);
+  assert.match(withBox.source, /\$rt__boxes\.set\(value, \{ \$b: buf, \$o: off \}\);/);
 
   const literalShim = `${shim}globalThis.__rt.str = () => "__rt.outer";\n`;
   const literalMod = minimalShim(["__rt.str(); __rt.outer(1);"], literalShim, { module: true });
@@ -160,16 +160,16 @@ test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffe
     4095,
     null,
     undefined,
-    { buf: stackArr, off: 0 },
-    { buf: stackArr, off: 3 },
+    { $b: stackArr, $o: 0 },
+    { $b: stackArr, $o: 3 },
     heapPtr,
-    { pr: 0, ps: 1 },
-    { pr: null, ps: 1 },
-    { pr: { buf: stackArr, off: 0 }, ps: 4 },
-    { buf: null, off: 0 },
-    { buf: 0, off: 0 },
+    { $pr: 0, $ps: 1 },
+    { $pr: null, $ps: 1 },
+    { $pr: { $b: stackArr, $o: 0 }, $ps: 4 },
+    { $b: null, $o: 0 },
+    { $b: 0, $o: 0 },
     dangling,
-    { buf: dangling.buf, off: -4 },
+    { $b: dangling.$b, $o: -4 },
   ];
   for (const ptr of cases) {
     assert.equal(rt.ptr_is_null(ptr), (rt.addr(ptr, 1) >>> 0) === 0, `mismatch for ${String(ptr)}`);
@@ -177,17 +177,17 @@ test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffe
 
   // Fresh live pointer must not mint an address or flip _addrs membership.
   const freshArr = [10, 20];
-  assert.equal(rt.ptr_is_null({ buf: freshArr, off: 0 }), false);
-  assert.equal(rt.ptr_is_null({ buf: freshArr, off: 1 }), false);
+  assert.equal(rt.ptr_is_null({ $b: freshArr, $o: 0 }), false);
+  assert.equal(rt.ptr_is_null({ $b: freshArr, $o: 1 }), false);
   assert.equal(rt._addrs.has(freshArr), false);
 
   // Offset-wrapped pointer reaching address 0 must fall back and return true.
   const freshContext = vm.createContext({});
   vm.runInContext(fullShim, freshContext);
   const frt = freshContext.__rt;
-  assert.equal(frt.ptr_is_null({ buf: [1], off: -4096 }), true);
+  assert.equal(frt.ptr_is_null({ $b: [1], $o: -4096 }), true);
 
-  // Projected `.pr` must preserve `.ps` for dangling/heap negative offsets and large wraps, plus 2-arg size.
+  // Projected `.$pr` must preserve `.$ps` for dangling/heap negative offsets and large wraps, plus 2-arg size.
   const d4 = frt._dangling(4);
   const dMoved = frt.offset(d4, -1, 4);
   const dProj = frt.prefix(dMoved, "_0", 4);
@@ -207,13 +207,13 @@ test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffe
   const wrt = wCtx.__rt;
   wrt._addrNext = 1048576;
   const largeBuf = [1];
-  const wProj = { pr: { buf: largeBuf, off: 4095 }, ps: 1048576 };
+  const wProj = { $pr: { $b: largeBuf, $o: 4095 }, $ps: 1048576 };
   assert.equal(wrt.ptr_is_null(wProj), true);
   assert.equal((wrt.addr(wProj, 1) >>> 0) === 0, true);
-  assert.equal(wrt.ptr_is_null({ buf: largeBuf, off: 4095 }, 1048576), true);
+  assert.equal(wrt.ptr_is_null({ $b: largeBuf, $o: 4095 }, 1048576), true);
 
   // Poisoned provenance-less pointer must throw just like addr().
-  assert.throws(() => rt.ptr_is_null({ buf: undefined, off: NaN }), /no provenance/);
+  assert.throws(() => rt.ptr_is_null({ $b: undefined, $o: NaN }), /no provenance/);
 });
 
 test("dealloc skips _addrHeap WeakMap lookup when no heap address was minted", () => {
@@ -272,9 +272,9 @@ test("minimalShim isolates _ASCII_CHUNK subslice state cleanly in classic and mo
   );
   const src = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const rec = mod.str_bytes(src);
-  const sub = mod.bytes_str(rec.buf, 5, 22);
+  const sub = mod.bytes_str(rec.$b, 5, 22);
   assert.equal(sub, src.slice(5, 27));
-  assert.equal(mod.str_bytes(sub).buf, rec.buf);
-  assert.equal(mod.str_bytes(sub).off, 5);
+  assert.equal(mod.str_bytes(sub).$b, rec.$b);
+  assert.equal(mod.str_bytes(sub).$o, 5);
   assert.equal(mod.str_len(sub), 22);
 });

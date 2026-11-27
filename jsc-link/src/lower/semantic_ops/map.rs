@@ -339,9 +339,10 @@ fn emit_key_expr(lowering: &KeyLowering, helpers: &mut BTreeSet<&'static str>) -
     let arg = jsast::id("$native1");
     match lowering {
         KeyLowering::Direct => arg,
-        KeyLowering::SlotDeref => {
-            jsast::index(jsast::member(arg.clone(), "buf"), jsast::member(arg, "off"))
-        }
+        KeyLowering::SlotDeref => jsast::index(
+            jsast::member(arg.clone(), rcgjs_object::ptr::BUF),
+            jsast::member(arg, rcgjs_object::ptr::OFF),
+        ),
         KeyLowering::NativeString => jsast::member(arg, "s"),
         KeyLowering::BaselineString(layout) => {
             helpers.insert("bytes_str");
@@ -350,8 +351,8 @@ fn emit_key_expr(lowering: &KeyLowering, helpers: &mut BTreeSet<&'static str>) -
             jsast::rt_call(
                 "bytes_str",
                 vec![
-                    jsast::member(ptr_expr.clone(), "buf"),
-                    jsast::member(ptr_expr, "off"),
+                    jsast::member(ptr_expr.clone(), rcgjs_object::ptr::BUF),
+                    jsast::member(ptr_expr, rcgjs_object::ptr::OFF),
                     len_expr,
                 ],
             )
