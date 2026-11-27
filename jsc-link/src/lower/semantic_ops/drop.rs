@@ -152,7 +152,10 @@ fn box_pointee<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, SemanticDecli
         BodySemantic::Standard(operation) => {
             return Err(SemanticDecline::UnsupportedOperation(operation));
         }
-        BodySemantic::Ordinary | BodySemantic::PanicImpl | BodySemantic::JsExport => {
+        BodySemantic::Ordinary
+        | BodySemantic::PanicImpl
+        | BodySemantic::JsExport
+        | BodySemantic::JsExportOut => {
             return Err(SemanticDecline::NotAStandardOperation);
         }
     };

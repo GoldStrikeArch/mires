@@ -1331,7 +1331,9 @@ globalThis.__rt.read_array = (p, n) => {
       const ev = globalThis.__rt._element_view_of.get(held);
       if (ev !== undefined) return Array.prototype.slice.call(ev.buf, ev.off, ev.off + n);
     }
-    return held;
+    if ((Array.isArray(held) || ArrayBuffer.isView(held)) && held.length === n) {
+      return held;
+    }
   }
   const buf = globalThis.__rt._bv !== null ? globalThis.__rt._bv.raw_buf(p.buf) : p.buf;
   return Array.prototype.slice.call(buf, p.off, p.off + n);

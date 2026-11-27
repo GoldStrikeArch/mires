@@ -154,6 +154,22 @@ impl<K: MapKey, V> Default for HashMap<K, V> {
     }
 }
 
+impl<K: MapKey, V> core::iter::Extend<(K, V)> for HashMap<K, V> {
+    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
+        for (key, value) in iter {
+            let _ = self.insert(key, value);
+        }
+    }
+}
+
+impl<K: MapKey, V> core::iter::FromIterator<(K, V)> for HashMap<K, V> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let mut map = Self::new();
+        map.extend(iter);
+        map
+    }
+}
+
 impl<'a, K: MapKey, V> IntoIterator for &'a HashMap<K, V> {
     type Item = (&'a K::Class, &'a V);
     type IntoIter = Iter<'a, K, V>;

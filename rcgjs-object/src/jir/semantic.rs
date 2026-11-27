@@ -148,6 +148,9 @@ pub enum BodySemantic {
     /// A function exported with `#[js_export]` (`link_section = "rcgjs.export.v1"`), eligible for
     /// automatic JS↔Rust boundary marshaling.
     JsExport,
+    /// An internal return-marshaling helper emitted for `#[js_export] async fn`
+    /// (`link_section = "rcgjs.export.out.v1"`), lowered directly to Rust→JS value conversion.
+    JsExportOut,
 }
 
 /// Standard-library operation families eligible for native representation analysis.

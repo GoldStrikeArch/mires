@@ -1784,7 +1784,7 @@ fn canonical_clone_allowed(
         && !func.sig.abi.caller_location
         && !matches!(
             semantic,
-            Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport)
+            Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport | BodySemantic::JsExportOut)
         )
         && !matches!(
             semantic,
@@ -1819,7 +1819,7 @@ pub(super) fn refuses(
     }
     if matches!(
         semantic,
-        Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport)
+        Some(BodySemantic::DropGlue(_) | BodySemantic::JsExport | BodySemantic::JsExportOut)
     ) {
         return Some(BoundaryDecline::NonCallReference);
     }

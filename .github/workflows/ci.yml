@@ -20,8 +20,12 @@ jobs:
       - run: cargo clippy -p rcgjs-object --features interp --all-targets -- -D warnings
       - run: npm ci --ignore-scripts
       - run: bash scripts/build.sh --locked
+      - run: cargo build --release --locked -p cargo-mires
+      - run: cargo test --workspace
+      - run: SKIP_BUILD=1 bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/build_sysroot.sh
       - run: SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/test.sh --require-core
+      - run: bash scripts/ergonomics-e2e.sh
       - run: bash scripts/check.sh
       - run: node scripts/standalone-check.mjs
       - run: SKIP_BUILD=1 bash scripts/cleanup-smoke.sh

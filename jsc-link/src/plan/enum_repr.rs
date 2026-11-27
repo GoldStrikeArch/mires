@@ -532,9 +532,11 @@ impl<'a> EnumBoundaryScanner<'a> {
                 .record_static(body.signature.result, interns, self.global_types);
         }
 
-        // 2. Exported / imported / DTS-bearing items cross the JS boundary.
-        let is_js_boundary_item =
-            item.linkage.exported || item.kind == ItemKind::Import || item.dts.is_some();
+        // 2. Exported / imported / DTS-bearing / async export-out items cross the JS boundary.
+        let is_js_boundary_item = item.linkage.exported
+            || item.kind == ItemKind::Import
+            || item.dts.is_some()
+            || body.semantic == BodySemantic::JsExportOut;
         let item_is_offered = self.offered_set.contains(item.name.as_str());
         if is_js_boundary_item {
             self.walk_signature_both(body, interns);

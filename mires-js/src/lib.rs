@@ -48,6 +48,7 @@ impl HostHandle {
     }
 }
 
+pub mod class_handle;
 pub mod collections;
 pub mod web;
 
@@ -56,10 +57,75 @@ pub use js_extern_macro::{js_bindings, js_export, js_extern};
 mod executor;
 mod host;
 mod host_value;
+mod map_entries;
 mod promise;
 
 pub use executor::*;
 pub use host::*;
 pub use host_value::*;
+pub use map_entries::{JsBTreeMapEntries, JsMapEntries};
 pub use promise::*;
 pub use web::*;
+
+/// Internal runtime support items referenced by `#[js_export]` macro expansions.
+#[doc(hidden)]
+pub mod __export {
+    pub use alloc::string::String;
+
+    pub use crate::class_handle;
+    pub use crate::host::JsValue;
+    pub use crate::map_entries::{JsBTreeMapEntries, JsMapEntries};
+    pub use crate::promise::TypedPromise;
+}
+
+#[cfg(test)]
+mod export_crate_override_tests {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+
+    use crate::js_export;
+
+    #[js_export(crate = crate)]
+    async fn ping_from_mires_js(label: &str) -> usize {
+        label.len()
+    }
+
+    #[js_export(crate = crate)]
+    fn count_keys(map: BTreeMap<String, u32>) -> usize {
+        map.len()
+    }
+
+    #[js_export(crate = crate)]
+    struct BoxedAcc {
+        total: u32,
+    }
+
+    #[js_export(crate = crate)]
+    impl BoxedAcc {
+        pub fn new(total: u32) -> Self {
+            Self { total }
+        }
+
+        pub fn add(&mut self, delta: u32) -> u32 {
+            self.total += delta;
+            self.total
+        }
+
+        pub fn finish(self) -> u32 {
+            self.total
+        }
+    }
+
+    #[test]
+    fn crate_override_exports_work_natively() {
+        let mut map = BTreeMap::new();
+        map.insert(String::from("a"), 1);
+        assert_eq!(count_keys(map), 1);
+
+        let mut acc = BoxedAcc::new(3);
+        assert_eq!(acc.add(4), 7);
+        assert_eq!(acc.finish(), 7);
+
+        let _async_fn = ping_from_mires_js("ok");
+    }
+}

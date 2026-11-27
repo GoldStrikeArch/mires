@@ -38,9 +38,95 @@ impl fmt::Display for StripPrefixError {
 
 impl Error for StripPrefixError {}
 
+/// Windows path prefixes, e.g., `C:` or `\\server\share`.
+///
+/// Provided for cross-platform API compatibility with upstream `std::path`;
+/// POSIX/JS paths do not produce prefix components.
+#[derive(Copy, Clone, Debug, Hash, PartialOrd, Ord, PartialEq, Eq)]
+pub enum Prefix<'a> {
+    /// Verbatim prefix, e.g., `\\?\cat_pics`.
+    Verbatim(&'a OsStr),
+    /// Verbatim prefix using Windows' UNC, e.g., `\\?\UNC\server\share`.
+    VerbatimUNC(&'a OsStr, &'a OsStr),
+    /// Verbatim disk prefix, e.g., `\\?\C:`.
+    VerbatimDisk(u8),
+    /// Device namespace prefix, e.g., `\\.\COM42`.
+    DeviceNS(&'a OsStr),
+    /// UNC prefix, e.g., `\\server\share`.
+    UNC(&'a OsStr, &'a OsStr),
+    /// Prefix `C:` for the given disk drive.
+    Disk(u8),
+}
+
+impl<'a> Prefix<'a> {
+    /// Determines if the prefix is verbatim, i.e., begins with `\\?\`.
+    #[inline]
+    #[must_use]
+    pub fn is_verbatim(&self) -> bool {
+        matches!(
+            *self,
+            Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+        )
+    }
+}
+
+/// A structure wrapping a Windows path prefix as well as its unparsed string representation.
+///
+/// Does not occur on Unix or JavaScript targets.
+#[derive(Copy, Clone, Eq, Debug)]
+pub struct PrefixComponent<'a> {
+    raw: &'a OsStr,
+    parsed: Prefix<'a>,
+}
+
+impl<'a> PrefixComponent<'a> {
+    /// Returns the parsed prefix data.
+    #[must_use]
+    #[inline]
+    pub fn kind(&self) -> Prefix<'a> {
+        self.parsed
+    }
+
+    /// Returns the raw [`OsStr`] slice for this prefix.
+    #[must_use]
+    #[inline]
+    pub fn as_os_str(&self) -> &'a OsStr {
+        self.raw
+    }
+}
+
+impl<'a> PartialEq for PrefixComponent<'a> {
+    #[inline]
+    fn eq(&self, other: &PrefixComponent<'a>) -> bool {
+        self.parsed == other.parsed
+    }
+}
+
+impl<'a> PartialOrd for PrefixComponent<'a> {
+    #[inline]
+    fn partial_cmp(&self, other: &PrefixComponent<'a>) -> Option<Ordering> {
+        PartialOrd::partial_cmp(&self.parsed, &other.parsed)
+    }
+}
+
+impl Ord for PrefixComponent<'_> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        Ord::cmp(&self.parsed, &other.parsed)
+    }
+}
+
+impl Hash for PrefixComponent<'_> {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.parsed.hash(h);
+    }
+}
+
 /// A single component of a path.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Component<'a> {
+    /// A Windows path prefix, e.g., `C:` or `\\server\share`. Does not occur on JS/POSIX.
+    Prefix(PrefixComponent<'a>),
     /// The root directory component (`/`).
     RootDir,
     /// A reference to the current directory (`.`).
@@ -56,6 +142,7 @@ impl<'a> Component<'a> {
     #[must_use]
     pub fn as_os_str(self) -> &'a OsStr {
         match self {
+            Component::Prefix(p) => p.as_os_str(),
             Component::RootDir => OsStr::new("/"),
             Component::CurDir => OsStr::new("."),
             Component::ParentDir => OsStr::new(".."),

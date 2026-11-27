@@ -212,7 +212,10 @@ fn map_kv<'a>(
             .copied()
             .ok_or(SemanticDecline::WrongArgumentType(0))?,
         BodySemantic::Standard(op) => return Err(SemanticDecline::UnsupportedOperation(op)),
-        BodySemantic::Ordinary | BodySemantic::PanicImpl | BodySemantic::JsExport => {
+        BodySemantic::Ordinary
+        | BodySemantic::PanicImpl
+        | BodySemantic::JsExport
+        | BodySemantic::JsExportOut => {
             return Err(SemanticDecline::NotAStandardOperation);
         }
     };

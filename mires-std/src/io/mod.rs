@@ -17,8 +17,8 @@ use crate::vec::Vec;
 pub use buffered::{BufReader, BufWriter, IntoInnerError, LineWriter};
 pub use cursor::Cursor;
 pub use stdio::{
-    Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, _eprint, _eprintln, _print,
-    _println, stderr, stdin, stdout,
+    _eprint, _eprintln, _print, _println, stderr, stdin, stdout, Stderr, StderrLock, Stdin,
+    StdinLock, Stdout, StdoutLock,
 };
 
 /// A specialized [`core::result::Result`] type for I/O operations.
@@ -124,7 +124,7 @@ impl fmt::Display for ErrorKind {
 enum ErrorRepr {
     Simple(ErrorKind),
     SimpleMessage(ErrorKind, &'static str),
-    Custom(ErrorKind, String),
+    Custom(ErrorKind, Box<dyn StdError + Send + Sync>),
     Os(i32),
 }
 
@@ -134,23 +134,21 @@ pub struct Error {
 }
 
 impl Error {
-    /// Creates a new I/O error from a known kind and message/error value.
-    ///
-    /// Stores the formatted message directly so constructing an `io::Error`
-    /// never instantiates a `dyn core::error::Error` vtable.
+    /// Creates a new I/O error from a known kind of error as well as an
+    /// arbitrary error payload.
     pub fn new<E>(kind: ErrorKind, error: E) -> Error
     where
-        E: fmt::Display,
+        E: Into<Box<dyn StdError + Send + Sync>>,
     {
         Error {
-            repr: ErrorRepr::Custom(kind, alloc_crate::string::ToString::to_string(&error)),
+            repr: ErrorRepr::Custom(kind, error.into()),
         }
     }
 
     /// Creates a new I/O error with [`ErrorKind::Other`].
     pub fn other<E>(error: E) -> Error
     where
-        E: fmt::Display,
+        E: Into<Box<dyn StdError + Send + Sync>>,
     {
         Error::new(ErrorKind::Other, error)
     }
@@ -192,21 +190,46 @@ impl Error {
     #[must_use]
     #[inline]
     pub fn get_ref(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
-        None
+        match &self.repr {
+            ErrorRepr::Custom(_, err) => Some(&**err),
+            _ => None,
+        }
     }
 
     /// Returns a mutable reference to the inner boxed error, if any.
     #[must_use]
     #[inline]
     pub fn get_mut(&mut self) -> Option<&mut (dyn StdError + Send + Sync + 'static)> {
-        None
+        match &mut self.repr {
+            ErrorRepr::Custom(_, err) => Some(&mut **err),
+            _ => None,
+        }
     }
 
     /// Consumes the `Error`, returning its inner boxed error if any.
-    #[must_use]
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[inline]
     pub fn into_inner(self) -> Option<Box<dyn StdError + Send + Sync>> {
-        None
+        match self.repr {
+            ErrorRepr::Custom(_, err) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// Attempts to downcast the custom boxed error to `E`.
+    pub fn downcast<E>(self) -> core_crate::result::Result<E, Self>
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        match self.repr {
+            ErrorRepr::Custom(kind, err) => match err.downcast::<E>() {
+                Ok(boxed) => Ok(*boxed),
+                Err(err) => Err(Error {
+                    repr: ErrorRepr::Custom(kind, err),
+                }),
+            },
+            other => Err(Error { repr: other }),
+        }
     }
 
     /// Returns the corresponding [`ErrorKind`] for this error.
@@ -245,10 +268,10 @@ impl fmt::Debug for Error {
                 .field("kind", kind)
                 .field("message", msg)
                 .finish(),
-            ErrorRepr::Custom(kind, msg) => f
+            ErrorRepr::Custom(kind, err) => f
                 .debug_struct("Custom")
                 .field("kind", kind)
-                .field("error", msg)
+                .field("error", err)
                 .finish(),
             ErrorRepr::Os(code) => f.debug_struct("Os").field("code", code).finish(),
         }
@@ -260,13 +283,20 @@ impl fmt::Display for Error {
         match &self.repr {
             ErrorRepr::Simple(kind) => f.write_str(kind.as_str()),
             ErrorRepr::SimpleMessage(_, msg) => f.write_str(msg),
-            ErrorRepr::Custom(_, msg) => f.write_str(msg),
+            ErrorRepr::Custom(_, err) => fmt::Display::fmt(err, f),
             ErrorRepr::Os(code) => write!(f, "os error {code}"),
         }
     }
 }
 
-impl StdError for Error {}
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match &self.repr {
+            ErrorRepr::Custom(_, err) => err.source(),
+            _ => None,
+        }
+    }
+}
 
 /// A buffer type used with [`Write::write_vectored`].
 #[derive(Clone, Copy)]
@@ -524,7 +554,10 @@ pub trait Write {
                 if output.error.is_err() {
                     output.error
                 } else {
-                    Err(Error::from_static_message(ErrorKind::Other, "formatter error"))
+                    Err(Error::from_static_message(
+                        ErrorKind::Other,
+                        "formatter error",
+                    ))
                 }
             }
         }

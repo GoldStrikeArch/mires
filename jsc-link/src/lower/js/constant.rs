@@ -735,10 +735,10 @@ impl<'a> JsCx<'a> {
                 }
                 Ok(binding)
             }
-            GlobalReference::Type(_) => Err(decline(
-                OpClass::Constant,
-                format!("a pointer to a type allocation at type {:032x}", ty.0),
-            )),
+            // `GlobalAlloc::TypeId { ty }` carries CTFE-only provenance alongside the
+            // pointer-sized chunk of `tcx.type_id_hash(ty)` stored in `offset`. Strip
+            // provenance at runtime and emit the exact integer chunk.
+            GlobalReference::Type(_) => Ok(jsast::num(offset as f64)),
         }
     }
 

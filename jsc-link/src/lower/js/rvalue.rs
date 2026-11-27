@@ -1569,7 +1569,23 @@ impl<'a> JsCx<'a> {
                 if let Some(converted) = self.cast_str_ptr(from_ty, to_ty, value.clone()) {
                     return converted;
                 }
-                self.cast_pointer(from_pointee, to_pointee, value)
+                // Two trait-object pointers with the same principal trait (differing only in
+                // auto traits or lifetimes) share the exact `{ ptr, meta }` representation.
+                if let (
+                    Some(TypeKind::Dynamic { principal: a, .. }),
+                    Some(TypeKind::Dynamic { principal: b, .. }),
+                ) = (
+                    value::kind(table, table.peeled(from_pointee)),
+                    value::kind(table, table.peeled(to_pointee)),
+                ) {
+                    if a == b || b.is_none() {
+                        return Ok(value);
+                    }
+                }
+                match self.cast_scalar_reinterp_ptr(from_pointee, to_pointee, value) {
+                    Ok(converted) => Ok(converted),
+                    Err(value) => self.cast_pointer(from_pointee, to_pointee, value),
+                }
             }
             CastKind::PointerExposeProvenance => {
                 let address = match value::pointee_of(table, from_ty) {
@@ -1590,6 +1606,75 @@ impl<'a> JsCx<'a> {
             CastKind::PointerCoercion => self.pointer_coercion(from_ty, to_ty, value),
             CastKind::Transmute => self.transmute(from_ty, to_ty, value),
         }
+    }
+
+    /// Reinterprets a raw pointer between two different-width multi-byte scalar or thin-pointer
+    /// element types (for example `*const *const ()` / `*const [*const ()]` -> `*const u64` in
+    /// `core::any::TypeId::hash`) by composing `__rt.scale_scalar` and `__rt.unscale_scalar`.
+    ///
+    /// Returns `Err(value)` unchanged when the cast is not a cross-width multi-byte scalar
+    /// reinterpretation so the normal pointer cast matrix handles it.
+    pub(super) fn cast_scalar_reinterp_ptr(
+        &self,
+        from_pointee: TypeId,
+        to_pointee: TypeId,
+        value: Expr,
+    ) -> Result<Expr, Expr> {
+        let table = self.table;
+        let to = table.peeled(to_pointee);
+        if table.is_zst(to) || table.is_indirect(to) {
+            return Err(value);
+        }
+        let Some(to_size) = value::size_of(table, to).filter(|&s| s > 1) else {
+            return Err(value);
+        };
+        let Some(to_kind) = reinterp_scalar_kind(table, to) else {
+            return Err(value);
+        };
+        let mut from = table.peeled(from_pointee);
+        let mut unwrap_arrays = 0u32;
+        for _ in 0..16 {
+            match value::kind(table, from) {
+                Some(TypeKind::Slice(element)) => {
+                    from = table.peeled(*element);
+                }
+                Some(TypeKind::Array { element, .. }) => {
+                    from = table.peeled(*element);
+                    unwrap_arrays += 1;
+                }
+                _ => break,
+            }
+        }
+        if from == to || table.is_zst(from) || table.is_indirect(from) {
+            return Err(value);
+        }
+        let Some(from_size) = value::size_of(table, from).filter(|&s| s > 1 && s != to_size) else {
+            return Err(value);
+        };
+        let Some(from_kind) = reinterp_scalar_kind(table, from) else {
+            return Err(value);
+        };
+        let mut ptr_expr = value;
+        for _ in 0..unwrap_arrays {
+            ptr_expr = jsast::rt_call("unwindow", vec![ptr_expr]);
+        }
+        let scaled = jsast::rt_call(
+            "scale_scalar",
+            vec![
+                ptr_expr,
+                jsast::num(from_size as f64),
+                jsast::string(from_kind),
+            ],
+        );
+        Ok(jsast::rt_call(
+            "unscale_scalar",
+            vec![
+                scaled,
+                jsast::num(to_size as f64),
+                self.zero_factory(to),
+                jsast::string(to_kind),
+            ],
+        ))
     }
 
     /// The pointer coercions, told apart by their two types (`rvalue.rs:601-668`).
@@ -2500,6 +2585,57 @@ impl<'a> JsCx<'a> {
     #[allow(dead_code, reason = "helper exposed for switch-case lowering tests")]
     pub fn switch_case_value(&self, ty: TypeId, raw: u128) -> Expr {
         value::int_literal(self.table, ty, raw).unwrap_or_else(|| jsast::num(raw as f64))
+    }
+}
+
+/// Scalar view tag for cross-width multi-byte pointer reinterpretation via
+/// `__rt.scale_scalar` / `__rt.unscale_scalar`. Thin pointers on the 32-bit target are
+/// 4-byte unsigned words (`"u32"`), which enables `core::any::TypeId::hash`'s
+/// `self.data.as_ptr().cast::<u64>().offset(1)` read.
+fn reinterp_scalar_kind(table: &TypeTable, ty: TypeId) -> Option<&'static str> {
+    match value::kind(table, ty)? {
+        TypeKind::Integer {
+            signed: false,
+            bits: 16,
+        } => Some("u16"),
+        TypeKind::Integer {
+            signed: true,
+            bits: 16,
+        } => Some("i16"),
+        TypeKind::Integer {
+            signed: false,
+            bits: 32,
+        } => Some("u32"),
+        TypeKind::Integer {
+            signed: true,
+            bits: 32,
+        } => Some("i32"),
+        TypeKind::Integer {
+            signed: false,
+            bits: 64,
+        } => Some("u64"),
+        TypeKind::Integer {
+            signed: true,
+            bits: 64,
+        } => Some("i64"),
+        TypeKind::Integer {
+            signed: false,
+            bits: 128,
+        } => Some("u128"),
+        TypeKind::Integer {
+            signed: true,
+            bits: 128,
+        } => Some("i128"),
+        TypeKind::Float { bits: 32 } => Some("f32"),
+        TypeKind::Float { bits: 64 } => Some("f64"),
+        TypeKind::Char => Some("u32"),
+        TypeKind::RawPointer { pointee, .. } | TypeKind::Reference { pointee, .. }
+            if table.get(*pointee).is_some_and(|d| d.layout.sized) =>
+        {
+            Some("u32")
+        }
+        TypeKind::FnPtr { .. } => Some("u32"),
+        _ => None,
     }
 }
 

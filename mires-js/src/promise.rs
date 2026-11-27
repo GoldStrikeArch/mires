@@ -82,6 +82,83 @@ impl IntoFuture for Promise {
     }
 }
 
+#[cfg(test)]
+impl Promise {
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self {
+            handle: HostHandle::from_raw(raw),
+        }
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.handle.raw()
+    }
+}
+
+/// A native JavaScript `Promise` whose settled value carries a static Rust type `T`.
+///
+/// At run time this is `#[repr(transparent)]` over [`Promise`] (zero runtime overhead — it is the
+/// host `Promise` object itself). The compiler's `.d.ts` generator inspects `T` to emit
+/// `Promise<T>` (unwrapping `Result<OkT, ErrT>` to `Promise<OkT>` with `@throws {ErrT}`, and `()`
+/// to `Promise<void>`).
+#[repr(transparent)]
+pub struct TypedPromise<T> {
+    inner: Promise,
+    _marker: core::marker::PhantomData<T>,
+}
+
+impl<T> Clone for TypedPromise<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for TypedPromise<T> {}
+
+impl<T> TypedPromise<T> {
+    /// Wraps an untyped host [`Promise`] as a [`TypedPromise<T>`].
+    #[must_use]
+    pub const fn from_promise(promise: Promise) -> Self {
+        Self {
+            inner: promise,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Unwraps this typed promise into its underlying [`Promise`].
+    #[must_use]
+    pub const fn into_promise(self) -> Promise {
+        self.inner
+    }
+
+    /// Converts a Rust future into a [`TypedPromise<T>`].
+    #[must_use]
+    pub fn from_future<F>(future: F) -> Self
+    where
+        F: Future<Output = Result<JsValue, JsValue>> + 'static,
+    {
+        Self::from_promise(Promise::from_future(future))
+    }
+
+    /// Erases this `TypedPromise` handle to an opaque [`JsValue`].
+    #[must_use]
+    pub fn as_value(self) -> JsValue {
+        self.inner.as_value()
+    }
+}
+
+impl<T> From<TypedPromise<T>> for Promise {
+    fn from(value: TypedPromise<T>) -> Self {
+        value.into_promise()
+    }
+}
+
+impl<T> From<TypedPromise<T>> for JsValue {
+    fn from(value: TypedPromise<T>) -> Self {
+        value.as_value()
+    }
+}
+
 js_bindings! {
     #[js(call = "Promise.resolve")]
     fn promise_resolve(value: JsValue) -> Promise;
@@ -516,5 +593,31 @@ mod tests {
         );
         fn assert_host_value<T: HostValue + Copy>() {}
         assert_host_value::<Promise>();
+    }
+
+    #[test]
+    fn typed_promise_is_transparent_over_promise() {
+        use alloc::string::String;
+
+        assert_eq!(
+            core::mem::size_of::<TypedPromise<()>>(),
+            core::mem::size_of::<Promise>()
+        );
+        assert_eq!(
+            core::mem::size_of::<TypedPromise<String>>(),
+            core::mem::size_of::<Promise>()
+        );
+        assert_eq!(
+            core::mem::align_of::<TypedPromise<Result<String, u64>>>(),
+            core::mem::align_of::<Promise>()
+        );
+
+        let raw = Promise::from_raw(123);
+        let typed: TypedPromise<String> = TypedPromise::from_promise(raw);
+        let copied = typed;
+        let cloned = Clone::clone(&copied);
+        assert_eq!(typed.into_promise().raw(), 123);
+        let as_promise: Promise = cloned.into();
+        assert_eq!(as_promise.raw(), 123);
     }
 }

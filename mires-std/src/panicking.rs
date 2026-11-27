@@ -1,17 +1,56 @@
 //! Internal panic machinery: panic depth counter, payload slot, and unwind catching.
 
 use crate::any::Any;
-use crate::borrow::Cow;
 use crate::boxed::Box;
 use crate::cell::{Cell, UnsafeCell};
 use crate::string::String;
+
+/// Stored payload for an in-flight unwinding panic.
+///
+/// Keeping static strings and formatted `String`s unboxed in dedicated variants
+/// avoids instantiating `dyn Any` vtables in programs that never call
+/// `catch_unwind` or `panic_any`, while preserving the exact payload type
+/// (`&'static str`, `String`, or arbitrary `Box<dyn Any + Send>`) when caught.
+enum PanicPayload {
+    StaticStr(&'static str),
+    OwnedString(String),
+    Any(Box<dyn Any + Send>),
+}
+
+impl PanicPayload {
+    fn into_any(self) -> Box<dyn Any + Send> {
+        match self {
+            Self::StaticStr(s) => Box::new(s),
+            Self::OwnedString(s) => Box::new(s),
+            Self::Any(b) => b,
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::StaticStr(s) => String::from(s),
+            Self::OwnedString(s) => s,
+            Self::Any(b) => payload_message(&*b),
+        }
+    }
+}
+
+fn payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        String::from(*s)
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::from("Box<dyn Any>")
+    }
+}
 
 /// Single-threaded global panic state.
 ///
 /// Sound on single-threaded JavaScript targets (`singlethread = true`).
 struct PanicState {
     depth: Cell<usize>,
-    message: UnsafeCell<Option<Cow<'static, str>>>,
+    payload: UnsafeCell<Option<PanicPayload>>,
 }
 
 // SAFETY: `mires` targets single-threaded JavaScript execution (`singlethread = true`),
@@ -20,7 +59,7 @@ unsafe impl Sync for PanicState {}
 
 static PANIC_STATE: PanicState = PanicState {
     depth: Cell::new(0),
-    message: UnsafeCell::new(None),
+    payload: UnsafeCell::new(None),
 };
 
 /// Returns `true` if the current execution is unwinding due to a panic.
@@ -30,17 +69,17 @@ pub(crate) fn panicking() -> bool {
 }
 
 #[inline]
-fn set_message(msg: Cow<'static, str>) {
-    // SAFETY: Single-threaded execution; no overlapping borrows of `PANIC_STATE.message`.
+fn set_payload(payload: PanicPayload) {
+    // SAFETY: Single-threaded execution; no overlapping borrows of `PANIC_STATE.payload`.
     unsafe {
-        *PANIC_STATE.message.get() = Some(msg);
+        *PANIC_STATE.payload.get() = Some(payload);
     }
 }
 
 #[inline]
-fn take_message() -> Option<Cow<'static, str>> {
-    // SAFETY: Single-threaded execution; no overlapping borrows of `PANIC_STATE.message`.
-    unsafe { (*PANIC_STATE.message.get()).take() }
+fn take_payload() -> Option<PanicPayload> {
+    // SAFETY: Single-threaded execution; no overlapping borrows of `PANIC_STATE.payload`.
+    unsafe { (*PANIC_STATE.payload.get()).take() }
 }
 
 /// Raises a panic with a static message `&'static str`.
@@ -53,7 +92,7 @@ pub(crate) fn panic_with_static_str(msg: &'static str) -> ! {
     if cfg!(panic = "unwind") {
         let depth = PANIC_STATE.depth.get();
         PANIC_STATE.depth.set(depth.saturating_add(1));
-        set_message(Cow::Borrowed(msg));
+        set_payload(PanicPayload::StaticStr(msg));
         crate::sys::panic_error(msg)
     } else {
         crate::sys::abort(msg)
@@ -74,7 +113,7 @@ pub(crate) fn panic_with_fmt(args: crate::fmt::Arguments<'_>) -> ! {
             let depth = PANIC_STATE.depth.get();
             PANIC_STATE.depth.set(depth.saturating_add(1));
             let msg_copy = text.clone();
-            set_message(Cow::Owned(msg_copy));
+            set_payload(PanicPayload::OwnedString(msg_copy));
             crate::sys::panic_error(&text)
         } else {
             crate::sys::abort(&text)
@@ -94,37 +133,18 @@ pub fn begin_panic<M: Any + Send>(msg: M) -> ! {
 #[inline(never)]
 #[cold]
 pub(crate) fn resume_unwind(payload: Box<dyn Any + Send>) -> ! {
-    let text = if let Some(s) = payload.downcast_ref::<&'static str>() {
-        String::from(*s)
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        String::from("Box<dyn Any>")
-    };
+    let text = payload_message(&*payload);
     if cfg!(panic = "unwind") {
         let depth = PANIC_STATE.depth.get();
         PANIC_STATE.depth.set(depth.saturating_add(1));
-        set_message(Cow::Owned(text.clone()));
+        set_payload(PanicPayload::Any(payload));
         crate::sys::panic_error(&text)
     } else {
         crate::sys::abort(&text)
     }
 }
 
-/// Invokes `f`, catching a Rust panic when compiled in unwind mode.
-pub(crate) fn catch_unwind<F, R>(f: F) -> Result<R, Box<dyn Any + Send>>
-where
-    F: FnOnce() -> R,
-{
-    match catch_unwind_message(f) {
-        Ok(val) => Ok(val),
-        Err(msg) => Err(Box::new(msg)),
-    }
-}
-
-/// Invokes `f`, catching a Rust panic and returning its message without requiring `dyn Any`.
-#[doc(hidden)]
-pub fn catch_unwind_message<F, R>(f: F) -> Result<R, String>
+fn catch_unwind_payload<F, R>(f: F) -> Result<R, Option<PanicPayload>>
 where
     F: FnOnce() -> R,
 {
@@ -135,7 +155,7 @@ where
 
     extern "C-unwind" fn trampoline<F: FnOnce() -> R, R>(raw: *mut u8) -> i32 {
         // SAFETY: `raw` is a valid pointer to `CatchData<F, R>` passed by
-        // `catch_unwind_message` below, alive for the synchronous JS `try` call.
+        // `catch_unwind_payload` below, alive for the synchronous JS `try` call.
         let data = unsafe { &mut *(raw as *mut CatchData<F, R>) };
         if let Some(func) = data.f.take() {
             data.out = Some(func());
@@ -157,7 +177,31 @@ where
         }
     } else {
         PANIC_STATE.depth.set(prev_depth);
-        let msg = take_message().map_or_else(|| String::from("panicked"), Cow::into_owned);
-        Err(msg)
+        Err(take_payload())
+    }
+}
+
+/// Invokes `f`, catching a Rust panic when compiled in unwind mode.
+pub(crate) fn catch_unwind<F, R>(f: F) -> Result<R, Box<dyn Any + Send>>
+where
+    F: FnOnce() -> R,
+{
+    match catch_unwind_payload(f) {
+        Ok(val) => Ok(val),
+        Err(Some(payload)) => Err(payload.into_any()),
+        Err(None) => Err(Box::new("panicked")),
+    }
+}
+
+/// Invokes `f`, catching a Rust panic and returning its message without requiring `dyn Any`.
+#[doc(hidden)]
+pub fn catch_unwind_message<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> R,
+{
+    match catch_unwind_payload(f) {
+        Ok(val) => Ok(val),
+        Err(Some(payload)) => Err(payload.into_message()),
+        Err(None) => Err(String::from("panicked")),
     }
 }

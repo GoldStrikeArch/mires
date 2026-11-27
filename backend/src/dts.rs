@@ -96,7 +96,22 @@ pub(crate) fn signature<'tcx>(
         .collect();
     let mut rust = format!("{sig}");
     let ret = if is_js_export {
-        if let Some((ok_ty, err_ty)) = result_type_args(tcx, sig.output()) {
+        if let Some(inner_ty) = typed_promise_inner(tcx, sig.output()) {
+            if let Some((ok_ty, err_ty)) = result_type_args(tcx, inner_ty) {
+                let ok_ts = if ok_ty.is_unit() {
+                    "void".to_owned()
+                } else {
+                    ts_type(tcx, ok_ty, &mut types, 0, true)
+                };
+                let err_ts = ts_type(tcx, err_ty, &mut types, 0, true);
+                rust = format!("{sig}\n@throws {{{err_ts}}}");
+                format!("Promise<{ok_ts}>")
+            } else if inner_ty.is_unit() {
+                "Promise<void>".to_owned()
+            } else {
+                format!("Promise<{}>", ts_type(tcx, inner_ty, &mut types, 0, true))
+            }
+        } else if let Some((ok_ty, err_ty)) = result_type_args(tcx, sig.output()) {
             let ok_ts = if ok_ty.is_unit() {
                 "void".to_owned()
             } else {
@@ -201,7 +216,115 @@ fn result_type_args<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<(Ty<'tcx>, 
     Some((types.next()?, types.next()?))
 }
 
-/// Recognized `mires_js` host handle types for `#[js_export]` `.d.ts` output.
+/// Formats a registered named type key for [`Dts::types`]. `#[js_export]` modules prefix named
+/// types with `"export "` so `rcgjs_object::dts::module_dts` emits `export type Name = ...;`.
+fn type_key(name: &str, is_js_export: bool) -> String {
+    if is_js_export {
+        format!("export {name}")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Whether `did` names a known `mires_js` item.
+fn is_mires_js_type(
+    tcx: TyCtxt<'_>,
+    did: rustc_hir::def_id::DefId,
+    expected_item: &str,
+    expected_suffix: &str,
+) -> bool {
+    let crate_name = tcx.crate_name(did.krate);
+    let item_name = tcx.item_name(did);
+    if crate_name.as_str() == "mires_js" && item_name.as_str() == expected_item {
+        return true;
+    }
+    let path = tcx.def_path_str(did);
+    path == expected_suffix || path.ends_with(&format!("::{expected_suffix}"))
+}
+
+/// If `ty` is `mires_js::promise::TypedPromise<R>`, returns `Some(R)`.
+fn typed_promise_inner<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    let ty::Adt(def, args) = ty.kind() else {
+        return None;
+    };
+    if !is_mires_js_type(
+        tcx,
+        def.did(),
+        "TypedPromise",
+        "mires_js::promise::TypedPromise",
+    ) {
+        return None;
+    }
+    args.types().next()
+}
+
+/// Whether `did` is `std::collections::HashMap`, `mires_std::collections::HashMap`, or
+/// `alloc::collections::BTreeMap` (`std::collections::BTreeMap`).
+fn is_std_map_def(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    if tcx
+        .get_diagnostic_name(did)
+        .is_some_and(|name| matches!(name.as_str(), "HashMap" | "BTreeMap"))
+    {
+        return true;
+    }
+    let crate_name = tcx.crate_name(did.krate);
+    let item_name = tcx.item_name(did);
+    if matches!(crate_name.as_str(), "std" | "mires_std") && item_name.as_str() == "HashMap" {
+        return true;
+    }
+    if matches!(crate_name.as_str(), "alloc" | "std" | "mires_std")
+        && item_name.as_str() == "BTreeMap"
+    {
+        return true;
+    }
+    matches!(
+        tcx.def_path_str(did).as_str(),
+        "std::collections::HashMap"
+            | "std::collections::hash_map::HashMap"
+            | "std::collections::hash::map::HashMap"
+            | "mires_std::collections::HashMap"
+            | "mires_std::collections::hash_map::HashMap"
+            | "alloc::collections::BTreeMap"
+            | "alloc::collections::btree::map::BTreeMap"
+            | "std::collections::BTreeMap"
+    )
+}
+
+/// Whether map key type `ty` is a string key (`String`, `&str`, or `str`), which marshals to
+/// TypeScript `Record<string, V>` rather than `Map<K, V>`.
+fn is_string_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::Str => true,
+        ty::Ref(_, pointee, mutbl) if !mutbl.is_mut() => pointee.is_str(),
+        ty::Adt(def, _) => is_string_def(tcx, def.did()),
+        _ => false,
+    }
+}
+
+/// Formats a map-like `(K, V)` generic type as `Record<string, V>` or `Map<K, V>`.
+fn ts_map_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    args: ty::GenericArgsRef<'tcx>,
+    types: &mut BTreeMap<String, String>,
+    depth: u32,
+) -> String {
+    let mut type_args = args.types();
+    let Some(key_ty) = type_args.next() else {
+        return "Map<unknown, unknown>".to_owned();
+    };
+    let val_ts = type_args
+        .next()
+        .map(|val_ty| ts_type(tcx, val_ty, types, depth + 1, true))
+        .unwrap_or_else(|| "unknown".to_owned());
+    if is_string_key_ty(tcx, key_ty) {
+        format!("Record<string, {val_ts}>")
+    } else {
+        let key_ts = ts_type(tcx, key_ty, types, depth + 1, true);
+        format!("Map<{key_ts}, {val_ts}>")
+    }
+}
+
+/// Recognized `mires_js` host handle and boundary adapter types for `#[js_export]` `.d.ts` output.
 fn mires_js_host_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     did: rustc_hir::def_id::DefId,
@@ -209,29 +332,56 @@ fn mires_js_host_type<'tcx>(
     types: &mut BTreeMap<String, String>,
     depth: u32,
 ) -> Option<String> {
-    let crate_name = tcx.crate_name(did.krate);
-    let item_name = tcx.item_name(did);
-    let is_mires_js = crate_name.as_str() == "mires_js";
-    let path = (!is_mires_js).then(|| tcx.def_path_str(did));
-    let matches_type = |expected_item: &str, expected_suffix: &str| {
-        (is_mires_js && item_name.as_str() == expected_item)
-            || path.as_deref().is_some_and(|p| {
-                p == expected_suffix || p.ends_with(&format!("::{expected_suffix}"))
-            })
-    };
-    if matches_type("JsValue", "mires_js::host::JsValue") {
+    if is_mires_js_type(tcx, did, "JsValue", "mires_js::host::JsValue") {
         return Some("unknown".to_owned());
     }
-    if matches_type("JsString", "mires_js::host_value::JsString") {
+    if is_mires_js_type(tcx, did, "JsString", "mires_js::host_value::JsString") {
         return Some("string".to_owned());
     }
-    if matches_type("JsArray", "mires_js::host_value::JsArray") {
+    if is_mires_js_type(tcx, did, "JsArray", "mires_js::host_value::JsArray") {
         let elem = args
             .types()
             .next()
             .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
             .unwrap_or_else(|| "unknown".to_owned());
         return Some(ts_array_type(elem));
+    }
+    if is_mires_js_type(tcx, did, "Promise", "mires_js::promise::Promise") {
+        return Some("Promise<unknown>".to_owned());
+    }
+    if is_mires_js_type(tcx, did, "TypedPromise", "mires_js::promise::TypedPromise") {
+        let Some(inner_ty) = args.types().next() else {
+            return Some("Promise<unknown>".to_owned());
+        };
+        if let Some((ok_ty, _)) = result_type_args(tcx, inner_ty) {
+            let ok_ts = if ok_ty.is_unit() {
+                "void".to_owned()
+            } else {
+                ts_type(tcx, ok_ty, types, depth + 1, true)
+            };
+            return Some(format!("Promise<{ok_ts}>"));
+        }
+        if inner_ty.is_unit() {
+            return Some("Promise<void>".to_owned());
+        }
+        return Some(format!(
+            "Promise<{}>",
+            ts_type(tcx, inner_ty, types, depth + 1, true)
+        ));
+    }
+    if is_mires_js_type(
+        tcx,
+        did,
+        "JsMapEntries",
+        "mires_js::map_entries::JsMapEntries",
+    ) || is_mires_js_type(
+        tcx,
+        did,
+        "JsBTreeMapEntries",
+        "mires_js::map_entries::JsBTreeMapEntries",
+    ) || is_mires_js_type(tcx, did, "HashMap", "mires_js::collections::map::HashMap")
+    {
+        return Some(ts_map_type(tcx, args, types, depth));
     }
     None
 }
@@ -299,6 +449,9 @@ fn ts_type<'tcx>(
                         .unwrap_or_else(|| "unknown".to_owned());
                     return ts_array_type(elem);
                 }
+                if is_std_map_def(tcx, def.did()) {
+                    return ts_map_type(tcx, args, types, depth);
+                }
                 if is_option_def(tcx, def.did()) {
                     let inner = args
                         .types()
@@ -324,7 +477,7 @@ fn ts_type<'tcx>(
             }
             if let Some(opaque) = opaque_handle(tcx, def.did()) {
                 types.insert(
-                    opaque.to_owned(),
+                    type_key(opaque, is_js_export),
                     format!("{{ readonly __{opaque}: unique symbol }}"),
                 );
                 return opaque.to_owned();
@@ -370,11 +523,12 @@ fn ts_struct<'tcx>(
         );
     }
     let name = ts_name(tcx, ty);
-    if types.contains_key(&name) {
+    let key = type_key(&name, is_js_export);
+    if types.contains_key(&key) {
         return name;
     }
     // Registered before the fields are walked, so a struct that mentions itself terminates.
-    types.insert(name.clone(), "unknown".to_owned());
+    types.insert(key.clone(), "unknown".to_owned());
     let members: Vec<String> = variant
         .fields
         .iter()
@@ -392,7 +546,7 @@ fn ts_struct<'tcx>(
             format!("{field_name}: {field_ty}")
         })
         .collect();
-    types.insert(name.clone(), object(&members));
+    types.insert(key, object(&members));
     name
 }
 
@@ -442,10 +596,11 @@ fn ts_enum<'tcx>(
     }
 
     let name = ts_name(tcx, ty);
-    if types.contains_key(&name) {
+    let key = type_key(&name, is_js_export);
+    if types.contains_key(&key) {
         return name;
     }
-    types.insert(name.clone(), "unknown".to_owned());
+    types.insert(key.clone(), "unknown".to_owned());
 
     let fieldless = matches!(repr, EnumRepr::Tag { fieldless: true });
     let arms: Vec<String> = def
@@ -475,7 +630,7 @@ fn ts_enum<'tcx>(
             object(&members)
         })
         .collect();
-    types.insert(name.clone(), arms.join(" | "));
+    types.insert(key, arms.join(" | "));
     name
 }
 

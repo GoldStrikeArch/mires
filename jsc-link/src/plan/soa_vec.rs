@@ -525,8 +525,14 @@ fn audit_live_items<V>(
             break;
         }
 
-        // Export / root boundary check: no SoA type or container may cross exported/root ABI.
-        if item.linkage.exported || opts.roots.iter().any(|r| r == name.as_str()) {
+        // Export / root / async export-out boundary check: no SoA type or container may cross.
+        if item.linkage.exported
+            || opts.roots.iter().any(|r| r == name.as_str())
+            || matches!(
+                item.jir.body.as_ref().map(|b| b.semantic),
+                Some(BodySemantic::JsExportOut)
+            )
+        {
             let mut mentioned = BTreeSet::new();
             for &arg_ty in &func.sig.arguments {
                 collect_any_soa_mentions(types, arg_ty, &state.candidates, &mut mentioned);

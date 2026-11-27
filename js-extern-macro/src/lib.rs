@@ -38,9 +38,11 @@ use syn::{
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
     spanned::Spanned,
-    AngleBracketedGenericArguments, Attribute, FnArg, ForeignItem, GenericArgument, Ident, ItemFn,
+    AngleBracketedGenericArguments, Attribute, FnArg, ForeignItem, GenericArgument, Ident,
     ItemForeignMod, LitStr, PathArguments, ReturnType, Signature, Token, Type, Visibility,
 };
+
+mod export;
 
 /// Declares the JavaScript interface a foreign block describes. See the crate docs.
 #[proc_macro_attribute]
@@ -73,219 +75,28 @@ pub fn js_bindings(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Exports a Rust function to JavaScript.
+/// Exports a Rust function, `async fn`, struct, or inherent `impl` class to JavaScript.
 ///
 /// Supported attribute forms:
 ///
-/// - `#[js_export]` — exports under the Rust function's name with JS boundary marshaling.
+/// - `#[js_export]` — exports under the Rust item's name with JS boundary marshaling.
 /// - `#[js_export(name = "parseMarkdown")]` — exports under `"parseMarkdown"` with JS boundary
 ///   marshaling.
-/// - `#[js_export(raw)]` — exports under the Rust function's name using the raw internal ABI
-///   without boundary marshaling.
+/// - `#[js_export(raw)]` — exports a synchronous function under its Rust name using the raw
+///   internal ABI without boundary marshaling.
 /// - `#[js_export(name = "foo", raw)]` or `#[js_export(raw, name = "foo")]` — exports under
 ///   `"foo"` using the raw internal ABI.
+/// - `#[js_export(crate = mires_js)]` — overrides the support crate path (defaults to `::mires`).
 ///
 /// On native host targets (`not(target_arch = "wasm32")`), no symbol-export or `link_section`
-/// attributes are emitted so exported functions can be tested normally with `cargo test` without
+/// attributes are emitted so exported items can be tested normally with `cargo test` without
 /// symbol collisions.
 #[proc_macro_attribute]
 pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
-    match expand_export(attr.into(), item.into()) {
+    match export::expand_export(attr.into(), item.into()) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
-}
-
-/// Link section tagging JS exports that need boundary marshaling by `rustc_codegen_js`.
-const EXPORT_MARSHAL_SECTION: &str = "rcgjs.export.v1";
-
-/// ECMAScript strict-mode reserved words (sorted for binary search).
-const JS_RESERVED_WORDS: &[&str] = &[
-    "await",
-    "break",
-    "case",
-    "catch",
-    "class",
-    "const",
-    "continue",
-    "debugger",
-    "default",
-    "delete",
-    "do",
-    "else",
-    "enum",
-    "export",
-    "extends",
-    "false",
-    "finally",
-    "for",
-    "function",
-    "if",
-    "implements",
-    "import",
-    "in",
-    "instanceof",
-    "interface",
-    "let",
-    "new",
-    "null",
-    "package",
-    "private",
-    "protected",
-    "public",
-    "return",
-    "static",
-    "super",
-    "switch",
-    "this",
-    "throw",
-    "true",
-    "try",
-    "typeof",
-    "var",
-    "void",
-    "while",
-    "with",
-    "yield",
-];
-
-/// Arguments parsed from `#[js_export(..)]`.
-struct ExportAttr {
-    name: Option<String>,
-    raw: bool,
-}
-
-/// One entry inside `#[js_export(..)]`.
-enum ExportEntry {
-    Name(proc_macro2::Span, String),
-    Raw(proc_macro2::Span),
-}
-
-impl Parse for ExportEntry {
-    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let key: Ident = input.parse()?;
-        match key.to_string().as_str() {
-            "name" => {
-                if !input.peek(Token![=]) {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        "`name` in `#[js_export(..)]` requires a JavaScript identifier string, \
-                         e.g. `#[js_export(name = \"myFunc\")]`",
-                    ));
-                }
-                input.parse::<Token![=]>()?;
-                let lit: LitStr = input.parse()?;
-                Ok(Self::Name(lit.span(), lit.value()))
-            }
-            "raw" => {
-                if input.peek(Token![=]) {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        "`raw` in `#[js_export(..)]` takes no value",
-                    ));
-                }
-                Ok(Self::Raw(key.span()))
-            }
-            other => Err(syn::Error::new(
-                key.span(),
-                format!(
-                    "unknown `#[js_export]` argument `{other}`; expected `name = \"..\"` or `raw`"
-                ),
-            )),
-        }
-    }
-}
-
-impl Parse for ExportAttr {
-    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let mut name = None;
-        let mut raw = false;
-
-        for entry in Punctuated::<ExportEntry, Token![,]>::parse_terminated(input)? {
-            match entry {
-                ExportEntry::Name(span, value) => {
-                    if name.is_some() {
-                        return Err(syn::Error::new(
-                            span,
-                            "duplicate `name` in `#[js_export(..)]`",
-                        ));
-                    }
-                    validate_js_export_ident(&value, span)?;
-                    name = Some(value);
-                }
-                ExportEntry::Raw(span) => {
-                    if raw {
-                        return Err(syn::Error::new(
-                            span,
-                            "duplicate `raw` in `#[js_export(..)]`",
-                        ));
-                    }
-                    raw = true;
-                }
-            }
-        }
-
-        Ok(Self { name, raw })
-    }
-}
-
-/// Validates that `name` is a legal JavaScript identifier for a `#[js_export(name = "..")]` export.
-fn validate_js_export_ident(name: &str, span: proc_macro2::Span) -> syn::Result<()> {
-    if name.is_empty() {
-        return Err(syn::Error::new(
-            span,
-            "`name` in `#[js_export(name = \"..\")]` must not be empty",
-        ));
-    }
-    if !is_js_ident(name) {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "`{name}` is not a valid JavaScript identifier: it must start with an ASCII \
-                 letter, `_`, or `$`, and contain only ASCII alphanumerics, `_`, or `$`"
-            ),
-        ));
-    }
-    if is_js_reserved_word(name) {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "`{name}` is a JavaScript reserved word and cannot be used as a `#[js_export]` name"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Whether `name` is an ECMAScript strict-mode reserved word.
-fn is_js_reserved_word(name: &str) -> bool {
-    JS_RESERVED_WORDS.binary_search(&name).is_ok()
-}
-
-fn expand_export(
-    attr: proc_macro2::TokenStream,
-    item: proc_macro2::TokenStream,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let args: ExportAttr = syn::parse2(attr)?;
-    let function: ItemFn = syn::parse2(item)?;
-    let symbol_attr = match args.name {
-        Some(export_name) => {
-            quote! { #[cfg_attr(target_arch = "wasm32", unsafe(export_name = #export_name))] }
-        }
-        None => {
-            quote! { #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))] }
-        }
-    };
-    let section_attr = if args.raw {
-        quote! {}
-    } else {
-        quote! { #[cfg_attr(target_arch = "wasm32", unsafe(link_section = #EXPORT_MARSHAL_SECTION))] }
-    };
-    Ok(quote! {
-        #symbol_attr
-        #section_attr
-        #function
-    })
 }
 
 /// A safe JavaScript bindings block.
@@ -943,6 +754,7 @@ fn is_js_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::export::{expand_export, JS_RESERVED_WORDS};
     use super::*;
 
     fn descriptor(module: &str, source: &str) -> Result<String, String> {

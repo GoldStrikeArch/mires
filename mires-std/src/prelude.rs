@@ -18,11 +18,12 @@ pub mod v1 {
     // Re-exported built-in macros and derive traits from `core`.
     #[allow(deprecated)]
     pub use core_crate::prelude::v1::{
-        Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, assert, assert_eq,
-        assert_ne, cfg, cfg_select, column, compile_error, concat, debug_assert, debug_assert_eq,
-        debug_assert_ne, derive, env, file, format_args, include, include_bytes, include_str, line,
-        matches, module_path, option_env, stringify, todo, r#try, unimplemented, unreachable,
-        write, writeln,
+        Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, alloc_error_handler,
+        assert, assert_eq, assert_ne, bench, cfg, cfg_select, column, compile_error, concat,
+        debug_assert, debug_assert_eq, debug_assert_ne, derive, env, file, format_args,
+        global_allocator, include, include_bytes, include_str, line, matches, module_path,
+        option_env, stringify, test, test_case, todo, r#try, unimplemented, unreachable, write,
+        writeln,
     };
 
     // Re-exported std macros.

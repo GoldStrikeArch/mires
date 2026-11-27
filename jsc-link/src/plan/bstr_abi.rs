@@ -982,7 +982,12 @@ fn collect_matched_sites(
 fn bstr_semantic_allowed(semantic: Option<BodySemantic>) -> bool {
     !matches!(
         semantic,
-        Some(BodySemantic::DropGlue(_) | BodySemantic::PanicImpl | BodySemantic::JsExport)
+        Some(
+            BodySemantic::DropGlue(_)
+                | BodySemantic::PanicImpl
+                | BodySemantic::JsExport
+                | BodySemantic::JsExportOut
+        )
     ) && !matches!(
         semantic,
         Some(BodySemantic::Standard(operation))

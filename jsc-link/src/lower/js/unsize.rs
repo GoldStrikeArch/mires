@@ -112,24 +112,27 @@ impl JsCx<'_> {
             let arr = self.expr_of(operand)?;
             return Ok(super::i64_pair::bytes_expr_to_i64_pair(self, stmts, arr));
         }
-        if scalar_array_info(table, from_ty)
-            .is_some_and(|info| info.count == 2 && info.elem_bits == 32)
-        {
-            if self.is_inline(operand) {
-                if let Some(op) = self.def_of(operand) {
-                    if let OpKind::Aggregate { fields, .. } = &op.kind {
-                        if fields.len() == 2 {
-                            let lo = jsast::i32_wrap(self.expr_of(fields[0])?);
-                            let hi = jsast::i32_wrap(self.expr_of(fields[1])?);
-                            return Ok((lo, hi));
+        if let Some(info) = scalar_array_info(table, from_ty) {
+            if info.count == 2 && info.elem_bits == 32 {
+                if self.is_inline(operand) {
+                    if let Some(op) = self.def_of(operand) {
+                        if let OpKind::Aggregate { fields, .. } = &op.kind {
+                            if fields.len() == 2 {
+                                let lo = self
+                                    .scalar_elem_to_i32(info.elem_kind, self.expr_of(fields[0])?);
+                                let hi = self
+                                    .scalar_elem_to_i32(info.elem_kind, self.expr_of(fields[1])?);
+                                return Ok((lo, hi));
+                            }
                         }
                     }
                 }
+                let arr = super::i64_pair::materialize(self, stmts, self.expr_of(operand)?);
+                let lo = self
+                    .scalar_elem_to_i32(info.elem_kind, jsast::index(arr.clone(), jsast::num(0)));
+                let hi = self.scalar_elem_to_i32(info.elem_kind, jsast::index(arr, jsast::num(1)));
+                return Ok((lo, hi));
             }
-            let arr = super::i64_pair::materialize(self, stmts, self.expr_of(operand)?);
-            let lo = jsast::i32_wrap(jsast::index(arr.clone(), jsast::num(0)));
-            let hi = jsast::i32_wrap(jsast::index(arr, jsast::num(1)));
-            return Ok((lo, hi));
         }
         if value::float_bits(table, table.peeled(from_ty)) == Some(64) {
             let val = self.expr_of(operand)?;
@@ -247,6 +250,19 @@ impl JsCx<'_> {
                         let to_is_ref = !value::is_raw(table, to);
                         let from_shape = table.peeled(from_pointee);
                         let to_shape = table.peeled(to_pointee);
+                        // Two trait-object pointers with the same principal trait (differing only
+                        // in auto-trait bounds like `Send`/`Sync` or lifetimes, e.g.
+                        // `Box<dyn Error> -> Box<dyn Error + Send + Sync>` in `alloc`) share the
+                        // exact `{ ptr, meta }` representation.
+                        if let (
+                            Some(TypeKind::Dynamic { principal: a, .. }),
+                            Some(TypeKind::Dynamic { principal: b, .. }),
+                        ) = (value::kind(table, from_shape), value::kind(table, to_shape))
+                        {
+                            if a == b || b.is_none() {
+                                return Ok(value);
+                            }
+                        }
                         let preserve_ref = from_is_ref
                             && ((to_is_ref && from_shape == to_shape)
                                 || (!to_is_ref
@@ -271,7 +287,16 @@ impl JsCx<'_> {
                             } else {
                                 value
                             };
-                            let raw_out = self.cast_pointer(from_pointee, to_pointee, raw_in)?;
+                            let raw_out = match self.cast_scalar_reinterp_ptr(
+                                from_pointee,
+                                to_pointee,
+                                raw_in,
+                            ) {
+                                Ok(converted) => converted,
+                                Err(raw_in) => {
+                                    self.cast_pointer(from_pointee, to_pointee, raw_in)?
+                                }
+                            };
                             if to_is_ref {
                                 self.raw_to_ref(to_pointee, raw_out)
                             } else {
@@ -284,20 +309,7 @@ impl JsCx<'_> {
             }
             // A thin pointer and a pointer sized integer.
             (ReprClass::Pointer(true), ReprClass::Int(b)) if b.bits == POINTER_BITS => {
-                let address = match value::pointee_of(table, from) {
-                    Some(pointee) => {
-                        let raw = if !value::is_raw(table, from) {
-                            self.ref_value_to_raw(pointee, value)
-                        } else {
-                            value
-                        };
-                        self.ptr_addr(pointee, raw)
-                    }
-                    None if matches!(value::kind(table, from), Some(TypeKind::FnPtr { .. })) => {
-                        jsast::rt_call("addr", vec![value, jsast::num(1.0)])
-                    }
-                    None => value,
-                };
+                let address = self.thin_ptr_addr(from, value);
                 value::mask(b.repr, b.signed, b.bits, address)
             }
             (ReprClass::Int(a), ReprClass::Pointer(true)) if a.bits == POINTER_BITS => {
@@ -307,7 +319,43 @@ impl JsCx<'_> {
                     value
                 }
             }
-            // `[E; N]` and `uN`/`iN`, little endian (e.g. `[u8; 8] <-> u64`, `[i32; 4] <-> u128`).
+            // A thin pointer and a pointer-sized scalar array (`*const () <-> [u8; 4]`, reached
+            // when MIR folds `ptr.addr().to_ne_bytes()` in `core::any::TypeId::as_u128`).
+            (ReprClass::Pointer(true), ReprClass::Other)
+                if scalar_array_info(table, to).is_some_and(|info| {
+                    info.count.checked_mul(info.elem_bits) == Some(POINTER_BITS)
+                }) =>
+            {
+                let info = scalar_array_info(table, to).unwrap();
+                let addr = jsast::u32_wrap(self.thin_ptr_addr(from, value));
+                int_to_array(
+                    Repr {
+                        repr: IntRepr::Number,
+                        signed: false,
+                        bits: POINTER_BITS,
+                    },
+                    info,
+                    addr,
+                )
+            }
+            (ReprClass::Other, ReprClass::Pointer(true))
+                if scalar_array_info(table, from).is_some_and(|info| {
+                    info.count.checked_mul(info.elem_bits) == Some(POINTER_BITS)
+                }) =>
+            {
+                let info = scalar_array_info(table, from).unwrap();
+                self.array_to_int(
+                    info,
+                    Repr {
+                        repr: IntRepr::Number,
+                        signed: false,
+                        bits: POINTER_BITS,
+                    },
+                    value,
+                )
+            }
+            // `[E; N]` and `uN`/`iN`, little endian (e.g. `[u8; 8] <-> u64`, `[i32; 4] <-> u128`,
+            // `[*const (); 4] <-> u128` for `core::any::TypeId`).
             (ReprClass::Other, ReprClass::Int(b))
                 if matches!(b.bits, 16 | 32 | 64 | 128)
                     && scalar_array_info(table, from).is_some_and(|info| {
@@ -315,7 +363,7 @@ impl JsCx<'_> {
                     }) =>
             {
                 let info = scalar_array_info(table, from).unwrap();
-                array_to_int(info, b, value)
+                self.array_to_int(info, b, value)
             }
             (ReprClass::Int(a), ReprClass::Other)
                 if matches!(a.bits, 16 | 32 | 64 | 128)
@@ -325,6 +373,15 @@ impl JsCx<'_> {
             {
                 let info = scalar_array_info(table, to).unwrap();
                 int_to_array(a, info, value)
+            }
+            // Same-length 32-bit scalar/thin-pointer arrays (e.g. `TypeId`'s `[*const (); 4]`
+            // <-> `[u32; 4]` / `[usize; 4]` / `[i32; 4]`), or a 128-bit scalar/thin-pointer array
+            // <-> `(u64, u64)` / `(i64, i64)`.
+            (ReprClass::Other, ReprClass::Other)
+                if self.transmute_scalar_composites(from, to, &value).is_some() =>
+            {
+                self.transmute_scalar_composites(from, to, &value)
+                    .expect("checked Some above")
             }
             // A fieldless enum with an integer `repr` and an integer of its own width: such a
             // value *is* its discriminant, so moving between the two moves nothing at all when the
@@ -367,6 +424,25 @@ impl JsCx<'_> {
                 },
             },
         })
+    }
+
+    /// Converts a thin pointer expression of type `from` into its runtime address expression.
+    fn thin_ptr_addr(&self, from: TypeId, value: Expr) -> Expr {
+        let table = self.table;
+        match value::pointee_of(table, from) {
+            Some(pointee) => {
+                let raw = if !value::is_raw(table, from) {
+                    self.ref_value_to_raw(pointee, value)
+                } else {
+                    value
+                };
+                self.ptr_addr(pointee, raw)
+            }
+            None if matches!(value::kind(table, from), Some(TypeKind::FnPtr { .. })) => {
+                jsast::rt_call("addr", vec![value, jsast::num(1.0)])
+            }
+            None => value,
+        }
     }
 
     /// Converts a reference value (rather than a place expression) to a raw pointer.
@@ -612,14 +688,25 @@ fn direct_tag(table: &rcgjs_object::jir::types::TypeTable, ty: TypeId) -> Option
     }
 }
 
+/// Element kind of a scalar-array transmute lane.
+#[derive(Clone, Copy)]
+enum ScalarElemKind {
+    Int,
+    Bool,
+    ThinPtr {
+        pointee: Option<TypeId>,
+        is_ref: bool,
+    },
+}
+
 /// Element width, signedness, and length of `[E; N]` when `E` is a plain scalar integer, `bool`,
-/// `char`, or fieldless integer-`repr` enum.
+/// `char`, fieldless integer-`repr` enum, or thin pointer.
 #[derive(Clone, Copy)]
 struct ScalarArrayInfo {
     count: u32,
     elem_bits: u32,
     elem_signed: bool,
-    elem_bool: bool,
+    elem_kind: ScalarElemKind,
 }
 
 /// The length of `ty` if it is an array of bytes, and `None` otherwise.
@@ -648,7 +735,7 @@ fn scalar_array_info(
             count,
             elem_bits: bits,
             elem_signed: signed,
-            elem_bool: false,
+            elem_kind: ScalarElemKind::Int,
         });
     }
     match value::kind(table, elem)? {
@@ -656,23 +743,74 @@ fn scalar_array_info(
             count,
             elem_bits: 8,
             elem_signed: false,
-            elem_bool: true,
+            elem_kind: ScalarElemKind::Bool,
         }),
         TypeKind::Char => Some(ScalarArrayInfo {
             count,
             elem_bits: 32,
             elem_signed: false,
-            elem_bool: false,
+            elem_kind: ScalarElemKind::Int,
         }),
+        TypeKind::FnPtr { .. } => Some(ScalarArrayInfo {
+            count,
+            elem_bits: POINTER_BITS,
+            elem_signed: false,
+            elem_kind: ScalarElemKind::ThinPtr {
+                pointee: None,
+                is_ref: false,
+            },
+        }),
+        TypeKind::RawPointer { pointee, .. }
+            if table.get(*pointee).is_some_and(|d| d.layout.sized) =>
+        {
+            Some(ScalarArrayInfo {
+                count,
+                elem_bits: POINTER_BITS,
+                elem_signed: false,
+                elem_kind: ScalarElemKind::ThinPtr {
+                    pointee: Some(*pointee),
+                    is_ref: false,
+                },
+            })
+        }
+        TypeKind::Reference { pointee, .. }
+            if table.get(*pointee).is_some_and(|d| d.layout.sized) =>
+        {
+            Some(ScalarArrayInfo {
+                count,
+                elem_bits: POINTER_BITS,
+                elem_signed: false,
+                elem_kind: ScalarElemKind::ThinPtr {
+                    pointee: Some(*pointee),
+                    is_ref: true,
+                },
+            })
+        }
         _ => direct_tag(table, elem).and_then(|(bits, signed)| {
             matches!(bits, 8 | 16 | 32 | 64).then_some(ScalarArrayInfo {
                 count,
                 elem_bits: bits,
                 elem_signed: signed,
-                elem_bool: false,
+                elem_kind: ScalarElemKind::Int,
             })
         }),
     }
+}
+
+/// Pair of 64-bit integer representations if `ty` is a 2-tuple `(i64|u64, i64|u64)`.
+fn int64_pair_tuple(
+    table: &rcgjs_object::jir::types::TypeTable,
+    ty: TypeId,
+) -> Option<(bool, bool)> {
+    let TypeKind::Tuple(elems) = value::kind(table, table.peeled(ty))? else {
+        return None;
+    };
+    let [first, second] = elems.as_slice() else {
+        return None;
+    };
+    let (s0, b0) = table.int_info(table.peeled(*first))?;
+    let (s1, b1) = table.int_info(table.peeled(*second))?;
+    (b0 == 64 && b1 == 64).then_some((s0, s1))
 }
 
 /// `new To(From.of(value).buffer)[0]`: the bits of `value`, read back as another type.
@@ -705,52 +843,178 @@ fn int_array(int: Repr) -> &'static str {
     }
 }
 
-/// `[E; N]` to the integer those elements spell, little endian.
-fn array_to_int(arr: ScalarArrayInfo, int: Repr, value: Expr) -> Expr {
-    let bound = jsast::id(BYTES_PARAM);
-    let big = int.repr == IntRepr::BigInt;
-    let lane = |index: u32| {
-        let read = jsast::index(bound.clone(), jsast::num(index));
-        let unsigned = if arr.elem_bool {
-            jsast::cond(read, jsast::num(1), jsast::num(0))
-        } else if arr.elem_bits == 64 {
-            return jsast::call(
-                jsast::member(jsast::id("BigInt"), "asUintN"),
-                vec![jsast::num(64), read],
-            );
-        } else if arr.elem_signed {
-            match arr.elem_bits {
-                8 => jsast::binary(BinOp::BitAnd, read, jsast::num(255)),
-                16 => jsast::binary(BinOp::BitAnd, read, jsast::num(65535)),
-                32 => jsast::u32_wrap(read),
-                _ => unreachable!(),
+impl JsCx<'_> {
+    /// Extracts the unsigned 32-bit address of a thin-pointer lane in a scalar array.
+    fn thin_ptr_lane_addr(&self, pointee: Option<TypeId>, is_ref: bool, read: Expr) -> Expr {
+        let address = match pointee {
+            Some(pointee) => {
+                let raw = if is_ref {
+                    self.ref_value_to_raw(pointee, read)
+                } else {
+                    read
+                };
+                self.ptr_addr(pointee, raw)
             }
-        } else {
-            read
+            None => jsast::rt_call("addr", vec![read, jsast::num(1.0)]),
         };
-        if big {
-            jsast::call(jsast::id("BigInt"), vec![unsigned])
-        } else {
-            unsigned
-        }
-    };
-    let shift = |amount: u32| {
-        if big {
-            jsast::bigint(amount)
-        } else {
-            jsast::num(amount)
-        }
-    };
-    let mut combined = lane(0);
-    for index in 1..arr.count {
-        let shifted = jsast::binary(BinOp::Shl, lane(index), shift(index * arr.elem_bits));
-        combined = jsast::binary(BinOp::BitOr, combined, shifted);
+        jsast::u32_wrap(address)
     }
-    let combined = value::mask(int.repr, int.signed, int.bits, combined);
-    jsast::call(
-        jsast::arrow(vec![BYTES_PARAM.to_owned()], combined),
-        vec![value],
-    )
+
+    fn scalar_elem_to_i32(&self, kind: ScalarElemKind, read: Expr) -> Expr {
+        match kind {
+            ScalarElemKind::Int | ScalarElemKind::Bool => jsast::i32_wrap(read),
+            ScalarElemKind::ThinPtr { pointee, is_ref } => {
+                jsast::i32_wrap(self.thin_ptr_lane_addr(pointee, is_ref, read))
+            }
+        }
+    }
+
+    /// `[E; N]` to the integer those elements spell, little endian.
+    fn array_to_int(&self, arr: ScalarArrayInfo, int: Repr, value: Expr) -> Expr {
+        let bound = jsast::id(BYTES_PARAM);
+        let big = int.repr == IntRepr::BigInt;
+        let lane = |index: u32| {
+            let read = jsast::index(bound.clone(), jsast::num(index));
+            let unsigned = match arr.elem_kind {
+                ScalarElemKind::Bool => jsast::cond(read, jsast::num(1), jsast::num(0)),
+                ScalarElemKind::ThinPtr { pointee, is_ref } => {
+                    self.thin_ptr_lane_addr(pointee, is_ref, read)
+                }
+                ScalarElemKind::Int if arr.elem_bits == 64 => {
+                    return jsast::call(
+                        jsast::member(jsast::id("BigInt"), "asUintN"),
+                        vec![jsast::num(64), read],
+                    );
+                }
+                ScalarElemKind::Int if arr.elem_signed => match arr.elem_bits {
+                    8 => jsast::binary(BinOp::BitAnd, read, jsast::num(255)),
+                    16 => jsast::binary(BinOp::BitAnd, read, jsast::num(65535)),
+                    32 => jsast::u32_wrap(read),
+                    _ => unreachable!(),
+                },
+                ScalarElemKind::Int => read,
+            };
+            if big {
+                jsast::call(jsast::id("BigInt"), vec![unsigned])
+            } else {
+                unsigned
+            }
+        };
+        let shift = |amount: u32| {
+            if big {
+                jsast::bigint(amount)
+            } else {
+                jsast::num(amount)
+            }
+        };
+        let mut combined = lane(0);
+        for index in 1..arr.count {
+            let shifted = jsast::binary(BinOp::Shl, lane(index), shift(index * arr.elem_bits));
+            combined = jsast::binary(BinOp::BitOr, combined, shifted);
+        }
+        let combined = value::mask(int.repr, int.signed, int.bits, combined);
+        jsast::call(
+            jsast::arrow(vec![BYTES_PARAM.to_owned()], combined),
+            vec![value],
+        )
+    }
+
+    /// Transmutations between scalar/thin-pointer arrays and matching-width composite layouts:
+    /// `[E1; N] <-> [E2; N]` (for 32-bit integer/pointer elements) and 128-bit `[E; N]` <->
+    /// `(u64|i64, u64|i64)`.
+    fn transmute_scalar_composites(&self, from: TypeId, to: TypeId, value: &Expr) -> Option<Expr> {
+        let table = self.table;
+        if let (Some(from_arr), Some(to_arr)) =
+            (scalar_array_info(table, from), scalar_array_info(table, to))
+        {
+            if from_arr.count == to_arr.count
+                && from_arr.elem_bits == POINTER_BITS
+                && to_arr.elem_bits == POINTER_BITS
+            {
+                let bound = jsast::id(BYTES_PARAM);
+                let elems = (0..from_arr.count)
+                    .map(|index| {
+                        let read = jsast::index(bound.clone(), jsast::num(index));
+                        let raw = match from_arr.elem_kind {
+                            ScalarElemKind::ThinPtr { pointee, is_ref } => {
+                                self.thin_ptr_lane_addr(pointee, is_ref, read)
+                            }
+                            ScalarElemKind::Int | ScalarElemKind::Bool => read,
+                        };
+                        match to_arr.elem_kind {
+                            ScalarElemKind::ThinPtr { .. } => {
+                                if from_arr.elem_signed {
+                                    jsast::u32_wrap(raw)
+                                } else {
+                                    raw
+                                }
+                            }
+                            ScalarElemKind::Int => {
+                                value::mask(IntRepr::Number, to_arr.elem_signed, 32, raw)
+                            }
+                            ScalarElemKind::Bool => {
+                                jsast::binary(BinOp::StrictNe, raw, jsast::num(0))
+                            }
+                        }
+                    })
+                    .collect();
+                return Some(jsast::call(
+                    jsast::arrow(vec![BYTES_PARAM.to_owned()], jsast::array(elems)),
+                    vec![value.clone()],
+                ));
+            }
+        }
+        let u128_repr = Repr {
+            repr: IntRepr::BigInt,
+            signed: false,
+            bits: 128,
+        };
+        if let (Some(from_arr), Some((s0, s1))) =
+            (scalar_array_info(table, from), int64_pair_tuple(table, to))
+        {
+            if from_arr.count.checked_mul(from_arr.elem_bits) == Some(128) {
+                let wide = self.array_to_int(from_arr, u128_repr, value.clone());
+                let bound = jsast::id(BYTES_PARAM);
+                let lo = value::mask(IntRepr::BigInt, s0, 64, bound.clone());
+                let hi = value::mask(
+                    IntRepr::BigInt,
+                    s1,
+                    64,
+                    jsast::binary(BinOp::Shr, bound, jsast::bigint(64)),
+                );
+                return Some(jsast::call(
+                    jsast::arrow(vec![BYTES_PARAM.to_owned()], jsast::array(vec![lo, hi])),
+                    vec![wide],
+                ));
+            }
+        }
+        if let (Some(_), Some(to_arr)) =
+            (int64_pair_tuple(table, from), scalar_array_info(table, to))
+        {
+            if to_arr.count.checked_mul(to_arr.elem_bits) == Some(128) {
+                let bound = jsast::id(BYTES_PARAM);
+                let lo = jsast::call(
+                    jsast::member(jsast::id("BigInt"), "asUintN"),
+                    vec![jsast::num(64), jsast::index(bound.clone(), jsast::num(0))],
+                );
+                let hi = jsast::call(
+                    jsast::member(jsast::id("BigInt"), "asUintN"),
+                    vec![jsast::num(64), jsast::index(bound, jsast::num(1))],
+                );
+                let combined = jsast::binary(
+                    BinOp::BitOr,
+                    lo,
+                    jsast::binary(BinOp::Shl, hi, jsast::bigint(64)),
+                );
+                let wide = jsast::call(
+                    jsast::arrow(vec![BYTES_PARAM.to_owned()], combined),
+                    vec![value.clone()],
+                );
+                return Some(int_to_array(u128_repr, to_arr, wide));
+            }
+        }
+        None
+    }
 }
 
 /// The other direction: an integer unpacked into `[E; N]`, least significant first.
@@ -789,7 +1053,7 @@ fn int_to_array(int: Repr, arr: ScalarArrayInfo, value: Expr) -> Expr {
             } else {
                 shifted
             };
-            if arr.elem_bool {
+            if matches!(arr.elem_kind, ScalarElemKind::Bool) {
                 jsast::binary(BinOp::StrictNe, raw, jsast::num(0))
             } else if big && !arr.elem_signed {
                 raw
@@ -845,5 +1109,692 @@ impl ReprClass {
             }
             _ => ReprClass::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod type_id_tests {
+    use rcgjs_object::item::JsName;
+    use rcgjs_object::jir::interns::Interns;
+    use rcgjs_object::jir::repr::{Func, FuncBuilder, OpKind, RBlockId, RTerm, ValueId};
+    use rcgjs_object::jir::semantic::{
+        AbiSignature, Body, BodyKind, BodySemantic, CastKind, ConstTree, DefinitionId,
+        GlobalReference, ItemId, Signature,
+    };
+    use rcgjs_object::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+    use rcgjs_object::jir::types::{
+        FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, NominalForm,
+        PointerForm, TypeDescriptor, TypeId, TypeKind, TypeMeta, VariantDescriptor,
+    };
+    use rcgjs_object::jsast::{self, Style};
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+    use rcgjs_object::opts::{EcmaTarget, Opts};
+    use structurizer::Region;
+
+    use crate::lower::js::{function, host};
+    use crate::lower::plan::{BlockPayload, OpRef, Plan, NO_ORIGIN};
+    use crate::lower::LowerInput;
+
+    const UNIT: TypeId = TypeId(1);
+    const U32: TypeId = TypeId(2);
+    const I32: TypeId = TypeId(3);
+    const U64: TypeId = TypeId(4);
+    const U128: TypeId = TypeId(5);
+    const RAW_UNIT: TypeId = TypeId(6);
+    const PTR_ARRAY: TypeId = TypeId(7);
+    const TYPE_ID: TypeId = TypeId(8);
+    const U32_ARRAY: TypeId = TypeId(9);
+    const U64_PAIR: TypeId = TypeId(10);
+    const RAW_PTR_UNIT: TypeId = TypeId(11);
+    const SLICE_PTR_UNIT: TypeId = TypeId(12);
+    const RAW_SLICE_PTR_UNIT: TypeId = TypeId(13);
+    const RAW_U64: TypeId = TypeId(14);
+    const U8: TypeId = TypeId(15);
+    const U8_ARRAY_4: TypeId = TypeId(16);
+    const DYN_ERR: TypeId = TypeId(17);
+    const DYN_ERR_SEND_SYNC: TypeId = TypeId(18);
+    const RAW_DYN_ERR: TypeId = TypeId(19);
+    const RAW_DYN_ERR_SEND_SYNC: TypeId = TypeId(20);
+
+    fn base_desc(id: TypeId, kind: TypeKind, size: u64) -> TypeDescriptor {
+        TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: Some(size),
+                unsized_prefix: None,
+                align: Some(size.clamp(1, 4)),
+                sized: true,
+                zst: size == 0,
+                one_zst: size == 0,
+                needs_drop: false,
+                has_own_drop: false,
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: size == 0,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        }
+    }
+
+    fn int_desc(id: TypeId, signed: bool, bits: u32) -> TypeDescriptor {
+        let mut d = base_desc(id, TypeKind::Integer { signed, bits }, u64::from(bits / 8));
+        d.js.int = Some(IntFacts {
+            signed,
+            bits,
+            repr: if bits > 32 {
+                IntRepr::BigInt
+            } else {
+                IntRepr::Number
+            },
+        });
+        d
+    }
+
+    fn raw_ptr_desc(id: TypeId, pointee: TypeId, form: PointerForm) -> TypeDescriptor {
+        let mut d = base_desc(
+            id,
+            TypeKind::RawPointer {
+                pointee,
+                mutable: false,
+            },
+            if form == PointerForm::Thin { 4 } else { 8 },
+        );
+        d.js.pointer_form = Some(form);
+        d
+    }
+
+    fn type_id_world() -> Interns {
+        let mut interns = Interns::new();
+        let data_key = interns.intern_str("data");
+        let type_id_name = interns.intern_str("TypeId");
+
+        interns.intern_type(base_desc(UNIT, TypeKind::Tuple(Vec::new()), 0));
+        interns.intern_type(int_desc(U32, false, 32));
+        interns.intern_type(int_desc(I32, true, 32));
+        interns.intern_type(int_desc(U64, false, 64));
+        interns.intern_type(int_desc(U128, false, 128));
+        interns.intern_type(raw_ptr_desc(RAW_UNIT, UNIT, PointerForm::Thin));
+
+        let mut ptr_arr = base_desc(
+            PTR_ARRAY,
+            TypeKind::Array {
+                element: RAW_UNIT,
+                length: 4,
+            },
+            16,
+        );
+        ptr_arr.js.is_indirect = true;
+        ptr_arr.js.needs_clone = true;
+        ptr_arr.js.fields = vec![FieldDescriptor {
+            key: FieldKey::Index(0),
+            ty: RAW_UNIT,
+            offset: 0,
+        }];
+        interns.intern_type(ptr_arr);
+
+        let mut tid = base_desc(
+            TYPE_ID,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 42,
+                },
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: type_id_name,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(data_key),
+                        ty: PTR_ARRAY,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            16,
+        );
+        tid.js.is_indirect = true;
+        tid.js.needs_clone = true;
+        tid.js.fields = vec![FieldDescriptor {
+            key: FieldKey::Name(data_key),
+            ty: PTR_ARRAY,
+            offset: 0,
+        }];
+        interns.intern_type(tid);
+
+        let mut u32_arr = base_desc(
+            U32_ARRAY,
+            TypeKind::Array {
+                element: U32,
+                length: 4,
+            },
+            16,
+        );
+        u32_arr.js.is_indirect = true;
+        u32_arr.js.needs_clone = true;
+        interns.intern_type(u32_arr);
+
+        let mut u64_pair = base_desc(U64_PAIR, TypeKind::Tuple(vec![U64, U64]), 16);
+        u64_pair.js.is_indirect = true;
+        u64_pair.js.needs_clone = true;
+        interns.intern_type(u64_pair);
+
+        interns.intern_type(raw_ptr_desc(RAW_PTR_UNIT, RAW_UNIT, PointerForm::Thin));
+        let mut slice_ptr = base_desc(SLICE_PTR_UNIT, TypeKind::Slice(RAW_UNIT), 0);
+        slice_ptr.layout.sized = false;
+        slice_ptr.layout.size = None;
+        slice_ptr.layout.zst = false;
+        slice_ptr.js.is_indirect = true;
+        interns.intern_type(slice_ptr);
+        interns.intern_type(raw_ptr_desc(
+            RAW_SLICE_PTR_UNIT,
+            SLICE_PTR_UNIT,
+            PointerForm::FatSlice,
+        ));
+        interns.intern_type(raw_ptr_desc(RAW_U64, U64, PointerForm::Thin));
+        let mut u8_desc = int_desc(U8, false, 8);
+        u8_desc.js.byte_element = true;
+        interns.intern_type(u8_desc);
+        let mut u8_arr = base_desc(
+            U8_ARRAY_4,
+            TypeKind::Array {
+                element: U8,
+                length: 4,
+            },
+            4,
+        );
+        u8_arr.js.is_indirect = true;
+        u8_arr.js.needs_clone = true;
+        interns.intern_type(u8_arr);
+
+        let err_principal = DefinitionId {
+            crate_id: 1,
+            local_hash: 99,
+        };
+        let send_auto = DefinitionId {
+            crate_id: 1,
+            local_hash: 100,
+        };
+        let sync_auto = DefinitionId {
+            crate_id: 1,
+            local_hash: 101,
+        };
+        let mut dyn_err = base_desc(
+            DYN_ERR,
+            TypeKind::Dynamic {
+                principal: Some(err_principal),
+                auto: Vec::new(),
+            },
+            0,
+        );
+        dyn_err.layout.sized = false;
+        dyn_err.layout.size = None;
+        dyn_err.layout.zst = false;
+        dyn_err.js.is_indirect = true;
+        interns.intern_type(dyn_err);
+
+        let mut dyn_err_ss = base_desc(
+            DYN_ERR_SEND_SYNC,
+            TypeKind::Dynamic {
+                principal: Some(err_principal),
+                auto: vec![send_auto, sync_auto],
+            },
+            0,
+        );
+        dyn_err_ss.layout.sized = false;
+        dyn_err_ss.layout.size = None;
+        dyn_err_ss.layout.zst = false;
+        dyn_err_ss.js.is_indirect = true;
+        interns.intern_type(dyn_err_ss);
+
+        interns.intern_type(raw_ptr_desc(RAW_DYN_ERR, DYN_ERR, PointerForm::FatDyn));
+        interns.intern_type(raw_ptr_desc(
+            RAW_DYN_ERR_SEND_SYNC,
+            DYN_ERR_SEND_SYNC,
+            PointerForm::FatDyn,
+        ));
+
+        interns
+    }
+
+    fn lower_fn(
+        interns: &Interns,
+        name: &str,
+        func: &Func,
+        param_names: &[(u32, &str)],
+        target: EcmaTarget,
+    ) -> String {
+        let mut plan = Plan::default();
+        for &(id, pname) in param_names {
+            plan.names.insert(ValueId(id), pname.to_owned());
+        }
+        for index in 0..func.values.len() {
+            let v = ValueId(index as u32);
+            if let std::collections::btree_map::Entry::Vacant(entry) = plan.names.entry(v) {
+                entry.insert(format!("_{index}"));
+                plan.inline.insert(v);
+            }
+        }
+        let body = Body {
+            item: func.item,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: func.sig.clone(),
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: name.to_owned(),
+                item: Some(func.item),
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let opts = Opts::default();
+        let js_name = JsName::new(name.to_owned());
+        let region = Region::Seq(vec![
+            Region::Block(BlockPayload {
+                block: Some(RBlockId(0)),
+                ops: (0..func.blocks[0].ops.len())
+                    .map(|index| OpRef {
+                        block: RBlockId(0),
+                        index: index as u32,
+                    })
+                    .collect(),
+                edge: None,
+            }),
+            Region::Return,
+        ]);
+        let input = LowerInput {
+            name: &js_name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns,
+            table: &interns.types,
+            opts: &opts,
+            items: host::EMPTY_ITEMS,
+            drop_glue: host::EMPTY_DROP_GLUE,
+            vtables: &super::EMPTY_VTABLES,
+            spills: &[],
+            abi: None,
+            final_lowering: false,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
+            nested_clone: crate::lower::NestedClone::default(),
+        };
+        let lowered = function::lower(&input, func, &plan, region).expect("lowering failed");
+        assert!(
+            lowered.zombies.is_empty(),
+            "unexpected zombies: {:?}",
+            lowered.zombies
+        );
+        jsast::stmt_to_string_styled_for_target(&lowered.decl, Style::Readable, target)
+    }
+
+    fn sig(arguments: Vec<TypeId>, result: TypeId) -> Signature {
+        Signature {
+            abi: AbiSignature {
+                parameters: arguments.len() as u16,
+                spread: None,
+                caller_location: false,
+                inline_never: false,
+                inline_hint: false,
+                inline_always: false,
+            },
+            arguments,
+            result,
+        }
+    }
+
+    #[test]
+    fn type_id_const_lowers_global_type_chunks_to_exact_u32_offsets() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 1,
+        };
+        let mut b = FuncBuilder::new(item, sig(vec![], TYPE_ID));
+        let tid_const = ConstTree::Aggregate(vec![ConstTree::Aggregate(vec![
+            ConstTree::Global {
+                target: GlobalReference::Type(U32),
+                offset: 0x144b_08f1,
+            },
+            ConstTree::Global {
+                target: GlobalReference::Type(U32),
+                offset: 0x85a8_9e43,
+            },
+            ConstTree::Global {
+                target: GlobalReference::Type(U32),
+                offset: 0xb401_5888,
+            },
+            ConstTree::Global {
+                target: GlobalReference::Type(U32),
+                offset: 0x79f1_9461,
+            },
+        ])]);
+        let v = b.op(e, OpKind::Const(tid_const), TYPE_ID, NO_ORIGIN);
+        b.terminate(e, RTerm::Return(Some(v)));
+        let func = b.finish();
+        let js = lower_fn(&interns, "tid_u32", &func, &[], EcmaTarget::Es2018);
+        assert_eq!(
+            js,
+            "function tid_u32() {\n  return { data: [340461809, 2242420291, 3019987080, 2045875297] };\n}\n"
+        );
+    }
+
+    #[test]
+    fn transmute_type_id_to_u128_is_es2018_safe_and_roundtrips() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 2,
+            },
+            instantiation: 2,
+        };
+        let mut b = FuncBuilder::new(item, sig(vec![TYPE_ID], U128));
+        let p = b.param(TYPE_ID, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: TYPE_ID,
+                to: U128,
+            },
+            U128,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let func = b.finish();
+        let js_es2018 = lower_fn(
+            &interns,
+            "tid_to_u128",
+            &func,
+            &[(0, "a")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_es2018.contains("BigInt(\"32\")")
+                && js_es2018.contains("BigInt(\"64\")")
+                && js_es2018.contains("BigInt(\"96\")"),
+            "expected ES2018 BigInt shifts, got:\n{js_es2018}"
+        );
+        assert!(
+            !js_es2018.contains("32n") && !js_es2018.contains("64n") && !js_es2018.contains("96n"),
+            "bare BigInt literal leaked into ES2018 output:\n{js_es2018}"
+        );
+
+        let mut b2 = FuncBuilder::new(item, sig(vec![U128], TYPE_ID));
+        let p2 = b2.param(U128, NO_ORIGIN);
+        let out2 = b2.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p2,
+                from: U128,
+                to: TYPE_ID,
+            },
+            TYPE_ID,
+            NO_ORIGIN,
+        );
+        b2.terminate(e, RTerm::Return(Some(out2)));
+        let func2 = b2.finish();
+        let js2 = lower_fn(
+            &interns,
+            "u128_to_tid",
+            &func2,
+            &[(0, "bits")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js2.contains("data:") && js2.contains("BigInt.asUintN(32,"),
+            "expected rebuilt TypeId struct from u128, got:\n{js2}"
+        );
+    }
+
+    #[test]
+    fn transmute_type_id_to_u32_array_and_u64_pair() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 3,
+            },
+            instantiation: 3,
+        };
+        let mut b = FuncBuilder::new(item, sig(vec![TYPE_ID], U32_ARRAY));
+        let p = b.param(TYPE_ID, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: TYPE_ID,
+                to: U32_ARRAY,
+            },
+            U32_ARRAY,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let func = b.finish();
+        let js_arr = lower_fn(&interns, "tid_u32s", &func, &[(0, "t")], EcmaTarget::Es2018);
+        assert!(
+            js_arr.contains("__rt.addr($b[0], 1)") && js_arr.contains("__rt.addr($b[3], 1)"),
+            "expected 4-element u32 array lowering, got:\n{js_arr}"
+        );
+
+        let mut b2 = FuncBuilder::new(item, sig(vec![TYPE_ID], U64_PAIR));
+        let p2 = b2.param(TYPE_ID, NO_ORIGIN);
+        let out2 = b2.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p2,
+                from: TYPE_ID,
+                to: U64_PAIR,
+            },
+            U64_PAIR,
+            NO_ORIGIN,
+        );
+        b2.terminate(e, RTerm::Return(Some(out2)));
+        let func2 = b2.finish();
+        let js_pair = lower_fn(
+            &interns,
+            "tid_pair",
+            &func2,
+            &[(0, "t")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_pair.contains("BigInt.asUintN(64,") && js_pair.contains("BigInt(\"64\")"),
+            "expected (u64, u64) tuple lowering, got:\n{js_pair}"
+        );
+    }
+
+    #[test]
+    fn ptr_to_ptr_casts_thin_ptr_elem_and_slice_to_u64_via_scalar_views() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 4,
+            },
+            instantiation: 4,
+        };
+        for (name, from_ty) in [
+            ("thin_to_u64", RAW_PTR_UNIT),
+            ("slice_to_u64", RAW_SLICE_PTR_UNIT),
+        ] {
+            let mut b = FuncBuilder::new(item, sig(vec![from_ty], RAW_U64));
+            let p = b.param(from_ty, NO_ORIGIN);
+            let out = b.op(
+                e,
+                OpKind::Cast {
+                    kind: CastKind::PtrToPtr,
+                    v: p,
+                    from: from_ty,
+                    to: RAW_U64,
+                },
+                RAW_U64,
+                NO_ORIGIN,
+            );
+            b.terminate(e, RTerm::Return(Some(out)));
+            let func = b.finish();
+            let js = lower_fn(&interns, name, &func, &[(0, "p")], EcmaTarget::Es2018);
+            assert_eq!(
+                js,
+                format!(
+                    "function {name}(p) {{\n  return __rt.unscale_scalar(__rt.scale_scalar(p, 4, \"u32\"), 8, () => BigInt(\"0\"), \"u64\");\n}}\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn transmute_thin_ptr_and_four_byte_array_roundtrips() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 5,
+            },
+            instantiation: 5,
+        };
+        let mut b1 = FuncBuilder::new(item, sig(vec![RAW_UNIT], U8_ARRAY_4));
+        let p = b1.param(RAW_UNIT, NO_ORIGIN);
+        let out = b1.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: RAW_UNIT,
+                to: U8_ARRAY_4,
+            },
+            U8_ARRAY_4,
+            NO_ORIGIN,
+        );
+        b1.terminate(e, RTerm::Return(Some(out)));
+        let f1 = b1.finish();
+        let js1 = lower_fn(
+            &interns,
+            "ptr_to_bytes",
+            &f1,
+            &[(0, "p")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js1.contains("__rt.addr(p, 1) >>> 0") && js1.contains("$b >>> 24 & 255"),
+            "expected thin ptr -> [u8; 4] lowering, got:\n{js1}"
+        );
+
+        let mut b2 = FuncBuilder::new(item, sig(vec![U8_ARRAY_4], RAW_UNIT));
+        let bs = b2.param(U8_ARRAY_4, NO_ORIGIN);
+        let out2 = b2.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: bs,
+                from: U8_ARRAY_4,
+                to: RAW_UNIT,
+            },
+            RAW_UNIT,
+            NO_ORIGIN,
+        );
+        b2.terminate(e, RTerm::Return(Some(out2)));
+        let f2 = b2.finish();
+        let js2 = lower_fn(
+            &interns,
+            "bytes_to_ptr",
+            &f2,
+            &[(0, "b")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js2.contains("$b[0]") && js2.contains("$b[3] << 24"),
+            "expected [u8; 4] -> thin ptr lowering, got:\n{js2}"
+        );
+    }
+
+    #[test]
+    fn transmute_dyn_auto_traits_preserves_fat_pointer_identity() {
+        let interns = type_id_world();
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 6,
+            },
+            instantiation: 6,
+        };
+        let mut b = FuncBuilder::new(item, sig(vec![RAW_DYN_ERR], RAW_DYN_ERR_SEND_SYNC));
+        let p = b.param(RAW_DYN_ERR, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: RAW_DYN_ERR,
+                to: RAW_DYN_ERR_SEND_SYNC,
+            },
+            RAW_DYN_ERR_SEND_SYNC,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let func = b.finish();
+        let js = lower_fn(
+            &interns,
+            "reapply_send_sync",
+            &func,
+            &[(0, "s")],
+            EcmaTarget::Es2018,
+        );
+        assert_eq!(js, "function reapply_send_sync(s) {\n  return s;\n}\n");
     }
 }

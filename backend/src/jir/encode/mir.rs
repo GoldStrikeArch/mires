@@ -182,6 +182,9 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
         {
             return Ok(BodySemantic::JsExport);
         }
+        if super::is_js_export_out_fn(self.tcx(), self.instance) {
+            return Ok(BodySemantic::JsExportOut);
+        }
         Ok(BodySemantic::Ordinary)
     }
 

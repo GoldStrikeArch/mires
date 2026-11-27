@@ -18,8 +18,13 @@
 //! - `alloc::vec::Vec<T>`: JS `Array` ↔ Rust `Vec<T>` in both `native_vec_enabled` (TypedArray /
 //!   JS Array) and `RawVec` modes.
 //! - `&[T]`: JS `Array` ↔ Rust fat slice `{ buf, off, len }`.
+//! - `JsMapEntries<K, V>` / `JsBTreeMapEntries<K, V>`: JS plain object / `Map` → Rust `Vec<(K, V)>`.
+//! - `std::collections::HashMap<K, V, S>` (`mires-std`) and `mires_js::collections::HashMap<K, V>`:
+//!   Rust map → JS plain object `{}` (string keys) or `Map` (non-string keys).
 //! - Plain Rust `struct`s, `enum`s, tuples, fixed arrays, and shared `Thin` references (`&T`):
 //!   recursive field/element marshaling when any constituent requires conversion.
+//! - `BodySemantic::JsExportOut` (`link_section = "rcgjs.export.out.v1"`): direct Rust→JS return
+//!   marshaling helper for `#[js_export] async fn`.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -84,16 +89,59 @@ pub fn wrap_js_export(
     reassigned
 }
 
+/// Lowers the complete body of an internal `BodySemantic::JsExportOut` function
+/// (`fn __mires_export_out(value: R) -> JsValue`) used by `#[js_export] async fn`.
+///
+/// - `()` / ZST returns `return undefined;`
+/// - `Result<T, E>` unwraps `Ok(v)` via `rust_to_js` or throws a JS `Error` on `Err(e)`
+///   (rejecting the returned `Promise` at the poll boundary)
+/// - Any other type returns `rust_to_js($p0, R)` (or bare `return $p0;` when identity).
+pub fn lower_export_out_body(cx: &BoundaryCx<'_>, param_name: &str, value_ty: TypeId) -> Vec<Stmt> {
+    if cx.table.is_zst(value_ty) {
+        return vec![jsast::ret(jsast::undefined())];
+    }
+    let mut emitter = MarshalEmitter::new_export_out(cx);
+    if let Some(res) = result_info(cx.table, cx.interns, value_ty) {
+        return emitter.result_return_stmts(jsast::id(param_name), &res);
+    }
+    if emitter.needs_rust_to_js_value(value_ty) {
+        return vec![jsast::ret(emitter.rust_to_js(
+            jsast::id(param_name),
+            value_ty,
+            0,
+        ))];
+    }
+    vec![jsast::ret(jsast::id(param_name))]
+}
+
 /// Whether a JS caller value of Rust type `ty` requires marshaling into Rust's representation.
 pub fn needs_js_to_rust(cx: &BoundaryCx<'_>, ty: TypeId) -> bool {
     let mut seen = BTreeSet::new();
-    needs_conversion(cx, ty, Dir::JsToRust, 0, &mut seen)
+    needs_conversion(
+        cx,
+        ty,
+        ConvertMode {
+            dir: Dir::JsToRust,
+            convert_str_refs: false,
+        },
+        0,
+        &mut seen,
+    )
 }
 
 /// Whether a Rust value of type `ty` requires marshaling into a JS value for JS callers.
 pub fn needs_rust_to_js(cx: &BoundaryCx<'_>, ty: TypeId) -> bool {
     let mut seen = BTreeSet::new();
-    needs_conversion(cx, ty, Dir::RustToJs, 0, &mut seen)
+    needs_conversion(
+        cx,
+        ty,
+        ConvertMode {
+            dir: Dir::RustToJs,
+            convert_str_refs: false,
+        },
+        0,
+        &mut seen,
+    )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -102,10 +150,19 @@ enum Dir {
     RustToJs,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ConvertMode {
+    dir: Dir,
+    /// Convert `&str` (`PointerForm::Str`) directly via `__rt.bstr_out` when `bstr` is active.
+    /// Enabled only for non-exported `BodySemantic::JsExportOut` helpers, which are not wrapped
+    /// by `link.rs::byte_string_facades`.
+    convert_str_refs: bool,
+}
+
 fn needs_conversion(
     cx: &BoundaryCx<'_>,
     ty: TypeId,
-    dir: Dir,
+    mode: ConvertMode,
     depth: u32,
     seen: &mut BTreeSet<TypeId>,
 ) -> bool {
@@ -115,11 +172,22 @@ fn needs_conversion(
     let Some(desc) = cx.table.get(ty) else {
         return false;
     };
+    // Detect `mires_js` transparent map adapters/maps BEFORE `PinnedBoundary::Host` and before
+    // peeling transparent wrappers.
+    if map_entries_info(cx.table, cx.interns, ty).is_some() {
+        return mode.dir == Dir::JsToRust;
+    }
+    if mires_js_hashmap_info(cx.table, cx.interns, ty).is_some() {
+        return mode.dir == Dir::RustToJs;
+    }
     if desc.meta.boundary == PinnedBoundary::Host {
         return false;
     }
     if is_string_ty(cx.table, cx.interns, ty) || is_marshal_vec_ty(cx.table, ty) {
         return true;
+    }
+    if std_hashmap_info(cx.table, cx.interns, ty).is_some() {
+        return mode.dir == Dir::RustToJs;
     }
     if matches!(
         desc.meta.candidate,
@@ -131,10 +199,10 @@ fn needs_conversion(
         return false;
     }
     if let TypeKind::Pattern(inner) = desc.kind {
-        return needs_conversion(cx, inner, dir, depth + 1, seen);
+        return needs_conversion(cx, inner, mode, depth + 1, seen);
     }
     if let Some(transparent) = desc.js.transparent {
-        return needs_conversion(cx, transparent.ty, dir, depth + 1, seen);
+        return needs_conversion(cx, transparent.ty, mode, depth + 1, seen);
     }
     if !seen.insert(ty) {
         return false;
@@ -148,13 +216,14 @@ fn needs_conversion(
                 cx.table.get(cx.table.peeled(*pointee)).map(|d| &d.kind),
                 Some(TypeKind::Slice(_))
             ),
-            Some(PointerForm::Thin) => needs_conversion(cx, *pointee, dir, depth + 1, seen),
+            Some(PointerForm::Str) => mode.convert_str_refs && mode.dir == Dir::RustToJs,
+            Some(PointerForm::Thin) => needs_conversion(cx, *pointee, mode, depth + 1, seen),
             _ => false,
         },
         TypeKind::Tuple(elems) => elems
             .iter()
-            .any(|&elem| needs_conversion(cx, elem, dir, depth + 1, seen)),
-        TypeKind::Array { element, .. } => needs_conversion(cx, *element, dir, depth + 1, seen),
+            .any(|&elem| needs_conversion(cx, elem, mode, depth + 1, seen)),
+        TypeKind::Array { element, .. } => needs_conversion(cx, *element, mode, depth + 1, seen),
         TypeKind::Adt {
             form: NominalForm::Struct,
             variants,
@@ -163,7 +232,7 @@ fn needs_conversion(
             variant
                 .fields
                 .iter()
-                .any(|f| needs_conversion(cx, f.ty, dir, depth + 1, seen))
+                .any(|f| needs_conversion(cx, f.ty, mode, depth + 1, seen))
         }),
         TypeKind::Adt {
             form: NominalForm::Enum,
@@ -173,7 +242,7 @@ fn needs_conversion(
             if option_info(cx.table, cx.interns, ty).is_some() {
                 true
             } else {
-                enum_needs_conversion(cx, ty, variants, dir, depth, seen)
+                enum_needs_conversion(cx, ty, variants, mode, depth, seen)
             }
         }
         _ => false,
@@ -186,7 +255,7 @@ fn enum_needs_conversion(
     cx: &BoundaryCx<'_>,
     ty: TypeId,
     variants: &[VariantDescriptor],
-    dir: Dir,
+    mode: ConvertMode,
     depth: u32,
     seen: &mut BTreeSet<TypeId>,
 ) -> bool {
@@ -202,7 +271,7 @@ fn enum_needs_conversion(
             variants.iter().any(|v| {
                 v.fields
                     .iter()
-                    .any(|f| needs_conversion(cx, f.ty, dir, depth + 1, seen))
+                    .any(|f| needs_conversion(cx, f.ty, mode, depth + 1, seen))
             })
         }
         EnumRepr::NullNiche { .. } | EnumRepr::SentinelNiche { .. } => {
@@ -212,7 +281,7 @@ fn enum_needs_conversion(
             variants
                 .get(some_variant as usize)
                 .and_then(|v| v.fields.get(some_field as usize))
-                .is_some_and(|f| needs_conversion(cx, f.ty, dir, depth + 1, seen))
+                .is_some_and(|f| needs_conversion(cx, f.ty, mode, depth + 1, seen))
         }
     }
 }
@@ -251,6 +320,34 @@ struct RawVecLayout {
     inner_extra_keys: Vec<String>,
 }
 
+/// Structural info for `JsMapEntries<K, V>` / `JsBTreeMapEntries<K, V>` transparent adapters.
+struct MapEntriesInfo {
+    vec_ty: TypeId,
+    pair_ty: TypeId,
+    key_ty: TypeId,
+    is_global: bool,
+}
+
+/// Structural info for `mires-std`'s open-addressing `HashMap<K, V, S>`.
+struct StdHashMapInfo {
+    slots_field_key: FieldKey,
+    slots_vec_ty: TypeId,
+    slots_is_global: bool,
+    slot_ty: TypeId,
+    slot_repr: EnumRepr,
+    occupied_idx: u32,
+    key_field_key: FieldKey,
+    key_ty: TypeId,
+    val_field_key: FieldKey,
+    val_ty: TypeId,
+}
+
+/// Structural info for `mires_js::collections::HashMap<K, V>`.
+struct MiresJsHashMapInfo {
+    key_ty: TypeId,
+    val_ty: TypeId,
+}
+
 /// Precomputed element layout facts for native `Vec<T, Global>` JS→Rust conversion.
 struct NativeVecElem {
     elem_ty: TypeId,
@@ -258,6 +355,247 @@ struct NativeVecElem {
     elem_needs: bool,
     ta_kind: Option<u8>,
     tracked: bool,
+}
+
+fn is_str_ref_ty(table: &TypeTable, ty: TypeId) -> bool {
+    let peeled = table.peeled(ty);
+    match table.get(peeled).map(|d| &d.kind) {
+        Some(TypeKind::Str) => true,
+        Some(TypeKind::Reference {
+            pointee,
+            mutable: false,
+        }) => {
+            table.pointer_form(peeled) == Some(PointerForm::Str)
+                || matches!(
+                    table.get(table.peeled(*pointee)).map(|d| &d.kind),
+                    Some(TypeKind::Str)
+                )
+        }
+        _ => false,
+    }
+}
+
+fn is_string_key_ty(table: &TypeTable, interns: &Interns, ty: TypeId) -> bool {
+    is_string_ty(table, interns, ty) || is_str_ref_ty(table, ty)
+}
+
+fn map_entries_info(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<MapEntriesInfo> {
+    let desc = table.get(ty)?;
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        args,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let name_matches = desc
+        .name
+        .and_then(|id| interns.str(id))
+        .is_some_and(|name| {
+            let base = name.split('<').next().unwrap_or(name);
+            base == "JsMapEntries"
+                || base == "JsBTreeMapEntries"
+                || base.ends_with("::JsMapEntries")
+                || base.ends_with("::JsBTreeMapEntries")
+        });
+    let variant_matches = desc.meta.boundary == PinnedBoundary::Host
+        && variants
+            .first()
+            .and_then(|v| interns.str(v.name))
+            .is_some_and(|name| name == "JsMapEntries" || name == "JsBTreeMapEntries");
+    if !name_matches && !variant_matches {
+        return None;
+    }
+    let transparent = desc.js.transparent?;
+    let (pair_ty, is_global) = vec_elem_and_global(table, transparent.ty)?;
+    Some(MapEntriesInfo {
+        vec_ty: transparent.ty,
+        pair_ty,
+        key_ty: args[0],
+        is_global,
+    })
+}
+
+fn mires_js_hashmap_info(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+) -> Option<MiresJsHashMapInfo> {
+    let desc = table.get(ty)?;
+    if desc.meta.boundary != PinnedBoundary::Host {
+        return None;
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        args,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let name_matches = desc
+        .name
+        .and_then(|id| interns.str(id))
+        .is_some_and(|name| {
+            let base = name.split('<').next().unwrap_or(name);
+            base == "HashMap" || base.ends_with("::HashMap")
+        });
+    let variant_matches = variants
+        .first()
+        .and_then(|v| interns.str(v.name))
+        .is_some_and(|name| name == "HashMap");
+    if !name_matches && !variant_matches {
+        return None;
+    }
+    let transparent = desc.js.transparent?;
+    if vec_elem_and_global(table, transparent.ty).is_some() {
+        return None;
+    }
+    Some(MiresJsHashMapInfo {
+        key_ty: args[0],
+        val_ty: args[1],
+    })
+}
+
+fn std_hashmap_info(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<StdHashMapInfo> {
+    let peeled = table.peeled(ty);
+    let desc = table.get(peeled)?;
+    if desc.meta.boundary == PinnedBoundary::Host {
+        return None;
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return None;
+    };
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    let name_matches = desc
+        .name
+        .and_then(|id| interns.str(id))
+        .is_some_and(|name| {
+            let base = name.split('<').next().unwrap_or(name);
+            base == "HashMap" || base.ends_with("::HashMap")
+        });
+    let variant_matches = interns.str(variant.name) == Some("HashMap");
+    if !name_matches && !variant_matches {
+        return None;
+    }
+    let mut slots_field = None;
+    let mut has_len = false;
+    let mut has_tombstones = false;
+    for field in &variant.fields {
+        match field_key_str(interns, field.key).as_deref() {
+            Some("slots") => slots_field = Some((field.key, field.ty)),
+            Some("len") => has_len = true,
+            Some("tombstones") => has_tombstones = true,
+            _ => {}
+        }
+    }
+    if !has_len || !has_tombstones {
+        return None;
+    }
+    let (slots_field_key, slots_vec_ty) = slots_field?;
+    let (slot_ty_raw, slots_is_global) = vec_elem_and_global(table, slots_vec_ty)?;
+    let slot_ty = table.peeled(slot_ty_raw);
+    let slot_desc = table.get(slot_ty)?;
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants: slot_variants,
+        ..
+    } = &slot_desc.kind
+    else {
+        return None;
+    };
+    let slot_repr = table.enum_repr(slot_ty)?;
+    let (occupied_idx, occupied_variant) = slot_variants
+        .iter()
+        .enumerate()
+        .find(|(_, v)| interns.str(v.name) == Some("Occupied"))?;
+    let mut key_field = None;
+    let mut val_field = None;
+    for field in &occupied_variant.fields {
+        match field_key_str(interns, field.key).as_deref() {
+            Some("key") => key_field = Some((field.key, field.ty)),
+            Some("value") => val_field = Some((field.key, field.ty)),
+            _ => {}
+        }
+    }
+    let (key_field_key, key_ty) = key_field?;
+    let (val_field_key, val_ty) = val_field?;
+    Some(StdHashMapInfo {
+        slots_field_key,
+        slots_vec_ty,
+        slots_is_global,
+        slot_ty,
+        slot_repr,
+        occupied_idx: occupied_idx as u32,
+        key_field_key,
+        key_ty,
+        val_field_key,
+        val_ty,
+    })
+}
+
+/// Finds the exact `Option<val_ty>` descriptor used inside `mires_js::collections::map::MapEntry<V>`
+/// when present in `table`.
+fn find_map_entry_option(
+    table: &TypeTable,
+    interns: &Interns,
+    val_ty: TypeId,
+) -> Option<OptionInfo> {
+    let peeled_val = table.peeled(val_ty);
+    for desc in table.descriptors() {
+        if desc.meta.boundary != PinnedBoundary::Host {
+            continue;
+        }
+        let TypeKind::Adt {
+            form: NominalForm::Struct,
+            args,
+            variants,
+            ..
+        } = &desc.kind
+        else {
+            continue;
+        };
+        let [variant] = variants.as_slice() else {
+            continue;
+        };
+        if interns.str(variant.name) == Some("MapEntry")
+            && args.first().copied().map(|t| table.peeled(t)) == Some(peeled_val)
+        {
+            if let Some(field) = variant
+                .fields
+                .iter()
+                .find(|f| field_key_str(interns, f.key).as_deref() == Some("value"))
+            {
+                if let Some(opt) = option_info(table, interns, field.ty) {
+                    return Some(opt);
+                }
+            }
+        }
+    }
+    for desc in table.descriptors() {
+        if let Some(opt) = option_info(table, interns, desc.id) {
+            if opt.inner_ty == val_ty || table.peeled(opt.inner_ty) == peeled_val {
+                return Some(opt);
+            }
+        }
+    }
+    None
 }
 
 fn is_string_ty(table: &TypeTable, interns: &Interns, ty: TypeId) -> bool {
@@ -561,11 +899,38 @@ impl RawVecLayout {
 struct MarshalEmitter<'a> {
     cx: &'a BoundaryCx<'a>,
     next_id: usize,
+    convert_str_refs: bool,
 }
 
 impl<'a> MarshalEmitter<'a> {
     fn new(cx: &'a BoundaryCx<'a>) -> Self {
-        Self { cx, next_id: 0 }
+        Self {
+            cx,
+            next_id: 0,
+            convert_str_refs: false,
+        }
+    }
+
+    fn new_export_out(cx: &'a BoundaryCx<'a>) -> Self {
+        Self {
+            cx,
+            next_id: 0,
+            convert_str_refs: cx.bstr,
+        }
+    }
+
+    fn needs_rust_to_js_value(&self, ty: TypeId) -> bool {
+        let mut seen = BTreeSet::new();
+        needs_conversion(
+            self.cx,
+            ty,
+            ConvertMode {
+                dir: Dir::RustToJs,
+                convert_str_refs: self.convert_str_refs,
+            },
+            0,
+            &mut seen,
+        )
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -597,6 +962,9 @@ impl<'a> MarshalEmitter<'a> {
         let Some(desc) = self.cx.table.get(ty) else {
             return expr;
         };
+        if let Some(info) = map_entries_info(self.cx.table, self.cx.interns, ty) {
+            return self.map_entries_js_to_rust(expr, &info, depth);
+        }
         if desc.meta.boundary == PinnedBoundary::Host {
             return expr;
         }
@@ -658,12 +1026,15 @@ impl<'a> MarshalEmitter<'a> {
     }
 
     fn rust_to_js(&mut self, expr: Expr, ty: TypeId, depth: u32) -> Expr {
-        if depth >= MAX_DEPTH || !needs_rust_to_js(self.cx, ty) {
+        if depth >= MAX_DEPTH || !self.needs_rust_to_js_value(ty) {
             return expr;
         }
         let Some(desc) = self.cx.table.get(ty) else {
             return expr;
         };
+        if let Some(info) = mires_js_hashmap_info(self.cx.table, self.cx.interns, ty) {
+            return self.mires_js_hashmap_rust_to_js(expr, &info, depth);
+        }
         if desc.meta.boundary == PinnedBoundary::Host {
             return expr;
         }
@@ -672,6 +1043,9 @@ impl<'a> MarshalEmitter<'a> {
         }
         if let Some((elem, is_global)) = vec_elem_and_global(self.cx.table, ty) {
             return self.vec_rust_to_js(expr, ty, elem, is_global, depth);
+        }
+        if let Some(info) = std_hashmap_info(self.cx.table, self.cx.interns, ty) {
+            return self.std_hashmap_rust_to_js(expr, &info, depth);
         }
         if let TypeKind::Pattern(inner) = desc.kind {
             return self.rust_to_js(expr, inner, depth + 1);
@@ -694,6 +1068,9 @@ impl<'a> MarshalEmitter<'a> {
                         return self.slice_rust_to_js(expr, *elem, depth);
                     }
                     expr
+                }
+                Some(PointerForm::Str) if self.convert_str_refs => {
+                    jsast::rt_call("bstr_out", vec![expr])
                 }
                 Some(PointerForm::Thin) => self.rust_to_js(expr, *pointee, depth + 1),
                 _ => expr,
@@ -1308,6 +1685,384 @@ impl<'a> MarshalEmitter<'a> {
         jsast::call(jsast::arrow(vec![b_name], body), vec![buf_expr])
     }
 
+    fn map_entries_js_to_rust(&mut self, expr: Expr, info: &MapEntriesInfo, depth: u32) -> Expr {
+        let string_key = is_string_key_ty(self.cx.table, self.cx.interns, info.key_ty);
+        let key_is_bstr_str = self.cx.bstr && is_str_ref_ty(self.cx.table, info.key_ty);
+        let entries_expr = self.bind_once(expr, "m", |_, v| {
+            let is_map = jsast::method_call(
+                jsast::member(jsast::id("Map"), "prototype"),
+                "isPrototypeOf",
+                vec![v.clone()],
+            );
+            let from_map = jsast::method_call(
+                jsast::id("Array"),
+                "from",
+                vec![jsast::method_call(v.clone(), "entries", Vec::new())],
+            );
+            let is_nullish = jsast::binary(BinOp::Eq, v.clone(), jsast::null());
+            let fallback = if string_key {
+                let safe_obj = jsast::cond(is_nullish, jsast::object(Vec::new()), v);
+                jsast::method_call(jsast::id("Object"), "entries", vec![safe_obj])
+            } else {
+                let safe_iter = jsast::cond(is_nullish, jsast::array(Vec::new()), v);
+                jsast::method_call(jsast::id("Array"), "from", vec![safe_iter])
+            };
+            jsast::cond(is_map, from_map, fallback)
+        });
+        let entries_expr = if key_is_bstr_str {
+            let p_name = self.fresh("p");
+            let p_id = jsast::id(p_name.clone());
+            let k_conv = jsast::rt_call("bstr_in", vec![jsast::index(p_id.clone(), jsast::num(0))]);
+            let pair = jsast::array(vec![k_conv, jsast::index(p_id, jsast::num(1))]);
+            jsast::method_call(entries_expr, "map", vec![jsast::arrow(vec![p_name], pair)])
+        } else {
+            entries_expr
+        };
+        self.vec_js_to_rust(
+            entries_expr,
+            info.vec_ty,
+            info.pair_ty,
+            info.is_global,
+            depth,
+        )
+    }
+
+    fn std_hashmap_rust_to_js(&mut self, expr: Expr, info: &StdHashMapInfo, depth: u32) -> Expr {
+        let string_key = is_string_key_ty(self.cx.table, self.cx.interns, info.key_ty);
+        let key_is_bstr_str = self.cx.bstr && is_str_ref_ty(self.cx.table, info.key_ty);
+        let native = self.cx.heap.native_vec_enabled && info.slots_is_global;
+
+        let m_name = self.fresh("hm");
+        let m_id = jsast::id(m_name.clone());
+        let out_name = self.fresh("out");
+        let out_id = jsast::id(out_name.clone());
+        let v_name = self.fresh("sv");
+        let v_id = jsast::id(v_name.clone());
+        let n_name = self.fresh("n");
+        let n_id = jsast::id(n_name.clone());
+
+        let init_out = if string_key {
+            jsast::object(Vec::new())
+        } else {
+            jsast::new(jsast::id("Map"), Vec::new())
+        };
+        let slots_expr = value::field_expr(self.cx.interns, m_id, info.slots_field_key);
+        let (len_expr, ptr_expr) = if native {
+            (jsast::member(v_id.clone(), "len"), None)
+        } else {
+            let layout = raw_vec_layout(self.cx.table, self.cx.interns, info.slots_vec_ty);
+            (
+                layout.len_expr(v_id.clone()),
+                Some(layout.ptr_expr(v_id.clone())),
+            )
+        };
+
+        let mut stmts = vec![
+            jsast::const_(out_name, init_out),
+            jsast::const_(v_name, slots_expr),
+            jsast::const_(n_name, len_expr),
+            jsast::if_(
+                jsast::binary(BinOp::StrictEq, n_id.clone(), jsast::num(0)),
+                vec![jsast::ret(out_id.clone())],
+            ),
+        ];
+
+        let (buf_expr, off_expr) = if let Some(ptr) = ptr_expr {
+            let p_name = self.fresh("p");
+            let p_id = jsast::id(p_name.clone());
+            stmts.push(jsast::const_(p_name, ptr));
+            (
+                jsast::member(p_id.clone(), "buf"),
+                Some(jsast::member(p_id, "off")),
+            )
+        } else {
+            (jsast::member(v_id, "buf"), None)
+        };
+
+        let b_name = self.fresh("b");
+        let b_id = jsast::id(b_name.clone());
+        stmts.push(jsast::const_(b_name, buf_expr));
+        let off_id = off_expr.map(|off| {
+            let o_name = self.fresh("off");
+            stmts.push(jsast::const_(o_name.clone(), off));
+            jsast::id(o_name)
+        });
+        let i_name = self.fresh("i");
+        let i_id = jsast::id(i_name.clone());
+        stmts.push(jsast::let_(i_name, jsast::num(0)));
+
+        let idx_expr = match off_id {
+            Some(off) => jsast::binary(BinOp::Add, off, i_id.clone()),
+            None => i_id.clone(),
+        };
+        let s_name = self.fresh("sl");
+        let s_id = jsast::id(s_name.clone());
+        let mut loop_body = vec![jsast::const_(s_name, jsast::index(b_id, idx_expr))];
+
+        if let Some(is_occupied) = self.enum_variant_test(
+            info.slot_ty,
+            info.slot_repr,
+            info.occupied_idx,
+            s_id.clone(),
+        ) {
+            let raw_key = self.extract_variant_field(
+                info.slot_repr,
+                info.occupied_idx,
+                info.key_field_key,
+                info.key_ty,
+                s_id.clone(),
+            );
+            let raw_val = self.extract_variant_field(
+                info.slot_repr,
+                info.occupied_idx,
+                info.val_field_key,
+                info.val_ty,
+                s_id,
+            );
+            let js_key = if key_is_bstr_str {
+                jsast::rt_call("bstr_out", vec![raw_key])
+            } else {
+                self.rust_to_js(raw_key, info.key_ty, depth + 1)
+            };
+            let js_val = if self.cx.table.is_zst(info.val_ty) {
+                jsast::undefined()
+            } else {
+                self.rust_to_js(raw_val, info.val_ty, depth + 1)
+            };
+            let store_stmt = if string_key {
+                jsast::assign_stmt(jsast::index(out_id.clone(), js_key), js_val)
+            } else {
+                jsast::expr_stmt(jsast::method_call(
+                    out_id.clone(),
+                    "set",
+                    vec![js_key, js_val],
+                ))
+            };
+            loop_body.push(jsast::if_(is_occupied, vec![store_stmt]));
+        }
+
+        loop_body.push(jsast::expr_stmt(jsast::compound_assign(
+            jsast::CompoundOp::Add,
+            i_id.clone(),
+            jsast::num(1),
+        )));
+        stmts.push(jsast::while_(
+            jsast::binary(BinOp::Lt, i_id, n_id),
+            loop_body,
+        ));
+        stmts.push(jsast::ret(out_id));
+        jsast::call(jsast::arrow_block(vec![m_name], stmts), vec![expr])
+    }
+
+    fn mires_js_hashmap_rust_to_js(
+        &mut self,
+        expr: Expr,
+        info: &MiresJsHashMapInfo,
+        depth: u32,
+    ) -> Expr {
+        let string_key = is_string_key_ty(self.cx.table, self.cx.interns, info.key_ty);
+        let val_is_zst = self.cx.table.is_zst(info.val_ty);
+        let opt_info = find_map_entry_option(self.cx.table, self.cx.interns, info.val_ty);
+
+        let m_name = self.fresh("hm");
+        let m_id = jsast::id(m_name.clone());
+        let out_name = self.fresh("out");
+        let out_id = jsast::id(out_name.clone());
+        let es_name = self.fresh("es");
+        let es_id = jsast::id(es_name.clone());
+        let i_name = self.fresh("i");
+        let i_id = jsast::id(i_name.clone());
+        let p_name = self.fresh("p");
+        let p_id = jsast::id(p_name.clone());
+
+        let init_out = if string_key {
+            jsast::object(Vec::new())
+        } else {
+            jsast::new(jsast::id("Map"), Vec::new())
+        };
+        let mut stmts = vec![
+            jsast::const_(out_name, init_out),
+            jsast::const_(
+                es_name,
+                jsast::method_call(
+                    jsast::id("Array"),
+                    "from",
+                    vec![jsast::method_call(m_id, "entries", Vec::new())],
+                ),
+            ),
+            jsast::let_(i_name, jsast::num(0)),
+        ];
+
+        let raw_key = jsast::index(p_id.clone(), jsast::num(0));
+        let js_key = if string_key && self.cx.bstr {
+            jsast::rt_call("bstr_out", vec![raw_key])
+        } else {
+            raw_key
+        };
+
+        let raw_entry = jsast::index(p_id, jsast::num(1));
+        let mut loop_body = vec![jsast::const_(
+            p_name,
+            jsast::index(es_id.clone(), i_id.clone()),
+        )];
+
+        let opt_name = self.fresh("ev");
+        let opt_id = jsast::id(opt_name.clone());
+        loop_body.push(jsast::const_(opt_name, jsast::member(raw_entry, "value")));
+
+        let store_stmt = |this: &mut Self, raw_val: Expr| -> Stmt {
+            let js_val = if val_is_zst {
+                jsast::undefined()
+            } else {
+                this.rust_to_js(raw_val, info.val_ty, depth + 1)
+            };
+            if string_key {
+                jsast::assign_stmt(jsast::index(out_id.clone(), js_key.clone()), js_val)
+            } else {
+                jsast::expr_stmt(jsast::method_call(
+                    out_id.clone(),
+                    "set",
+                    vec![js_key.clone(), js_val],
+                ))
+            }
+        };
+
+        if let Some(opt) = opt_info {
+            if let Some(is_none) =
+                self.enum_variant_test(opt.ty, opt.repr, opt.none_idx, opt_id.clone())
+            {
+                let payload = self.extract_variant_field(
+                    opt.repr,
+                    opt.some_idx,
+                    opt.some_field_key,
+                    opt.inner_ty,
+                    opt_id,
+                );
+                let stmt = store_stmt(self, payload);
+                loop_body.push(jsast::if_(jsast::not(is_none), vec![stmt]));
+            } else {
+                let stmt = store_stmt(self, opt_id);
+                loop_body.push(stmt);
+            }
+        } else {
+            let (is_none, unwrapped) = self.dynamic_map_entry_unwrap(opt_id, info.val_ty);
+            let stmt = store_stmt(self, unwrapped);
+            loop_body.push(jsast::if_(jsast::not(is_none), vec![stmt]));
+        }
+
+        loop_body.push(jsast::expr_stmt(jsast::compound_assign(
+            jsast::CompoundOp::Add,
+            i_id.clone(),
+            jsast::num(1),
+        )));
+        stmts.push(jsast::while_(
+            jsast::binary(BinOp::Lt, i_id, jsast::member(es_id, "length")),
+            loop_body,
+        ));
+        stmts.push(jsast::ret(out_id));
+        jsast::call(jsast::arrow_block(vec![m_name], stmts), vec![expr])
+    }
+
+    fn dynamic_map_entry_unwrap(&self, opt_id: Expr, val_ty: TypeId) -> (Expr, Expr) {
+        let val_is_zst = self.cx.table.is_zst(val_ty);
+        let peeled_val = self.cx.table.peeled(val_ty);
+        let val_is_tagged = matches!(
+            self.cx.table.enum_repr(peeled_val),
+            Some(
+                EnumRepr::Tag { fieldless: false }
+                    | EnumRepr::IntTag { fieldless: false }
+                    | EnumRepr::State
+            )
+        );
+        let is_obj = jsast::binary(
+            BinOp::And,
+            jsast::binary(
+                BinOp::StrictEq,
+                jsast::unary(UnOp::TypeOf, opt_id.clone()),
+                jsast::string("object"),
+            ),
+            jsast::binary(BinOp::StrictNe, opt_id.clone(), jsast::null()),
+        );
+        let mut is_none = if val_is_zst {
+            jsast::binary(
+                BinOp::Or,
+                jsast::binary(BinOp::StrictEq, opt_id.clone(), jsast::string("None")),
+                jsast::binary(BinOp::StrictEq, opt_id.clone(), jsast::num(0)),
+            )
+        } else {
+            jsast::binary(BinOp::StrictEq, opt_id.clone(), jsast::null())
+        };
+        if let Some(sn) = value::sentinel_none_expr(self.cx.table) {
+            is_none = jsast::binary(
+                BinOp::Or,
+                is_none,
+                jsast::binary(BinOp::StrictEq, opt_id.clone(), sn),
+            );
+        }
+        if !val_is_tagged {
+            let tag_is_none = jsast::binary(
+                BinOp::And,
+                is_obj.clone(),
+                jsast::binary(
+                    BinOp::Or,
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        jsast::member(opt_id.clone(), value::TAG),
+                        jsast::string("None"),
+                    ),
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        jsast::member(opt_id.clone(), value::TAG),
+                        jsast::num(0),
+                    ),
+                ),
+            );
+            is_none = jsast::binary(BinOp::Or, is_none, tag_is_none);
+        }
+        let unwrapped = if val_is_tagged {
+            let has_some_variant = self
+                .cx
+                .table
+                .variants(peeled_val)
+                .iter()
+                .any(|v| self.cx.interns.str(v.name) == Some("Some"));
+            if has_some_variant {
+                opt_id
+            } else {
+                let tag_is_some = jsast::binary(
+                    BinOp::And,
+                    is_obj,
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        jsast::member(opt_id.clone(), value::TAG),
+                        jsast::string("Some"),
+                    ),
+                );
+                jsast::cond(tag_is_some, jsast::member(opt_id.clone(), "_0"), opt_id)
+            }
+        } else {
+            let tag_is_some = jsast::binary(
+                BinOp::And,
+                is_obj,
+                jsast::binary(
+                    BinOp::Or,
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        jsast::member(opt_id.clone(), value::TAG),
+                        jsast::string("Some"),
+                    ),
+                    jsast::binary(
+                        BinOp::StrictEq,
+                        jsast::member(opt_id.clone(), value::TAG),
+                        jsast::num(1),
+                    ),
+                ),
+            );
+            jsast::cond(tag_is_some, jsast::member(opt_id.clone(), "_0"), opt_id)
+        };
+        (is_none, unwrapped)
+    }
+
     fn slice_js_to_rust(&mut self, expr: Expr, elem_ty: TypeId, depth: u32) -> Expr {
         let is_zst = self.cx.table.is_zst(elem_ty);
         let elem_needs = !is_zst && needs_js_to_rust(self.cx, elem_ty);
@@ -1516,7 +2271,7 @@ impl<'a> MarshalEmitter<'a> {
         for (idx, variant) in variants.iter().enumerate() {
             let variant_needs = variant.fields.iter().any(|f| match dir {
                 Dir::JsToRust => needs_js_to_rust(self.cx, f.ty),
-                Dir::RustToJs => needs_rust_to_js(self.cx, f.ty),
+                Dir::RustToJs => self.needs_rust_to_js_value(f.ty),
             });
             if !variant_needs {
                 continue;
@@ -1751,7 +2506,9 @@ mod tests {
 
     use crate::analysis::heap::HeapPlan;
 
-    use super::{needs_js_to_rust, needs_rust_to_js, wrap_js_export, BoundaryCx};
+    use super::{
+        lower_export_out_body, needs_js_to_rust, needs_rust_to_js, wrap_js_export, BoundaryCx,
+    };
 
     struct TestTypes {
         interns: Interns,
@@ -2390,6 +3147,425 @@ mod tests {
                     pointer_form: None,
                     byte_element: false,
                     fields: fds,
+                },
+            })
+        }
+
+        fn tuple(&mut self, elems: Vec<TypeId>) -> TypeId {
+            let id = self.id();
+            let fields: Vec<FieldDescriptor> = elems
+                .iter()
+                .enumerate()
+                .map(|(i, &ty)| FieldDescriptor {
+                    key: FieldKey::Index(i as u32),
+                    ty,
+                    offset: (i * 4) as u64,
+                })
+                .collect();
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::Tuple(elems.clone()),
+                layout: LayoutFacts {
+                    size: Some((elems.len().max(1) * 4) as u64),
+                    align: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: None,
+                    is_indirect: true,
+                    needs_clone: true,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: id,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields,
+                },
+            })
+        }
+
+        fn raw_mut_ptr(&mut self, pointee: TypeId) -> TypeId {
+            let id = self.id();
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::RawPointer {
+                    pointee,
+                    mutable: true,
+                },
+                layout: LayoutFacts {
+                    size: Some(4),
+                    align: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: None,
+                    is_indirect: false,
+                    needs_clone: false,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: id,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: Some(PointerForm::Slot),
+                    byte_element: false,
+                    fields: Vec::new(),
+                },
+            })
+        }
+
+        fn typed_promise(&mut self, inner: TypeId, u32_ty: TypeId) -> TypeId {
+            let promise_ty = self.host_value(u32_ty);
+            let id = self.id();
+            let def = self.def();
+            let name = self.interns.intern_str("TypedPromise");
+            let inner_key = self.interns.intern_str("inner");
+            let field = FieldDescriptor {
+                key: FieldKey::Name(inner_key),
+                ty: promise_ty,
+                offset: 0,
+            };
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::Adt {
+                    def,
+                    args: vec![inner],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name,
+                        fields: vec![field.clone()],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    size: Some(4),
+                    align: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta {
+                    abi: NominalAbi::Transparent,
+                    boundary: PinnedBoundary::Host,
+                    ..TypeMeta::default()
+                },
+                js: JsFacts {
+                    int: None,
+                    is_indirect: false,
+                    needs_clone: false,
+                    crosses_transparent_union: false,
+                    transparent: Some(TransparentField {
+                        field: 0,
+                        ty: promise_ty,
+                    }),
+                    peeled: u32_ty,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: vec![field],
+                },
+            })
+        }
+
+        fn map_entries(
+            &mut self,
+            variant_name: &str,
+            key_ty: TypeId,
+            val_ty: TypeId,
+            usize_ty: TypeId,
+            unit_ty: TypeId,
+        ) -> TypeId {
+            let pair_ty = self.tuple(vec![key_ty, val_ty]);
+            let vec_ty = self.vec(pair_ty, usize_ty, unit_ty);
+            let id = self.id();
+            let def = self.def();
+            let v_name = self.interns.intern_str(variant_name);
+            let field = FieldDescriptor {
+                key: FieldKey::Transparent,
+                ty: vec_ty,
+                offset: 0,
+            };
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::Adt {
+                    def,
+                    args: vec![key_ty, val_ty],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: v_name,
+                        fields: vec![field.clone()],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    size: Some(12),
+                    align: Some(4),
+                    sized: true,
+                    needs_drop: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta {
+                    abi: NominalAbi::Transparent,
+                    boundary: PinnedBoundary::Host,
+                    ..TypeMeta::default()
+                },
+                js: JsFacts {
+                    int: None,
+                    is_indirect: true,
+                    needs_clone: true,
+                    crosses_transparent_union: false,
+                    transparent: Some(TransparentField {
+                        field: 0,
+                        ty: vec_ty,
+                    }),
+                    peeled: vec_ty,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: vec![field],
+                },
+            })
+        }
+
+        fn std_hash_map(
+            &mut self,
+            key_ty: TypeId,
+            val_ty: TypeId,
+            u64_ty: TypeId,
+            usize_ty: TypeId,
+            unit_ty: TypeId,
+            slot_repr: EnumRepr,
+        ) -> TypeId {
+            let slot_id = self.id();
+            let slot_def = self.def();
+            let s_empty = self.interns.intern_str("Empty");
+            let s_tomb = self.interns.intern_str("Tombstone");
+            let s_occ = self.interns.intern_str("Occupied");
+            let s_hash = self.interns.intern_str("hash");
+            let s_key = self.interns.intern_str("key");
+            let s_val = self.interns.intern_str("value");
+            self.insert(TypeDescriptor {
+                id: slot_id,
+                name: None,
+                kind: TypeKind::Adt {
+                    def: slot_def,
+                    args: vec![key_ty, val_ty],
+                    form: NominalForm::Enum,
+                    variants: vec![
+                        VariantDescriptor {
+                            name: s_empty,
+                            fields: Vec::new(),
+                            logical_discr: 0,
+                            physical_tag: None,
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                        VariantDescriptor {
+                            name: s_tomb,
+                            fields: Vec::new(),
+                            logical_discr: 1,
+                            physical_tag: None,
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                        VariantDescriptor {
+                            name: s_occ,
+                            fields: vec![
+                                FieldDescriptor {
+                                    key: FieldKey::Name(s_hash),
+                                    ty: u64_ty,
+                                    offset: 0,
+                                },
+                                FieldDescriptor {
+                                    key: FieldKey::Name(s_key),
+                                    ty: key_ty,
+                                    offset: 8,
+                                },
+                                FieldDescriptor {
+                                    key: FieldKey::Name(s_val),
+                                    ty: val_ty,
+                                    offset: 16,
+                                },
+                            ],
+                            logical_discr: 2,
+                            physical_tag: None,
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        },
+                    ],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    size: Some(24),
+                    align: Some(8),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: None,
+                    is_indirect: true,
+                    needs_clone: true,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: slot_id,
+                    unsized_tail: None,
+                    enum_repr: Some(slot_repr),
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: Vec::new(),
+                },
+            });
+            let slots_vec = self.vec(slot_id, usize_ty, unit_ty);
+            let id = self.id();
+            let def = self.def();
+            let s_hm = self.interns.intern_str("HashMap");
+            let s_slots = self.interns.intern_str("slots");
+            let s_len = self.interns.intern_str("len");
+            let s_tombs = self.interns.intern_str("tombstones");
+            let s_hb = self.interns.intern_str("hash_builder");
+            let fields = vec![
+                FieldDescriptor {
+                    key: FieldKey::Name(s_slots),
+                    ty: slots_vec,
+                    offset: 0,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(s_len),
+                    ty: usize_ty,
+                    offset: 12,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(s_tombs),
+                    ty: usize_ty,
+                    offset: 16,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(s_hb),
+                    ty: unit_ty,
+                    offset: 20,
+                },
+            ];
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::Adt {
+                    def,
+                    args: vec![key_ty, val_ty, unit_ty],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: s_hm,
+                        fields: fields.clone(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    size: Some(24),
+                    align: Some(4),
+                    sized: true,
+                    needs_drop: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: None,
+                    is_indirect: true,
+                    needs_clone: true,
+                    crosses_transparent_union: false,
+                    transparent: None,
+                    peeled: id,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields,
+                },
+            })
+        }
+
+        fn mires_js_hash_map(&mut self, key_ty: TypeId, val_ty: TypeId, u32_ty: TypeId) -> TypeId {
+            let raw_map = self.host_value(u32_ty);
+            let id = self.id();
+            let def = self.def();
+            let s_hm = self.interns.intern_str("HashMap");
+            let s_raw = self.interns.intern_str("raw");
+            let field = FieldDescriptor {
+                key: FieldKey::Name(s_raw),
+                ty: raw_map,
+                offset: 0,
+            };
+            self.insert(TypeDescriptor {
+                id,
+                name: None,
+                kind: TypeKind::Adt {
+                    def,
+                    args: vec![key_ty, val_ty],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: s_hm,
+                        fields: vec![field.clone()],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    size: Some(4),
+                    align: Some(4),
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta {
+                    abi: NominalAbi::Transparent,
+                    boundary: PinnedBoundary::Host,
+                    ..TypeMeta::default()
+                },
+                js: JsFacts {
+                    int: None,
+                    is_indirect: false,
+                    needs_clone: false,
+                    crosses_transparent_union: false,
+                    transparent: Some(TransparentField {
+                        field: 0,
+                        ty: raw_map,
+                    }),
+                    peeled: u32_ty,
+                    unsized_tail: None,
+                    enum_repr: None,
+                    is_primitive_enum: false,
+                    pointer_form: None,
+                    byte_element: false,
+                    fields: vec![field],
                 },
             })
         }
@@ -3086,5 +4262,449 @@ mod tests {
             jsast::stmt_to_string(&d_sentinel),
         );
         run_node_script(&js);
+    }
+
+    #[test]
+    fn export_out_body_handles_unit_plain_and_result_in_node() {
+        let mut tt = TestTypes::new();
+        let u8_ty = tt.int(false, 8);
+        let u32_ty = tt.int(false, 32);
+        let i32_ty = tt.int(true, 32);
+        let usize_ty = tt.int(false, 32);
+        let unit = tt.unit();
+        let str_ty = tt.string(u8_ty, usize_ty, unit);
+        let res_str = tt.result(str_ty, str_ty);
+        let promise_str = tt.typed_promise(str_ty, u32_ty);
+        let raw_ptr = tt.raw_mut_ptr(i32_ty);
+
+        let heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            ..HeapPlan::default()
+        };
+        let cx = BoundaryCx {
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            heap: &heap,
+            bstr: true,
+        };
+
+        // TypedPromise and raw *mut T are identity at the JS export boundary.
+        assert!(!needs_rust_to_js(&cx, promise_str));
+        assert!(!needs_js_to_rust(&cx, raw_ptr));
+        assert!(!needs_rust_to_js(&cx, raw_ptr));
+
+        let unit_fn = jsast::function(
+            "out_unit",
+            vec!["$p0".to_owned()],
+            lower_export_out_body(&cx, "$p0", unit),
+        );
+        let str_fn = jsast::function(
+            "out_str",
+            vec!["$p0".to_owned()],
+            lower_export_out_body(&cx, "$p0", str_ty),
+        );
+        let res_fn = jsast::function(
+            "out_res",
+            vec!["$p0".to_owned()],
+            lower_export_out_body(&cx, "$p0", res_str),
+        );
+        let id_fn = jsast::function(
+            "out_i32",
+            vec!["$p0".to_owned()],
+            lower_export_out_body(&cx, "$p0", i32_ty),
+        );
+
+        let js = format!(
+            "{}\n{}\n{}\n{}\n\
+             const mkStr = (s) => {{ const b = __rt.bstr_in(s); return {{ s: b, cap: b.length }}; }};\n\
+             assert.strictEqual(out_unit(123), undefined);\n\
+             assert.strictEqual(out_i32(42), 42);\n\
+             assert.strictEqual(out_str(mkStr('async 🦀')), 'async 🦀');\n\
+             assert.strictEqual(out_res({{ TAG: 'Ok', _0: mkStr('done') }}), 'done');\n\
+             assert.throws(() => out_res({{ TAG: 'Err', _0: mkStr('async fail') }}), (e) => {{\n\
+               assert.ok(e instanceof Error);\n\
+               assert.strictEqual(e.message, 'async fail');\n\
+               return true;\n\
+             }});\n",
+            jsast::stmt_to_string(&unit_fn),
+            jsast::stmt_to_string(&str_fn),
+            jsast::stmt_to_string(&res_fn),
+            jsast::stmt_to_string(&id_fn),
+        );
+        run_node_script(&js);
+    }
+
+    #[test]
+    fn map_entries_and_hashmap_marshaling_in_node() {
+        let mut tt = TestTypes::new();
+        let u8_ty = tt.int(false, 8);
+        let i32_ty = tt.int(true, 32);
+        let u32_ty = tt.int(false, 32);
+        let u64_ty = tt.int(false, 64);
+        let usize_ty = tt.int(false, 32);
+        let unit = tt.unit();
+        let str_ty = tt.string(u8_ty, usize_ty, unit);
+
+        let entries_str_i32 = tt.map_entries("JsMapEntries", str_ty, i32_ty, usize_ty, unit);
+        let entries_i32_str = tt.map_entries("JsBTreeMapEntries", i32_ty, str_ty, usize_ty, unit);
+        let hm_str_u32_tag = tt.std_hash_map(
+            str_ty,
+            u32_ty,
+            u64_ty,
+            usize_ty,
+            unit,
+            EnumRepr::Tag { fieldless: false },
+        );
+        let hm_i32_str_int = tt.std_hash_map(
+            i32_ty,
+            str_ty,
+            u64_ty,
+            usize_ty,
+            unit,
+            EnumRepr::IntTag { fieldless: false },
+        );
+        let report_struct =
+            tt.plain_struct("Report", &[("counts", hm_str_u32_tag), ("total", u32_ty)]);
+        let host_hm_str = tt.mires_js_hash_map(str_ty, str_ty, u32_ty);
+        let host_hm_i32 = tt.mires_js_hash_map(i32_ty, i32_ty, u32_ty);
+        let _opt_str = tt.option(str_ty, EnumRepr::Tag { fieldless: false });
+
+        let native_heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            ..HeapPlan::default()
+        };
+        let raw_heap = HeapPlan::default();
+
+        let cx_native = BoundaryCx {
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            heap: &native_heap,
+            bstr: true,
+        };
+        let cx_raw = BoundaryCx {
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            heap: &raw_heap,
+            bstr: false,
+        };
+
+        assert!(needs_js_to_rust(&cx_native, entries_str_i32));
+        assert!(needs_js_to_rust(&cx_native, entries_i32_str));
+        assert!(needs_rust_to_js(&cx_native, hm_str_u32_tag));
+        assert!(!needs_js_to_rust(&cx_native, hm_str_u32_tag));
+        assert!(needs_rust_to_js(&cx_native, report_struct));
+        assert!(needs_rust_to_js(&cx_native, host_hm_str));
+        assert!(needs_rust_to_js(&cx_native, host_hm_i32));
+
+        // 1. JsMapEntries<String, i32> input (native Vec + native String) -> returns raw Vec for inspection
+        let f_in_str = dummy_func(vec![entries_str_i32], unit);
+        let mut b_in_str = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_native, &f_in_str, &["m".to_owned()], &mut b_in_str);
+        let d_in_str = jsast::function("in_str_map_native", vec!["m".to_owned()], b_in_str);
+
+        // 2. JsMapEntries<String, i32> input (RawVec mode)
+        let mut b_in_raw = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_raw, &f_in_str, &["m".to_owned()], &mut b_in_raw);
+        let d_in_raw = jsast::function("in_str_map_raw", vec!["m".to_owned()], b_in_raw);
+
+        // 3. JsBTreeMapEntries<i32, String> input (native Vec)
+        let f_in_i32 = dummy_func(vec![entries_i32_str], unit);
+        let mut b_in_i32 = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_native, &f_in_i32, &["m".to_owned()], &mut b_in_i32);
+        let d_in_i32 = jsast::function("in_i32_map", vec!["m".to_owned()], b_in_i32);
+
+        // 4. mires-std HashMap<String, u32> nested inside Report struct (native Vec + Tag)
+        let f_rep = dummy_func(Vec::new(), report_struct);
+        let mut b_rep = vec![jsast::ret(jsast::id("r"))];
+        wrap_js_export(&cx_native, &f_rep, &[], &mut b_rep);
+        let d_rep = jsast::function("out_report_native", vec!["r".to_owned()], b_rep);
+
+        // 5. mires-std HashMap<i32, String> (RawVec + IntTag)
+        let f_hm_i32 = dummy_func(Vec::new(), hm_i32_str_int);
+        let mut b_hm_i32 = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_raw, &f_hm_i32, &[], &mut b_hm_i32);
+        let d_hm_i32 = jsast::function("out_hm_i32_raw", vec!["m".to_owned()], b_hm_i32);
+
+        // 6. mires_js::collections::HashMap<String, String> & <i32, i32>
+        let f_host_str = dummy_func(Vec::new(), host_hm_str);
+        let mut b_host_str = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_native, &f_host_str, &[], &mut b_host_str);
+        let d_host_str = jsast::function("out_host_hm_str", vec!["m".to_owned()], b_host_str);
+
+        let f_host_i32 = dummy_func(Vec::new(), host_hm_i32);
+        let mut b_host_i32 = vec![jsast::ret(jsast::id("m"))];
+        wrap_js_export(&cx_native, &f_host_i32, &[], &mut b_host_i32);
+        let d_host_i32 = jsast::function("out_host_hm_i32", vec!["m".to_owned()], b_host_i32);
+
+        let js = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n\
+             const mkNStr = (s) => {{ const b = __rt.bstr_in(s); return {{ s: b, cap: b.length }}; }};\n\
+             const mkRawStr = (s) => {{\n\
+               const b = __rt.str_bytes_mut(s);\n\
+               const ptr = b.len === 0 ? 1 : __rt._register(b.buf, b.len, false);\n\
+               return {{ vec: {{ buf: {{ inner: {{ ptr, cap: b.len, alloc: undefined }}, _marker: undefined }}, len: b.len }} }};\n\
+             }};\n\
+             // JsMapEntries<String, i32> from plain object, JS Map, and null\n\
+             const vObj = in_str_map_native({{ a: 1, 'café': 2 }});\n\
+             assert.strictEqual(vObj.len, 2);\n\
+             assert.strictEqual(__rt.bstr_out(vObj.buf[0][0].s), 'a');\n\
+             assert.strictEqual(vObj.buf[0][1], 1);\n\
+             assert.strictEqual(__rt.bstr_out(vObj.buf[1][0].s), 'café');\n\
+             assert.strictEqual(vObj.buf[1][1], 2);\n\
+             const vMap = in_str_map_native(new Map([['k', 99]]));\n\
+             assert.strictEqual(vMap.len, 1);\n\
+             assert.strictEqual(__rt.bstr_out(vMap.buf[0][0].s), 'k');\n\
+             assert.strictEqual(vMap.buf[0][1], 99);\n\
+             assert.strictEqual(in_str_map_native(undefined).len, 0);\n\
+             const vRaw = in_str_map_raw({{ hi: 7 }});\n\
+             assert.strictEqual(vRaw.len, 1);\n\
+             const rEntry = vRaw.buf.inner.ptr.buf[vRaw.buf.inner.ptr.off];\n\
+             assert.strictEqual(rEntry[1], 7);\n\
+             // JsBTreeMapEntries<i32, String> from JS Map and entries array\n\
+             const bMap = in_i32_map(new Map([[10, 'ten'], [20, 'twenty']]));\n\
+             assert.strictEqual(bMap.len, 2);\n\
+             assert.strictEqual(bMap.buf[0][0], 10);\n\
+             assert.strictEqual(__rt.bstr_out(bMap.buf[0][1].s), 'ten');\n\
+             const bArr = in_i32_map([[3, 'three']]);\n\
+             assert.strictEqual(bArr.len, 1);\n\
+             assert.strictEqual(bArr.buf[0][0], 3);\n\
+             // Report {{ counts: HashMap<String, u32>, total: u32 }} (native Vec + Tag)\n\
+             const rep = out_report_native({{\n\
+               counts: {{\n\
+                 slots: {{ buf: [\n\
+                   {{ TAG: 'Empty' }},\n\
+                   {{ TAG: 'Occupied', hash: 1n, key: mkNStr('rust'), value: 3 }},\n\
+                   {{ TAG: 'Tombstone' }},\n\
+                   {{ TAG: 'Occupied', hash: 2n, key: mkNStr('js'), value: 5 }},\n\
+                 ], len: 4 }},\n\
+                 len: 2, tombstones: 1, hash_builder: undefined\n\
+               }},\n\
+               total: 8\n\
+             }});\n\
+             assert.deepStrictEqual(rep, {{ counts: {{ rust: 3, js: 5 }}, total: 8 }});\n\
+             // Empty HashMap\n\
+             assert.deepStrictEqual(out_report_native({{\n\
+               counts: {{ slots: {{ buf: [], len: 0 }}, len: 0, tombstones: 0, hash_builder: undefined }},\n\
+               total: 0\n\
+             }}), {{ counts: {{}}, total: 0 }});\n\
+             // mires-std HashMap<i32, String> (RawVec + IntTag where Empty=0, Tombstone=1, Occupied=2)\n\
+             const rawSlots = [\n\
+               {{ TAG: 0 }},\n\
+               {{ TAG: 2, hash: 1n, key: 7, value: mkRawStr('seven') }},\n\
+               {{ TAG: 1 }},\n\
+               {{ TAG: 2, hash: 2n, key: 9, value: mkRawStr('nine') }},\n\
+             ];\n\
+             const outMap = out_hm_i32_raw({{\n\
+               slots: {{ buf: {{ inner: {{ ptr: {{ buf: rawSlots, off: 0 }}, cap: 4, alloc: undefined }}, _marker: undefined }}, len: 4 }},\n\
+               len: 2, tombstones: 1, hash_builder: undefined\n\
+             }});\n\
+             assert.ok(outMap instanceof Map);\n\
+             assert.strictEqual(outMap.size, 2);\n\
+             assert.strictEqual(outMap.get(7), 'seven');\n\
+             assert.strictEqual(outMap.get(9), 'nine');\n\
+             const emptyRawMap = out_hm_i32_raw({{\n\
+               slots: {{ buf: {{ inner: {{ ptr: 8, cap: 0, alloc: undefined }}, _marker: undefined }}, len: 0 }},\n\
+               len: 0, tombstones: 0, hash_builder: undefined\n\
+             }});\n\
+             assert.ok(emptyRawMap instanceof Map && emptyRawMap.size === 0);\n\
+             // mires_js::collections::HashMap<String, String> (with Option<String> Tag in TypeTable)\n\
+             const hostStr = new Map([\n\
+               [__rt.bstr_in('greeting'), {{ value: {{ TAG: 'Some', _0: mkNStr('héllo') }} }}],\n\
+               [__rt.bstr_in('dead'), {{ value: {{ TAG: 'None' }} }}],\n\
+             ]);\n\
+             assert.deepStrictEqual(out_host_hm_str(hostStr), {{ greeting: 'héllo' }});\n\
+             // mires_js::collections::HashMap<i32, i32> (dynamic MapEntry unwrap: Tag + NullNiche)\n\
+             const hostI32 = new Map([\n\
+               [1, {{ value: {{ TAG: 'Some', _0: 100 }} }}],\n\
+               [2, {{ value: 200 }}],\n\
+               [3, {{ value: null }}],\n\
+             ]);\n\
+             const outHostI32 = out_host_hm_i32(hostI32);\n\
+             assert.ok(outHostI32 instanceof Map);\n\
+             assert.strictEqual(outHostI32.size, 2);\n\
+             assert.strictEqual(outHostI32.get(1), 100);\n\
+             assert.strictEqual(outHostI32.get(2), 200);\n",
+            jsast::stmt_to_string(&d_in_str),
+            jsast::stmt_to_string(&d_in_raw),
+            jsast::stmt_to_string(&d_in_i32),
+            jsast::stmt_to_string(&d_rep),
+            jsast::stmt_to_string(&d_hm_i32),
+            jsast::stmt_to_string(&d_host_str),
+            jsast::stmt_to_string(&d_host_i32),
+        );
+        run_node_script(&js);
+    }
+
+    #[test]
+    fn lower_item_short_circuits_js_export_out_and_collects_rt_refs() {
+        use rcgjs_object::item::JsName;
+        use rcgjs_object::jir::semantic::{
+            BasicBlock, BlockId, Body, BodyKind, BodySemantic, Call, CallSemantic, Callee,
+            Constant, Local, LocalId, LocalRole, Operand, OperandKind, Place, Terminator, Unwind,
+        };
+
+        let mut tt = TestTypes::new();
+        let u8_ty = tt.int(false, 8);
+        let u32_ty = tt.int(false, 32);
+        let usize_ty = tt.int(false, 32);
+        let unit = tt.unit();
+        let str_ty = tt.string(u8_ty, usize_ty, unit);
+        let js_val = tt.host_value(u32_ty);
+        let dummy_callee = tt.interns.intern_str("never_emit_dummy_callee");
+
+        // Dummy MIR body calls `never_emit_dummy_callee` (simulating `ManuallyDrop::new` +
+        // `JsValue::undefined()`). `BodySemantic::JsExportOut` MUST short-circuit before lowering
+        // this MIR so `never_emit_dummy_callee` is absent from both JS and `refs`, while `__rt`
+        // (needed for `bstr_out` / `bytes_str`) IS recorded in `refs`.
+        let body = Body {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 99,
+                },
+                instantiation: 1,
+            },
+            kind: BodyKind::Function,
+            semantic: BodySemantic::JsExportOut,
+            signature: Signature {
+                arguments: vec![str_ty],
+                result: js_val,
+                abi: AbiSignature {
+                    parameters: 1,
+                    inline_never: true,
+                    ..AbiSignature::default()
+                },
+            },
+            locals: vec![
+                Local {
+                    id: LocalId(0),
+                    role: LocalRole::Return,
+                    ty: js_val,
+                },
+                Local {
+                    id: LocalId(1),
+                    role: LocalRole::Argument,
+                    ty: str_ty,
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: unit,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        },
+                        callee: Callee::Direct {
+                            item: ItemId {
+                                definition: DefinitionId {
+                                    crate_id: 1,
+                                    local_hash: 100,
+                                },
+                                instantiation: 1,
+                            },
+                            link_name: dummy_callee,
+                        },
+                        semantic: CallSemantic::Ordinary,
+                        arguments: Vec::new(),
+                        destination: Place {
+                            local: LocalId(0),
+                            projection: Vec::new(),
+                            ty: js_val,
+                        },
+                        target: Some(BlockId(1)),
+                        unwind: Unwind::Continue,
+                        track_caller: None,
+                        host: None,
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Return,
+                },
+            ],
+        };
+
+        let heap = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            ..HeapPlan::default()
+        };
+        let opts = crate::opts::Opts::default();
+        let name = JsName::new("__mires_export_out$h0123456789abcdef".to_owned());
+        let summary = rcgjs_object::jir::summary::ItemSummary {
+            key: rcgjs_object::jir::summary::SemanticKey {
+                link_name: name.as_str().to_owned(),
+                item: Some(body.item),
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: rcgjs_object::jir::summary::Availability::Available,
+            deps: Vec::new(),
+            abi: Some(body.signature.abi),
+            physical: None,
+            kind: rcgjs_object::object::ItemKind::Fn,
+            linkage: rcgjs_object::object::Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: rcgjs_object::object::BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: rcgjs_object::jir::summary::ItemClass::empty(),
+        };
+        let input = crate::lower::LowerInput {
+            name: &name,
+            body: &body,
+            origins: None,
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            opts: &opts,
+            summary: &summary,
+            items: crate::lower::js::host::EMPTY_ITEMS,
+            drop_glue: crate::lower::js::host::EMPTY_DROP_GLUE,
+            vtables: &crate::lower::js::unsize::EMPTY_VTABLES,
+            spills: &[],
+            abi: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: Some(&heap),
+            nested_clone: crate::lower::NestedClone::default(),
+            final_lowering: true,
+        };
+        let lowered = crate::lower::lower_item(&input).expect("JsExportOut lowers cleanly");
+        let printed = jsast::stmt_to_string(&lowered.decl);
+        assert!(
+            !printed.contains("never_emit_dummy_callee"),
+            "dummy MIR body must be bypassed:\n{printed}"
+        );
+        assert!(
+            !lowered.refs.contains("never_emit_dummy_callee"),
+            "dummy callee must not appear in refs: {:?}",
+            lowered.refs
+        );
+        assert!(
+            lowered.refs.contains("__rt"),
+            "marshaled return must record `__rt` in refs: {:?}",
+            lowered.refs
+        );
+        assert!(
+            printed.contains("__rt.bstr_out($p0.s)"),
+            "expected native String conversion in body:\n{printed}"
+        );
     }
 }

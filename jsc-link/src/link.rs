@@ -155,6 +155,10 @@ impl Read {
             match read.sources() {
                 Ok(sources) => {
                     for (name, text) in sources {
+                        if name.starts_with('<') && name.ends_with('>') {
+                            self.sources.entry(name).or_insert(text);
+                            continue;
+                        }
                         match self.sources.entry(name) {
                             std::collections::btree_map::Entry::Vacant(entry) => {
                                 entry.insert(text);
@@ -1106,6 +1110,9 @@ fn print_units_with_opts(
                 text.push_str("__rt._bv_enable;\n");
             }
         }
+        // Synthesize ES6 wrapper classes for `#[js_export] impl ClassName` groups after all items
+        // (preserving `starts` source-map offsets) and before the export clause.
+        text.push_str(&synthesize_classes(opts, unit, &renames));
         // After the rename, so that the clause is written once, out of the names that survived it,
         // and never scanned as if it were an item's code.
         text.push_str(&export_clause(opts, unit, &renames));
@@ -1228,7 +1235,20 @@ fn artifact_records(
         } else {
             program.items.insert(root_identity(item));
         }
-        if item.linkage.exported || unit.exports.contains(item.name.as_str()) {
+        if item.linkage.exported {
+            if let Some((class_name, _)) =
+                rcgjs_object::dts::parse_class_export(export_name_of(item))
+            {
+                program.exports.insert(class_name.to_owned());
+            } else {
+                program.exports.insert(
+                    renames
+                        .get(item.name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| item.name.to_string()),
+                );
+            }
+        } else if unit.exports.contains(item.name.as_str()) {
             program.exports.insert(
                 renames
                     .get(item.name.as_str())
@@ -1333,6 +1353,169 @@ fn shim_import() -> LinkItem {
     }
 }
 
+fn export_name_of(item: &LinkItem) -> &str {
+    item.linkage
+        .fixed_name
+        .as_deref()
+        .unwrap_or_else(|| item.name.as_str())
+}
+
+#[derive(Default)]
+struct ClassSynth<'a> {
+    drop_fn: Option<&'a str>,
+    ctor_fn: Option<&'a str>,
+    methods: Vec<(&'a str, &'a str)>,
+    consuming_methods: Vec<(&'a str, &'a str)>,
+    static_ctors: Vec<(&'a str, &'a str)>,
+    static_methods: Vec<(&'a str, &'a str)>,
+}
+
+/// Synthesizes ES2018-compatible ES6 wrapper `class` declarations for every `#[js_export] impl`
+/// group (`__mires_cls$<ClassName>$<op>`) in `unit`.
+fn synthesize_classes(
+    opts: &crate::opts::Opts,
+    unit: &Unit<'_>,
+    renames: &BTreeMap<String, String>,
+) -> String {
+    use rcgjs_object::dts::{parse_class_export, ClassExportOp};
+
+    let mut classes: BTreeMap<&str, ClassSynth<'_>> = BTreeMap::new();
+    for item in &unit.items {
+        if !item.linkage.exported {
+            continue;
+        }
+        let Some((class_name, op)) = parse_class_export(export_name_of(item)) else {
+            continue;
+        };
+        let fn_ident = renames
+            .get(item.name.as_str())
+            .map_or(item.name.as_str(), String::as_str);
+        let entry = classes.entry(class_name).or_default();
+        match op {
+            ClassExportOp::Drop => entry.drop_fn = Some(fn_ident),
+            ClassExportOp::Ctor => entry.ctor_fn = Some(fn_ident),
+            ClassExportOp::Method(method) => entry.methods.push((method, fn_ident)),
+            ClassExportOp::ConsumingMethod(method) => {
+                entry.consuming_methods.push((method, fn_ident));
+            }
+            ClassExportOp::StaticCtor(method) => entry.static_ctors.push((method, fn_ident)),
+            ClassExportOp::StaticMethod(method) => entry.static_methods.push((method, fn_ident)),
+        }
+    }
+    if classes.is_empty() {
+        return String::new();
+    }
+
+    let compact = opts.minify.is_enabled();
+    let mut out = String::new();
+    for (class_name, cls) in classes {
+        if compact {
+            out.push_str(&format!("class {class_name}{{"));
+            out.push_str(&format!(
+                "static _fromPtr(p){{const o=Object.create({class_name}.prototype);o._ptr=p;return o;}}"
+            ));
+            match cls.ctor_fn {
+                Some(ctor) => {
+                    out.push_str(&format!("constructor(...a){{this._ptr={ctor}(...a);}}"));
+                }
+                None => {
+                    out.push_str(&format!(
+                        "constructor(){{throw new Error(\"{class_name} cannot be constructed directly\");}}"
+                    ));
+                }
+            }
+            for (method, target) in cls.methods {
+                out.push_str(&format!(
+                    "{method}(...a){{if(this._ptr===null)throw new Error(\"{class_name} was already freed\");return {target}(this._ptr,...a);}}"
+                ));
+            }
+            for (method, target) in cls.consuming_methods {
+                out.push_str(&format!(
+                    "{method}(...a){{if(this._ptr===null)throw new Error(\"{class_name} was already freed\");const p=this._ptr;this._ptr=null;return {target}(p,...a);}}"
+                ));
+            }
+            for (method, target) in cls.static_ctors {
+                out.push_str(&format!(
+                    "static {method}(...a){{return {class_name}._fromPtr({target}(...a));}}"
+                ));
+            }
+            for (method, target) in cls.static_methods {
+                out.push_str(&format!("static {method}(...a){{return {target}(...a);}}"));
+            }
+            if let Some(drop_fn) = cls.drop_fn {
+                out.push_str(&format!(
+                    "free(){{if(this._ptr!==null){{const p=this._ptr;this._ptr=null;{drop_fn}(p);}}}}"
+                ));
+            }
+            out.push_str("}\n");
+            if cls.drop_fn.is_some() {
+                out.push_str(&format!(
+                    "if(typeof Symbol!==\"undefined\"&&Symbol.dispose){class_name}.prototype[Symbol.dispose]={class_name}.prototype.free;\n"
+                ));
+            }
+            if opts.modules != Modules::Esm {
+                out.push_str(&format!(
+                    "if(typeof globalThis!==\"undefined\")globalThis.{class_name}={class_name};\n"
+                ));
+            }
+        } else {
+            out.push_str(&format!("\nclass {class_name} {{\n"));
+            out.push_str(&format!(
+                "  static _fromPtr(p) {{ const o = Object.create({class_name}.prototype); o._ptr = p; return o; }}\n"
+            ));
+            match cls.ctor_fn {
+                Some(ctor) => {
+                    out.push_str(&format!(
+                        "  constructor(...a) {{ this._ptr = {ctor}(...a); }}\n"
+                    ));
+                }
+                None => {
+                    out.push_str(&format!(
+                        "  constructor() {{ throw new Error(\"{class_name} cannot be constructed directly\"); }}\n"
+                    ));
+                }
+            }
+            for (method, target) in cls.methods {
+                out.push_str(&format!(
+                    "  {method}(...a) {{ if (this._ptr === null) throw new Error(\"{class_name} was already freed\"); return {target}(this._ptr, ...a); }}\n"
+                ));
+            }
+            for (method, target) in cls.consuming_methods {
+                out.push_str(&format!(
+                    "  {method}(...a) {{ if (this._ptr === null) throw new Error(\"{class_name} was already freed\"); const p = this._ptr; this._ptr = null; return {target}(p, ...a); }}\n"
+                ));
+            }
+            for (method, target) in cls.static_ctors {
+                out.push_str(&format!(
+                    "  static {method}(...a) {{ return {class_name}._fromPtr({target}(...a)); }}\n"
+                ));
+            }
+            for (method, target) in cls.static_methods {
+                out.push_str(&format!(
+                    "  static {method}(...a) {{ return {target}(...a); }}\n"
+                ));
+            }
+            if let Some(drop_fn) = cls.drop_fn {
+                out.push_str(&format!(
+                    "  free() {{ if (this._ptr !== null) {{ const p = this._ptr; this._ptr = null; {drop_fn}(p); }} }}\n"
+                ));
+            }
+            out.push_str("}\n");
+            if cls.drop_fn.is_some() {
+                out.push_str(&format!(
+                    "if (typeof Symbol !== \"undefined\" && Symbol.dispose) {class_name}.prototype[Symbol.dispose] = {class_name}.prototype.free;\n"
+                ));
+            }
+            if opts.modules != Modules::Esm {
+                out.push_str(&format!(
+                    "if (typeof globalThis !== \"undefined\") globalThis.{class_name} = {class_name};\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The trailing `export { .. };` naming the items the module exposes. Empty in script mode.
 ///
 /// One clause at the end rather than an `export` keyword on each declaration, for the same reason
@@ -1350,20 +1533,25 @@ fn export_clause(
     if opts.modules != Modules::Esm {
         return String::new();
     }
-    let mut names: BTreeSet<&str> = unit
-        .items
-        .iter()
-        .filter(|item| item.linkage.exported)
-        .map(|item| item.name.as_str())
-        .collect();
-    names.extend(unit.exports.iter().copied());
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for item in &unit.items {
+        if !item.linkage.exported {
+            continue;
+        }
+        if let Some((class_name, _)) = rcgjs_object::dts::parse_class_export(export_name_of(item)) {
+            names.insert(class_name);
+        } else {
+            let exported = item.name.as_str();
+            names.insert(renames.get(exported).map_or(exported, String::as_str));
+        }
+    }
+    for exported in &unit.exports {
+        names.insert(renames.get(*exported).map_or(*exported, String::as_str));
+    }
     if names.is_empty() {
         return String::new();
     }
-    let names: Vec<&str> = names
-        .into_iter()
-        .map(|name| renames.get(name).map_or(name, String::as_str))
-        .collect();
+    let names: Vec<&str> = names.into_iter().collect();
     match opts.minify.is_enabled() {
         true => format!("export{{{}}};\n", names.join(",")),
         false => format!("export {{ {} }};\n", names.join(", ")),
@@ -3526,5 +3714,233 @@ mod tests {
             "none mode does not declare an ESM import"
         );
         assert!(rt.external.contains("host_only"));
+    }
+
+    #[test]
+    fn synthesizes_es6_class_in_esm_script_and_minified_modes_and_runs_in_node() {
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jsc-link-class-synth-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let make_exported = |name: &str, js: &str| {
+            let mut item = duplicate(name, js, Some(1), Some(1));
+            item.linkage = Linkage::exported(name.to_owned());
+            item
+        };
+
+        let drop_log = duplicate("let $drops = 0;\n", "let $drops = 0;\n", Some(1), Some(1));
+        let mut drop_state = drop_log;
+        drop_state.name = JsName::new("$drops".to_owned());
+        drop_state.kind = ItemKind::Static;
+        drop_state.linkage = Linkage {
+            fixed_name: Some("$drops".to_owned()),
+            root: false,
+            exported: false,
+        };
+
+        let cls_drop = make_exported(
+            "__mires_cls$Counter$__drop",
+            "function __mires_cls$Counter$__drop(p) { $drops += 1; p.freed = true; }\n",
+        );
+        let cls_new = make_exported(
+            "__mires_cls$Counter$new",
+            "function __mires_cls$Counter$new(init) { return { v: init, freed: false }; }\n",
+        );
+        let cls_inc = make_exported(
+            "__mires_cls$Counter$increment",
+            "function __mires_cls$Counter$increment(p, by) { p.v += by; return p.v; }\n",
+        );
+        let cls_val = make_exported(
+            "__mires_cls$Counter$value",
+            "function __mires_cls$Counter$value(p) { return p.v; }\n",
+        );
+        let cls_take = make_exported(
+            "__mires_cls$Counter$__take$intoValue",
+            "function __mires_cls$Counter$__take$intoValue(p) { return p.v; }\n",
+        );
+        let cls_from_zero = make_exported(
+            "__mires_cls$Counter$__static_ctor$fromZero",
+            "function __mires_cls$Counter$__static_ctor$fromZero() { return { v: 0, freed: false }; }\n",
+        );
+        let cls_version = make_exported(
+            "__mires_cls$Counter$__static$version",
+            "function __mires_cls$Counter$__static$version() { return \"1.0\"; }\n",
+        );
+        let ro_drop = make_exported(
+            "__mires_cls$ReadOnly$__drop",
+            "function __mires_cls$ReadOnly$__drop(p) { $drops += 1; }\n",
+        );
+        let ro_open = make_exported(
+            "__mires_cls$ReadOnly$__static_ctor$open",
+            "function __mires_cls$ReadOnly$__static_ctor$open(x) { return { x }; }\n",
+        );
+        let ro_get = make_exported(
+            "__mires_cls$ReadOnly$get",
+            "function __mires_cls$ReadOnly$get(p) { return p.x; }\n",
+        );
+        let drops_fn = make_exported("get_drops", "function get_drops() { return $drops; }\n");
+
+        let items = vec![
+            &drop_state,
+            &cls_drop,
+            &cls_new,
+            &cls_inc,
+            &cls_val,
+            &cls_take,
+            &cls_from_zero,
+            &cls_version,
+            &ro_drop,
+            &ro_open,
+            &ro_get,
+            &drops_fn,
+        ];
+
+        // 1. ESM mode
+        let esm_path = dir.join("counter.mjs");
+        let unit_esm = Unit {
+            label: "program".to_owned(),
+            path: Some(esm_path.clone()),
+            items: items.clone(),
+            exports: BTreeSet::new(),
+            entry: None,
+        };
+        let esm_opts = crate::opts::Opts {
+            modules: Modules::Esm,
+            runtime: RuntimeMode::None,
+            ..crate::opts::Opts::default()
+        };
+        let dcx = Sink::new();
+        let printed_esm =
+            print_units_with_opts(&dcx, &esm_opts, &BTreeMap::new(), &[unit_esm], false);
+        assert_eq!(dcx.errors(), 0);
+        let esm_text = &printed_esm[0].text;
+        assert!(esm_text.contains("class Counter {"), "{esm_text}");
+        assert!(esm_text.contains("class ReadOnly {"), "{esm_text}");
+        assert!(
+            esm_text.contains("export { Counter, ReadOnly, get_drops };\n"),
+            "{esm_text}"
+        );
+        assert!(
+            !esm_text.contains("export { __mires_cls$"),
+            "raw class helpers must not be exported:\n{esm_text}"
+        );
+        assert!(
+            !esm_text.contains("#ptr") && !esm_text.contains("??"),
+            "synthesized class must stay ES2018-compatible:\n{esm_text}"
+        );
+        let art = &printed_esm[0].artifacts["counter.mjs"];
+        assert_eq!(
+            art.exports,
+            BTreeSet::from([
+                "Counter".to_owned(),
+                "ReadOnly".to_owned(),
+                "get_drops".to_owned()
+            ])
+        );
+        fs::write(&esm_path, esm_text).expect("write esm file");
+
+        let esm_runner = dir.join("test_esm.mjs");
+        fs::write(
+            &esm_runner,
+            "\
+import assert from 'node:assert';
+import { Counter, ReadOnly, get_drops } from './counter.mjs';
+const c = new Counter(10);
+assert.strictEqual(c.value(), 10);
+assert.strictEqual(c.increment(5), 15);
+assert.strictEqual(c.intoValue(), 15);
+assert.throws(() => c.value(), /Counter was already freed/);
+c.free(); // already consumed -> must not double drop
+assert.strictEqual(get_drops(), 0);
+
+const z = Counter.fromZero();
+assert.ok(z instanceof Counter);
+assert.strictEqual(z.value(), 0);
+assert.strictEqual(Counter.version(), '1.0');
+z.free();
+z.free(); // idempotent
+assert.strictEqual(get_drops(), 1);
+assert.throws(() => z.increment(1), /Counter was already freed/);
+
+assert.throws(() => new ReadOnly(), /ReadOnly cannot be constructed directly/);
+const ro = ReadOnly.open(99);
+assert.ok(ro instanceof ReadOnly);
+assert.strictEqual(ro.get(), 99);
+ro.free();
+assert.strictEqual(get_drops(), 2);
+",
+        )
+        .expect("write esm runner");
+
+        let out = Command::new("node")
+            .arg(&esm_runner)
+            .output()
+            .expect("node executable must be available");
+        assert!(
+            out.status.success(),
+            "node ESM test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+
+        // 2. Script + minified mode
+        let script_unit = Unit {
+            label: "program".to_owned(),
+            path: None,
+            items,
+            exports: BTreeSet::new(),
+            entry: None,
+        };
+        let script_opts = crate::opts::Opts {
+            modules: Modules::Script,
+            runtime: RuntimeMode::None,
+            minify: rcgjs_object::opts::MinifyMode::All,
+            ..crate::opts::Opts::default()
+        };
+        let dcx_s = Sink::new();
+        let printed_s = print_units_with_opts(
+            &dcx_s,
+            &script_opts,
+            &BTreeMap::new(),
+            &[script_unit],
+            false,
+        );
+        assert_eq!(dcx_s.errors(), 0);
+        let script_text = &printed_s[0].text;
+        assert!(!script_text.contains("export{"), "{script_text}");
+        assert!(script_text.contains("class Counter{"), "{script_text}");
+        assert!(
+            script_text.contains("globalThis.Counter=Counter;"),
+            "{script_text}"
+        );
+
+        let script_check = format!(
+            "const assert = require('assert');\n{script_text}\n\
+             const c = new globalThis.Counter(3);\n\
+             assert.strictEqual(c.increment(4), 7);\n\
+             c.free();\n\
+             assert.throws(() => c.value(), /Counter was already freed/);\n"
+        );
+        let out_s = Command::new("node")
+            .arg("-e")
+            .arg(&script_check)
+            .output()
+            .expect("node executable must be available");
+        assert!(
+            out_s.status.success(),
+            "node Script+Minified test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out_s.stdout),
+            String::from_utf8_lossy(&out_s.stderr),
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

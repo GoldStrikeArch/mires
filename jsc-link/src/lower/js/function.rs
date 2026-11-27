@@ -87,6 +87,9 @@ pub fn lower_with_plans(
     if let Some(lowered) = try_lower_noop_drop_glue(input, func) {
         return Ok(lowered);
     }
+    if input.body.semantic == BodySemantic::JsExportOut {
+        return lower_js_export_out(input, func);
+    }
     if input.body.semantic
         == BodySemantic::Standard(rcgjs_object::jir::semantic::StandardOperation::SliceSort)
     {
@@ -141,6 +144,37 @@ fn try_lower_noop_drop_glue(input: &LowerInput<'_>, func: &Func) -> Option<Lower
         js_alloc_origins: Vec::new(),
         bigints: BTreeSet::new(),
     })
+}
+
+/// Directly lowers an internal `BodySemantic::JsExportOut` helper (`link_section =
+/// "rcgjs.export.out.v1"`) emitted by `#[js_export] async fn`, replacing its dummy MIR body with
+/// Rust→JS return marshaling (and `Result` unwrap/throw) before any MIR lowering runs.
+fn lower_js_export_out(input: &LowerInput<'_>, func: &Func) -> Result<LoweredItem, Decline> {
+    let Some(&value_ty) = func.sig.arguments.first() else {
+        return Err(decline(
+            OpClass::Other,
+            "BodySemantic::JsExportOut function must take one argument",
+        ));
+    };
+    let default_heap = crate::analysis::heap::HeapPlan::default();
+    let boundary = super::export_boundary::BoundaryCx {
+        table: input.table,
+        interns: input.interns,
+        heap: input.heap.unwrap_or(&default_heap),
+        bstr: crate::lower::bstr::enabled_for(input.opts),
+    };
+    let param = "$p0".to_owned();
+    let body = super::export_boundary::lower_export_out_body(&boundary, &param, value_ty);
+    let decl = jsast::function(input.name.as_str(), vec![param], body);
+    finish(
+        input,
+        decl,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        input.bigints,
+        &HashSet::new(),
+    )
 }
 
 fn build_js_cx<'a>(

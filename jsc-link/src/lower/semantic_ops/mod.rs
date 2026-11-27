@@ -584,9 +584,10 @@ pub fn support_of(
                 _ => Err(SemanticDecline::NotAStandardOperation),
             }
         }
-        BodySemantic::Ordinary | BodySemantic::PanicImpl | BodySemantic::JsExport => {
-            Err(SemanticDecline::NotAStandardOperation)
-        }
+        BodySemantic::Ordinary
+        | BodySemantic::PanicImpl
+        | BodySemantic::JsExport
+        | BodySemantic::JsExportOut => Err(SemanticDecline::NotAStandardOperation),
     }
 }
 

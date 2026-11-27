@@ -32,17 +32,28 @@ pub mod prelude;
 pub use error::JsError;
 pub use js_macro::js;
 pub use mires_js::{
-    abort, await_promise, callback0, callback1, callback2, callback3, callback4, collections,
-    construct, future_to_promise, invoke, js_bindings, js_export, js_extern, spawn_local,
-    throw_value, try_host, web, yield_task, HostValue, JsArray, JsString, JsUint8Array, JsValue,
-    Promise, PromiseFuture, YieldTask,
+    abort, await_promise, callback0, callback1, callback2, callback3, callback4, class_handle,
+    collections, construct, future_to_promise, invoke, js_bindings, js_export, js_extern,
+    spawn_local, throw_value, try_host, web, yield_task, HostValue, JsArray, JsBTreeMapEntries,
+    JsMapEntries, JsString, JsUint8Array, JsValue, Promise, PromiseFuture, TypedPromise, YieldTask,
 };
+
+/// Internal runtime support items referenced by `#[js_export]` macro expansions.
+#[doc(hidden)]
+pub use mires_js::__export;
+
+#[cfg(test)]
+extern crate self as mires;
 
 #[cfg(test)]
 mod tests {
+    use alloc::collections::BTreeMap;
     use alloc::format;
     use alloc::string::String;
     use core::fmt::Write as _;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
 
     use crate::prelude::*;
 
@@ -91,6 +102,80 @@ mod tests {
             return Err("division by zero".into());
         }
         Ok(a / b)
+    }
+
+    #[js_export(name = "asyncGreet")]
+    async fn async_greet(name: &str) -> Result<String, JsError> {
+        if name.is_empty() {
+            return Err(JsError::new("empty name"));
+        }
+        Ok(format!("hello async, {name}!"))
+    }
+
+    #[js_export]
+    async fn async_unit_ping() {}
+
+    #[js_export(name = "sumBTreeScores")]
+    fn sum_btree_scores(scores: BTreeMap<String, i32>, bonus: i32) -> i32 {
+        scores.values().copied().sum::<i32>() + bonus
+    }
+
+    #[js_export(name = "sumHostMap")]
+    fn sum_host_map(scores: crate::collections::HashMap<String, i32>) -> i32 {
+        scores.iter().map(|(_, v)| *v).sum()
+    }
+
+    #[js_export]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Counter {
+        value: i32,
+        label: String,
+    }
+
+    #[js_export]
+    impl Counter {
+        pub fn new(start: i32, label: &str) -> Self {
+            Self {
+                value: start,
+                label: String::from(label),
+            }
+        }
+
+        pub fn try_positive(start: i32) -> Result<Self, JsError> {
+            if start < 0 {
+                return Err(JsError::new("negative start"));
+            }
+            Ok(Self::new(start, "positive"))
+        }
+
+        #[js_export(name = "getValue")]
+        pub fn value(&self) -> i32 {
+            self.value
+        }
+
+        pub fn add(&mut self, delta: i32) -> i32 {
+            self.value += delta;
+            self.value
+        }
+
+        pub fn add_all(&mut self, deltas: BTreeMap<String, i32>) -> i32 {
+            for delta in deltas.values() {
+                self.value += *delta;
+            }
+            self.value
+        }
+
+        pub fn into_summary(self) -> String {
+            format!("{}: {}", self.label, self.value)
+        }
+
+        pub fn default_step() -> i32 {
+            1
+        }
+
+        fn helper_double(&self) -> i32 {
+            self.value * 2
+        }
     }
 
     // Two separate modules exporting identical symbol names verify that native host `cargo test`
@@ -209,5 +294,91 @@ mod tests {
     )]
     fn js_extern_panics_cleanly_when_called_on_host() {
         let _ = host_only_min(1.0, 2.0);
+    }
+
+    fn poll_ready<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => val,
+            Poll::Pending => panic!("expected test future to resolve immediately"),
+        }
+    }
+
+    #[test]
+    fn js_export_v3_async_map_and_class_run_natively_on_host() {
+        assert_eq!(
+            poll_ready(async_greet("mires")),
+            Ok(String::from("hello async, mires!"))
+        );
+        assert_eq!(poll_ready(async_greet("")), Err(JsError::new("empty name")));
+        poll_ready(async_unit_ping());
+
+        let mut scores = BTreeMap::new();
+        scores.insert(String::from("alice"), 10);
+        scores.insert(String::from("bob"), 25);
+        assert_eq!(sum_btree_scores(scores, 5), 40);
+
+        let mut counter = Counter::new(10, "hits");
+        assert_eq!(counter.value(), 10);
+        assert_eq!(counter.helper_double(), 20);
+        assert_eq!(counter.add(5), 15);
+        let mut deltas = BTreeMap::new();
+        deltas.insert(String::from("bonus"), 7);
+        assert_eq!(counter.add_all(deltas), 22);
+        assert_eq!(Counter::default_step(), 1);
+        assert_eq!(counter.into_summary(), "hits: 22");
+
+        assert!(Counter::try_positive(-1).is_err());
+        assert_eq!(Counter::try_positive(3).unwrap().value(), 3);
+
+        // Keep `sum_host_map` referenced as a type-checked function item on host.
+        let _check_fn: fn(crate::collections::HashMap<String, i32>) -> i32 = sum_host_map;
+
+        let mut safe_box = forbid_unsafe_v3::SafeBox::new(42);
+        assert_eq!(safe_box.get(), 42);
+        safe_box.set(99);
+        assert_eq!(safe_box.take(), 99);
+        assert_eq!(
+            poll_ready(forbid_unsafe_v3::forbid_unsafe_async("hi", BTreeMap::new())),
+            2
+        );
+    }
+
+    #[forbid(unsafe_code)]
+    mod forbid_unsafe_v3 {
+        use alloc::collections::BTreeMap;
+        use alloc::string::String;
+
+        use crate::js_export;
+
+        #[js_export]
+        pub struct SafeBox {
+            inner: i32,
+        }
+
+        #[js_export]
+        impl SafeBox {
+            pub fn new(inner: i32) -> Self {
+                Self { inner }
+            }
+
+            pub fn get(&self) -> i32 {
+                self.inner
+            }
+
+            pub fn set(&mut self, next: i32) {
+                self.inner = next;
+            }
+
+            pub fn take(self) -> i32 {
+                self.inner
+            }
+        }
+
+        #[js_export(name = "forbidUnsafeAsync")]
+        pub async fn forbid_unsafe_async(msg: &str, tags: BTreeMap<String, u32>) -> usize {
+            msg.len() + tags.len()
+        }
     }
 }

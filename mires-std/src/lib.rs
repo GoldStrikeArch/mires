@@ -8,12 +8,15 @@
 #![no_std]
 #![allow(internal_features)]
 #![feature(
+    alloc_error_handler,
+    const_eval_select,
+    core_intrinsics,
+    custom_test_frameworks,
     lang_items,
     never_type,
-    rustc_attrs,
-    core_intrinsics,
     panic_internals,
-    const_eval_select
+    rustc_attrs,
+    test
 )]
 // Allow unused items across std APIs that exist for compatibility with upstream `std`.
 #![allow(dead_code)]
@@ -28,6 +31,7 @@ mod num_float;
 mod panicking;
 mod sys;
 
+pub mod backtrace;
 pub mod collections;
 pub mod env;
 pub mod ffi;
