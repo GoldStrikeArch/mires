@@ -2,6 +2,7 @@
 name = "rcgjs-object"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "The rustc-free JIR-S schema shared by the rustc_codegen_js producer and the jsc-link consumer"
 
 [lib]

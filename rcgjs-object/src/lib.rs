@@ -31,8 +31,8 @@
 //! Beyond the schema, this crate holds every module of the compiler that never needed rustc: the
 //! JavaScript AST and its printer ([`jsast`]), the minifier ([`minify`]), the item-local AST passes
 //! ([`optimizer`], [`sroa`]), the object file's item model and reader/writer ([`item`]), the source
-//! map builder ([`sourcemap`]), the `.d.ts` writer ([`dts`]), the frozen v1 late IR schema
-//! ([`late_ir`]) and the parsed `-Cllvm-args` options ([`opts`]). That is what makes `jsc-link` —
+//! map builder ([`sourcemap`]), the `.d.ts` writer ([`dts`]), and the parsed `-Cllvm-args` options
+//! ([`opts`]). That is what makes `jsc-link` —
 //! the consumer that turns a set of objects into a finished program — a plain cargo crate with a
 //! plain `cargo test`, and it is why this crate, not the backend, is the shared contract.
 //!

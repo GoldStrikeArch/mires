@@ -38,7 +38,7 @@ pub struct Analysis {
 ///
 /// JIR structuring can expose a product one layer at a time: splitting an iterator wrapper makes
 /// its inner iterator a new local aggregate. The sysroot producer deliberately keeps the
-/// historical one-round policy in [`analyze`]; the linker may peel up to eight layers and may
+/// historical one-round policy; the linker may peel up to eight layers and may
 /// forward compiler-local aliases whose source value is never replaced.
 pub fn analyze_jir(decl: Stmt, mode: OptimizerMode) -> Analysis {
     if mode == OptimizerMode::Off

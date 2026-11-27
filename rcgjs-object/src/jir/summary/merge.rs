@@ -36,7 +36,7 @@ pub enum MergeDecision {
     Available(Side),
     /// Both sides carry a body and the normal forms differ. Keep `keep`'s body, whose hash is
     /// `chosen`, and drop the other, whose hash is `rejected`; record `decline` against the item.
-    /// See [`choose_body`]: the choice depends only on the two summaries, so the outcome does not
+    /// See `choose_body`: the choice depends only on the two summaries, so the outcome does not
     /// depend on the order objects were read in.
     Choose {
         keep: Side,
@@ -116,7 +116,7 @@ pub fn merge_duplicates(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {
 /// surviving item.
 ///
 /// So this is [`merge_duplicates`] without the identity check: never an error, never a loss of
-/// availability, and the deterministic [`choose_body`] pick recorded as
+/// availability, and the deterministic `choose_body` pick recorded as
 /// [`MergeDecline::BodyChoice`] when the bodies differ. v1 instead declined the winner's late-IR
 /// availability outright, which is where all 74 of its `DUPLICATE_CONFLICT`s came from.
 pub fn merge_aliases(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {

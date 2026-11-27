@@ -25,7 +25,7 @@
 //! a block parameter does not duplicate it.
 //!
 //! The lowerer is what maps this onto JavaScript object identity (`Carrier::Baseline`), and the
-//! two interpreters in [`super::interp`] are what check that a lowering from JIR-S preserved the
+//! two interpreters in `jir::interp` (behind the `interp` feature) are what check that a lowering from JIR-S preserved the
 //! meaning: they evaluate a JIR-S `Body` and a JIR-R `Func` on one abstract heap and compare
 //! results and traces.
 //!

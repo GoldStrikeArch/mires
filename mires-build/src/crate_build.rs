@@ -810,6 +810,11 @@ mod tests {
         let target_dir = builder.resolved_target_dir(out_dir);
         assert_eq!(target_dir, out_dir.join("mires-target"));
 
+        let expected_manifest = Path::new("../client")
+            .join("Cargo.toml")
+            .display()
+            .to_string();
+        let expected_target = out_dir.join("mires-target").display().to_string();
         let args = strings(&builder.build_args(
             out_dir,
             &target_dir,
@@ -821,7 +826,7 @@ mod tests {
             [
                 "build",
                 "--manifest-path",
-                "../client/Cargo.toml",
+                expected_manifest.as_str(),
                 "--profile",
                 "dev",
                 "--format",
@@ -833,7 +838,7 @@ mod tests {
                 "--out-dir",
                 "/tmp/host/target/debug/build/host-123/out",
                 "--target-dir",
-                "/tmp/host/target/debug/build/host-123/out/mires-target",
+                expected_target.as_str(),
                 "--mires-root",
                 "/opt/mires",
             ]
@@ -1145,11 +1150,15 @@ mod tests {
         )));
         assert!(directives.contains(&format!(
             "cargo:rerun-if-changed={}",
-            dir.path().join("src/lib.rs").display()
+            dir.path().join("src").join("lib.rs").display()
         )));
         assert!(directives.contains(&format!(
             "cargo:rerun-if-changed={}",
-            dir.path().join("src/nested/mod.rs").display()
+            dir.path()
+                .join("src")
+                .join("nested")
+                .join("mod.rs")
+                .display()
         )));
         assert!(!directives.iter().any(|line| line.contains("notes.txt")));
 

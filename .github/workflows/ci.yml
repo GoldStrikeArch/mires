@@ -3,7 +3,72 @@ on: [push, pull_request]
 concurrency:
   group: mires-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
+  lint-and-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint-and-docs
+      - run: rustc --version --verbose
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check Clippy lints
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p mires-build --all-features --all-targets -- -D warnings
+          cargo clippy -p rcgjs-object --features interp --all-targets -- -D warnings
+      - name: Check rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --workspace --no-deps
+          cargo doc -p mires-build --all-features --no-deps
+          cargo doc -p rcgjs-object --features interp --no-deps
+      - name: Check publishable crate package lists
+        run: |
+          for pkg in mires-marker-abi js-macro js-extern-macro mires-js mires mires-build cargo-mires; do
+            cargo package --list -p "$pkg" >/dev/null
+          done
+      - name: Lint shell scripts
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/ergonomics-e2e.sh
+          shellcheck scripts/install.sh scripts/ergonomics-e2e.sh
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          command: check all
+
+  cross-platform-cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cli-${{ matrix.os }}
+      - run: rustc --version --verbose
+      - name: Test cargo-mires and mires-build
+        run: cargo test --locked -p cargo-mires -p mires-build
+
   compiler:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -14,11 +79,9 @@ jobs:
           node-version: 24
           cache: npm
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compiler
       - run: rustc --version --verbose
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p mires-build --all-features --all-targets -- -D warnings
-      - run: cargo clippy -p rcgjs-object --features interp --all-targets -- -D warnings
       - run: npm ci --ignore-scripts
       - run: bash scripts/build.sh --locked
       - run: cargo build --release --locked -p cargo-mires

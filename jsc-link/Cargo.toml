@@ -2,6 +2,7 @@
 name = "jsc-link"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "The rustc-free consumer: objects in, finished JavaScript program out"
 
 [lib]

@@ -477,7 +477,7 @@ impl SlotFacts {
 pub enum DecodeErrorKind {
     /// Fewer than the expected number of `.`-delimited fields.
     TooFewFields,
-    /// The version field is not in [`READS`].
+    /// The version field is not a supported descriptor version.
     UnsupportedVersion(String),
     /// The kind field does not start with a known [`Shape`] letter.
     InvalidShape(String),
