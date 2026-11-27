@@ -8,6 +8,7 @@ mod npm;
 mod patch;
 mod sysroot;
 mod sysroot_build;
+mod test_cmd;
 mod toolchain;
 mod watch;
 mod wrapper;
@@ -18,8 +19,12 @@ use std::process::ExitCode;
 use cli::Command;
 
 fn main() -> ExitCode {
-    // Single-binary dual role: when Cargo invokes us as `RUSTC_WRAPPER`, bypass CLI parsing
-    // immediately and forward/rewrite the `rustc` invocation cleanly.
+    // Dual/triple role binary:
+    // 1. Link wrapper (`JSC_LINK_BIN`) for `cargo mires test` binaries to root & export `main()`.
+    if env::var_os(wrapper::ENV_LINK_WRAPPER).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return wrapper::run_link_wrapper();
+    }
+    // 2. `RUSTC_WRAPPER` invoked by Cargo during `build`, `check`, and `test`.
     if env::var_os(wrapper::ENV_WRAPPER_ACTIVE).as_deref() == Some(std::ffi::OsStr::new("1")) {
         return wrapper::run();
     }
@@ -44,6 +49,7 @@ fn main() -> ExitCode {
         }
         Command::Build(opts) => build::run_build(&opts),
         Command::Check(opts) => build::run_check(&opts),
+        Command::Test(opts) => test_cmd::run_test(&opts),
         Command::Watch(opts) => watch::run(&opts),
         Command::Sysroot(opts) => sysroot::run_sysroot_cmd(&opts),
         Command::Setup(opts) => toolchain::run_setup_cmd(&opts),

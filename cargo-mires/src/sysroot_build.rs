@@ -201,7 +201,8 @@ pub fn compute_sysroot_key(input: &SysrootKeyInput<'_>) -> Result<String, String
 
     let backend_hash = sha256_file(input.dylib_path)?;
     let patches_hash = patches_digest(&input.sources_root.join("patches"))?;
-    let mires_std_hash = mires_std_digest(input.sources_root)?;
+    let mires_std_hash = mires_crate_digest(input.sources_root, "mires-std")?;
+    let mires_test_hash = mires_crate_digest(input.sources_root, "mires-test")?;
     let rustc_identity = query_rustc_identity(input.channel)?;
     let target = input.panic.target_name();
     let rust_opt = input.rust_opt_level.unwrap_or("default");
@@ -212,6 +213,7 @@ pub fn compute_sysroot_key(input: &SysrootKeyInput<'_>) -> Result<String, String
     let _ = writeln!(material, "backend={backend_hash}");
     let _ = writeln!(material, "patches={patches_hash}");
     let _ = writeln!(material, "mires-std={mires_std_hash}");
+    let _ = writeln!(material, "mires-test={mires_test_hash}");
     let _ = writeln!(material, "channel={}", input.channel);
     let _ = writeln!(material, "rustc={rustc_identity}");
     let _ = writeln!(material, "target={target}");
@@ -231,7 +233,7 @@ pub fn compute_sysroot_key(input: &SysrootKeyInput<'_>) -> Result<String, String
 }
 
 /// Check whether a sysroot directory has all expected core libraries (`core`,
-/// `compiler_builtins`, `alloc`, and `std` when present).
+/// `compiler_builtins`, `alloc`, `std`, and `test`).
 pub fn sysroot_has_core_libs(sysroot: &Path, target_name: &str) -> bool {
     let lib_dir = sysroot
         .join("lib")
@@ -245,6 +247,7 @@ pub fn sysroot_has_core_libs(sysroot: &Path, target_name: &str) -> bool {
     let mut has_builtins = false;
     let mut has_alloc = false;
     let mut has_std = false;
+    let mut has_test = false;
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -262,10 +265,12 @@ pub fn sysroot_has_core_libs(sysroot: &Path, target_name: &str) -> bool {
             has_alloc = true;
         } else if name.starts_with("libstd-") {
             has_std = true;
+        } else if name.starts_with("libtest-") {
+            has_test = true;
         }
     }
 
-    has_core && has_builtins && has_alloc && has_std
+    has_core && has_builtins && has_alloc && has_std && has_test
 }
 
 /// Check whether a keyed sysroot directory is complete and matches its metadata stamps.
@@ -592,9 +597,26 @@ fn stage_and_install_sysroot(
 
     let mires_std_lib_rs = req.sources_root.join("mires-std/src/lib.rs");
     if mires_std_lib_rs.is_file() {
-        compile_mires_std(
+        compile_mires_sysroot_crate(
             req,
+            "std",
+            "mires-std",
             &mires_std_lib_rs,
+            &install_dir,
+            &install_lib,
+            target_arg,
+            normalized_args,
+            key,
+        )?;
+    }
+
+    let mires_test_lib_rs = req.sources_root.join("mires-test/src/lib.rs");
+    if mires_test_lib_rs.is_file() {
+        compile_mires_sysroot_crate(
+            req,
+            "test",
+            "mires-test",
+            &mires_test_lib_rs,
             &install_dir,
             &install_lib,
             target_arg,
@@ -625,8 +647,14 @@ fn stage_and_install_sysroot(
     Ok(sysroot_dir.to_path_buf())
 }
 
-fn compile_mires_std(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal sysroot crate compiler passes explicit target/sysroot staging paths"
+)]
+fn compile_mires_sysroot_crate(
     req: &SysrootBuildRequest<'_>,
+    crate_name: &str,
+    package_label: &str,
     lib_rs: &Path,
     install_dir: &Path,
     install_lib: &Path,
@@ -635,9 +663,9 @@ fn compile_mires_std(
     key: &str,
 ) -> Result<(), String> {
     if req.verbose {
-        eprintln!("cargo-mires: building sysroot crate `std` (mires-std)...");
+        eprintln!("cargo-mires: building sysroot crate `{crate_name}` ({package_label})...");
     }
-    let std_hash = &key[..16.min(key.len())];
+    let hash = &key[..16.min(key.len())];
     let opt_level = req.rust_opt_level.filter(|s| !s.is_empty()).unwrap_or("3");
     let mut remap = req.sources_root.to_string_lossy().into_owned();
     if !remap.ends_with(std::path::MAIN_SEPARATOR) {
@@ -647,7 +675,7 @@ fn compile_mires_std(
     let mut cmd = Command::new("rustc");
     cmd.arg(format!("+{}", req.channel))
         .arg("--crate-name")
-        .arg("std")
+        .arg(crate_name)
         .arg("--crate-type")
         .arg("rlib")
         .arg("--edition")
@@ -667,8 +695,8 @@ fn compile_mires_std(
         .arg("-Cdebug-assertions=off")
         .arg("-Cdebuginfo=0")
         .arg(format!("-Copt-level={opt_level}"))
-        .arg(format!("-Cmetadata=mires_std_{std_hash}"))
-        .arg(format!("-Cextra-filename=-{std_hash}"))
+        .arg(format!("-Cmetadata=mires_{crate_name}_{hash}"))
+        .arg(format!("-Cextra-filename=-{hash}"))
         .arg("--remap-path-prefix")
         .arg(format!("{remap}="))
         .arg(format!("-Cllvm-args=js-producer={}", req.dylib_sha256));
@@ -685,15 +713,15 @@ fn compile_mires_std(
 
     let status = cmd
         .status()
-        .map_err(|err| format!("failed to run `rustc` for `mires-std`: {err}"))?;
+        .map_err(|err| format!("failed to run `rustc` for `{package_label}`: {err}"))?;
     if !status.success() {
-        return Err(format!("building `mires-std` failed with {status}"));
+        return Err(format!("building `{package_label}` failed with {status}"));
     }
 
-    let expected_rlib = install_lib.join(format!("libstd-{std_hash}.rlib"));
+    let expected_rlib = install_lib.join(format!("lib{crate_name}-{hash}.rlib"));
     if !expected_rlib.is_file() {
         return Err(format!(
-            "expected `{}` after building `mires-std`",
+            "expected `{}` after building `{package_label}`",
             expected_rlib.display()
         ));
     }
@@ -912,8 +940,8 @@ fn patches_digest(dir: &Path) -> Result<String, String> {
     Ok(sha256_bytes(material.as_bytes()))
 }
 
-fn mires_std_digest(sources_root: &Path) -> Result<String, String> {
-    let dir = sources_root.join("mires-std");
+fn mires_crate_digest(sources_root: &Path, dir_name: &str) -> Result<String, String> {
+    let dir = sources_root.join(dir_name);
     let mut material = String::new();
     let mut found = false;
 

@@ -1,0 +1,71 @@
+name: differential-oracle
+
+on:
+  schedule:
+    # Daily continuous differential oracle at 06:00 UTC.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Oracle tier to execute"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full
+          - fast
+
+concurrency:
+  group: mires-oracle-${{ github.ref }}-${{ inputs.tier || 'full' }}
+  cancel-in-progress: true
+
+jobs:
+  oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mires-oracle
+
+      - name: Print toolchain versions
+        run: |
+          rustc --version --verbose
+          node --version
+
+      - name: Build Mires compiler backend and cargo-mires
+        run: |
+          unset CARGO_INCREMENTAL
+          bash scripts/build.sh --locked
+          cargo build --release --locked -p cargo-mires
+
+      - name: Run continuous differential oracle
+        run: |
+          unset CARGO_INCREMENTAL
+          node oracle/run-oracle.mjs --tier "${{ inputs.tier || 'full' }}"
+
+      - name: Publish scorecard to job summary
+        if: always()
+        run: |
+          if [ -f build/oracle/scorecard.md ]; then
+            cat build/oracle/scorecard.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload oracle scorecard and JSON receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mires-oracle-${{ inputs.tier || 'full' }}
+          path: |
+            build/oracle/scorecard.md
+            build/oracle/receipt.json
+          if-no-files-found: warn
+          retention-days: 30

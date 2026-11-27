@@ -411,6 +411,44 @@ if [ -f "$root/mires-std/src/lib.rs" ]; then
 	fi
 fi
 
+# Build the lightweight `mires-test` sysroot crate as `test` (`libtest`) against
+# `core`, `compiler_builtins`, `alloc`, and `std` so `rustc --test` works natively.
+if [ -f "$root/mires-test/src/lib.rs" ]; then
+	echo "==> building test (mires-test)"
+	test_hash=$(printf '%s' "$key" | cut -c1-16)
+	test_backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
+	if [ -n "${JS_EXTRA_ARGS:-}" ]; then
+		for arg in $JS_EXTRA_ARGS; do
+			test_backend_args+=(-Cllvm-args="$arg")
+		done
+	fi
+	rustc "+$channel" \
+		--crate-name test \
+		--crate-type rlib \
+		--edition 2024 \
+		--target "$jsc_target" \
+		${jsc_unstable_args[@]+"${jsc_unstable_args[@]}"} \
+		--sysroot "$install" \
+		-Zcodegen-backend="$dylib" \
+		-Zinline-mir \
+		"$jsc_panic_flag" \
+		-Ccodegen-units=1 \
+		-Coverflow-checks=off \
+		-Cdebug-assertions=off \
+		-Cdebuginfo=0 \
+		-Copt-level="${JSC_RUST_OPT_LEVEL:-3}" \
+		-Cmetadata="mires_test_$test_hash" \
+		-Cextra-filename="-$test_hash" \
+		--remap-path-prefix "$root/=" \
+		"${test_backend_args[@]}" \
+		--out-dir "$install_lib" \
+		"$root/mires-test/src/lib.rs"
+	if [ ! -f "$install_lib/libtest-$test_hash.rlib" ]; then
+		echo "build_sysroot.sh: expected libtest-$test_hash.rlib in $install_lib" >&2
+		exit 1
+	fi
+fi
+
 elapsed=$(($(date +%s) - start))
 
 # The backend options this sysroot was built with, for scripts/test.sh to compare

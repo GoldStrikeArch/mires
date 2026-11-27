@@ -80,6 +80,16 @@ patch_b=$(JS_EXTRA_ARGS='js-opt=report js-minify=on' key)
 printf 'patch-a' >"$work/root/patches/0001.patch"
 
 printf 'backend-a' >"$work/root/target/release/backend"
+mkdir -p "$work/root/mires-test/src"
+printf '[package]\nname = "mires-test"\n' >"$work/root/mires-test/Cargo.toml"
+printf 'pub fn a() {}\n' >"$work/root/mires-test/src/lib.rs"
+mires_test_a=$(JS_EXTRA_ARGS='js-opt=report js-minify=on' key)
+[ "$mires_test_a" != "$first" ]
+printf 'pub fn b() {}\n' >"$work/root/mires-test/src/lib.rs"
+mires_test_b=$(JS_EXTRA_ARGS='js-opt=report js-minify=on' key)
+[ "$mires_test_b" != "$mires_test_a" ]
+rm -rf "$work/root/mires-test"
+[ "$(JS_EXTRA_ARGS='js-opt=report js-minify=on' key)" = "$first" ]
 rustc_b=$(FAKE_RUSTC_COMMIT=bbb JS_EXTRA_ARGS='js-opt=report js-minify=on' key)
 [ "$rustc_b" != "$first" ]
 
