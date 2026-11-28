@@ -2,8 +2,9 @@
 //! helpers answer the way v1's `value.rs` did.
 
 use super::interns::Interns;
-use super::origin::{Origin, OriginId, OriginKind, OriginTable, SourceFact};
+use super::origin::{Origin, OriginId, OriginKind, OriginTable, SourceFact, SourceFactId};
 use super::semantic::*;
+use super::summary::NormalizedBody;
 use super::types::*;
 
 fn scalar(id: u128, kind: TypeKind, size: u64) -> TypeDescriptor {
@@ -753,6 +754,141 @@ fn interns_dedup_and_keep_ids_stable() {
     let id = interns.intern_sig(sig.clone());
     assert_eq!(interns.intern_sig(sig.clone()), id);
     assert_eq!(interns.sig(id), Some(&sig));
+}
+
+#[test]
+fn schema_v25_track_caller_sentinels_and_dyn_upcast_verify_and_normalize() {
+    assert_eq!(super::JIR_SCHEMA, 25);
+    assert!(SourceFactId::FORWARD.is_sentinel());
+    assert!(SourceFactId::FORWARD.is_forward());
+    assert!(!SourceFactId::FORWARD.is_not_tracked());
+    assert!(SourceFactId::NOT_TRACKED.is_sentinel());
+    assert!(SourceFactId::NOT_TRACKED.is_not_tracked());
+    assert!(!SourceFactId::NOT_TRACKED.is_forward());
+    assert!(!SourceFactId(0).is_sentinel());
+
+    let mut interns = build_interns();
+    let callee_name = interns.intern_str("callee$h1");
+    let def_id = |local_hash| DefinitionId {
+        crate_id: 1,
+        local_hash,
+    };
+    let body = Body {
+        item: ItemId {
+            definition: def_id(90),
+            instantiation: 0,
+        },
+        kind: BodyKind::Function,
+        semantic: BodySemantic::Ordinary,
+        signature: Signature {
+            arguments: vec![I32],
+            result: I32,
+            abi: AbiSignature {
+                parameters: 2,
+                caller_location: true,
+                ..AbiSignature::default()
+            },
+        },
+        locals: vec![
+            Local {
+                id: LocalId(0),
+                role: LocalRole::Return,
+                ty: I32,
+            },
+            Local {
+                id: LocalId(1),
+                role: LocalRole::Argument,
+                ty: I32,
+            },
+        ],
+        blocks: vec![
+            BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: vec![Statement {
+                    kind: StatementKind::Assign {
+                        destination: place(0, I32),
+                        value: Rvalue::Cast {
+                            kind: CastKind::DynUpcast { slot: Some(4) },
+                            value: Operand {
+                                ty: I32,
+                                kind: OperandKind::Copy(place(1, I32)),
+                            },
+                            result: I32,
+                        },
+                    },
+                }],
+                terminator: Terminator::Call(Call {
+                    function: Operand {
+                        ty: UNIT,
+                        kind: OperandKind::Constant(Constant::ZeroSized),
+                    },
+                    callee: Callee::Direct {
+                        item: ItemId {
+                            definition: def_id(91),
+                            instantiation: 0,
+                        },
+                        link_name: callee_name,
+                    },
+                    semantic: CallSemantic::Ordinary,
+                    arguments: vec![constant_i32(1)],
+                    destination: place(0, I32),
+                    target: Some(BlockId(1)),
+                    unwind: Unwind::Continue,
+                    track_caller: Some(SourceFactId::NOT_TRACKED),
+                    host: None,
+                }),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Call(Call {
+                    function: Operand {
+                        ty: UNIT,
+                        kind: OperandKind::Constant(Constant::ZeroSized),
+                    },
+                    callee: Callee::Direct {
+                        item: ItemId {
+                            definition: def_id(92),
+                            instantiation: 0,
+                        },
+                        link_name: callee_name,
+                    },
+                    semantic: CallSemantic::Ordinary,
+                    arguments: vec![constant_i32(2)],
+                    destination: place(0, I32),
+                    target: Some(BlockId(2)),
+                    unwind: Unwind::Continue,
+                    track_caller: Some(SourceFactId::FORWARD),
+                    host: None,
+                }),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Return,
+            },
+        ],
+    };
+
+    body.verify(&interns.types, &interns)
+        .expect("sentinels and DynUpcast verify");
+    let encoded = postcard::to_allocvec(&body).expect("encode v25 body");
+    let decoded: Body = postcard::from_bytes(&encoded).expect("decode v25 body");
+    assert_eq!(decoded, body);
+
+    let normalized = NormalizedBody::of(&body, &interns);
+    assert!(normalized.source_facts.is_empty());
+    match &normalized.body.blocks[0].terminator {
+        Terminator::Call(call) => assert_eq!(call.track_caller, Some(SourceFactId::NOT_TRACKED)),
+        other => panic!("expected call, got {other:?}"),
+    }
+    match &normalized.body.blocks[1].terminator {
+        Terminator::Call(call) => assert_eq!(call.track_caller, Some(SourceFactId::FORWARD)),
+        other => panic!("expected call, got {other:?}"),
+    }
 }
 
 impl Interns {

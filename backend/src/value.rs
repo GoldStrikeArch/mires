@@ -115,6 +115,7 @@ pub(crate) fn transparent_field_indexed<'tcx>(
     let qualifies = def.is_union()
         || def.repr().transparent()
         || def.is_box()
+        || tcx.is_lang_item(def.did(), rustc_hir::LangItem::DynMetadata)
         || layout_identical_newtype(tcx, peeled, *def, field.0, field.1);
     qualifies.then_some(field)
 }

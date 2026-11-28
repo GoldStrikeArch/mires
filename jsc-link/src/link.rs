@@ -391,6 +391,10 @@ fn analyze_reachable_graph(
     if pre_changed {
         (reachable, parents) = reach(dcx, table);
     }
+    let js_export_moved = js_export_facades(table, &mut reachable, lane_run.heap());
+    for (name, body) in &js_export_moved {
+        lane_run.rename(name, body);
+    }
     let facades_changed = if crate::lower::bstr::enabled() {
         let facades = byte_string_facades(dcx, table, &mut reachable);
         for (name, body) in &facades {
@@ -399,13 +403,13 @@ fn analyze_reachable_graph(
         let pre_synth = reachable.len();
         let native_vec_enabled = lane_run.native_vec_enabled();
         crate::lower::bstr::synthesize_converters(table, &mut reachable, native_vec_enabled);
-        !facades.is_empty() || reachable.len() != pre_synth
+        !js_export_moved.is_empty() || !facades.is_empty() || reachable.len() != pre_synth
     } else {
         let facades = track_caller_location_facades(table, &mut reachable);
         for (name, body) in &facades {
             lane_run.rename(name, body);
         }
-        pre_changed || !facades.is_empty()
+        pre_changed || !js_export_moved.is_empty() || !facades.is_empty()
     };
     let mut dedup = crate::profile::time("link.dedup", || {
         crate::link_dedup::merge_duplicates(table, &reachable, &BTreeSet::new(), &mut conflicts)
@@ -726,6 +730,161 @@ fn panic_location_field_keys(
     }
 }
 
+/// Wraps exported `#[js_export]` (`BodySemantic::JsExport`) functions in thin external JavaScript
+/// boundary facades (`name -> name$rs`) whenever their signature needs JS↔Rust marshaling (or
+/// `js-str=bytes` string conversion).
+///
+/// The compiled Rust body stays unmodified under `name$rs`, so Rust-to-Rust callers (recursion,
+/// sibling functions, function pointers, and `cargo mires test` unit tests) pass and receive pure
+/// Rust representations. Identity-only exports emit zero wrapper code.
+fn js_export_facades(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+    heap: &crate::analysis::heap::HeapPlan,
+) -> Vec<(JsName, JsName)> {
+    use crate::jir::semantic::BodySemantic;
+    use crate::lower::bstr;
+    use crate::lower::js::export_boundary::{
+        build_js_export_wrapper, needs_js_export_wrapper, BoundaryCx,
+    };
+
+    let bstr_enabled = bstr::enabled();
+    let mut loc_ctx: Option<(BTreeSet<crate::jir::DefinitionId>, BTreeSet<u64>)> = None;
+    let mut facades = Vec::new();
+    let mut reserved_inners: BTreeSet<JsName> = BTreeSet::new();
+
+    for name in reachable.iter() {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if !item.linkage.exported {
+            continue;
+        }
+        let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
+            continue;
+        };
+        if body.semantic != BodySemantic::JsExport {
+            continue;
+        }
+        let signature = &body.signature;
+        if signature.abi.spread.is_some()
+            || usize::from(signature.abi.parameters)
+                != signature.arguments.len() + usize::from(signature.abi.caller_location)
+        {
+            continue;
+        }
+        let boundary = BoundaryCx {
+            table: &interns.types,
+            interns,
+            heap,
+            bstr: bstr_enabled,
+        };
+        if !needs_js_export_wrapper(&boundary, signature) {
+            continue;
+        }
+        let mut inner = JsName::new(format!("{}$rs", name.as_str()));
+        if table.contains_key(&inner) || reserved_inners.contains(&inner) {
+            let mut suffix = 0u32;
+            loop {
+                let candidate = JsName::new(format!("{}$rs{suffix}", name.as_str()));
+                if !table.contains_key(&candidate) && !reserved_inners.contains(&candidate) {
+                    inner = candidate;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
+        let loc_arg = if signature.abi.caller_location {
+            let (global_loc_defs, core_crate_ids) =
+                loc_ctx.get_or_insert_with(|| collect_panic_location_context(table));
+            let (file_key, file_is_mut_str, line_key, col_key) = panic_location_field_keys(
+                &interns.types,
+                interns,
+                Some(body),
+                global_loc_defs,
+                core_crate_ids,
+            );
+            let loc_param = "a_loc".to_owned();
+            let loc_id = jsast::id(loc_param.clone());
+            let file_member = jsast::member(loc_id.clone(), file_key.clone());
+            let default_file = if bstr_enabled {
+                if file_is_mut_str {
+                    jsast::rt_call("bstr_bytes", vec![bstr::literal("<host>")])
+                } else {
+                    bstr::literal("<host>")
+                }
+            } else if file_is_mut_str {
+                jsast::rt_call("str_bytes", vec![jsast::string("<host>")])
+            } else {
+                jsast::string("<host>")
+            };
+            let default_loc = jsast::object(vec![
+                (file_key.clone(), default_file),
+                (line_key.clone(), jsast::num(0)),
+                (col_key.clone(), jsast::num(1)),
+            ]);
+            let wrapped_loc = if bstr_enabled {
+                if file_is_mut_str {
+                    let converted_file = jsast::rt_call(
+                        "bstr_bytes",
+                        vec![jsast::rt_call("bstr_in", vec![file_member.clone()])],
+                    );
+                    jsast::cond(
+                        jsast::binary(
+                            jsast::BinOp::StrictEq,
+                            jsast::unary(jsast::UnOp::TypeOf, file_member),
+                            jsast::string("string"),
+                        ),
+                        jsast::object(vec![
+                            (file_key, converted_file),
+                            (line_key.clone(), jsast::member(loc_id.clone(), line_key)),
+                            (col_key.clone(), jsast::member(loc_id.clone(), col_key)),
+                        ]),
+                        loc_id.clone(),
+                    )
+                } else {
+                    let loc_spec = jsast::object_of(vec![
+                        ("k", jsast::string("o")),
+                        ("f", jsast::object(vec![(file_key, jsast::string("s"))])),
+                    ]);
+                    jsast::rt_call("bstr_ref_in", vec![loc_id.clone(), loc_spec])
+                }
+            } else if file_is_mut_str {
+                jsast::cond(
+                    jsast::binary(
+                        jsast::BinOp::StrictEq,
+                        jsast::unary(jsast::UnOp::TypeOf, file_member.clone()),
+                        jsast::string("string"),
+                    ),
+                    jsast::object(vec![
+                        (file_key, jsast::rt_call("str_bytes", vec![file_member])),
+                        (line_key.clone(), jsast::member(loc_id.clone(), line_key)),
+                        (col_key.clone(), jsast::member(loc_id.clone(), col_key)),
+                    ]),
+                    loc_id.clone(),
+                )
+            } else {
+                loc_id.clone()
+            };
+            let loc_expr = jsast::cond(
+                jsast::binary(jsast::BinOp::Eq, loc_id, jsast::null()),
+                default_loc,
+                wrapped_loc,
+            );
+            Some((loc_param, loc_expr))
+        } else {
+            None
+        };
+        if let Some(decl) =
+            build_js_export_wrapper(&boundary, name.as_str(), inner.as_str(), signature, loc_arg)
+        {
+            reserved_inners.insert(inner.clone());
+            facades.push((name.clone(), inner, decl));
+        }
+    }
+    install_export_facades(table, reachable, facades, "js_export wrapper")
+}
+
 fn byte_string_facades(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
@@ -989,14 +1148,18 @@ fn install_export_facades(
             })
             .collect();
     }
-    let style = match crate::opts::get().minify.is_enabled() {
+    let minify_enabled = crate::opts::get().minify.is_enabled();
+    let style = match minify_enabled {
         true => jsast::Style::Compact,
         false => jsast::Style::Readable,
     };
-    for (name, inner, decl) in facades {
+    for (name, inner, mut decl) in facades {
         let Some(mut body) = table.remove(&name) else {
             continue;
         };
+        if minify_enabled {
+            crate::minify::shorten_locals_for_measurement(&mut decl);
+        }
         let mut refs: BTreeSet<JsName> = BTreeSet::new();
         refs.insert(inner.clone());
         refs.insert(JsName::new(SHIM_NAMESPACE.to_owned()));

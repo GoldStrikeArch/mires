@@ -310,8 +310,9 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
                         }
                     }
                 }
+                let encoded_kind = self.encode_cast_kind(*kind, value, *result);
                 Rvalue::Cast {
-                    kind: cast_kind(*kind),
+                    kind: encoded_kind,
                     value: self.operand(value)?,
                     result: self.type_id(*result)?,
                 }
@@ -643,6 +644,86 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
         }
     }
 
+    /// Resolves a MIR `CastKind` to JIR-S `CastKind`, recording the exact supertrait vtable slot
+    /// (`CastKind::DynUpcast { slot }`) for `dyn -> dyn` pointer unsizing coercions.
+    fn encode_cast_kind(
+        &self,
+        kind: mir::CastKind,
+        value: &mir::Operand<'tcx>,
+        result: Ty<'tcx>,
+    ) -> CastKind {
+        if let mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _) = kind {
+            let tcx = self.tcx();
+            let from_ty = self.monomorphize(value.ty(&self.mir.local_decls, tcx));
+            let to_ty = self.monomorphize(result);
+            if let Some(slot) = self.dyn_upcast_slot(from_ty, to_ty, 0) {
+                return CastKind::DynUpcast { slot };
+            }
+        }
+        cast_kind(kind)
+    }
+
+    /// Returns `Some(slot)` when an `Unsize` coercion pair performs a `dyn -> dyn` trait-object
+    /// upcast (directly or through transparent wrappers / matching `CoerceUnsized` structs).
+    /// `slot` is `None` for primary-supertrait or auto-trait-only upcasts (identity vtable prefix)
+    /// and `Some(idx)` for non-primary supertraits whose vtable pointer sits at `vtable[idx]`.
+    fn dyn_upcast_slot(
+        &self,
+        from_ty: Ty<'tcx>,
+        to_ty: Ty<'tcx>,
+        depth: u32,
+    ) -> Option<Option<u32>> {
+        if depth >= 16 {
+            return None;
+        }
+        let tcx = self.tcx();
+        let from_ty = crate::value::peel_pattern(from_ty);
+        let to_ty = crate::value::peel_pattern(to_ty);
+        match (from_ty.kind(), to_ty.kind()) {
+            (
+                ty::Ref(_, source, _) | ty::RawPtr(source, _),
+                ty::Ref(_, target, _) | ty::RawPtr(target, _),
+            ) => {
+                let (source_tail, target_tail) =
+                    tcx.struct_lockstep_tails_for_codegen(*source, *target, typing_env());
+                if matches!(source_tail.kind(), ty::Dynamic(..))
+                    && matches!(target_tail.kind(), ty::Dynamic(..))
+                {
+                    if source_tail == target_tail {
+                        return Some(None);
+                    }
+                    let slot = tcx
+                        .supertrait_vtable_slot((source_tail, target_tail))
+                        .map(|idx| idx as u32);
+                    return Some(slot);
+                }
+                None
+            }
+            (ty::Adt(def_a, args_a), ty::Adt(def_b, args_b)) => {
+                if let (Some(from_field), Some(to_field)) = (
+                    crate::value::transparent_field(tcx, from_ty),
+                    crate::value::transparent_field(tcx, to_ty),
+                ) {
+                    return self.dyn_upcast_slot(from_field, to_field, depth + 1);
+                }
+                if def_a == def_b && def_a.is_struct() {
+                    let variant = def_a.non_enum_variant();
+                    for field in &variant.fields {
+                        let field_from =
+                            tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_a));
+                        let field_to =
+                            tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_b));
+                        if field_from != field_to && !crate::value::is_zst(tcx, field_from) {
+                            return self.dyn_upcast_slot(field_from, field_to, depth + 1);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Walks an `Unsize` coercion pair to queue any concrete-to-`dyn` vtable for interning and
     /// record its link name in `extra_refs`.
     fn record_unsize_vtables(&mut self, from_ty: Ty<'tcx>, to_ty: Ty<'tcx>) {
@@ -654,9 +735,6 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
                 ty::Ref(_, source, _) | ty::RawPtr(source, _),
                 ty::Ref(_, target, _) | ty::RawPtr(target, _),
             ) => {
-                if crate::value::unsized_tail(tcx, *target).is_some() {
-                    return;
-                }
                 let (source, target) =
                     tcx.struct_lockstep_tails_for_codegen(*source, *target, typing_env());
                 if !matches!(source.kind(), ty::Dynamic(..)) {

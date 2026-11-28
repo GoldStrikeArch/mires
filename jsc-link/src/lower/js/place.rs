@@ -506,7 +506,9 @@ impl<'a> JsCx<'a> {
                 _ => (None, None),
             };
             let base = self.read_place(&state.current);
-            state.current = self.tail_place(base, key, field_ty, tail, raw_tail)?;
+            let (place, tail_carry) = self.tail_place(base, key, field_ty, tail, raw_tail)?;
+            state.current = place;
+            state.carry = tail_carry;
             state.field_slot = false;
         } else {
             let base = self.read_place(&state.current);
@@ -692,7 +694,9 @@ impl<'a> JsCx<'a> {
         state.carry = carried;
     }
 
-    /// The place a struct's unsized tail is (`place.rs::tail_place`).
+    /// The place a struct's unsized tail is (`place.rs::tail_place`), along with any `DerefCarry`
+    /// the tail's JS representation needs (such as `DerefCarry::Str(StrPlaceKind::FatMut)` for a
+    /// live `str` byte-buffer tail).
     fn tail_place(
         &self,
         record: Expr,
@@ -700,20 +704,110 @@ impl<'a> JsCx<'a> {
         tail_ty: TypeId,
         tail: Option<Expr>,
         raw_tail: Option<Expr>,
-    ) -> Res<JsPlace> {
+    ) -> Res<(JsPlace, DerefCarry)> {
         let Some(tail) = tail else {
             return Err(decline(
                 OpClass::Place,
                 "the unsized tail of a struct projected out of a place that is not behind a { ptr, meta } pointer",
             ));
         };
-        if !matches!(value::kind(self.table, tail_ty), Some(TypeKind::Slice(_))) {
-            return Ok(JsPlace::Var(self.zombie(format!(
-                "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice \
-                 tail is, because only a run of elements can be laid out after the header",
-                self.type_display(tail_ty),
-            ))));
+        let tail_kind = value::kind(self.table, tail_ty);
+        if matches!(tail_kind, Some(TypeKind::Dynamic { .. })) {
+            let key_name = value::key_name(self.interns, key).expect("tail field key");
+            let v_id = jsast::id("$v");
+            let r_id = jsast::id("$r");
+            let m_id = jsast::id("$m");
+            let is_direct = jsast::binary(
+                BinOp::Or,
+                jsast::binary(
+                    BinOp::Or,
+                    jsast::binary(BinOp::StrictEq, v_id.clone(), jsast::null()),
+                    jsast::binary(
+                        BinOp::StrictNe,
+                        jsast::unary(jsast::UnOp::TypeOf, v_id.clone()),
+                        jsast::string("object"),
+                    ),
+                ),
+                jsast::binary(
+                    BinOp::Or,
+                    jsast::binary(
+                        BinOp::And,
+                        jsast::binary(
+                            BinOp::StrictNe,
+                            jsast::member(v_id.clone(), BUF),
+                            jsast::undefined(),
+                        ),
+                        jsast::binary(
+                            BinOp::StrictNe,
+                            jsast::member(v_id.clone(), OFF),
+                            jsast::undefined(),
+                        ),
+                    ),
+                    jsast::binary(
+                        BinOp::And,
+                        jsast::binary(
+                            BinOp::StrictNe,
+                            jsast::member(v_id.clone(), PTR),
+                            jsast::undefined(),
+                        ),
+                        jsast::binary(
+                            BinOp::StrictNe,
+                            jsast::member(v_id.clone(), META),
+                            jsast::undefined(),
+                        ),
+                    ),
+                ),
+            );
+            let data_ptr = jsast::cond(
+                is_direct,
+                ptr::slot(r_id.clone(), jsast::string(key_name.clone())),
+                v_id,
+            );
+            let dyn_expr = if let Some(raw_ptr) = raw_tail {
+                let rp_id = jsast::id("$rp");
+                let slot = jsast::member(rp_id.clone(), PTR);
+                let rec = jsast::index(ptr::slot_buf(slot.clone()), ptr::slot_off(slot));
+                jsast::call(
+                    jsast::arrow_block(
+                        vec!["$rp".to_owned()],
+                        vec![
+                            jsast::const_("$r", rec),
+                            jsast::const_("$v", jsast::member(r_id, key_name)),
+                            jsast::ret(ptr::fat_dyn(data_ptr, jsast::member(rp_id, META))),
+                        ],
+                    ),
+                    vec![raw_ptr],
+                )
+            } else {
+                jsast::call(
+                    jsast::arrow_block(
+                        vec!["$r".to_owned(), "$m".to_owned()],
+                        vec![
+                            jsast::const_("$v", jsast::member(r_id, key_name)),
+                            jsast::ret(ptr::fat_dyn(data_ptr, m_id)),
+                        ],
+                    ),
+                    vec![record, tail],
+                )
+            };
+            return Ok((JsPlace::Deref(dyn_expr), DerefCarry::None));
         }
+        let is_str_tail = matches!(tail_kind, Some(TypeKind::Str));
+        if !is_str_tail && !matches!(tail_kind, Some(TypeKind::Slice(_))) {
+            return Ok((
+                JsPlace::Var(self.zombie(format!(
+                    "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice, \
+                     `str`, or `dyn` tail is supported",
+                    self.type_display(tail_ty),
+                ))),
+                DerefCarry::None,
+            ));
+        }
+        let carry = if is_str_tail {
+            DerefCarry::Str(StrPlaceKind::FatMut)
+        } else {
+            DerefCarry::None
+        };
         let key_name = value::key_name(self.interns, key).expect("tail field key");
         let heap = self.heap();
         if heap.typed_heap_enabled && !heap.raw_alloc_reachable {
@@ -726,25 +820,28 @@ impl<'a> JsCx<'a> {
                     jsast::num(0),
                     jsast::member(rp, ptr::META),
                 );
-                return Ok(JsPlace::Deref(super::ptr::sequenced(setup, slice)));
+                return Ok((JsPlace::Deref(super::ptr::sequenced(setup, slice)), carry));
             }
-            return Ok(JsPlace::Deref(ptr::fat_slice(
-                value::field_expr(self.interns, record, key),
-                jsast::num(0),
-                tail,
-            )));
+            return Ok((
+                JsPlace::Deref(ptr::fat_slice(
+                    value::field_expr(self.interns, record, key),
+                    jsast::num(0),
+                    tail,
+                )),
+                carry,
+            ));
         }
         let key_str = jsast::string(key_name);
         if let Some(raw_ptr) = raw_tail {
-            return Ok(JsPlace::Deref(jsast::rt_call(
-                "tail_slice_raw",
-                vec![raw_ptr, key_str],
-            )));
+            return Ok((
+                JsPlace::Deref(jsast::rt_call("tail_slice_raw", vec![raw_ptr, key_str])),
+                carry,
+            ));
         }
-        Ok(JsPlace::Deref(jsast::rt_call(
-            "tail_slice",
-            vec![record, key_str, tail],
-        )))
+        Ok((
+            JsPlace::Deref(jsast::rt_call("tail_slice", vec![record, key_str, tail])),
+            carry,
+        ))
     }
 
     /// The address of an element of `base` (of type `base_ty`) when the element has no storage

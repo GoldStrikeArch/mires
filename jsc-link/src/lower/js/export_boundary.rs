@@ -26,10 +26,14 @@
 //! - `BodySemantic::JsExportOut` (`link_section = "rcgjs.export.out.v1"`): direct Rust→JS return
 //!   marshaling helper for `#[js_export] async fn`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::collections::HashSet;
 
 use rcgjs_object::jir::interns::Interns;
+#[cfg(test)]
 use rcgjs_object::jir::repr::Func;
+use rcgjs_object::jir::semantic::Signature;
 use rcgjs_object::jir::types::{
     AllocatorIdentity, EnumRepr, FieldDescriptor, FieldKey, NominalForm, PinnedBoundary,
     PointerForm, RepresentationCandidate, TypeId, TypeKind, TypeTable, VariantDescriptor,
@@ -52,9 +56,103 @@ pub struct BoundaryCx<'a> {
     pub bstr: bool,
 }
 
+/// Whether an exported `#[js_export]` function with signature `sig` requires a separate external
+/// JavaScript wrapper function to marshal arguments, return values, or `js-str=bytes` strings.
+///
+/// Returns `false` when all parameters and the return type are identity at the JS↔Rust boundary
+/// (so the internal Rust function can be exported directly with zero wrapper bytes).
+pub fn needs_js_export_wrapper(cx: &BoundaryCx<'_>, sig: &Signature) -> bool {
+    if sig.abi.spread.is_some() {
+        return false;
+    }
+    if result_info(cx.table, cx.interns, sig.result).is_some() {
+        return true;
+    }
+    let convert_str_refs = cx.bstr;
+    let arg_needs = sig.arguments.iter().any(|&arg_ty| {
+        let mut seen = BTreeSet::new();
+        needs_conversion(
+            cx,
+            arg_ty,
+            ConvertMode {
+                dir: Dir::JsToRust,
+                convert_str_refs,
+            },
+            0,
+            &mut seen,
+        )
+    });
+    if arg_needs {
+        return true;
+    }
+    let mut seen = BTreeSet::new();
+    needs_conversion(
+        cx,
+        sig.result,
+        ConvertMode {
+            dir: Dir::RustToJs,
+            convert_str_refs,
+        },
+        0,
+        &mut seen,
+    )
+}
+
+/// Builds a thin external JavaScript wrapper declaration `function <export_name>(...)` that
+/// marshals JS arguments into Rust representations, invokes the unmodified internal Rust function
+/// `<inner_name>(...)`, and marshals the Rust return value back to JS (unwrapping `Result<T, E>`
+/// and throwing a JS `Error` on `Err`).
+///
+/// Returns `None` when [`needs_js_export_wrapper`] is `false` (zero wrapper overhead).
+///
+/// When `cx.bstr` is active, this single wrapper also handles `&str` ↔ byte-string conversions
+/// (`__rt.bstr_in` / `__rt.bstr_out`), replacing any separate `byte_string_facades` wrapper.
+/// `loc_arg` optionally appends the trailing `#[track_caller]` location parameter `(param_name, expr)`.
+pub fn build_js_export_wrapper(
+    cx: &BoundaryCx<'_>,
+    export_name: &str,
+    inner_name: &str,
+    sig: &Signature,
+    loc_arg: Option<(String, Expr)>,
+) -> Option<Stmt> {
+    if !needs_js_export_wrapper(cx, sig) {
+        return None;
+    }
+    let mut emitter = MarshalEmitter::new_wrapper(cx);
+    let mut params: Vec<String> = (0..sig.arguments.len()).map(|i| format!("a{i}")).collect();
+    let mut call_args: Vec<Expr> = params
+        .iter()
+        .zip(&sig.arguments)
+        .map(|(param, &arg_ty)| {
+            let arg_expr = jsast::id(param.clone());
+            if emitter.needs_js_to_rust_value(arg_ty) {
+                emitter.js_to_rust(arg_expr, arg_ty, 0)
+            } else {
+                arg_expr
+            }
+        })
+        .collect();
+    if let Some((loc_param, loc_expr)) = loc_arg {
+        params.push(loc_param);
+        call_args.push(loc_expr);
+    }
+    let call = jsast::call(jsast::id(inner_name.to_owned()), call_args);
+    let ret_ty = sig.result;
+    let body = if let Some(res) = result_info(cx.table, cx.interns, ret_ty) {
+        emitter.result_return_stmts(call, &res)
+    } else if cx.table.is_zst(ret_ty) {
+        vec![jsast::expr_stmt(call)]
+    } else if emitter.needs_rust_to_js_value(ret_ty) {
+        vec![jsast::ret(emitter.rust_to_js(call, ret_ty, 0))]
+    } else {
+        vec![jsast::ret(call)]
+    };
+    Some(jsast::function(export_name.to_owned(), params, body))
+}
+
 /// Applies JS↔Rust boundary marshaling to a lowered `BodySemantic::JsExport` function body in
-/// place. Returns the set of formal parameter names that were reassigned at entry so downstream
-/// slice-immutability passes know they are not untouched.
+/// place. Retained for unit tests covering direct body-rewriting semantics.
+#[cfg(test)]
 pub fn wrap_js_export(
     cx: &BoundaryCx<'_>,
     func: &Func,
@@ -115,6 +213,7 @@ pub fn lower_export_out_body(cx: &BoundaryCx<'_>, param_name: &str, value_ty: Ty
 }
 
 /// Whether a JS caller value of Rust type `ty` requires marshaling into Rust's representation.
+#[cfg(test)]
 pub fn needs_js_to_rust(cx: &BoundaryCx<'_>, ty: TypeId) -> bool {
     let mut seen = BTreeSet::new();
     needs_conversion(
@@ -130,6 +229,7 @@ pub fn needs_js_to_rust(cx: &BoundaryCx<'_>, ty: TypeId) -> bool {
 }
 
 /// Whether a Rust value of type `ty` requires marshaling into a JS value for JS callers.
+#[cfg(test)]
 pub fn needs_rust_to_js(cx: &BoundaryCx<'_>, ty: TypeId) -> bool {
     let mut seen = BTreeSet::new();
     needs_conversion(
@@ -216,7 +316,7 @@ fn needs_conversion(
                 cx.table.get(cx.table.peeled(*pointee)).map(|d| &d.kind),
                 Some(TypeKind::Slice(_))
             ),
-            Some(PointerForm::Str) => mode.convert_str_refs && mode.dir == Dir::RustToJs,
+            Some(PointerForm::Str) => mode.convert_str_refs,
             Some(PointerForm::Thin) => needs_conversion(cx, *pointee, mode, depth + 1, seen),
             _ => false,
         },
@@ -903,11 +1003,20 @@ struct MarshalEmitter<'a> {
 }
 
 impl<'a> MarshalEmitter<'a> {
+    #[cfg(test)]
     fn new(cx: &'a BoundaryCx<'a>) -> Self {
         Self {
             cx,
             next_id: 0,
             convert_str_refs: false,
+        }
+    }
+
+    fn new_wrapper(cx: &'a BoundaryCx<'a>) -> Self {
+        Self {
+            cx,
+            next_id: 0,
+            convert_str_refs: cx.bstr,
         }
     }
 
@@ -917,6 +1026,20 @@ impl<'a> MarshalEmitter<'a> {
             next_id: 0,
             convert_str_refs: cx.bstr,
         }
+    }
+
+    fn needs_js_to_rust_value(&self, ty: TypeId) -> bool {
+        let mut seen = BTreeSet::new();
+        needs_conversion(
+            self.cx,
+            ty,
+            ConvertMode {
+                dir: Dir::JsToRust,
+                convert_str_refs: self.convert_str_refs,
+            },
+            0,
+            &mut seen,
+        )
     }
 
     fn needs_rust_to_js_value(&self, ty: TypeId) -> bool {
@@ -956,7 +1079,7 @@ impl<'a> MarshalEmitter<'a> {
     }
 
     fn js_to_rust(&mut self, expr: Expr, ty: TypeId, depth: u32) -> Expr {
-        if depth >= MAX_DEPTH || !needs_js_to_rust(self.cx, ty) {
+        if depth >= MAX_DEPTH || !self.needs_js_to_rust_value(ty) {
             return expr;
         }
         let Some(desc) = self.cx.table.get(ty) else {
@@ -995,6 +1118,9 @@ impl<'a> MarshalEmitter<'a> {
                         return self.slice_js_to_rust(expr, *elem, depth);
                     }
                     expr
+                }
+                Some(PointerForm::Str) if self.convert_str_refs => {
+                    jsast::rt_call("bstr_in", vec![expr])
                 }
                 Some(PointerForm::Thin) => self.js_to_rust(expr, *pointee, depth + 1),
                 _ => expr,
@@ -1399,7 +1525,7 @@ impl<'a> MarshalEmitter<'a> {
         let is_zst = elem_desc.is_some_and(|d| d.layout.zst);
         let elem_size = elem_desc.and_then(|d| d.layout.size).unwrap_or(1).max(1);
         let elem_align = elem_desc.and_then(|d| d.layout.align).unwrap_or(1).max(1);
-        let elem_needs = !is_zst && needs_js_to_rust(self.cx, elem_ty);
+        let elem_needs = !is_zst && self.needs_js_to_rust_value(elem_ty);
         let ta_kind = if is_zst {
             None
         } else {
@@ -1560,7 +1686,7 @@ impl<'a> MarshalEmitter<'a> {
         depth: u32,
     ) -> Expr {
         let is_zst = self.cx.table.is_zst(elem_ty);
-        let elem_needs = !is_zst && needs_rust_to_js(self.cx, elem_ty);
+        let elem_needs = !is_zst && self.needs_rust_to_js_value(elem_ty);
         let native = self.cx.heap.native_vec_enabled && is_global;
         let ta_kind = if is_zst {
             None
@@ -1694,7 +1820,8 @@ impl<'a> MarshalEmitter<'a> {
 
     fn map_entries_js_to_rust(&mut self, expr: Expr, info: &MapEntriesInfo, depth: u32) -> Expr {
         let string_key = is_string_key_ty(self.cx.table, self.cx.interns, info.key_ty);
-        let key_is_bstr_str = self.cx.bstr && is_str_ref_ty(self.cx.table, info.key_ty);
+        let key_is_bstr_str =
+            self.cx.bstr && !self.convert_str_refs && is_str_ref_ty(self.cx.table, info.key_ty);
         let entries_expr = self.bind_once(expr, "m", |_, v| {
             let is_map = jsast::method_call(
                 jsast::member(jsast::id("Map"), "prototype"),
@@ -2072,7 +2199,7 @@ impl<'a> MarshalEmitter<'a> {
 
     fn slice_js_to_rust(&mut self, expr: Expr, elem_ty: TypeId, depth: u32) -> Expr {
         let is_zst = self.cx.table.is_zst(elem_ty);
-        let elem_needs = !is_zst && needs_js_to_rust(self.cx, elem_ty);
+        let elem_needs = !is_zst && self.needs_js_to_rust_value(elem_ty);
         self.bind_once(expr, "a", |this, a| {
             let len = jsast::member(a.clone(), "length");
             let buf = if is_zst {
@@ -2090,7 +2217,7 @@ impl<'a> MarshalEmitter<'a> {
 
     fn slice_rust_to_js(&mut self, expr: Expr, elem_ty: TypeId, depth: u32) -> Expr {
         let is_zst = self.cx.table.is_zst(elem_ty);
-        let elem_needs = !is_zst && needs_rust_to_js(self.cx, elem_ty);
+        let elem_needs = !is_zst && self.needs_rust_to_js_value(elem_ty);
         let s_name = self.fresh("sl");
         let s_id = jsast::id(s_name.clone());
         let n_name = self.fresh("n");
@@ -2286,7 +2413,7 @@ impl<'a> MarshalEmitter<'a> {
         let mut cases = Vec::new();
         for (idx, variant) in variants.iter().enumerate() {
             let variant_needs = variant.fields.iter().any(|f| match dir {
-                Dir::JsToRust => needs_js_to_rust(self.cx, f.ty),
+                Dir::JsToRust => self.needs_js_to_rust_value(f.ty),
                 Dir::RustToJs => self.needs_rust_to_js_value(f.ty),
             });
             if !variant_needs {
@@ -2322,6 +2449,7 @@ impl<'a> MarshalEmitter<'a> {
         jsast::call(jsast::arrow_block(vec![v_name], vec![sw]), vec![expr])
     }
 
+    #[cfg(test)]
     fn rewrite_returns_value(&mut self, stmts: &mut [Stmt], ret_ty: TypeId) {
         for stmt in stmts.iter_mut() {
             match stmt {
@@ -2356,6 +2484,7 @@ impl<'a> MarshalEmitter<'a> {
         }
     }
 
+    #[cfg(test)]
     fn rewrite_returns_result(&mut self, stmts: &mut Vec<Stmt>, res: &ResultInfo) {
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in std::mem::take(stmts) {
@@ -2523,7 +2652,8 @@ mod tests {
     use crate::analysis::heap::HeapPlan;
 
     use super::{
-        lower_export_out_body, needs_js_to_rust, needs_rust_to_js, wrap_js_export, BoundaryCx,
+        build_js_export_wrapper, lower_export_out_body, needs_js_export_wrapper, needs_js_to_rust,
+        needs_rust_to_js, wrap_js_export, BoundaryCx,
     };
 
     struct TestTypes {
@@ -4722,5 +4852,129 @@ mod tests {
             printed.contains("__rt.bstr_out($p0.s)"),
             "expected native String conversion in body:\n{printed}"
         );
+    }
+
+    #[test]
+    fn separate_js_export_wrapper_skips_identity_and_wraps_marshaled_signatures() {
+        let mut tt = TestTypes::new();
+        let unit = tt.unit();
+        let u8_ty = tt.int(false, 8);
+        let usize_ty = tt.int(false, 32);
+        let i32_ty = tt.int(true, 32);
+        let bool_ty = tt.bool_ty();
+        let str_ref = tt.str_ref();
+        let string_ty = tt.string(u8_ty, usize_ty, unit);
+        let vec_i32 = tt.vec(i32_ty, usize_ty, unit);
+        let opt_string = tt.option(string_ty, EnumRepr::Tag { fieldless: false });
+        let res_vec_str = tt.result(vec_i32, string_ty);
+
+        let heap_default = HeapPlan::default();
+        let heap_native = HeapPlan {
+            typed_heap_enabled: true,
+            native_string_enabled: true,
+            native_vec_enabled: true,
+            ..HeapPlan::default()
+        };
+        let cx_utf16 = BoundaryCx {
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            heap: &heap_default,
+            bstr: false,
+        };
+        let cx_bstr = BoundaryCx {
+            table: &tt.interns.types,
+            interns: &tt.interns,
+            heap: &heap_native,
+            bstr: true,
+        };
+
+        // Identity-only signature under UTF-16 emits zero wrapper (None).
+        let id_sig = Signature {
+            arguments: vec![i32_ty, str_ref],
+            result: bool_ty,
+            abi: AbiSignature {
+                parameters: 2,
+                ..AbiSignature::default()
+            },
+        };
+        assert!(!needs_js_export_wrapper(&cx_utf16, &id_sig));
+        assert!(build_js_export_wrapper(&cx_utf16, "id_fn", "id_fn$rs", &id_sig, None).is_none());
+
+        // Under `js-str=bytes`, the `&str` parameter requires one thin wrapper with `__rt.bstr_in`.
+        assert!(needs_js_export_wrapper(&cx_bstr, &id_sig));
+        let bstr_id_decl = build_js_export_wrapper(&cx_bstr, "id_fn", "id_fn$rs", &id_sig, None)
+            .expect("bstr wrapper emitted");
+        let bstr_id_js = jsast::stmt_to_string(&bstr_id_decl);
+        assert!(
+            bstr_id_js.contains("function id_fn(a0, a1)"),
+            "{bstr_id_js}"
+        );
+        assert!(
+            bstr_id_js.contains("id_fn$rs(a0, __rt.bstr_in(a1))"),
+            "{bstr_id_js}"
+        );
+
+        // `fn render_markdown(&str) -> String` (npm-markdown shape):
+        // UTF-16 leaves `&str` untouched and converts return `String` via `__rt.bytes_str`.
+        let md_sig = Signature {
+            arguments: vec![str_ref],
+            result: string_ty,
+            abi: AbiSignature {
+                parameters: 1,
+                ..AbiSignature::default()
+            },
+        };
+        let md_utf16 = jsast::stmt_to_string(
+            &build_js_export_wrapper(
+                &cx_utf16,
+                "render_markdown",
+                "render_markdown$rs",
+                &md_sig,
+                None,
+            )
+            .expect("utf16 wrapper"),
+        );
+        assert!(md_utf16.contains("render_markdown$rs(a0)"), "{md_utf16}");
+        assert!(md_utf16.contains("__rt.bytes_str"), "{md_utf16}");
+
+        // Under `bstr + native_string`, one wrapper does BOTH `bstr_in` and `bstr_out` with zero UTF-16 helpers.
+        let md_bstr = jsast::stmt_to_string(
+            &build_js_export_wrapper(
+                &cx_bstr,
+                "render_markdown",
+                "render_markdown$rs",
+                &md_sig,
+                None,
+            )
+            .expect("bstr wrapper"),
+        );
+        assert!(
+            md_bstr.contains("__rt.bstr_out(render_markdown$rs(__rt.bstr_in(a0)).s)"),
+            "{md_bstr}"
+        );
+        assert!(!md_bstr.contains("str_bytes"), "{md_bstr}");
+        assert!(!md_bstr.contains("bytes_str"), "{md_bstr}");
+
+        // Complex `fn(Option<String>) -> Result<Vec<i32>, String>` wrapper unwraps Ok / throws Err.
+        let complex_sig = Signature {
+            arguments: vec![opt_string],
+            result: res_vec_str,
+            abi: AbiSignature {
+                parameters: 1,
+                ..AbiSignature::default()
+            },
+        };
+        let complex_js = jsast::stmt_to_string(
+            &build_js_export_wrapper(
+                &cx_bstr,
+                "parse_items",
+                "parse_items$rs",
+                &complex_sig,
+                None,
+            )
+            .expect("complex wrapper"),
+        );
+        assert!(complex_js.contains("parse_items$rs("), "{complex_js}");
+        assert!(complex_js.contains("throw "), "{complex_js}");
     }
 }

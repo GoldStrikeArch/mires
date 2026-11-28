@@ -1098,6 +1098,7 @@ impl<'a> LaneDriver<'a> {
             added_items,
             byte_views: self.indexes.byte_views,
             native_vec_enabled: self.indexes.heap.native_vec_enabled,
+            heap: self.indexes.heap,
         }
     }
 }

@@ -914,7 +914,7 @@ impl<'a> InlineCx<'a> {
                     }
                 }
             }
-            if let Some(site_fact) = site_abi.track_caller {
+            if let Some(site_fact) = site_abi.track_caller.filter(|f| !f.is_sentinel()) {
                 rewrite_forwarded_track_caller(
                     &mut callee_func,
                     site_fact,
@@ -1187,7 +1187,7 @@ impl<'a> InlineCx<'a> {
             block: block_index,
             op: op_index,
             callee,
-            has_track_caller: track_caller.is_some()
+            has_track_caller: track_caller.is_some_and(|f| !f.is_not_tracked())
                 || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
             host_boundary: callee_has_host_boundary(callee_func, &callee_metadata.interns, speed),
         }))
@@ -1353,11 +1353,19 @@ impl<'a> InlineCx<'a> {
         let caller_caller_location = site_abi.caller_caller_location;
         let site_track_caller = site_abi.track_caller;
 
+        let site_concrete = site_track_caller.filter(|f| !f.is_sentinel());
+        let site_forwards = site_track_caller.is_some_and(SourceFactId::is_forward)
+            || (caller_caller_location && site_track_caller.is_none());
+        let site_is_not_tracked = site_track_caller.is_some_and(SourceFactId::is_not_tracked);
+
         if callee.has_invoke() && !(speed && callee_has_only_noop_invokes(callee)) {
             return Some(InlineDecline::ExceptionalControlFlow);
         }
         let expected_params = if callee.sig.abi.caller_location {
-            let can_bind_used_loc = site_track_caller.is_some_and(|fact| {
+            if site_is_not_tracked {
+                return Some(InlineDecline::TrackCallerUnavailable);
+            }
+            let can_bind_used_loc = site_concrete.is_some_and(|fact| {
                 caller_interns.source_fact(fact).is_some()
                     && callee
                         .params
@@ -1374,7 +1382,7 @@ impl<'a> InlineCx<'a> {
             } else {
                 return Some(InlineDecline::TrackCallerUnavailable);
             }
-        } else if site_track_caller.is_some() {
+        } else if site_track_caller.is_some_and(|f| !f.is_not_tracked()) {
             return Some(InlineDecline::TrackCallerUnavailable);
         } else {
             args
@@ -1388,7 +1396,7 @@ impl<'a> InlineCx<'a> {
         {
             return Some(InlineDecline::AbiUnsupported);
         }
-        let forwards_caller_location = caller_caller_location && site_track_caller.is_none();
+        let forwards_caller_location = site_forwards;
         callee
             .blocks
             .iter()
@@ -1405,7 +1413,7 @@ impl<'a> InlineCx<'a> {
                 OpKind::Assert { .. }
                     if callee.sig.abi.caller_location
                         && !forwards_caller_location
-                        && site_track_caller.is_none() =>
+                        && site_concrete.is_none() =>
                 {
                     Some(InlineDecline::TrackCallerUnavailable)
                 }
@@ -1417,9 +1425,9 @@ impl<'a> InlineCx<'a> {
                     ..
                 } if interns.str(*name) == Some("caller_location") => {
                     let ok = speed
-                        && (inner_tc.is_some()
+                        && (inner_tc.is_some_and(|f| !f.is_sentinel())
                             || (callee.sig.abi.caller_location
-                                && (site_track_caller.is_some() || caller_caller_location)));
+                                && (site_concrete.is_some() || forwards_caller_location)));
                     (!ok).then_some(InlineDecline::TrackCallerUnavailable)
                 }
                 // Host and template lowering may own item-local bindings and observable ordering.
@@ -1437,6 +1445,17 @@ impl<'a> InlineCx<'a> {
                     Some(InlineDecline::SemanticBoundary)
                 }
                 OpKind::Call {
+                    track_caller: Some(inner_tc),
+                    ..
+                } if inner_tc.is_not_tracked() => None,
+                OpKind::Call {
+                    track_caller: Some(inner_tc),
+                    ..
+                } if callee.sig.abi.caller_location && inner_tc.is_forward() => {
+                    (site_concrete.is_none() && !forwards_caller_location)
+                        .then_some(InlineDecline::TrackCallerUnavailable)
+                }
+                OpKind::Call {
                     callee: inner_callee,
                     args: inner_args,
                     track_caller: None,
@@ -1449,8 +1468,8 @@ impl<'a> InlineCx<'a> {
                         if !entry.abi_known
                             || entry.params != inner_args.len() + usize::from(entry.caller_location)
                             || (entry.caller_location
-                                && site_track_caller.is_none()
-                                && !caller_caller_location)
+                                && site_concrete.is_none()
+                                && !forwards_caller_location)
                         {
                             Some(InlineDecline::TrackCallerUnavailable)
                         } else {
@@ -2134,6 +2153,12 @@ fn rewrite_forwarded_track_caller(
     for block in &mut callee.blocks {
         for op in &mut block.ops {
             match &mut op.kind {
+                OpKind::Call {
+                    track_caller: Some(f),
+                    ..
+                } if f.is_forward() => {
+                    *f = site_fact;
+                }
                 OpKind::Call {
                     callee: Callee::Direct { item, .. },
                     track_caller: tc @ None,

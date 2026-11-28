@@ -364,11 +364,18 @@ pub(crate) struct LaneRun {
     pub(super) added_items: bool,
     /// Whole-program lazy byte-view policy.
     pub(super) byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Whole-program finalized heap plan (needed by `link.rs::js_export_facades`).
+    pub(super) heap: crate::analysis::heap::HeapPlan,
     /// Whether universal flat `Vec<T, Global>` representation was active.
     pub(super) native_vec_enabled: bool,
 }
 
 impl LaneRun {
+    /// Whole-program finalized heap plan for link-time boundary facades.
+    pub(crate) fn heap(&self) -> &crate::analysis::heap::HeapPlan {
+        &self.heap
+    }
+
     /// Whether universal flat `Vec<T, Global>` representation was active.
     pub(crate) fn native_vec_enabled(&self) -> bool {
         self.native_vec_enabled

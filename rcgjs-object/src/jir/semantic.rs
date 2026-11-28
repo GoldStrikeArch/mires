@@ -741,6 +741,13 @@ pub enum CastKind {
     FnPtrToPtr,
     Transmute,
     Subtype,
+    /// Trait-object supertrait upcast (`&dyn Sub -> &dyn Super`, `Box<dyn Sub> -> Box<dyn Super>`,
+    /// `Rc<dyn Sub> -> Rc<dyn Super>`, etc.): `slot = Some(i)` selects `meta[i]` in the vtable
+    /// array for a non-primary supertrait; `slot = None` is a primary-supertrait or
+    /// auto-trait-only upcast whose vtable prefix already matches (identity at runtime).
+    DynUpcast {
+        slot: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

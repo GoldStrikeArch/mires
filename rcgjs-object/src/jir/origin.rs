@@ -20,9 +20,37 @@ use super::interns::StrId;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OriginId(pub u32);
 
-/// An index into [`super::interns::Interns::source_facts`].
+/// An index into [`super::interns::Interns::source_facts`], or one of the two `Call::track_caller`
+/// ABI sentinels ([`SourceFactId::FORWARD`] / [`SourceFactId::NOT_TRACKED`]).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceFactId(pub u32);
+
+impl SourceFactId {
+    /// Sentinel on `Call::track_caller` meaning the callee is `#[track_caller]` and the enclosing
+    /// `#[track_caller]` body forwards its incoming `$loc` parameter directly.
+    pub const FORWARD: Self = Self(u32::MAX);
+
+    /// Sentinel on `Call::track_caller` meaning the encoder proved the callee is NOT
+    /// `#[track_caller]`, so even inside a `#[track_caller]` body no trailing `$loc` argument is
+    /// passed and link-time lowering never needs to inspect `ItemIndex` for the callee's ABI.
+    pub const NOT_TRACKED: Self = Self(u32::MAX - 1);
+
+    /// Whether this id is a `Call::track_caller` ABI sentinel rather than an index into
+    /// [`super::interns::Interns::source_facts`].
+    pub const fn is_sentinel(self) -> bool {
+        self.0 >= Self::NOT_TRACKED.0
+    }
+
+    /// Whether this id explicitly forwards the enclosing body's incoming `$loc`.
+    pub const fn is_forward(self) -> bool {
+        self.0 == Self::FORWARD.0
+    }
+
+    /// Whether the encoder proved the callee does not take a caller location.
+    pub const fn is_not_tracked(self) -> bool {
+        self.0 == Self::NOT_TRACKED.0
+    }
+}
 
 /// One source position, already rendered: the file as rustc names it, 1-based line, 0-based
 /// column (as `SourceMap::lookup_char_pos` reports).

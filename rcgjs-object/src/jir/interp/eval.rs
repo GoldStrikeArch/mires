@@ -589,6 +589,7 @@ pub fn cast(
             Ok(Value::float(*value, *bits))
         }
         CastKind::PointerCoercion
+        | CastKind::DynUpcast { .. }
         | CastKind::PtrToPtr
         | CastKind::Subtype
         | CastKind::FnPtrToPtr => unsize_or_identity(v, to, table, heap),

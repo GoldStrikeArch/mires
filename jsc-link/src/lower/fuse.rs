@@ -97,6 +97,7 @@ pub fn op_purity(kind: &OpKind) -> Purity {
             | CastKind::PointerExposeProvenance
             | CastKind::PointerWithExposedProvenance
             | CastKind::PointerCoercion
+            | CastKind::DynUpcast { .. }
             | CastKind::PtrToPtr
             | CastKind::FnPtrToPtr
             | CastKind::Transmute => Purity::Read,
@@ -869,7 +870,7 @@ impl<'a> Planner<'a> {
         }
         // Unsizing an aggregate rebuilds its fields and can read the source for each one.
         if let OpKind::Cast {
-            kind: CastKind::PointerCoercion,
+            kind: CastKind::PointerCoercion | CastKind::DynUpcast { .. },
             from,
             ..
         } = op.kind

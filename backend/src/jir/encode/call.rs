@@ -161,13 +161,28 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
         let host = self.host_payload(function_ty, marker, args)?;
         let arguments = self.call_arguments(function_ty, args)?;
         // Resolve the caller location across any MIR-inlined `#[track_caller]` frames:
-        // `None` forwards the outermost body's `$loc` parameter; `Some(span)` materializes that
-        // concrete call site (including when a non-`#[track_caller]` helper was MIR-inlined into
-        // a `#[track_caller]` body).
+        // - `Some(fact)` materializes that concrete call site (including when a non-`#[track_caller]`
+        //   helper was MIR-inlined into a `#[track_caller]` body).
+        // - `Some(SourceFactId::FORWARD)` explicitly marks a `#[track_caller]` callee that forwards
+        //   the enclosing body's `$loc` parameter.
+        // - `Some(SourceFactId::NOT_TRACKED)` explicitly marks a non-`#[track_caller]` callee inside
+        //   a `#[track_caller]` body so link-time lowering never needs to guess its ABI from
+        //   `ItemIndex`.
+        // - `None` is kept for non-`#[track_caller]` callers calling non-`#[track_caller]` callees
+        //   and for un-inlined `caller_location` intrinsics forwarding `$loc`.
+        let is_caller_location_intrinsic = matches!(
+            &callee,
+            Callee::Intrinsic { name, .. }
+                if self.core.types.interns.str(*name) == Some("caller_location")
+        );
         let track_caller = if tracks_caller {
-            resolve_caller_location_span(tcx, self.mir, self.instance, source_info)
-                .map(|span| self.caller_location_fact(span))
-                .transpose()?
+            match resolve_caller_location_span(tcx, self.mir, self.instance, source_info) {
+                Some(span) => Some(self.caller_location_fact(span)?),
+                None if is_caller_location_intrinsic => None,
+                None => Some(SourceFactId::FORWARD),
+            }
+        } else if self.instance.def.requires_caller_location(tcx) && !is_caller_location_intrinsic {
+            Some(SourceFactId::NOT_TRACKED)
         } else {
             None
         };

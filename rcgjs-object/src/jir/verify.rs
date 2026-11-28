@@ -588,7 +588,9 @@ fn verify_call(call: &Call, context: &Context<'_>) -> Result<(), VerifyError> {
     }
     verify_unwind(call.unwind, context)?;
     if let Some(location) = call.track_caller {
-        context.source_fact(location)?;
+        if !location.is_sentinel() {
+            context.source_fact(location)?;
+        }
     }
     match &call.host {
         Some(HostPayload::Extern(bytes)) | Some(HostPayload::Block(bytes)) => {

@@ -142,6 +142,9 @@ impl Remap<'_> {
     }
 
     fn fact(&mut self, id: SourceFactId) -> Res<SourceFactId> {
+        if id.is_sentinel() {
+            return Ok(id);
+        }
         let mut fact = self
             .source
             .source_fact(id)

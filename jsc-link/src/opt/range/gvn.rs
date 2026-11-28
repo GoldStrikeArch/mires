@@ -771,7 +771,16 @@ impl Analysis {
                         v,
                         from,
                         to,
-                    } => GvnKey::Cast(*kind as u8, self.canon(*v), *from, *to),
+                    } => {
+                        let tag = match kind {
+                            CastKind::IntToInt => 0,
+                            CastKind::FloatToFloat => 1,
+                            CastKind::IntToFloat => 2,
+                            CastKind::Subtype => 3,
+                            _ => unreachable!(),
+                        };
+                        GvnKey::Cast(tag, self.canon(*v), *from, *to)
+                    }
                     _ => continue,
                 };
                 let entry = classes.entry(key).or_insert(result);

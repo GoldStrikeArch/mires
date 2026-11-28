@@ -285,6 +285,9 @@ impl<'a> Normalizer<'a> {
     }
 
     fn source_fact(&mut self, id: SourceFactId) -> SourceFactId {
+        if id.is_sentinel() {
+            return id;
+        }
         if let Some(mapped) = self.source_fact_index.get(&id) {
             return *mapped;
         }

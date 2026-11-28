@@ -1604,6 +1604,7 @@ impl<'a> JsCx<'a> {
                 }
             }
             CastKind::PointerCoercion => self.pointer_coercion(from_ty, to_ty, value),
+            CastKind::DynUpcast { slot } => self.dyn_upcast(from_ty, to_ty, value, slot),
             CastKind::Transmute => self.transmute(from_ty, to_ty, value),
         }
     }
@@ -1944,6 +1945,9 @@ impl<'a> JsCx<'a> {
         ) {
             (Some(TypeKind::Array { length, .. }), Some(TypeKind::Slice(_))) => {
                 jsast::num(*length as f64)
+            }
+            (_, Some(TypeKind::Dynamic { principal, .. })) => {
+                jsast::id(self.vtable_name(source_tail, *principal)?)
             }
             _ => {
                 return Err(decline(

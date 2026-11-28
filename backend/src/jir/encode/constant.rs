@@ -15,7 +15,11 @@ use crate::jir::types::{definition_id, type_name};
 use crate::value::typing_env;
 
 /// The largest anonymous constant allocation decoded into an owned constant tree.
-pub(super) const MAX_CONST_MEMORY_BYTES: u64 = 65536;
+pub(super) const MAX_CONST_MEMORY_BYTES: u64 = 1_048_576;
+
+/// ZST slices longer than this encode as `ConstTree::SliceAddress` in O(1) space so constants
+/// like `&[(); usize::MAX]` avoid materializing billions of `ConstTree::Unit` entries.
+const MAX_MATERIALIZED_ZST_SLICE_LEN: u64 = 64;
 
 /// The deepest pointer chain followed while decoding constant memory.
 const MAX_CONST_TREE_DEPTH: u32 = 64;
@@ -138,15 +142,17 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
                 };
                 let allocation = allocation.inner();
                 check_const_memory(allocation)?;
-                let pointee = ty.peel_refs();
+                let pointee = crate::value::peel_pattern(crate::value::peel_transparent(tcx, ty))
+                    .builtin_deref(true)
+                    .unwrap_or_else(|| ty.peel_refs());
                 // A transparent wrapper over the slice (`CStr` over `[c_char]`) is the slice it
                 // wraps, at the wrapper's field offset.
                 let (peeled, offset) = self.core.peel_transparent_at(pointee);
                 if let ty::Slice(element) = peeled.kind() {
-                    return Ok(Constant::Memory(ConstTree::Slice(
+                    return Ok(Constant::Memory(
                         self.core
-                            .const_slice(allocation, offset, *element, meta, 0)?,
-                    )));
+                            .const_slice_tree(allocation, offset, *element, meta, 0)?,
+                    ));
                 }
                 if peeled.is_str() {
                     let text = crate::const_raw::read_str(allocation, offset, meta)
@@ -187,19 +193,27 @@ impl<'a, 'tcx> EncodeCore<'a, 'tcx> {
         meta: Option<u64>,
         depth: u32,
     ) -> Result<ConstTree, EncodeDecline> {
-        if pointee.is_str() {
+        let (peeled, inner_offset) = self.peel_transparent_at(pointee);
+        let target_offset = offset + inner_offset;
+        if peeled.is_str() {
             let length = meta.ok_or(EncodeDecline::StrConstantNoLength)?;
-            let text = crate::const_raw::read_str(allocation, offset, length)
+            let text = crate::const_raw::read_str(allocation, target_offset, length)
                 .map_err(|_| EncodeDecline::StringConstantInvalid)?;
             return Ok(ConstTree::Str(self.types.str(text)));
         }
-        if let ty::Slice(element) = pointee.kind() {
+        if let ty::Slice(element) = peeled.kind() {
             let length = meta.ok_or_else(|| EncodeDecline::SliceConstantNoLength {
                 pointee: type_name(pointee),
             })?;
-            return Ok(ConstTree::Slice(
-                self.const_slice(allocation, offset, *element, length, depth)?,
-            ));
+            return self.const_slice_tree(allocation, target_offset, *element, length, depth);
+        }
+        if crate::value::unsized_tail_indexed(self.tcx(), pointee).is_some() {
+            let length = meta.ok_or_else(|| EncodeDecline::SliceConstantNoLength {
+                pointee: type_name(pointee),
+            })?;
+            return Ok(ConstTree::Reference(Box::new(
+                self.const_tail_struct(allocation, offset, pointee, length, depth)?,
+            )));
         }
         Ok(ConstTree::Reference(Box::new(
             self.const_tree(allocation, offset, pointee, depth)?,
@@ -284,6 +298,31 @@ impl<'a, 'tcx> EncodeCore<'a, 'tcx> {
         Ok(ConstTree::Aggregate(fields))
     }
 
+    fn const_slice_tree(
+        &mut self,
+        allocation: &Allocation,
+        offset: Size,
+        element: Ty<'tcx>,
+        length: u64,
+        depth: u32,
+    ) -> Result<ConstTree, EncodeDecline> {
+        let tcx = self.tcx();
+        let layout = tcx
+            .layout_of(typing_env().as_query_input(element))
+            .map_err(|_| EncodeDecline::SliceElementNoLayout {
+                element: type_name(element),
+            })?;
+        if layout.is_zst() && length > MAX_MATERIALIZED_ZST_SLICE_LEN {
+            return Ok(ConstTree::SliceAddress {
+                address: layout.align.abi.bytes().max(1),
+                length,
+            });
+        }
+        Ok(ConstTree::Slice(
+            self.const_slice(allocation, offset, element, length, depth)?,
+        ))
+    }
+
     fn const_slice(
         &mut self,
         allocation: &Allocation,
@@ -360,10 +399,27 @@ impl<'a, 'tcx> EncodeCore<'a, 'tcx> {
             ty::Pat(base, _) => self.const_tree(allocation, offset, *base, depth),
             ty::Adt(def, args) if def.is_enum() => {
                 let variant_index =
-                    crate::const_raw::variant_index(tcx, allocation, offset, layout, *def)
-                        .map_err(|_| EncodeDecline::ConstantVariantUnreadable {
-                            ty: type_name(ty),
-                        })?;
+                    match crate::const_raw::variant_index(tcx, allocation, offset, layout, *def) {
+                        Ok(index) => index,
+                        Err(crate::const_raw::TagError::NoSuchVariant(bits))
+                            if crate::value::direct_tag(tcx, ty).is_some() =>
+                        {
+                            // At `-C opt-level=3`, MIR constant propagation can fold unreachable
+                            // `transmute::<usize, Alignment>(non_pow2)` branches into a constant of
+                            // an `EnumRepr::Number` fieldless enum (`AlignmentEnum`) whose bit
+                            // pattern does not match any declared discriminant. Preserve its raw
+                            // bits as `ConstTree::Scalar` for link-time `EnumRepr::Number` decoding.
+                            return Ok(ConstTree::Scalar {
+                                bits,
+                                bytes: layout.size.bytes() as u8,
+                            });
+                        }
+                        Err(_) => {
+                            return Err(EncodeDecline::ConstantVariantUnreadable {
+                                ty: type_name(ty),
+                            });
+                        }
+                    };
                 let variant = def.variant(variant_index);
                 let variant_layout = layout.for_variant(
                     &rustc_middle::ty::layout::LayoutCx::new(tcx, typing_env()),
@@ -424,14 +480,20 @@ impl<'a, 'tcx> EncodeCore<'a, 'tcx> {
             }
             ty::Array(element, count) => {
                 let count = count.try_to_target_usize(tcx).unwrap_or_default() as usize;
-                if count as u64 > MAX_CONST_MEMORY_BYTES {
-                    return Err(EncodeDecline::ArrayConstantTooLong);
+                if count == 0 {
+                    return Ok(ConstTree::Aggregate(Vec::new()));
                 }
                 let element_layout = tcx
                     .layout_of(typing_env().as_query_input(*element))
                     .map_err(|_| EncodeDecline::ConstantNoLayout {
                         ty: type_name(*element),
                     })?;
+                if element_layout.is_zst() && count as u64 > MAX_MATERIALIZED_ZST_SLICE_LEN {
+                    return Ok(ConstTree::Unit);
+                }
+                if count as u64 > MAX_CONST_MEMORY_BYTES {
+                    return Err(EncodeDecline::ArrayConstantTooLong);
+                }
                 let stride = element_layout.size.bytes();
                 let fields = (0..count)
                     .map(|index| {

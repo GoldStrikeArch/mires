@@ -38,7 +38,8 @@ mod tests;
 /// | 19 | Phase 3 typed native `RawVec`/`Box` allocation hooks (`TypedAlloc`, `TypedRealloc`, `TypedDealloc`, `BoxNew`, `TypedDeallocRaw`). |
 /// | 20 | Phase 5 native `{ s, cap }` `String` hooks (`NativeStr*`). |
 /// | 21 | v4 Phase 3 typed `Rc<[T]>`/`Arc<[T]>` slice allocation hooks (`RcAllocSlice`, `ArcAllocSlice`). |
-pub const JIR_SCHEMA: u16 = 24;
+/// | 25 | Seam 5: `CastKind::DynUpcast { slot }` for explicit `dyn` supertrait upcasting and `SourceFactId::{FORWARD, NOT_TRACKED}` explicit caller-location sentinels on `Call::track_caller`. |
+pub const JIR_SCHEMA: u16 = 25;
 
 use serde::{Deserialize, Serialize};
 

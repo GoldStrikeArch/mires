@@ -227,7 +227,9 @@ impl JsCx<'_> {
 
         // Phase 2C: Native ByteStr `core::slice::<impl [u8]>::{starts_with,ends_with}` and inline
         // `core::slice::<impl [T]>::{reverse,revswap}` under `ReleaseSpeed`.
-        if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) && track_caller.is_none() {
+        if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+            && track_caller.is_none_or(SourceFactId::is_not_tracked)
+        {
             if self.bstr_enabled() {
                 if let Some(lowered) = self.lower_bstr_slice_search(op, callee, args)? {
                     return Ok(Some(lowered));
@@ -650,6 +652,18 @@ impl JsCx<'_> {
         track_caller: Option<SourceFactId>,
     ) -> Res<Option<Expr>> {
         if let Some(fact) = track_caller {
+            if fact.is_not_tracked() {
+                return Ok(None);
+            }
+            if fact.is_forward() {
+                if !self.func.sig.abi.caller_location {
+                    return Err(decline(
+                        OpClass::Call,
+                        "a `#[track_caller]` forwarding call inside a non-`#[track_caller]` body",
+                    ));
+                }
+                return Ok(Some(jsast::id(CALLER_LOCATION_PARAM)));
+            }
             let Some(fact) = self.interns.source_fact(fact) else {
                 return Err(decline(
                     OpClass::Call,

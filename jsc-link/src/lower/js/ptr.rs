@@ -993,25 +993,38 @@ impl<'a> JsCx<'a> {
                 }
             },
             _ => {
-                let element = table.unsized_tail(pointee).and_then(|tail| {
-                    match value::kind(table, tail.ty) {
-                        Some(TypeKind::Slice(element)) => size_of(table, *element),
-                        _ => None,
-                    }
-                });
-                match element {
-                    Some(element_size) => Ok(jsast::rt_call(
+                let tail_kind = table
+                    .unsized_tail(pointee)
+                    .and_then(|tail| value::kind(table, tail.ty).cloned());
+                match tail_kind {
+                    Some(TypeKind::Slice(element)) => match size_of(table, element) {
+                        Some(element_size) => Ok(jsast::rt_call(
+                            "retype_rc",
+                            vec![
+                                data,
+                                self.header_factory(pointee),
+                                jsast::num(element_size as f64),
+                                meta,
+                            ],
+                        )),
+                        None => Err(decline(
+                            OpClass::Rvalue,
+                            "a fat pointer to a struct whose slice tail element has no size cannot be rebuilt from a thin data pointer",
+                        )),
+                    },
+                    Some(TypeKind::Str) => Ok(jsast::rt_call(
                         "retype_rc",
                         vec![
                             data,
                             self.header_factory(pointee),
-                            jsast::num(element_size as f64),
+                            jsast::num(1.0),
                             meta,
                         ],
                     )),
-                    None => Err(decline(
+                    Some(TypeKind::Dynamic { .. }) => Ok(ptr::fat_dyn(data, meta)),
+                    _ => Err(decline(
                         OpClass::Rvalue,
-                        "a fat pointer to a struct without a slice tail cannot be rebuilt from a thin data pointer",
+                        "a fat pointer to a struct without a slice, `str`, or `dyn` tail cannot be rebuilt from a thin data pointer",
                     )),
                 }
             }
@@ -1697,20 +1710,41 @@ impl<'a> JsCx<'a> {
         let Some(tail) = table.unsized_tail(to) else {
             return Err(decline(OpClass::Cast, "reshape to a struct without a tail"));
         };
-        let Some(TypeKind::Slice(element)) = value::kind(table, tail.ty) else {
+        let tail_kind = value::kind(table, tail.ty);
+        if matches!(tail_kind, Some(TypeKind::Dynamic { .. })) {
+            if matches!(value::kind(table, from), Some(TypeKind::Dynamic { .. })) {
+                return Ok(value);
+            }
             return Ok(self.zombie(format!(
-                "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice \
-                 tail is, because only a run of elements can be laid out after the header",
-                self.type_display(tail.ty),
+                "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`: the \
+                 vtable metadata of the tail is not carried by the source pointer",
+                self.type_display(from),
+                self.type_display(to),
             )));
+        }
+        let element_size = match tail_kind {
+            Some(TypeKind::Slice(element)) => match size_of(table, *element) {
+                Some(size) => size,
+                None => {
+                    return Ok(self.zombie(format!(
+                        "the elements of `{}` have no size here",
+                        self.type_display(tail.ty),
+                    )));
+                }
+            },
+            Some(TypeKind::Str) => 1,
+            _ => {
+                return Ok(self.zombie(format!(
+                    "a struct with a `{}` tail is not supported by rustc_codegen_js; only a slice, \
+                     `str`, or `dyn` tail is supported",
+                    self.type_display(tail.ty),
+                )));
+            }
         };
-        let Some(element_size) = size_of(table, *element) else {
-            return Ok(self.zombie(format!(
-                "the elements of `{}` have no size here",
-                self.type_display(tail.ty),
-            )));
-        };
-        if !matches!(value::kind(table, from), Some(TypeKind::Slice(_))) {
+        if !matches!(
+            value::kind(table, from),
+            Some(TypeKind::Slice(_) | TypeKind::Str)
+        ) {
             return Ok(self.zombie(format!(
                 "rustc_codegen_js cannot cast a pointer to `{}` into a pointer to `{}`: the \
                  length of the tail is not carried by the source pointer",
@@ -1718,17 +1752,134 @@ impl<'a> JsCx<'a> {
                 self.type_display(to),
             )));
         }
-        let (setup, pointer) = self.reread(value, &[BUF, OFF, LEN]);
-        let reshaped = jsast::rt_call(
-            "retype_rc",
-            vec![
-                pointer.clone(),
-                self.header_factory(to),
-                jsast::num(element_size as f64),
-                ptr::slot_len(pointer),
-            ],
+        // Fresh unwritten heap allocations (e.g. `Rc::allocate_for_slice`) and already-reshaped
+        // `RcInner` blocks (`Rc::from_raw`) go through `__rt.retype_rc`. Source pointers cast only
+        // for `PtrMetadata` (such as `ptr as *const RcInner<T>` inside `Rc::allocate_for_ptr_in`,
+        // where `ptr` may be a string literal, stack slice, or already-written `Vec` buffer) keep
+        // their metadata in `{ $p, $m }` without attempting an invalid reshape.
+        let p_id = jsast::id("$p");
+        let b_id = jsast::id("$b");
+        let blk_id = jsast::id("$blk");
+        let a_id = jsast::id("$a");
+        let rt_id = jsast::id("__rt");
+        let str_len_expr = if self.bstr_enabled() {
+            jsast::member(p_id.clone(), "length")
+        } else {
+            ptr::slot_len(jsast::rt_call("str_bytes", vec![p_id.clone()]))
+        };
+        let header_size = table.get(to).and_then(|d| d.layout.size).unwrap_or(0);
+        let unwrap_buf = jsast::cond(
+            jsast::binary(
+                BinOp::And,
+                ptr::slot_buf(p_id.clone()),
+                jsast::binary(
+                    BinOp::StrictNe,
+                    jsast::member(rt_id.clone(), "_bv"),
+                    jsast::null(),
+                ),
+            ),
+            jsast::method_call(
+                jsast::member(rt_id, "_bv"),
+                "unwrap_buf",
+                vec![ptr::slot_buf(p_id.clone())],
+            ),
+            ptr::slot_buf(p_id.clone()),
         );
-        Ok(sequenced(setup, reshaped))
+        let extract_buf = jsast::cond(
+            jsast::binary(
+                BinOp::And,
+                p_id.clone(),
+                jsast::binary(
+                    BinOp::StrictEq,
+                    jsast::unary(jsast::UnOp::TypeOf, p_id.clone()),
+                    jsast::string("object"),
+                ),
+            ),
+            unwrap_buf,
+            jsast::null(),
+        );
+        let lookup_blk = jsast::cond(
+            jsast::binary(BinOp::Ne, b_id.clone(), jsast::null()),
+            jsast::rt_call("_heap_block", vec![b_id.clone()]),
+            jsast::undefined(),
+        );
+        let active_expr = jsast::cond(
+            jsast::binary(
+                BinOp::StrictNe,
+                jsast::member(blk_id.clone(), "typed"),
+                jsast::undefined(),
+            ),
+            jsast::member(blk_id.clone(), "typed"),
+            b_id,
+        );
+        let is_unwritten = jsast::binary(
+            BinOp::And,
+            jsast::binary(
+                BinOp::And,
+                jsast::binary(BinOp::StrictEq, ptr::slot_off(p_id.clone()), jsast::num(0)),
+                jsast::binary(
+                    BinOp::Ge,
+                    jsast::member(blk_id.clone(), "bytes"),
+                    jsast::num(header_size as f64),
+                ),
+            ),
+            jsast::binary(
+                BinOp::And,
+                jsast::method_call(jsast::id("Array"), "isArray", vec![a_id.clone()]),
+                jsast::method_call(
+                    a_id,
+                    "every",
+                    vec![jsast::arrow(
+                        vec!["$e".to_owned()],
+                        jsast::binary(BinOp::StrictEq, jsast::id("$e"), jsast::undefined()),
+                    )],
+                ),
+            ),
+        );
+        let can_reshape = jsast::binary(
+            BinOp::Or,
+            jsast::binary(
+                BinOp::StrictNe,
+                jsast::member(blk_id.clone(), "hdr"),
+                jsast::undefined(),
+            ),
+            is_unwritten,
+        );
+        let stmts = vec![
+            jsast::if_(
+                jsast::binary(
+                    BinOp::StrictEq,
+                    jsast::unary(jsast::UnOp::TypeOf, p_id.clone()),
+                    jsast::string("string"),
+                ),
+                vec![jsast::ret(ptr::fat_dyn(p_id.clone(), str_len_expr))],
+            ),
+            jsast::const_("$b", extract_buf),
+            jsast::const_("$blk", lookup_blk),
+            jsast::if_(
+                jsast::binary(BinOp::StrictNe, blk_id, jsast::undefined()),
+                vec![
+                    jsast::const_("$a", active_expr),
+                    jsast::if_(
+                        can_reshape,
+                        vec![jsast::ret(jsast::rt_call(
+                            "retype_rc",
+                            vec![
+                                p_id.clone(),
+                                self.header_factory(to),
+                                jsast::num(element_size as f64),
+                                ptr::slot_len(p_id.clone()),
+                            ],
+                        ))],
+                    ),
+                ],
+            ),
+            jsast::ret(ptr::fat_dyn(p_id.clone(), ptr::slot_len(p_id))),
+        ];
+        Ok(jsast::call(
+            jsast::arrow_block(vec!["$p".to_owned()], stmts),
+            vec![value],
+        ))
     }
 
     /// The reprojection row of the cast matrix (`ptr.rs::reproject_to_field`).

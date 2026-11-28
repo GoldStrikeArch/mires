@@ -64,6 +64,111 @@ impl JsCx<'_> {
         ))
     }
 
+    /// Lowers a `CastKind::DynUpcast { slot }` trait-object supertrait upcast, directly on
+    /// references/raw pointers/transparent wrappers or through matching `CoerceUnsized` structs
+    /// (such as `Rc<dyn Sub> -> Rc<dyn Super>` / `Arc<dyn Sub> -> Arc<dyn Super>`).
+    pub fn dyn_upcast(
+        &self,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        value: Expr,
+        slot: Option<u32>,
+    ) -> Res<Expr> {
+        // Primary-supertrait and auto-trait-only upcasts (`slot == None`) share the exact vtable
+        // prefix and runtime representation, so the coercion is an identity move.
+        let Some(slot_idx) = slot else {
+            return Ok(value);
+        };
+        self.dyn_upcast_slot_at(from_ty, to_ty, value, slot_idx, 0)
+    }
+
+    fn dyn_upcast_slot_at(
+        &self,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        value: Expr,
+        slot_idx: u32,
+        depth: u32,
+    ) -> Res<Expr> {
+        if depth >= 16 {
+            return Err(decline(
+                OpClass::Unsize,
+                "`dyn` upcast wrapper nesting deeper than 16 levels",
+            ));
+        }
+        let table = self.table;
+        let from = table.peeled(from_ty);
+        let to = table.peeled(to_ty);
+        match (value::kind(table, from), value::kind(table, to)) {
+            (
+                Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. }),
+                Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. }),
+            ) => {
+                let (setup, fat) =
+                    self.reread(value, &[rcgjs_object::ptr::PTR, rcgjs_object::ptr::META]);
+                let super_meta = jsast::index(
+                    jsast::member(fat.clone(), rcgjs_object::ptr::META),
+                    jsast::num(f64::from(slot_idx)),
+                );
+                let rebuilt = rcgjs_object::ptr::fat_dyn(
+                    jsast::member(fat, rcgjs_object::ptr::PTR),
+                    super_meta,
+                );
+                Ok(super::ptr::sequenced(setup, rebuilt))
+            }
+            (
+                Some(TypeKind::Adt {
+                    def: def_a,
+                    form: NominalForm::Struct,
+                    variants: va,
+                    ..
+                }),
+                Some(TypeKind::Adt {
+                    def: def_b,
+                    form: NominalForm::Struct,
+                    variants: vb,
+                    ..
+                }),
+            ) if def_a == def_b => {
+                let (Some(var_a), Some(var_b)) = (va.first(), vb.first()) else {
+                    return Ok(value);
+                };
+                if var_a.fields.len() != var_b.fields.len() {
+                    return Err(decline(
+                        OpClass::Unsize,
+                        "`dyn` upcast struct field count mismatch",
+                    ));
+                }
+                let mut key_names = Vec::with_capacity(var_a.fields.len());
+                for field in &var_a.fields {
+                    if let Some(name) = value::key_name(self.interns, field.key) {
+                        key_names.push(name);
+                    }
+                }
+                let read_refs: Vec<&str> = key_names.iter().map(String::as_str).collect();
+                let (setup, src) = self.reread(value, &read_refs);
+                let mut entries = Vec::with_capacity(var_a.fields.len());
+                for (fa, fb) in var_a.fields.iter().zip(&var_b.fields) {
+                    let Some(key) = value::key_name(self.interns, fa.key) else {
+                        continue;
+                    };
+                    let field_val = jsast::member(src.clone(), key.clone());
+                    let converted = if fa.ty != fb.ty && !table.is_zst(fa.ty) {
+                        self.dyn_upcast_slot_at(fa.ty, fb.ty, field_val, slot_idx, depth + 1)?
+                    } else {
+                        field_val
+                    };
+                    entries.push((key, converted));
+                }
+                Ok(super::ptr::sequenced(setup, jsast::object(entries)))
+            }
+            _ => Err(decline(
+                OpClass::Unsize,
+                "unsupported `dyn` upcast source or target type",
+            )),
+        }
+    }
+
     /// `transmute::<From, To>(value)` (`intrinsics.rs::codegen_transmute`).
     pub fn transmute(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Res<Expr> {
         if from_ty == to_ty {

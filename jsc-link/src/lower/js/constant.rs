@@ -126,7 +126,16 @@ impl<'a> JsCx<'a> {
             ConstTree::Scalar { bits, .. } => self.scalar_expr(*bits, ty),
             ConstTree::Str(id) => {
                 let text = interns.str(*id).unwrap_or("");
-                if value::is_mut_str_ptr(table, ty) {
+                if value::is_str(table, ty) {
+                    // An unsized `str` tail field inside a struct constant is stored as its UTF-8
+                    // byte array so `tail_slice` and `DerefCarry::Str(FatMut)` observe a buffer.
+                    let bytes = text
+                        .as_bytes()
+                        .iter()
+                        .map(|&b| jsast::num(b as f64))
+                        .collect();
+                    Ok(jsast::array(bytes))
+                } else if value::is_mut_str_ptr(table, ty) {
                     let bytes = text
                         .as_bytes()
                         .iter()
@@ -192,6 +201,14 @@ impl<'a> JsCx<'a> {
                 vtable,
             } => self.dyn_const_expr(data, *concrete, *vtable, depth),
             ConstTree::Slice(elements) => {
+                if let Some(TypeKind::Slice(element)) = value::kind(table, ty) {
+                    let element = *element;
+                    let items = elements
+                        .iter()
+                        .map(|tree| self.const_expr_at(tree, element, depth + 1))
+                        .collect::<Res<Vec<_>>>()?;
+                    return Ok(jsast::array(items));
+                }
                 let Some(pointee) = value::pointee_of(table, ty) else {
                     return Err(decline(
                         OpClass::Constant,
@@ -568,7 +585,22 @@ impl<'a> JsCx<'a> {
                     Ok(self.string_literal(text))
                 }
             }
-            ConstTree::Slice(elements) => self.slice_expr(elements, pointee, depth),
+            ConstTree::Slice(elements)
+                if matches!(value::kind(table, pointee), Some(TypeKind::Slice(_))) =>
+            {
+                self.slice_expr(elements, pointee, depth)
+            }
+            _ if table.unsized_tail(pointee).is_some() => {
+                let value = self.const_expr_at(inner, pointee, depth + 1)?;
+                let meta = self.const_unsized_tail_len(inner).ok_or_else(|| {
+                    decline(
+                        OpClass::Constant,
+                        "an unsized-tail struct constant whose tail length could not be determined",
+                    )
+                })?;
+                let data = self.boxed_if_raw(ty, pointee, value);
+                Ok(ptr::fat_dyn(data, jsast::num(meta as f64)))
+            }
             _ => {
                 let value = self.const_expr_at(inner, pointee, depth + 1)?;
                 if table.is_indirect(pointee) {
@@ -579,6 +611,23 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
+    }
+
+    /// Walks the last field of a constant unsized-tail struct aggregate to recover its tail length
+    /// metadata (element count for slice tails, UTF-8 byte length for `str` tails).
+    fn const_unsized_tail_len(&self, tree: &ConstTree) -> Option<u64> {
+        let mut cur = tree;
+        for _ in 0..16 {
+            match cur {
+                ConstTree::Slice(elements) => return Some(elements.len() as u64),
+                ConstTree::Str(id) => {
+                    return Some(self.interns.str(*id).map_or(0, str::len) as u64);
+                }
+                ConstTree::Aggregate(fields) => cur = fields.last()?,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// `__rt.box(value)` for a raw pointer to a slot pointee, the value itself otherwise

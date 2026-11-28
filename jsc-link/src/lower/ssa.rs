@@ -1724,16 +1724,12 @@ impl<'a> Builder<'a> {
             .get(self.table.peeled(pointee))
             .map(|descriptor| descriptor.kind.clone());
         match kind {
-            Some(TypeKind::Slice(_) | TypeKind::Str) => Ok(self.op(
+            Some(TypeKind::Slice(_) | TypeKind::Str | TypeKind::Dynamic { .. }) => Ok(self.op(
                 OpKind::SliceView {
                     ptr: *data,
                     len: *meta,
                 },
                 result,
-            )),
-            Some(TypeKind::Dynamic { .. }) => Err(decline(
-                OpClass::Unsize,
-                "raw `dyn` pointer built from parts",
             )),
             _ if self.is_sized(pointee) => {
                 let from = self.ty_of(*data);
@@ -1747,9 +1743,16 @@ impl<'a> Builder<'a> {
                     result,
                 ))
             }
+            _ if self.table.unsized_tail(pointee).is_some() => Ok(self.op(
+                OpKind::SliceView {
+                    ptr: *data,
+                    len: *meta,
+                },
+                result,
+            )),
             _ => Err(decline(
                 OpClass::Unsize,
-                "raw pointer to an unsized-tail struct built from parts",
+                "raw pointer to an unsized type built from parts",
             )),
         }
     }
