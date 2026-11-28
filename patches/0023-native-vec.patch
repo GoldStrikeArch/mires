@@ -15,7 +15,7 @@ diff -ruN a/library/alloc/src/macros.rs b/library/alloc/src/macros.rs
 diff -ruN a/library/alloc/src/vec/mod.rs b/library/alloc/src/vec/mod.rs
 --- a/library/alloc/src/vec/mod.rs	2026-11-24 13:36:06
 +++ b/library/alloc/src/vec/mod.rs	2026-11-24 13:56:53
-@@ -438,6 +438,608 @@
+@@ -438,6 +438,610 @@
      len: usize,
  }
  
@@ -50,9 +50,11 @@ diff -ruN a/library/alloc/src/vec/mod.rs b/library/alloc/src/vec/mod.rs
 +#[cfg(not(no_global_oom_handling))]
 +#[doc(hidden)]
 +#[unstable(feature = "liballoc_internals", issue = "none")]
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++#[rustc_allow_const_fn_unstable(core_intrinsics, const_heap, liballoc_internals)]
 +#[inline(never)]
 +#[rustc_diagnostic_item = "rcgjs_vec_from_array"]
-+pub fn rcgjs_vec_from_array<T, const N: usize>(arr: [T; N]) -> Vec<T> {
++pub const fn rcgjs_vec_from_array<T, const N: usize>(arr: [T; N]) -> Vec<T> {
 +    crate::boxed::box_assume_init_into_vec_unsafe(
 +        crate::intrinsics::write_box_via_move(Box::new_uninit(), arr),
 +    )

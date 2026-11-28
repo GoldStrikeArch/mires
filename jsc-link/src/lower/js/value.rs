@@ -719,20 +719,34 @@ pub fn clone_expr_with(
     };
     match &descriptor.kind {
         TypeKind::Adt {
-            form: NominalForm::Struct | NominalForm::Union,
+            form: form @ (NominalForm::Struct | NominalForm::Union),
             variants,
             ..
         } => {
             let Some(variant) = variants.first() else {
                 return shallow_clone(value);
             };
+            let is_union = *form == NominalForm::Union;
             let struct_clone = |src: Expr| {
                 let entries = variant
                     .fields
                     .iter()
                     .map(|field| {
                         let key = key_name(interns, field.key).unwrap_or_default();
-                        let read = clone_field(field.ty, jsast::member(src.clone(), key.clone()));
+                        let field_read = jsast::member(src.clone(), key.clone());
+                        let read = if is_union && table.needs_clone(field.ty) {
+                            // Only one union field is active at runtime; inactive fields are
+                            // `undefined` and must not invoke `.slice()` / field clones.
+                            clone_once(field_read, "$cu", |v| {
+                                jsast::cond(
+                                    jsast::binary(BinOp::StrictNe, v.clone(), jsast::undefined()),
+                                    clone_field(field.ty, v),
+                                    jsast::undefined(),
+                                )
+                            })
+                        } else {
+                            clone_field(field.ty, field_read)
+                        };
                         (key, read)
                     })
                     .collect();

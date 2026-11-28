@@ -1926,7 +1926,7 @@ fn drain_callee_queue(
     queue: &mut VecDeque<JsName>,
 ) -> Result<(), String> {
     while let Some(callee_name) = queue.pop_front() {
-        if is_panic_impl_item(cx.table, &callee_name) {
+        if is_panic_impl_item(cx.table, cx.pre_funcs, &callee_name) {
             continue;
         }
         if let Some(Ok(callee_func)) = cx.pre_funcs.get(&callee_name) {

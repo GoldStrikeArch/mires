@@ -408,9 +408,15 @@ impl<'a> JsCx<'a> {
             Some(TypeKind::Array { length, .. }) if is_slot(table, state.ty) => {
                 JsPlace::Array(value, *length)
             }
+            // Dereferencing a pointer to a zero-sized pointee (e.g. `*const ()`,
+            // `&mut MaybeUninit<()>`, `Box<MaybeUninit<()>>`) has no storage; its address is
+            // the pointer value itself, reading it is `undefined`, and writing it is a no-op.
+            _ if table.is_zst(pointee) => JsPlace::Unit(value),
             _ if is_slot(table, state.ty) => JsPlace::Slot {
                 pointer: value,
-                indirect: table.is_indirect(pointee),
+                indirect: table.is_indirect(pointee)
+                    || (table.crosses_transparent_union(pointee)
+                        && table.is_indirect(table.peeled(pointee))),
                 byte_access: if self.byte_views.raw_byte_derefs {
                     match value::kind(table, shape) {
                         Some(TypeKind::Integer {
@@ -446,8 +452,8 @@ impl<'a> JsCx<'a> {
         state: &mut WalkState,
     ) -> Res<()> {
         let table = self.table;
-        let key = match table.field(state.ty, state.variant, field) {
-            Some(descriptor) => descriptor.key,
+        let (key, field_offset) = match table.field(state.ty, state.variant, field) {
+            Some(descriptor) => (descriptor.key, descriptor.offset),
             None => {
                 return Err(decline(
                     OpClass::Place,
@@ -508,6 +514,75 @@ impl<'a> JsCx<'a> {
             let base = self.read_place(&state.current);
             state.current = self.tail_place(base, key, field_ty, tail, raw_tail)?;
             state.field_slot = false;
+        } else if table.is_zst(field_ty) {
+            // A zero-sized field inside a slot-pointed non-ZST container (such as
+            // `ArcInner<Zst>::data` at byte offset 8) has no storage of its own, but taking
+            // `&raw const (*ptr).data` must preserve the container's byte-offset address so
+            // `Arc::from_raw` / `ptr::byte_sub` can recover the enclosing container pointer.
+            let zst_addr = match &state.current {
+                JsPlace::Slot { pointer, .. } => {
+                    let parent_size = table
+                        .get(table.peeled(state.ty))
+                        .and_then(|d| d.layout.size)
+                        .unwrap_or(0);
+                    if parent_size > 0 {
+                        let scaled = jsast::rt_call(
+                            "scale",
+                            vec![pointer.clone(), jsast::num(parent_size as f64)],
+                        );
+                        if field_offset == 0 {
+                            Some(scaled)
+                        } else {
+                            let (setup, slot) = self.reread(scaled, &[BUF, OFF, ptr::SCALE]);
+                            let num_branch = jsast::binary(
+                                BinOp::UShr,
+                                jsast::binary(
+                                    BinOp::Add,
+                                    slot.clone(),
+                                    jsast::num(field_offset as f64),
+                                ),
+                                jsast::num(0),
+                            );
+                            let slot_branch = Expr::Object(vec![
+                                (BUF.to_owned(), ptr::slot_buf(slot.clone())),
+                                (
+                                    OFF.to_owned(),
+                                    jsast::binary(
+                                        BinOp::Add,
+                                        ptr::slot_off(slot.clone()),
+                                        jsast::num(field_offset as f64),
+                                    ),
+                                ),
+                                (
+                                    ptr::SCALE.to_owned(),
+                                    jsast::member(slot.clone(), ptr::SCALE),
+                                ),
+                            ]);
+                            let shifted = jsast::cond(
+                                jsast::binary(
+                                    BinOp::StrictEq,
+                                    jsast::type_of(slot),
+                                    jsast::string("number"),
+                                ),
+                                num_branch,
+                                slot_branch,
+                            );
+                            Some(super::ptr::sequenced(setup, shifted))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(addr) = zst_addr {
+                state.current = JsPlace::Unit(addr);
+                state.field_slot = false;
+            } else {
+                let base = self.read_place(&state.current);
+                state.current = JsPlace::Var(field_expr(self.interns, base, key));
+                state.field_slot = true;
+            }
         } else {
             let base = self.read_place(&state.current);
             state.current = JsPlace::Var(field_expr(self.interns, base, key));
@@ -1213,6 +1288,7 @@ impl<'a> JsCx<'a> {
             )),
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => Ok(address),
+            JsPlace::Deref(value) if self.table.is_zst(ty) => Ok(value),
             JsPlace::Deref(value) | JsPlace::Var(value) => {
                 if self.table.is_indirect(ty) {
                     Ok(self.ref_to_raw(ty, value))

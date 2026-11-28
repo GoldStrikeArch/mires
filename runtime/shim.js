@@ -35,6 +35,11 @@ globalThis.__rt._abort_errors = () => {
 };
 
 globalThis.__rt.abort_error = (error) => {
+  const pkey = Symbol.for("rustc_codegen_js.panic-errors.v1");
+  const panics = globalThis[pkey];
+  if (panics && panics.has(error)) {
+    return error;
+  }
   if (error === null || (typeof error !== "object" && typeof error !== "function")) {
     error = new Error(String(error));
   }
@@ -1039,6 +1044,15 @@ globalThis.__rt._run = (p, count, op) => {
       off += ev.off;
     }
   }
+  if (typeof off === "string") {
+    if (n > 1) {
+      throw __rt.abort_error(new Error(
+        "rustc_codegen_js: `" + op + "` over " + n + " elements at field `" + off +
+          "` reaches past a single field",
+      ));
+    }
+    return { buf: buf, off: off, n: n };
+  }
   if ((Array.isArray(buf) || ArrayBuffer.isView(buf)) && off + n > buf.length) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: `" + op + "` over " + n + " elements at " + off +
@@ -1129,6 +1143,20 @@ globalThis.__rt.copy = (dst, src, count, clone, plain) => {
   }
   const bv = globalThis.__rt._bv;
   const down = (bv !== null ? bv.unwrap_buf(d.buf) : d.buf) === (bv !== null ? bv.unwrap_buf(s.buf) : s.buf) && d.off > s.off;
+  if (typeof d.off === "string" || typeof s.off === "string") {
+    if (s.n === 0) return;
+    if (effCl === undefined && (fromNs || globalThis.__rt._rebinds(dst, d.buf, s))) {
+      d.buf[d.off] = s.buf[s.off];
+      return;
+    }
+    const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
+    if (plain || globalThis.__rt._boxes === null) {
+      d.buf[d.off] = each(s.buf[s.off]);
+      return;
+    }
+    globalThis.__rt._put(d.buf, d.off, each(s.buf[s.off]), globalThis.__rt._blk_get(d.buf) !== undefined);
+    return;
+  }
   if (effCl === undefined && (fromNs || globalThis.__rt._rebinds(dst, d.buf, s))) {
     if (down) { for (let i = s.n - 1; i >= 0; i--) d.buf[d.off + i] = s.buf[s.off + i]; }
     else { for (let i = 0; i < s.n; i++) d.buf[d.off + i] = s.buf[s.off + i]; }
@@ -1191,9 +1219,8 @@ globalThis.__rt._put = (buf, off, value, heap) => {
   const old = off === "__proto__" && !Object.prototype.hasOwnProperty.call(buf, off) ? undefined : buf[off];
   if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
     globalThis.__rt.overwrite(old, value);
-    return;
-  }
-  if (off === "__proto__") {
+    value = old;
+  } else if (off === "__proto__") {
     Object.defineProperty(buf, off, {
       value,
       writable: true,
@@ -1228,9 +1255,8 @@ globalThis.__rt._put_tracked = (buf, off, value) => {
   const old = off === "__proto__" && !Object.prototype.hasOwnProperty.call(buf, off) ? undefined : buf[off];
   if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
     globalThis.__rt.overwrite(old, value);
-    return;
-  }
-  if (off === "__proto__") {
+    value = old;
+  } else if (off === "__proto__") {
     Object.defineProperty(buf, off, {
       value,
       writable: true,
@@ -1281,6 +1307,20 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
   if (effCl === undefined && ArrayBuffer.isView(d.buf) && ArrayBuffer.isView(s.buf)
       && d.buf.constructor === s.buf.constructor) {
     d.buf.set(s.buf.subarray(s.off, s.off + s.n), d.off);
+    return;
+  }
+  if (typeof d.off === "string" || typeof s.off === "string") {
+    if (s.n === 0) return;
+    if (effCl === undefined && (fromNs || globalThis.__rt._rebinds(dst, d.buf, s))) {
+      d.buf[d.off] = s.buf[s.off];
+      return;
+    }
+    const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
+    if (plain || globalThis.__rt._boxes === null) {
+      d.buf[d.off] = each(s.buf[s.off]);
+      return;
+    }
+    globalThis.__rt._put(d.buf, d.off, each(s.buf[s.off]), globalThis.__rt._blk_get(d.buf) !== undefined);
     return;
   }
   if (effCl === undefined && (fromNs || globalThis.__rt._rebinds(dst, d.buf, s))) {
@@ -1343,6 +1383,10 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
     }
   }
   const d = globalThis.__rt._run(dst, count, "write_bytes");
+  if (typeof d.off === "string") {
+    if (d.n > 0) d.buf[d.off] = value;
+    return;
+  }
   if (Array.isArray(d.buf) || ArrayBuffer.isView(d.buf)) {
     d.buf.fill(value, d.off, d.off + d.n);
     return;
@@ -1407,11 +1451,33 @@ globalThis.__rt.compare_bytes = (a, b, count) => {
   const x = globalThis.__rt._run(a, count, "compare_bytes");
   const y = globalThis.__rt._run(b, count, "compare_bytes");
   const scaled = a.$s !== undefined;
+  const xStr = typeof x.off === "string", yStr = typeof y.off === "string";
+  const cmpArr = (l, r) => {
+    for (let j = 0; j < l.length; j++) {
+      const a0 = l[j], b0 = r[j];
+      if (a0 !== b0) {
+        if (Array.isArray(a0) && Array.isArray(b0)) {
+          const d = cmpArr(a0, b0);
+          if (d !== 0) return d;
+        } else {
+          return a0 < b0 ? -1 : 1;
+        }
+      }
+    }
+    return 0;
+  };
   for (let i = 0; i < x.n; i++) {
-    const left = x.buf[x.off + i];
-    const right = y.buf[y.off + i];
+    const left = x.buf[xStr ? x.off : x.off + i];
+    const right = y.buf[yStr ? y.off : y.off + i];
     if (left !== right) {
-      if (scaled) return left < right ? -1 : 1;
+      if (scaled) {
+        if (Array.isArray(left) && Array.isArray(right)) {
+          const d = cmpArr(left, right);
+          if (d !== 0) return d;
+          continue;
+        }
+        return left < right ? -1 : 1;
+      }
       return left - right;
     }
   }
@@ -6894,7 +6960,13 @@ globalThis.__rt.nv_reserve_f64 = (v, used, add, minCap, exact, maxElems) => {
 
 // Std-support helpers. Append below, do not reorder.
 globalThis.__rt.js_eprint_str = (s) => console.error(s);
-globalThis.__rt.js_panic_error = (msg) => { throw new Error("rust panic: " + msg); };
+globalThis.__rt.js_panic_error = (msg) => {
+  const key = Symbol.for("rustc_codegen_js.panic-errors.v1");
+  const set = globalThis[key] || (globalThis[key] = new WeakSet());
+  const error = new Error("rust panic: " + msg);
+  set.add(error);
+  throw error;
+};
 globalThis.__rt.js_throw_error = (msg) => { throw new Error(msg); };
 globalThis.__rt.js_now_ms = () => (typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now());
 globalThis.__rt.js_epoch_ms = () => Date.now();
