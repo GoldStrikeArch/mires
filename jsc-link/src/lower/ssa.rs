@@ -107,13 +107,13 @@ pub fn build_with(
     if body.blocks.is_empty() {
         return Err(decline(OpClass::Region, "function body has no blocks"));
     }
-    let analysis = Analysis::of(body, table, interns);
+    let mut analysis = Analysis::of(body, table, interns);
     let mut cells: BTreeSet<LocalId> = analysis.cells.clone();
     let mut moves = true;
-    // Two demotion rounds at most: the first pass finds every local read where no definition
-    // reaches (demoting one local never creates such a read for another), and a verifier
-    // rejection of a move switches moves off for one more.
-    for _ in 0..3 {
+    // Demotion rounds: the first pass finds any local read where no definition reaches or any
+    // direct-typed local whose synthetic view requires a boxed cell, and a verifier rejection of a
+    // move switches moves off for one more.
+    for _ in 0..4 {
         let mut builder = Builder::new(
             body,
             origins,
@@ -128,7 +128,16 @@ pub fn build_with(
             cells.extend(builder.undefined.iter().copied());
             continue;
         }
-        let func = builder.finish()?;
+        let local_of_value = builder.local_of_value.clone();
+        let mut func = builder.finish()?;
+        let unboxed_value_locals = ensure_addressable_cells(&mut func, table, &local_of_value);
+        if !unboxed_value_locals.is_empty() {
+            for local in unboxed_value_locals {
+                cells.insert(local);
+                analysis.boxed.insert(local);
+            }
+            continue;
+        }
         match func.verify(table) {
             Ok(()) => return Ok(func),
             Err(err) if moves && err.kind == VerifyErrorKind::UseAfterMove => {
@@ -145,8 +154,87 @@ pub fn build_with(
     }
     Err(decline(
         OpClass::Region,
-        "SSA construction did not converge in three passes",
+        "SSA construction did not converge in four passes",
     ))
+}
+
+/// Enforces the addressable-place invariant on `func`: any `BorrowView`, `RawView`, or non-empty
+/// `Drop` whose projection path stays on the root (only `Downcast` and transparent `Field` steps)
+/// and names a direct (non-indirect) place requires that root to live in a boxed cell.
+///
+/// - When the root is already a `Root::Cell(cell)`, promotes `cell.boxed = true` in place.
+/// - When the root is a `Root::Value(v)` belonging to a MIR local, returns that `LocalId` so
+///   [`build_with`] demotes it to a boxed cell in the next round.
+fn ensure_addressable_cells(
+    func: &mut Func,
+    table: &TypeTable,
+    local_of_value: &BTreeMap<ValueId, LocalId>,
+) -> BTreeSet<LocalId> {
+    let mut needs_boxing: BTreeSet<CellId> = BTreeSet::new();
+    let mut demote_locals: BTreeSet<LocalId> = BTreeSet::new();
+
+    let stays_direct_root = |start_ty: TypeId, path: &[Proj]| -> bool {
+        let mut ty = start_ty;
+        let mut variant: Option<u32> = None;
+        for proj in path {
+            match proj {
+                Proj::Downcast { variant: v } => variant = Some(*v),
+                Proj::Field { field, ty: fty } => {
+                    let transparent = table
+                        .field(ty, variant, *field)
+                        .is_some_and(|f| f.key == crate::jir::types::FieldKey::Transparent);
+                    if !transparent {
+                        return false;
+                    }
+                    ty = *fty;
+                    variant = None;
+                }
+                _ => return false,
+            }
+        }
+        !table.is_indirect(ty)
+    };
+
+    for block in &func.blocks {
+        for op in &block.ops {
+            let (root, path) = match &op.kind {
+                OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+                    (root, path.as_slice())
+                }
+                OpKind::Drop {
+                    root, path, glue, ..
+                } if !matches!(glue, crate::jir::semantic::DropGlue::None) => {
+                    (root, path.as_slice())
+                }
+                _ => continue,
+            };
+            match root {
+                Root::Cell(cell) => {
+                    if let Some(def) = func.cells.get(cell.0 as usize) {
+                        if !def.boxed && stays_direct_root(def.ty, path) {
+                            needs_boxing.insert(*cell);
+                        }
+                    }
+                }
+                Root::Value(v) => {
+                    if let Some(ty) = func.ty(*v) {
+                        if stays_direct_root(ty, path) {
+                            if let Some(&local) = local_of_value.get(v) {
+                                demote_locals.insert(local);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for cell in needs_boxing {
+        if let Some(def) = func.cells.get_mut(cell.0 as usize) {
+            def.boxed = true;
+        }
+    }
+    demote_locals
 }
 
 fn decline(op: OpClass, detail: impl Into<String>) -> Decline {
@@ -269,7 +357,7 @@ impl Analysis {
                         }
                     }
                     StatementKind::SetDiscriminant { place, .. } => {
-                        record_place(&mut uses, place, false, true);
+                        record_place(&mut uses, place, !place.projection.is_empty(), true);
                     }
                     _ => {}
                 }
@@ -4247,6 +4335,70 @@ mod tests {
             );
         }
         let _ = Value::Unit;
+    }
+
+    #[test]
+    fn address_taken_transparent_direct_local_promotes_to_boxed_cell() {
+        let interns = world(true);
+        let source = body(
+            signature(vec![I32], I32),
+            vec![
+                local(0, LocalRole::Return, I32),
+                local(1, LocalRole::Argument, I32),
+                local(2, LocalRole::Temporary, WRAP),
+                local(3, LocalRole::Temporary, REF_I32),
+            ],
+            vec![block(
+                vec![
+                    assign(
+                        place(2, Vec::new(), WRAP),
+                        Rvalue::Aggregate {
+                            kind: AggregateKind::Adt {
+                                definition: crate::jir::semantic::DefinitionId {
+                                    crate_id: 1,
+                                    local_hash: 12,
+                                },
+                                variant: 0,
+                                active_field: None,
+                            },
+                            result: WRAP,
+                            operands: vec![copy(1, I32)],
+                        },
+                    ),
+                    assign(
+                        place(3, Vec::new(), REF_I32),
+                        Rvalue::Reference {
+                            kind: BorrowKind::Mutable,
+                            place: place(2, vec![Projection::Field { field: 0, ty: I32 }], I32),
+                        },
+                    ),
+                    assign(
+                        place(3, vec![Projection::Deref], I32),
+                        Rvalue::Use(i32_const(99)),
+                    ),
+                    assign(
+                        place(0, Vec::new(), I32),
+                        Rvalue::Use(copy_place(place(
+                            2,
+                            vec![Projection::Field { field: 0, ty: I32 }],
+                            I32,
+                        ))),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+        source
+            .verify(&interns.types, &interns)
+            .expect("body verifies");
+        let func = build(&source, None, &interns.types, &interns).expect("builds");
+        func.verify(&interns.types).expect("verifies");
+        let plan = fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+        structure::structure(&func, &plan, &interns.types, false).expect("structures");
+        assert!(
+            func.cells.iter().any(|cell| cell.ty == WRAP && cell.boxed),
+            "transparent wrapper over direct i32 with address-taken field must be a boxed cell"
+        );
     }
 }
 

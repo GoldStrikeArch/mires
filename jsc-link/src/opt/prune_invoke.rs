@@ -245,21 +245,93 @@ pub(crate) fn type_contains_fn_ptr(
     }
 }
 
-/// Whether `name` is the crate graph's `#[panic_handler]` (`LangItem::PanicImpl`), established
+/// Whether `name` is an aborting `#[panic_handler]` (`LangItem::PanicImpl`), established
 /// strictly from the rustc semantic tag (`BodySemantic::PanicImpl`), never from symbol names.
 ///
-/// Both the JIR and baseline emitters wrap `PanicImpl` bodies in `try { ... } catch ($e) { throw
-/// __rt.abort_error($e); }` (unless already an unconditional literal abort), so calling one can
-/// only diverge or raise a registered abort — never a catchable host exception.
+/// The emitter wraps `PanicImpl` bodies in `try { ... } catch ($e) { throw __rt.abort_error($e); }`
+/// (unless already an unconditional literal abort). Under `mires-std` with `-C panic=unwind`,
+/// `#[panic_handler]` calls `__rt.js_panic_error`, which `abort_error` leaves catchable so
+/// `std::panic::catch_unwind` and live `Drop` landing pads observe Rust panics. A `PanicImpl` is
+/// therefore only guaranteed non-catchable when it cannot transitively reach `js_panic_error`
+/// (which holds for all `#![no_std]` panic handlers and `-C panic=abort`).
 pub(crate) fn is_panic_impl_item(
     table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     name: &(impl AsRef<str> + ?Sized),
 ) -> bool {
-    table
+    let is_panic_impl = table
         .get(name.as_ref())
         .filter(|item| item.kind == ItemKind::Fn)
         .and_then(|item| item.jir.body.as_ref())
-        .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
+        .is_some_and(|body| body.semantic == BodySemantic::PanicImpl);
+    if !is_panic_impl {
+        return false;
+    }
+    !panic_impl_reaches_js_panic_error(table, funcs, name.as_ref())
+}
+
+fn panic_impl_reaches_js_panic_error(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    start: &str,
+) -> bool {
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut work: Vec<&str> = vec![start];
+    while let Some(cur) = work.pop() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        if cur == "js_panic_error" {
+            return true;
+        }
+        let Some(item) = table.get(cur) else {
+            continue;
+        };
+        if let (Some(Ok(func)), Some(interns)) = (funcs.get(cur), item.jir.interns()) {
+            for block in &func.blocks {
+                for op in &block.ops {
+                    let OpKind::Call { callee, .. } = &op.kind else {
+                        continue;
+                    };
+                    match callee {
+                        Callee::Runtime { member, .. } => {
+                            if interns.str(*member) == Some("js_panic_error") {
+                                return true;
+                            }
+                        }
+                        Callee::Foreign { symbol, .. } => {
+                            if let Some(sym) = interns.str(*symbol) {
+                                if sym == "js_panic_error" {
+                                    return true;
+                                }
+                                if table.contains_key(sym) {
+                                    work.push(sym);
+                                }
+                            }
+                        }
+                        Callee::Direct { link_name, .. } => {
+                            if let Some(sym) = interns.str(*link_name) {
+                                work.push(sym);
+                            }
+                        }
+                        Callee::Intrinsic {
+                            fallback: Some(d), ..
+                        } => {
+                            if let Some(sym) = interns.str(d.link_name) {
+                                work.push(sym);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            for r in &item.refs {
+                work.push(r.as_str());
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
@@ -324,6 +396,7 @@ struct ThrowAnalysis<'a> {
     vtable_drops: BTreeSet<JsName>,
     vtable_unknown: bool,
     static_refs: BTreeSet<JsName>,
+    aborting_panic_impls: BTreeSet<JsName>,
 }
 
 impl<'a> ThrowAnalysis<'a> {
@@ -479,6 +552,12 @@ impl<'a> ThrowAnalysis<'a> {
             }
         }
 
+        let aborting_panic_impls: BTreeSet<JsName> = table
+            .keys()
+            .filter(|name| is_panic_impl_item(table, funcs, name))
+            .cloned()
+            .collect();
+
         Self {
             table,
             interns_map,
@@ -492,11 +571,12 @@ impl<'a> ThrowAnalysis<'a> {
             vtable_drops,
             vtable_unknown,
             static_refs,
+            aborting_panic_impls,
         }
     }
 
     fn target_name_throws(&self, target: &str, may_throw: &BTreeSet<JsName>) -> bool {
-        if is_panic_impl_item(self.table, target) {
+        if self.aborting_panic_impls.contains(target) {
             return false;
         }
         if self.ok_funcs.contains(target) {
@@ -683,7 +763,7 @@ impl<'a> ThrowAnalysis<'a> {
         loop {
             let mut changed = false;
             for (name, res) in funcs.iter() {
-                if may_throw_host.contains(name) || is_panic_impl_item(self.table, name) {
+                if may_throw_host.contains(name) || self.aborting_panic_impls.contains(name) {
                     continue;
                 }
                 let Ok(func) = res else { continue };
@@ -4839,5 +4919,97 @@ mod tests {
                 "witness must accept monomorphic TypedArray helper `{sym}`"
             );
         }
+    }
+
+    #[test]
+    fn preserves_invoke_calling_panic_impl_that_reaches_js_panic_error() {
+        let mut panic_interns = Interns::new();
+        let unit_p = unit_types(&mut panic_interns);
+        let js_panic = panic_interns.intern_str("js_panic_error");
+        let mut pb = FuncBuilder::new(
+            item_id(210),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_p,
+                abi: AbiSignature::default(),
+            },
+        );
+        pb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Runtime {
+                    member: js_panic,
+                    sysroot: true,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        pb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let panic_fn = pb.finish();
+
+        let mut drop_interns = Interns::new();
+        let unit_d = unit_types(&mut drop_interns);
+        let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let panic_sym = caller_interns.intern_str("std_panic_handler");
+        let caller = build_caller_with_cleanup_drop(
+            &mut caller_interns,
+            unit_c,
+            Callee::Direct {
+                item: item_id(210),
+                link_name: panic_sym,
+            },
+            "real_drop",
+        );
+
+        let mut panic_item = test_item("std_panic_handler", panic_interns);
+        panic_item.jir.body = Some(semantic_body(item_id(210), unit_p, BodySemantic::PanicImpl));
+        let caller_item = test_item("caller", caller_interns);
+        let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+
+        let mut table = BTreeMap::new();
+        table.insert(JsName::new("std_panic_handler".to_owned()), panic_item);
+        table.insert(
+            JsName::new("real_drop".to_owned()),
+            test_item("real_drop", drop_interns),
+        );
+        table.insert(JsName::new("caller".to_owned()), caller_item);
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("std_panic_handler".to_owned()), Ok(panic_fn));
+        funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(
+            stats.modified, 0,
+            "PanicImpl reaching js_panic_error throws a catchable Rust panic and must not prune"
+        );
+        let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
+        assert!(updated.has_invoke());
+        let forged = [InvokePrunedSite {
+            block: FuncBuilder::ENTRY,
+            reason: InvokePruneReason::ProtectedOpCannotThrow,
+        }];
+        assert!(
+            witness::check_invoke_pruning(
+                &caller,
+                &caller_interns_ref,
+                &forged,
+                &table,
+                &funcs,
+                &live,
+            )
+            .is_err(),
+            "forged prune over catchable PanicImpl must fail witness check"
+        );
     }
 }

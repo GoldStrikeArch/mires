@@ -336,7 +336,7 @@ pub fn analyze_reachable(
         .fold(AllocatorProvider::Unknown, |acc, item| {
             acc.merge(item.allocator_provider)
         });
-    let typed_heap_enabled = matches!(
+    let mut typed_heap_enabled = matches!(
         opts.profile,
         Some(Profile::ReleaseSpeed | Profile::ReleaseBalanced | Profile::ReleaseSize)
     ) && allocator_provider == AllocatorProvider::Default
@@ -356,12 +356,23 @@ pub fn analyze_reachable(
             skip_native_string,
             skip_native_vec,
         );
-        let next_string = skip_native_string && !string_internally_accessed;
-        let next_vec =
-            skip_native_vec && !vec_internally_accessed && !plan.non_rc_raw_alloc_reachable;
-        if next_string == skip_native_string && next_vec == skip_native_vec {
+        // When non-Rc/Arc user code directly calls raw `__rust_alloc` / `__rust_dealloc` /
+        // `__rust_realloc` (e.g. `Box::into_raw` freed via `alloc::alloc::dealloc`), keep all
+        // `Box` and `RawVec` allocations on the unified `_blocks`-registered heap so every
+        // pointer obeys one coherent deallocation contract.
+        let next_typed = typed_heap_enabled && !plan.non_rc_raw_alloc_reachable;
+        let next_string = next_typed && skip_native_string && !string_internally_accessed;
+        let next_vec = next_typed
+            && skip_native_vec
+            && !vec_internally_accessed
+            && !plan.non_rc_raw_alloc_reachable;
+        if next_typed == typed_heap_enabled
+            && next_string == skip_native_string
+            && next_vec == skip_native_vec
+        {
             return plan;
         }
+        typed_heap_enabled = next_typed;
         skip_native_string = next_string;
         skip_native_vec = next_vec;
     }
@@ -3392,5 +3403,168 @@ mod tests {
         assert!(!plan.is_packed_arr_vec(&interns.types, vec_const));
         assert!(!plan.is_packed_arr_vec(&interns.types, vec_u32));
         assert!(!plan.is_packed_arr_vec(&interns.types, vec_zst));
+    }
+
+    #[test]
+    fn non_rc_raw_dealloc_disables_typed_heap_for_unified_box_contract() {
+        let mut interns = Interns::new();
+        let hook_sym = interns.intern_str("alloc$alloc$rcgjs_typed_alloc$h1");
+        let user_sym = interns.intern_str("app$manual_dealloc$h2");
+        let raw_dealloc_sym = interns.intern_str("_RNvCs1_7___rustc14___rust_dealloc");
+
+        let unit_ty = TypeId(1);
+        interns
+            .types
+            .insert(make_desc(1, TypeKind::Tuple(Vec::new()), 0, false));
+
+        let root_func = empty_func(
+            1,
+            vec![
+                Op {
+                    result: None,
+                    origin: OriginId(0),
+                    kind: OpKind::Call {
+                        callee: Callee::Direct {
+                            item: ItemId {
+                                definition: DefinitionId {
+                                    crate_id: 2,
+                                    local_hash: 10,
+                                },
+                                instantiation: 1,
+                            },
+                            link_name: hook_sym,
+                        },
+                        function: None,
+                        args: Vec::new(),
+                        track_caller: None,
+                        semantic: CallSemantic::Standard(StandardOperation::TypedAlloc),
+                        host: None,
+                    },
+                },
+                Op {
+                    result: None,
+                    origin: OriginId(0),
+                    kind: OpKind::Call {
+                        callee: Callee::Direct {
+                            item: ItemId {
+                                definition: DefinitionId {
+                                    crate_id: 1,
+                                    local_hash: 11,
+                                },
+                                instantiation: 1,
+                            },
+                            link_name: user_sym,
+                        },
+                        function: None,
+                        args: Vec::new(),
+                        track_caller: None,
+                        semantic: CallSemantic::Ordinary,
+                        host: None,
+                    },
+                },
+            ],
+            vec![ValueDef {
+                ty: unit_ty,
+                origin: OriginId(0),
+                carrier: Carrier::Baseline,
+            }],
+        );
+        let user_func = empty_func(
+            2,
+            vec![Op {
+                result: None,
+                origin: OriginId(0),
+                kind: OpKind::Call {
+                    callee: Callee::Foreign {
+                        definition: DefinitionId {
+                            crate_id: 3,
+                            local_hash: 2,
+                        },
+                        symbol: raw_dealloc_sym,
+                    },
+                    function: None,
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+            }],
+            Vec::new(),
+        );
+        let hook_func = empty_func(3, Vec::new(), Vec::new());
+
+        let mut table = BTreeMap::new();
+        let root_name = JsName::new("entry".to_owned());
+        let user_name = JsName::new("app$manual_dealloc$h2".to_owned());
+        let hook_name = JsName::new("alloc$alloc$rcgjs_typed_alloc$h1".to_owned());
+        let dealloc_name = JsName::new("_RNvCs1_7___rustc14___rust_dealloc".to_owned());
+        table.insert(
+            root_name.clone(),
+            make_item(
+                "entry",
+                "app::entry",
+                ItemKind::Fn,
+                true,
+                AllocatorProvider::Default,
+                Some(interns.clone()),
+                BodySemantic::Ordinary,
+            ),
+        );
+        table.insert(
+            user_name.clone(),
+            make_item(
+                "app$manual_dealloc$h2",
+                "app::manual_dealloc",
+                ItemKind::Fn,
+                false,
+                AllocatorProvider::Default,
+                Some(interns.clone()),
+                BodySemantic::Ordinary,
+            ),
+        );
+        table.insert(
+            hook_name.clone(),
+            make_item(
+                "alloc$alloc$rcgjs_typed_alloc$h1",
+                "alloc::alloc::rcgjs_typed_alloc",
+                ItemKind::Fn,
+                false,
+                AllocatorProvider::Default,
+                Some(interns),
+                BodySemantic::Standard(StandardOperation::TypedAlloc),
+            ),
+        );
+        table.insert(
+            dealloc_name,
+            make_item(
+                "_RNvCs1_7___rustc14___rust_dealloc",
+                "__rustc::__rust_dealloc",
+                ItemKind::Alloc,
+                false,
+                AllocatorProvider::Default,
+                None,
+                BodySemantic::Ordinary,
+            ),
+        );
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(root_name, Ok(root_func));
+        funcs.insert(user_name, Ok(user_func));
+        funcs.insert(hook_name, Ok(hook_func));
+
+        let bv_clean = ByteViewPlan {
+            raw_byte_derefs: false,
+            elide_scale_scalar: true,
+        };
+        let speed_opts = Opts {
+            profile: Some(Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let plan = analyze_reachable(&table, &funcs, &BTreeMap::new(), &speed_opts, bv_clean);
+        assert!(plan.non_rc_raw_alloc_reachable);
+        assert!(
+            !plan.typed_heap_enabled,
+            "non-RC raw dealloc must keep Box/RawVec on the unified _blocks heap"
+        );
     }
 }

@@ -1536,7 +1536,33 @@ impl Intrinsic<'_, '_> {
             | "volatile_store"
             | "unaligned_volatile_store"
             | "nontemporal_store" => {
-                Outcome::Done(cx.deref_write(self.type_at(0)?, self.arg(0)?, self.arg(1)?)?)
+                let pointee = self.type_at(0)?;
+                let pointer = self.arg(0)?;
+                let value = self.arg(1)?;
+                // `MaybeUninit<Indirect>` has `is_indirect == false` (`crosses_transparent_union`),
+                // so a raw store into a heap slot (such as `rcgjs_box_new::<MaybeUninit<T>>`)
+                // would otherwise bypass `__rt._put` and omit `_boxes` registration for an
+                // initialized indirect payload. Route slot stores through the peeled indirect
+                // type while avoiding `unwrap_rt_box` in-place overwrites on uninit values.
+                let is_rt_box = matches!(
+                    &pointer,
+                    Expr::Call(callee, _)
+                        if matches!(
+                            callee.as_ref(),
+                            Expr::Member(obj, name)
+                                if name == "box"
+                                    && matches!(obj.as_ref(), Expr::Ident(id) if id == "__rt")
+                        )
+                );
+                let store_ty = if !is_rt_box
+                    && cx.table.crosses_transparent_union(pointee)
+                    && cx.table.is_indirect(cx.table.peeled(pointee))
+                {
+                    cx.table.peeled(pointee)
+                } else {
+                    pointee
+                };
+                Outcome::Done(cx.deref_write(store_ty, pointer, value)?)
             }
             "typed_swap_nonoverlapping" => self.typed_swap()?,
             "aggregate_raw_ptr" => self.aggregate_raw_ptr()?,
