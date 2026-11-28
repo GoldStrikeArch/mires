@@ -1578,11 +1578,119 @@ impl<'a> JsCx<'a> {
         if from_size == to_size && table.is_indirect(from) == table.is_indirect(to) {
             return Ok(value);
         }
+        // Uninitialized stack scratch buffer cast (e.g. `core::slice::rotate`'s
+        // `MaybeUninit::<([usize; 32], [T; 0])>::uninit().as_mut_ptr() as *mut T`): when the
+        // aggregate carries a `[T; 0]` alignment marker, check for uninitialized storage BEFORE
+        // projecting offset-0 fields (otherwise `T = usize` would dereference `undefined[0]`) and
+        // BEFORE byte-scaling (`T = u8`). Initialized values fall through to the exact normal cast.
+        if table.is_indirect(from) && has_zero_len_array_of(table, from, to) {
+            let p_id = jsast::id("$p");
+            let fallback = self
+                .cast_initialized_aggregate_ptr(
+                    from_pointee,
+                    to_pointee,
+                    from,
+                    to,
+                    from_size,
+                    to_size,
+                    p_id,
+                    depth,
+                )
+                .map(|body| jsast::arrow(vec!["$p".to_owned()], body))
+                .unwrap_or_else(jsast::null);
+            return Ok(jsast::rt_call(
+                "uninit_cast",
+                vec![
+                    value,
+                    jsast::num(from_size as f64),
+                    jsast::num(to_size as f64),
+                    fallback,
+                ],
+            ));
+        }
+        if let Some(expr) = self.cast_initialized_aggregate_ptr(
+            from_pointee,
+            to_pointee,
+            from,
+            to,
+            from_size,
+            to_size,
+            value.clone(),
+            depth,
+        ) {
+            // For `MaybeUninit<Agg> -> *mut T` with no offset-0 prefix or equal-size POD view
+            // (where `cast_initialized_aggregate_ptr` only matched byte-scaling), still allow
+            // uninitialized scratch allocation while keeping initialized values on `scale`.
+            if table.is_indirect(from)
+                && table.crosses_transparent_union(from_pointee)
+                && to_size == 1
+                && !table.is_indirect(to)
+                && self.reproject_to_field(from, to, &value, depth).is_none()
+                && self.zero_offset_field(from, to).is_none()
+            {
+                let fallback = self
+                    .cast_initialized_aggregate_ptr(
+                        from_pointee,
+                        to_pointee,
+                        from,
+                        to,
+                        from_size,
+                        to_size,
+                        jsast::id("$p"),
+                        depth,
+                    )
+                    .map(|body| jsast::arrow(vec!["$p".to_owned()], body))
+                    .unwrap_or_else(jsast::null);
+                return Ok(jsast::rt_call(
+                    "uninit_cast",
+                    vec![
+                        value,
+                        jsast::num(from_size as f64),
+                        jsast::num(to_size as f64),
+                        fallback,
+                    ],
+                ));
+            }
+            return Ok(expr);
+        }
+        if table.is_indirect(from) && table.crosses_transparent_union(from_pointee) {
+            return Ok(jsast::rt_call(
+                "uninit_cast",
+                vec![
+                    value,
+                    jsast::num(from_size as f64),
+                    jsast::num(to_size as f64),
+                    jsast::null(),
+                ],
+            ));
+        }
+        unsupported()
+    }
+
+    /// The initialized sized-pointer cast rows after array windowing and 1-byte identity checks:
+    /// sole-field reprojection, single- and multi-level offset-0 layout-prefix casts, equal-size
+    /// POD pointer views (`*const Identifier -> *const NonZero<u64>`), and byte scale/unscale.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors PointerCast fields plus precomputed pointee sizes"
+    )]
+    fn cast_initialized_aggregate_ptr(
+        &self,
+        from_pointee: TypeId,
+        to_pointee: TypeId,
+        from: TypeId,
+        to: TypeId,
+        from_size: u64,
+        to_size: u64,
+        value: Expr,
+        depth: u32,
+    ) -> Option<Expr> {
+        let table = self.table;
         if let Some(reprojected) = self.reproject_to_field(from, to, &value, depth) {
-            return Ok(reprojected);
+            return Some(reprojected);
         }
         if let Some(key) = self.zero_offset_field(from, to) {
-            return Ok(jsast::rt_call(
+            return Some(jsast::rt_call(
                 "prefix",
                 vec![
                     value,
@@ -1592,10 +1700,30 @@ impl<'a> JsCx<'a> {
             ));
         }
         if let Some(key) = self.zero_offset_field(to, from) {
-            return Ok(jsast::rt_call(
+            return Some(jsast::rt_call(
                 "unproject",
                 vec![value, self.field_key_expr(key)],
             ));
+        }
+        // Multi-level offset-0 layout-prefix cast (structs/tuples and nested arrays) for non-byte
+        // or indirect targets, keeping `*mut StructWithByteArray -> *mut u8` on `__rt.scale` so
+        // allocator/dealloc provenance on heap blocks stays intact.
+        if to_size > 1 || table.is_indirect(to) {
+            if let Some(projected) = self.cast_offset0_prefix(from, to, &value, depth) {
+                return Some(projected);
+            }
+        }
+        // Equal-size POD pointer view when JS indirection shapes differ (e.g. `*const Identifier`
+        // -> `*const NonZero<u64>` or `*const Pair` -> `*const u32`).
+        if from_size == to_size && from_size > 0 {
+            if let Some(read_arrow) = super::pod_codec::pod_transmute_arrow(self, from, to, true) {
+                let write_arrow = super::pod_codec::pod_transmute_arrow(self, to, from, true)
+                    .unwrap_or_else(jsast::null);
+                return Some(jsast::rt_call(
+                    "pod_view",
+                    vec![value, read_arrow, write_arrow],
+                ));
+            }
         }
         if to_size == 1 && !table.is_indirect(to) {
             if !self.byte_views.elide_scale_scalar {
@@ -1605,7 +1733,7 @@ impl<'a> JsCx<'a> {
                         if *signed {
                             arguments.push(Expr::Bool(true));
                         }
-                        return Ok(jsast::rt_call("scale_scalar", arguments));
+                        return Some(jsast::rt_call("scale_scalar", arguments));
                     }
                 }
             }
@@ -1613,7 +1741,7 @@ impl<'a> JsCx<'a> {
             if let Some(clone) = self.non_scalar_clone_arg(from_pointee) {
                 arguments.push(clone);
             }
-            return Ok(jsast::rt_call("scale", arguments));
+            return Some(jsast::rt_call("scale", arguments));
         }
         if from_size == 1 && !table.is_indirect(from) {
             let mut arguments = vec![
@@ -1635,9 +1763,83 @@ impl<'a> JsCx<'a> {
                 }
                 "unscale"
             };
-            return Ok(jsast::rt_call(member, arguments));
+            return Some(jsast::rt_call(member, arguments));
         }
-        unsupported()
+        None
+    }
+
+    /// Recursively descends through offset-0 non-ZST struct/tuple fields and arrays from `from`
+    /// until reaching `to`, preserving `__rt.prefix` / `project_field` / `__rt.unwindow` aliasing.
+    fn cast_offset0_prefix(
+        &self,
+        from: TypeId,
+        to: TypeId,
+        value: &Expr,
+        depth: u32,
+    ) -> Option<Expr> {
+        let table = self.table;
+        let to = table.peeled(to);
+        let mut current = table.peeled(from);
+        let mut pointer = value.clone();
+        let mut steps = 0u32;
+        for _ in depth..CAST_DEPTH {
+            if let Some(TypeKind::Array { element, length }) = value::kind(table, current) {
+                let elem = table.peeled(*element);
+                if table.is_zst(elem) {
+                    return None;
+                }
+                let args = if *length > 0 {
+                    vec![pointer, jsast::num(*length as f64)]
+                } else {
+                    vec![pointer]
+                };
+                pointer = jsast::rt_call("unwindow", args);
+                current = elem;
+                steps += 1;
+                if current == to {
+                    return Some(pointer);
+                }
+                continue;
+            }
+            let cur_size = size_of(table, current)?;
+            if let Some((sole_ty, sole_key)) = self.sole_field(current) {
+                pointer = self.project_field(pointer, sole_key);
+                current = table.peeled(sole_ty);
+                steps += 1;
+                if current == to {
+                    return Some(pointer);
+                }
+                continue;
+            }
+            let desc = table.get(current)?;
+            let fields = match &desc.kind {
+                TypeKind::Adt {
+                    form: NominalForm::Struct,
+                    variants,
+                    ..
+                } => &variants.first()?.fields,
+                TypeKind::Tuple(_) => &desc.js.fields,
+                _ => return None,
+            };
+            let first = fields
+                .iter()
+                .find(|f| f.offset == 0 && !table.is_zst(f.ty))?;
+            pointer = jsast::rt_call(
+                "prefix",
+                vec![
+                    pointer,
+                    self.field_key_expr(first.key),
+                    jsast::num(cur_size as f64),
+                ],
+            );
+            current = table.peeled(first.ty);
+            steps += 1;
+            if current == to {
+                return Some(pointer);
+            }
+        }
+        let _ = steps;
+        None
     }
 
     /// The optional clone argument handed to `__rt.scale` / `__rt.unscale` / `__rt.unscale_uninit`
@@ -1679,7 +1881,7 @@ impl<'a> JsCx<'a> {
     /// A missing kind keeps aggregates, pointers, enums, and other semantic values on the precise
     /// refusal path in `__rt.unscale`; their size alone does not describe a JavaScript value.
     fn scalar_view_kind(&self, ty: TypeId) -> Option<Expr> {
-        let kind = match value::kind(self.table, ty) {
+        let kind = match value::kind(self.table, self.table.peeled(ty)) {
             Some(TypeKind::Integer { signed, bits }) if *bits > 8 => {
                 Some(format!("{}{bits}", if *signed { 'i' } else { 'u' }))
             }
@@ -1859,6 +2061,33 @@ impl<'a> JsCx<'a> {
         let (_, name) = self.temp(value.clone());
         (Some(jsast::assign(name.clone(), value)), name)
     }
+}
+
+/// Whether `agg` is a struct or tuple carrying a zero-length alignment-marker array `[target; 0]`
+/// (such as `core::slice::rotate`'s `([usize; 32], [T; 0])`).
+fn has_zero_len_array_of(table: &TypeTable, agg: TypeId, target: TypeId) -> bool {
+    let target = table.peeled(target);
+    let Some(desc) = table.get(table.peeled(agg)) else {
+        return false;
+    };
+    let fields = match &desc.kind {
+        TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } => match variants.first() {
+            Some(v) => v.fields.as_slice(),
+            None => return false,
+        },
+        TypeKind::Tuple(_) => desc.js.fields.as_slice(),
+        _ => return false,
+    };
+    fields.iter().any(|f| {
+        matches!(
+            value::kind(table, table.peeled(f.ty)),
+            Some(TypeKind::Array { element, length: 0 }) if table.peeled(*element) == target
+        )
+    })
 }
 
 /// `value`, preceded by the assignment `reread` asked for.

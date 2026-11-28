@@ -1648,12 +1648,17 @@ impl<'a> JsCx<'a> {
         if from == to || table.is_zst(from) || table.is_indirect(from) {
             return Err(value);
         }
-        let Some(from_size) = value::size_of(table, from).filter(|&s| s > 1 && s != to_size) else {
+        let Some(from_size) = value::size_of(table, from).filter(|&s| s > 1) else {
             return Err(value);
         };
         let Some(from_kind) = reinterp_scalar_kind(table, from) else {
             return Err(value);
         };
+        // Same-width reinterpretation only needs byte-view conversion when the JS value
+        // representations diverge (float <-> integer bits, e.g. `&[f32]` <-> `&[u32]`).
+        if from_size == to_size && from_kind.starts_with('f') == to_kind.starts_with('f') {
+            return Err(value);
+        }
         let mut ptr_expr = value;
         for _ in 0..unwrap_arrays {
             ptr_expr = jsast::rt_call("unwindow", vec![ptr_expr]);

@@ -25,7 +25,9 @@ use std::collections::BTreeMap;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{OpKind, ValueId};
 use rcgjs_object::jir::semantic::DefinitionId;
-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
+use rcgjs_object::jir::types::{
+    EnumRepr, FieldKey, IntRepr, NominalForm, RepresentationCandidate, TypeId, TypeKind,
+};
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 
 use super::{decline, value, JsCx, Res};
@@ -66,15 +68,38 @@ impl JsCx<'_> {
 
     /// `transmute::<From, To>(value)` (`intrinsics.rs::codegen_transmute`).
     pub fn transmute(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Res<Expr> {
+        match self.try_transmute(from_ty, to_ty, value, 0)? {
+            Some(expr) => Ok(expr),
+            None => Ok(self.zombie(
+                "`transmute` between these types is not supported by rustc_codegen_js".to_owned(),
+            )),
+        }
+    }
+
+    /// Recursive transmute helper returning `Ok(None)` instead of emitting a zombie when no
+    /// lossless value/structural/POD lowering applies.
+    fn try_transmute(
+        &self,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        value: Expr,
+        depth: usize,
+    ) -> Res<Option<Expr>> {
         if from_ty == to_ty {
-            return Ok(value);
+            return Ok(Some(value));
+        }
+        if depth >= 16 {
+            return Ok(None);
         }
         // Peel the single-field wrappers off the source, then rebuild the ones the destination
         // has. Doing it in that order keeps the two sides independent.
         let (inner_from, inner_value) = self.unwrap_wrappers(from_ty, value);
         let (inner_to, wrappers) = self.target_wrappers(to_ty);
-        let scalar = self.transmute_scalar(inner_from, inner_to, inner_value)?;
-        Ok(self.rebuild(&wrappers, scalar))
+        let Some(scalar) = self.try_transmute_scalar(inner_from, inner_to, inner_value, depth)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.rebuild(&wrappers, scalar)))
     }
 
     /// Lowers `transmute` whose destination is a 64-bit integer `(lo, hi)` pair.
@@ -176,13 +201,19 @@ impl JsCx<'_> {
     }
 
     /// The scalar half of a transmute, once both sides have had their wrappers removed.
-    fn transmute_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Expr> {
+    fn try_transmute_scalar(
+        &self,
+        from: TypeId,
+        to: TypeId,
+        value: Expr,
+        depth: usize,
+    ) -> Res<Option<Expr>> {
         let table = self.table;
         // Two types with the same *peeled* type have the same JavaScript value, whatever
         // transparent wrappers stand between them (`JsFacts::peeled`), so the transmute is the
         // identity. v1 asked the same question by peeling as it unwrapped.
         if from == to || table.peeled(from) == table.peeled(to) {
-            return Ok(value);
+            return Ok(Some(value));
         }
         // Two arrays of the same length whose elements have the same JavaScript representation
         // *are* the same array (`[T; N]` to `[MaybeUninit<T>; N]`, which `array::IntoIter` is
@@ -201,22 +232,22 @@ impl JsCx<'_> {
             value::kind(table, table.peeled(to)),
         ) {
             if from_len == to_len && table.peeled(*from_element) == table.peeled(*to_element) {
-                return Ok(value);
+                return Ok(Some(value));
             }
         }
         // A zero sized value carries no bits, and is `undefined`.
         if table.is_zst(to) {
-            return Ok(jsast::undefined());
+            return Ok(Some(jsast::undefined()));
         }
         // `str::as_bytes` and `str::from_utf8_unchecked` are both written as a transmute between
         // two pointers, and neither is one here: a `str` is a JavaScript string.
         if let Some(converted) = self.cast_str_ptr(from, to, value.clone()) {
-            return converted;
+            return converted.map(Some);
         }
 
         let from_class = ReprClass::of(table, from);
         let to_class = ReprClass::of(table, to);
-        Ok(match (from_class, to_class) {
+        Ok(Some(match (from_class, to_class) {
             (ReprClass::Int(a), ReprClass::Int(b)) if a.bits == b.bits => {
                 value::mask(b.repr, b.signed, b.bits, value)
             }
@@ -260,7 +291,7 @@ impl JsCx<'_> {
                         ) = (value::kind(table, from_shape), value::kind(table, to_shape))
                         {
                             if a == b || b.is_none() {
-                                return Ok(value);
+                                return Ok(Some(value));
                             }
                         }
                         let preserve_ref = from_is_ref
@@ -297,6 +328,9 @@ impl JsCx<'_> {
                                     self.cast_pointer(from_pointee, to_pointee, raw_in)?
                                 }
                             };
+                            if depth > 0 && is_zombie_expr(&raw_out) {
+                                return Ok(None);
+                            }
                             if to_is_ref {
                                 self.raw_to_ref(to_pointee, raw_out)
                             } else {
@@ -413,17 +447,259 @@ impl JsCx<'_> {
             {
                 value
             }
-            _ => match self.niche_from_scalar(from, to, value.clone())? {
-                Some(decoded) => decoded,
-                None => match self.niche_to_scalar(from, to, value)? {
-                    Some(encoded) => encoded,
-                    None => self.zombie(
-                        "`transmute` between these types is not supported by rustc_codegen_js"
-                            .to_owned(),
-                    ),
-                },
+            _ => {
+                if let Some(decoded) = self.niche_from_scalar(from, to, value.clone(), depth)? {
+                    return Ok(Some(decoded));
+                }
+                if let Some(encoded) = self.niche_to_scalar(from, to, value.clone(), depth)? {
+                    return Ok(Some(encoded));
+                }
+                if let Some(mapped) =
+                    self.transmute_structural_aggregate(from, to, value.clone(), depth)?
+                {
+                    return Ok(Some(mapped));
+                }
+                return Ok(super::pod_codec::pod_transmute(self, from, to, value));
+            }
+        }))
+    }
+
+    /// Structural field-aligned transmute for equal-size non-native structs, tuples, and
+    /// same-length arrays whose fields/elements transmute recursively at matching byte offsets
+    /// (e.g. `Box<MaybeUninit<Node<T>>, &Global> -> Box<Node<T>, &Global>` in `LinkedList`).
+    fn transmute_structural_aggregate(
+        &self,
+        from: TypeId,
+        to: TypeId,
+        value: Expr,
+        depth: usize,
+    ) -> Res<Option<Expr>> {
+        let table = self.table;
+        let from_p = table.peeled(from);
+        let to_p = table.peeled(to);
+        let (Some(from_size), Some(to_size)) =
+            (value::size_of(table, from_p), value::size_of(table, to_p))
+        else {
+            return Ok(None);
+        };
+        if from_size == 0 || from_size != to_size {
+            return Ok(None);
+        }
+        let (Some(from_desc), Some(to_desc)) = (table.get(from_p), table.get(to_p)) else {
+            return Ok(None);
+        };
+        let is_native_carrier = |c: RepresentationCandidate| {
+            matches!(
+                c,
+                RepresentationCandidate::Vec
+                    | RepresentationCandidate::String
+                    | RepresentationCandidate::BTreeMap
+            )
+        };
+        if is_native_carrier(from_desc.meta.candidate) || is_native_carrier(to_desc.meta.candidate)
+        {
+            return Ok(None);
+        }
+
+        // Same-length array whose elements transmute recursively (e.g. `[Box<MaybeUninit<T>, &A>; N]`).
+        if let (
+            TypeKind::Array {
+                element: fe,
+                length: fl,
             },
-        })
+            TypeKind::Array {
+                element: te,
+                length: tl,
+            },
+        ) = (&from_desc.kind, &to_desc.kind)
+        {
+            if fl == tl && *fl > 0 {
+                let ep = format!("$te{depth}");
+                let eid = jsast::id(ep.clone());
+                if let Some(mapped) = self.try_transmute(*fe, *te, eid.clone(), depth + 1)? {
+                    if mapped == eid {
+                        return Ok(Some(value));
+                    }
+                    return Ok(Some(jsast::method_call(
+                        value,
+                        "map",
+                        vec![jsast::arrow(vec![ep], mapped)],
+                    )));
+                }
+            }
+            return Ok(None);
+        }
+
+        enum AggShape<'a> {
+            Struct {
+                fields: &'a [rcgjs_object::jir::types::FieldDescriptor],
+            },
+            Tuple {
+                arity: usize,
+                fields: &'a [rcgjs_object::jir::types::FieldDescriptor],
+            },
+        }
+        fn shape_of(desc: &rcgjs_object::jir::types::TypeDescriptor) -> Option<AggShape<'_>> {
+            match &desc.kind {
+                TypeKind::Adt {
+                    form: NominalForm::Struct,
+                    variants,
+                    ..
+                } => {
+                    let [v] = variants.as_slice() else {
+                        return None;
+                    };
+                    Some(AggShape::Struct { fields: &v.fields })
+                }
+                TypeKind::Tuple(elems) => {
+                    if desc.js.fields.len() != elems.len() {
+                        return None;
+                    }
+                    Some(AggShape::Tuple {
+                        arity: elems.len(),
+                        fields: &desc.js.fields,
+                    })
+                }
+                _ => None,
+            }
+        }
+        let (Some(from_shape), Some(to_shape)) = (shape_of(from_desc), shape_of(to_desc)) else {
+            return Ok(None);
+        };
+        let (from_fields, to_fields) = match (&from_shape, &to_shape) {
+            (
+                AggShape::Struct { fields: ff } | AggShape::Tuple { fields: ff, .. },
+                AggShape::Struct { fields: tf } | AggShape::Tuple { fields: tf, .. },
+            ) => (*ff, *tf),
+        };
+        let mut live_from: Vec<&rcgjs_object::jir::types::FieldDescriptor> =
+            from_fields.iter().filter(|f| !table.is_zst(f.ty)).collect();
+        let mut live_to: Vec<&rcgjs_object::jir::types::FieldDescriptor> =
+            to_fields.iter().filter(|f| !table.is_zst(f.ty)).collect();
+        if live_from.is_empty() || live_from.len() != live_to.len() || live_from.len() > 16 {
+            return Ok(None);
+        }
+        live_from.sort_by_key(|f| f.offset);
+        live_to.sort_by_key(|f| f.offset);
+        for (ff, tf) in live_from.iter().zip(&live_to) {
+            if ff.offset != tf.offset {
+                return Ok(None);
+            }
+            let (Some(fs), Some(ts)) = (value::size_of(table, ff.ty), value::size_of(table, tf.ty))
+            else {
+                return Ok(None);
+            };
+            if fs != ts {
+                return Ok(None);
+            }
+        }
+
+        let param = format!("$ta{depth}");
+        let base = jsast::id(param.clone());
+        let mut all_identity = true;
+        let mut converted: Vec<(FieldKey, Expr)> = Vec::with_capacity(live_to.len());
+        for (ff, tf) in live_from.iter().zip(&live_to) {
+            let read = value::field_expr(self.interns, base.clone(), ff.key);
+            let Some(next) = self.try_transmute(ff.ty, tf.ty, read.clone(), depth + 1)? else {
+                return Ok(None);
+            };
+            if next != read {
+                all_identity = false;
+            }
+            converted.push((tf.key, next));
+        }
+
+        // If container shapes and keys match identically and every field transmute is identity,
+        // the aggregate value itself is unchanged (zero runtime cost).
+        if all_identity {
+            let same_container = match (&from_shape, &to_shape) {
+                (AggShape::Struct { .. }, AggShape::Struct { .. }) => {
+                    from_fields.len() == to_fields.len()
+                        && live_from
+                            .iter()
+                            .zip(&live_to)
+                            .all(|(ff, tf)| ff.key == tf.key)
+                        && from_fields
+                            .iter()
+                            .filter(|f| table.is_zst(f.ty))
+                            .all(|f| to_fields.iter().any(|t| t.key == f.key))
+                }
+                (AggShape::Tuple { arity: fa, .. }, AggShape::Tuple { arity: ta, .. }) => {
+                    fa == ta
+                        && live_from
+                            .iter()
+                            .zip(&live_to)
+                            .all(|(ff, tf)| ff.key == tf.key)
+                }
+                _ => false,
+            };
+            if same_container {
+                return Ok(Some(value));
+            }
+        }
+
+        let built = match to_shape {
+            AggShape::Tuple { arity, .. } => {
+                let mut elems = vec![jsast::undefined(); arity];
+                for (key, expr) in converted {
+                    let FieldKey::Index(idx) = key else {
+                        return Ok(None);
+                    };
+                    if (idx as usize) >= elems.len() {
+                        return Ok(None);
+                    }
+                    elems[idx as usize] = expr;
+                }
+                jsast::array(elems)
+            }
+            AggShape::Struct { fields } => {
+                let mut entries = Vec::with_capacity(fields.len());
+                let mut proto_val = None;
+                for (key, expr) in converted {
+                    let Some(name) = value::key_name(self.interns, key) else {
+                        return Ok(None);
+                    };
+                    if name == "__proto__" {
+                        proto_val = Some(expr);
+                    } else {
+                        entries.push((name, expr));
+                    }
+                }
+                for f in fields.iter().filter(|f| table.is_zst(f.ty)) {
+                    let Some(name) = value::key_name(self.interns, f.key) else {
+                        continue;
+                    };
+                    if name == "__proto__" {
+                        proto_val = Some(jsast::undefined());
+                    } else {
+                        entries.push((name, jsast::undefined()));
+                    }
+                }
+                let obj = jsast::object(entries);
+                if let Some(pv) = proto_val {
+                    let oname = format!("$to{depth}");
+                    return Ok(Some(jsast::call(
+                        jsast::arrow_block(
+                            vec![param],
+                            vec![
+                                jsast::const_(oname.clone(), obj),
+                                jsast::expr_stmt(value::define_proto_prop(
+                                    jsast::id(oname.clone()),
+                                    pv,
+                                )),
+                                jsast::ret(jsast::id(oname)),
+                            ],
+                        ),
+                        vec![value],
+                    )));
+                }
+                obj
+            }
+        };
+        Ok(Some(jsast::call(
+            jsast::arrow(vec![param], built),
+            vec![value],
+        )))
     }
 
     /// Converts a thin pointer expression of type `from` into its runtime address expression.
@@ -524,9 +800,15 @@ impl JsCx<'_> {
     /// applies only when the destination is an enum whose tag is niche encoded and as wide as the
     /// source integer, every inhabited niche variant carries no non-zero-sized data, and the
     /// untagged variant carries exactly one non-zero-sized field.
-    fn niche_from_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
+    fn niche_from_scalar(
+        &self,
+        from: TypeId,
+        to: TypeId,
+        value: Expr,
+        depth: usize,
+    ) -> Res<Option<Expr>> {
         let table = self.table;
-        let Some((_, bits)) = table.int_info(from) else {
+        let Some(bits) = super::pod_codec::niche_scalar_bits(table, from) else {
             return Ok(None);
         };
         let peeled = table.peeled(to);
@@ -553,7 +835,8 @@ impl JsCx<'_> {
             if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
                 return Ok(None);
             }
-            let Some(niche_lit) = value::int_literal(table, from, raw_bits) else {
+            let Some(niche_lit) = super::pod_codec::niche_scalar_literal(table, from, raw_bits)
+            else {
                 return Ok(None);
             };
             let Some(empty_value) =
@@ -577,7 +860,10 @@ impl JsCx<'_> {
             return Ok(None);
         };
         let bound = jsast::id(NICHE_PARAM);
-        let filled_field = self.transmute(from, field.ty, bound.clone())?;
+        let Some(filled_field) = self.try_transmute(from, field.ty, bound.clone(), depth + 1)?
+        else {
+            return Ok(None);
+        };
         let Some(filled) =
             value::enum_value(table, self.interns, to, untagged, vec![(key, filled_field)])
         else {
@@ -605,9 +891,15 @@ impl JsCx<'_> {
     /// bit pattern formatted at the destination integer's width and signedness, and the untagged
     /// variant is its one payload field transmuted into the integer. Both directions round trip
     /// across all signed and unsigned integer widths and wrapping niche ranges.
-    fn niche_to_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
+    fn niche_to_scalar(
+        &self,
+        from: TypeId,
+        to: TypeId,
+        value: Expr,
+        depth: usize,
+    ) -> Res<Option<Expr>> {
         let table = self.table;
-        let Some((_, bits)) = table.int_info(to) else {
+        let Some(bits) = super::pod_codec::niche_scalar_bits(table, to) else {
             return Ok(None);
         };
         let peeled = table.peeled(from);
@@ -637,7 +929,8 @@ impl JsCx<'_> {
             if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
                 return Ok(None);
             }
-            let Some(niche_lit) = value::int_literal(table, to, raw_bits) else {
+            let Some(niche_lit) = super::pod_codec::niche_scalar_literal(table, to, raw_bits)
+            else {
                 return Ok(None);
             };
             let Some(tag_lit) = value::variant_tag(table, self.interns, peeled, variant_index)
@@ -662,7 +955,9 @@ impl JsCx<'_> {
         } else {
             value::field_expr(self.interns, bound.clone(), field.key)
         };
-        let payload_bits = self.transmute(field.ty, to, payload_input)?;
+        let Some(payload_bits) = self.try_transmute(field.ty, to, payload_input, depth + 1)? else {
+            return Ok(None);
+        };
         let mut encoded = payload_bits;
         for (tag_lit, niche_lit) in niche_cases.into_iter().rev() {
             let is_variant = jsast::binary(
@@ -676,6 +971,18 @@ impl JsCx<'_> {
             jsast::arrow(vec![NICHE_PARAM.to_owned()], encoded),
             vec![value],
         )))
+    }
+}
+
+/// Detects whether an expression is an aborting zombie emitted by `JsCx::zombie`.
+fn is_zombie_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(callee, args) if args.is_empty() => matches!(
+            callee.as_ref(),
+            Expr::Arrow(_, rcgjs_object::jsast::ArrowBody::Block(stmts))
+                if stmts.iter().any(|s| matches!(s, Stmt::Throw(_)))
+        ),
+        _ => false,
     }
 }
 
@@ -844,6 +1151,16 @@ fn int_array(int: Repr) -> &'static str {
 }
 
 impl JsCx<'_> {
+    /// Exposes thin-pointer address extraction to [`super::pod_codec`].
+    pub(super) fn pod_thin_ptr_addr(
+        &self,
+        pointee: Option<TypeId>,
+        is_ref: bool,
+        read: Expr,
+    ) -> Expr {
+        self.thin_ptr_lane_addr(pointee, is_ref, read)
+    }
+
     /// Extracts the unsigned 32-bit address of a thin-pointer lane in a scalar array.
     fn thin_ptr_lane_addr(&self, pointee: Option<TypeId>, is_ref: bool, read: Expr) -> Expr {
         let address = match pointee {
@@ -1796,5 +2113,636 @@ mod type_id_tests {
             EcmaTarget::Es2018,
         );
         assert_eq!(js, "function reapply_send_sync(s) {\n  return s;\n}\n");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises 7 POD/niche/structural/raw_eq/cast lowering cases against one shared TypeTable"
+    )]
+    fn pod_transmute_niche_char_structural_box_raw_eq_and_casts_lower_cleanly() {
+        let mut interns = type_id_world();
+        let u16_ty = TypeId(30);
+        let u8_16 = TypeId(31);
+        let u16_8 = TypeId(32);
+        let char_ty = TypeId(33);
+        let opt_nz_char = TypeId(34);
+        let node_ty = TypeId(35);
+        let mu_node_ty = TypeId(36);
+        let ptr_node = TypeId(37);
+        let ptr_mu_node = TypeId(38);
+        let ref_alloc = TypeId(39);
+        let box_mu = TypeId(40);
+        let box_init = TypeId(41);
+        let u32_2 = TypeId(42);
+        let nested_u32 = TypeId(43);
+        let ref_nested_u32 = TypeId(44);
+        let bool_ty = TypeId(45);
+        let usize_32 = TypeId(46);
+        let u8_0 = TypeId(47);
+        let rot_buf = TypeId(48);
+        let ptr_rot_buf = TypeId(49);
+        let ptr_u8 = TypeId(50);
+        let ident_ty = TypeId(51);
+        let ptr_ident = TypeId(52);
+        let inner_ty = TypeId(53);
+        let outer_ty = TypeId(54);
+        let ptr_outer = TypeId(55);
+        let ptr_u32 = TypeId(56);
+
+        interns.intern_type(int_desc(u16_ty, false, 16));
+        let mut d_u8_16 = base_desc(
+            u8_16,
+            TypeKind::Array {
+                element: U8,
+                length: 16,
+            },
+            16,
+        );
+        d_u8_16.js.is_indirect = true;
+        interns.intern_type(d_u8_16);
+        let mut d_u16_8 = base_desc(
+            u16_8,
+            TypeKind::Array {
+                element: u16_ty,
+                length: 8,
+            },
+            16,
+        );
+        d_u16_8.js.is_indirect = true;
+        interns.intern_type(d_u16_8);
+
+        interns.intern_type(base_desc(char_ty, TypeKind::Char, 4));
+        let s_none = interns.intern_str("None");
+        let s_some = interns.intern_str("Some");
+        let k_0 = interns.intern_str("_0");
+        let k_1 = interns.intern_str("_1");
+        let mut d_opt = base_desc(
+            opt_nz_char,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 1,
+                },
+                args: vec![char_ty],
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: s_none,
+                        fields: vec![],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: vec![],
+                    },
+                    VariantDescriptor {
+                        name: s_some,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(k_0),
+                            ty: char_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: vec![],
+                    },
+                ],
+                niche: Some(rcgjs_object::jir::types::Niche {
+                    untagged_variant: 1,
+                    niche_field: vec![0],
+                    niche_start: 0,
+                    valid_range: (1, 0x10_ffff),
+                }),
+            },
+            4,
+        );
+        d_opt.js.enum_repr = Some(rcgjs_object::jir::types::EnumRepr::NullNiche {
+            none_variant: 0,
+            some_variant: 1,
+        });
+        interns.intern_type(d_opt);
+
+        // Box<MaybeUninit<Node>, &Global> -> Box<Node, &Global>
+        interns.intern_type(int_desc(node_ty, false, 32));
+        let mut d_mu = base_desc(
+            mu_node_ty,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+        );
+        d_mu.js.peeled = node_ty;
+        d_mu.js.crosses_transparent_union = true;
+        interns.intern_type(d_mu);
+        let mut d_pn = base_desc(
+            ptr_node,
+            TypeKind::RawPointer {
+                pointee: node_ty,
+                mutable: true,
+            },
+            4,
+        );
+        d_pn.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pn);
+        let mut d_pmn = base_desc(
+            ptr_mu_node,
+            TypeKind::RawPointer {
+                pointee: mu_node_ty,
+                mutable: true,
+            },
+            4,
+        );
+        d_pmn.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pmn);
+        let mut d_ra = base_desc(
+            ref_alloc,
+            TypeKind::Reference {
+                pointee: UNIT,
+                mutable: false,
+            },
+            4,
+        );
+        d_ra.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_ra);
+        let s_box = interns.intern_str("Box");
+        for (tid, ptr_field) in [(box_mu, ptr_mu_node), (box_init, ptr_node)] {
+            let fields = vec![
+                FieldDescriptor {
+                    key: FieldKey::Name(k_0),
+                    ty: ptr_field,
+                    offset: 0,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(k_1),
+                    ty: ref_alloc,
+                    offset: 4,
+                },
+            ];
+            let mut db = base_desc(
+                tid,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 2,
+                        local_hash: 2,
+                    },
+                    args: vec![],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: s_box,
+                        fields: fields.clone(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: vec![],
+                    }],
+                    niche: None,
+                },
+                8,
+            );
+            db.js.is_indirect = true;
+            db.js.fields = fields;
+            interns.intern_type(db);
+        }
+
+        // Nested array [[u32; 2]; 3] for raw_eq
+        let mut d_u32_2 = base_desc(
+            u32_2,
+            TypeKind::Array {
+                element: U32,
+                length: 2,
+            },
+            8,
+        );
+        d_u32_2.js.is_indirect = true;
+        interns.intern_type(d_u32_2);
+        let mut d_nested = base_desc(
+            nested_u32,
+            TypeKind::Array {
+                element: u32_2,
+                length: 3,
+            },
+            24,
+        );
+        d_nested.js.is_indirect = true;
+        interns.intern_type(d_nested);
+        let mut d_ref_nested = base_desc(
+            ref_nested_u32,
+            TypeKind::Reference {
+                pointee: nested_u32,
+                mutable: false,
+            },
+            4,
+        );
+        d_ref_nested.js.pointer_form = Some(PointerForm::Thin);
+        interns.intern_type(d_ref_nested);
+        interns.intern_type(base_desc(bool_ty, TypeKind::Bool, 1));
+
+        // ([usize; 32], [u8; 0]) -> *mut u8 (`uninit_cast`)
+        let mut d_us32 = base_desc(
+            usize_32,
+            TypeKind::Array {
+                element: U32,
+                length: 32,
+            },
+            128,
+        );
+        d_us32.js.is_indirect = true;
+        interns.intern_type(d_us32);
+        interns.intern_type(base_desc(
+            u8_0,
+            TypeKind::Array {
+                element: U8,
+                length: 0,
+            },
+            0,
+        ));
+        let mut d_rot = base_desc(rot_buf, TypeKind::Tuple(vec![usize_32, u8_0]), 128);
+        d_rot.js.is_indirect = true;
+        d_rot.js.fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Index(0),
+                ty: usize_32,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Index(1),
+                ty: u8_0,
+                offset: 128,
+            },
+        ];
+        interns.intern_type(d_rot);
+        let mut d_prot = base_desc(
+            ptr_rot_buf,
+            TypeKind::RawPointer {
+                pointee: rot_buf,
+                mutable: true,
+            },
+            4,
+        );
+        d_prot.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_prot);
+        let mut d_pu8 = base_desc(
+            ptr_u8,
+            TypeKind::RawPointer {
+                pointee: U8,
+                mutable: true,
+            },
+            4,
+        );
+        d_pu8.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pu8);
+
+        // SemverIdent { head: *const u8, tail: [u8; 4] } -> *const u64 (`pod_view`)
+        let k_head = interns.intern_str("head");
+        let k_tail = interns.intern_str("tail");
+        let s_ident = interns.intern_str("SemverIdent");
+        let ident_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(k_head),
+                ty: ptr_u8,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(k_tail),
+                ty: U8_ARRAY_4,
+                offset: 4,
+            },
+        ];
+        let mut d_ident = base_desc(
+            ident_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 3,
+                },
+                args: vec![],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: s_ident,
+                    fields: ident_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: vec![],
+                }],
+                niche: None,
+            },
+            8,
+        );
+        d_ident.js.is_indirect = true;
+        d_ident.js.fields = ident_fields;
+        interns.intern_type(d_ident);
+        let mut d_pident = base_desc(
+            ptr_ident,
+            TypeKind::RawPointer {
+                pointee: ident_ty,
+                mutable: false,
+            },
+            4,
+        );
+        d_pident.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pident);
+
+        // Outer { inner: Inner { val: u32, extra: u32 }, tag: u32 } -> *const u32 (nested prefix)
+        let k_val = interns.intern_str("val");
+        let k_extra = interns.intern_str("extra");
+        let k_inner = interns.intern_str("inner");
+        let k_tag = interns.intern_str("tag");
+        let s_inner = interns.intern_str("Inner");
+        let s_outer = interns.intern_str("Outer");
+        let inner_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(k_val),
+                ty: U32,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(k_extra),
+                ty: U32,
+                offset: 4,
+            },
+        ];
+        let mut d_inner = base_desc(
+            inner_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 4,
+                },
+                args: vec![],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: s_inner,
+                    fields: inner_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: vec![],
+                }],
+                niche: None,
+            },
+            8,
+        );
+        d_inner.js.is_indirect = true;
+        d_inner.js.fields = inner_fields;
+        interns.intern_type(d_inner);
+        let outer_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(k_inner),
+                ty: inner_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(k_tag),
+                ty: U32,
+                offset: 8,
+            },
+        ];
+        let mut d_outer = base_desc(
+            outer_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 2,
+                    local_hash: 5,
+                },
+                args: vec![],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: s_outer,
+                    fields: outer_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: vec![],
+                }],
+                niche: None,
+            },
+            12,
+        );
+        d_outer.js.is_indirect = true;
+        d_outer.js.fields = outer_fields;
+        interns.intern_type(d_outer);
+        let mut d_pouter = base_desc(
+            ptr_outer,
+            TypeKind::RawPointer {
+                pointee: outer_ty,
+                mutable: false,
+            },
+            4,
+        );
+        d_pouter.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pouter);
+        let mut d_pu32 = base_desc(
+            ptr_u32,
+            TypeKind::RawPointer {
+                pointee: U32,
+                mutable: false,
+            },
+            4,
+        );
+        d_pu32.js.pointer_form = Some(PointerForm::Slot);
+        interns.intern_type(d_pu32);
+
+        let e = FuncBuilder::ENTRY;
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 2,
+                local_hash: 10,
+            },
+            instantiation: 1,
+        };
+
+        // 1. [u8; 16] -> [u16; 8] (`Ipv6Addr::segments`)
+        let mut b = FuncBuilder::new(item, sig(vec![u8_16], u16_8));
+        let p = b.param(u8_16, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: u8_16,
+                to: u16_8,
+            },
+            u16_8,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_ipv6 = lower_fn(
+            &interns,
+            "ipv6_segs",
+            &b.finish(),
+            &[(0, "b")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_ipv6.contains("new DataView(new ArrayBuffer(16))")
+                && js_ipv6.contains("setUint8")
+                && js_ipv6.contains("getUint16"),
+            "expected DataView pack/unpack for [u8; 16] -> [u16; 8], got:\n{js_ipv6}"
+        );
+
+        // 2. char -> Option<NonZero<char>>
+        let mut b = FuncBuilder::new(item, sig(vec![char_ty], opt_nz_char));
+        let p = b.param(char_ty, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: char_ty,
+                to: opt_nz_char,
+            },
+            opt_nz_char,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_nz = lower_fn(
+            &interns,
+            "nz_char",
+            &b.finish(),
+            &[(0, "c")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_nz.contains("$n === 0 ? null : $n"),
+            "expected NonZero<char> niche decode, got:\n{js_nz}"
+        );
+
+        // 3. Box<MaybeUninit<Node>, &Global> -> Box<Node, &Global> folds to identity
+        let mut b = FuncBuilder::new(item, sig(vec![box_mu], box_init));
+        let p = b.param(box_mu, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: p,
+                from: box_mu,
+                to: box_init,
+            },
+            box_init,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_box = lower_fn(
+            &interns,
+            "box_assume",
+            &b.finish(),
+            &[(0, "bx")],
+            EcmaTarget::Es2018,
+        );
+        assert_eq!(js_box, "function box_assume(bx) {\n  return bx;\n}\n");
+
+        // 4. raw_eq(&[[u32; 2]; 3], &[[u32; 2]; 3])
+        let raw_eq_name = interns.intern_str("raw_eq");
+        let mut b = FuncBuilder::new(item, sig(vec![ref_nested_u32, ref_nested_u32], bool_ty));
+        let a = b.param(ref_nested_u32, NO_ORIGIN);
+        let c = b.param(ref_nested_u32, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Intrinsic {
+                name: raw_eq_name,
+                args: vec![a, c],
+                types: vec![nested_u32],
+                fallback: None,
+                track_caller: None,
+            },
+            bool_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_eq = lower_fn(
+            &interns,
+            "nested_raw_eq",
+            &b.finish(),
+            &[(0, "a"), (1, "b")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_eq.contains(".every(") && js_eq.contains("$e1 === $t1[$i][$i1]"),
+            "expected nested every raw_eq lowering, got:\n{js_eq}"
+        );
+
+        // 5. *mut ([usize; 32], [u8; 0]) -> *mut u8 (`uninit_cast`)
+        let mut b = FuncBuilder::new(item, sig(vec![ptr_rot_buf], ptr_u8));
+        let p = b.param(ptr_rot_buf, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: p,
+                from: ptr_rot_buf,
+                to: ptr_u8,
+            },
+            ptr_u8,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_rot = lower_fn(
+            &interns,
+            "rot_cast",
+            &b.finish(),
+            &[(0, "p")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_rot.contains("__rt.uninit_cast(p, 128, 1,"),
+            "expected uninit_cast lowering, got:\n{js_rot}"
+        );
+
+        // 6. *const SemverIdent -> *const u64 (`pod_view`)
+        let mut b = FuncBuilder::new(item, sig(vec![ptr_ident], RAW_U64));
+        let p = b.param(ptr_ident, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: p,
+                from: ptr_ident,
+                to: RAW_U64,
+            },
+            RAW_U64,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_ident = lower_fn(
+            &interns,
+            "ident_cast",
+            &b.finish(),
+            &[(0, "p")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_ident.contains("__rt.pod_view(p,"),
+            "expected pod_view lowering for *const SemverIdent -> *const u64, got:\n{js_ident}"
+        );
+
+        // 7. *const Outer -> *const u32 (multi-level offset-0 prefix)
+        let mut b = FuncBuilder::new(item, sig(vec![ptr_outer], ptr_u32));
+        let p = b.param(ptr_outer, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: p,
+                from: ptr_outer,
+                to: ptr_u32,
+            },
+            ptr_u32,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let js_outer = lower_fn(
+            &interns,
+            "outer_cast",
+            &b.finish(),
+            &[(0, "p")],
+            EcmaTarget::Es2018,
+        );
+        assert!(
+            js_outer.contains("__rt.prefix(__rt.prefix(p, \"inner\", 12), \"val\", 8)"),
+            "expected nested offset-0 prefix cast, got:\n{js_outer}"
+        );
     }
 }

@@ -438,6 +438,20 @@ globalThis.__rt.addr = (p, size) => {
           }
         }
       }
+      if (globalThis.__rt._pod_view_of !== null) {
+        const pv = globalThis.__rt._pod_view_of.get(buf);
+        if (pv !== undefined) {
+          buf = pv.buf;
+          continue;
+        }
+      }
+      if (globalThis.__rt._sign_view_of !== null) {
+        const sv = globalThis.__rt._sign_view_of.get(buf);
+        if (sv !== undefined) {
+          buf = sv;
+          continue;
+        }
+      }
       const scalar = globalThis.__rt._scalar_view_of.get(buf);
       if (scalar !== undefined) {
         off = off * scalar.size + scalar.phase;
@@ -804,6 +818,20 @@ globalThis.__rt.ptr_eq = (a, b) => {
         }
       }
     }
+    if (globalThis.__rt._pod_view_of !== null) {
+      const pv = globalThis.__rt._pod_view_of.get(lb);
+      if (pv !== undefined) {
+        lb = pv.buf;
+        continue;
+      }
+    }
+    if (globalThis.__rt._sign_view_of !== null) {
+      const sgn = globalThis.__rt._sign_view_of.get(lb);
+      if (sgn !== undefined) {
+        lb = sgn;
+        continue;
+      }
+    }
     const sv = globalThis.__rt._scalar_view_of.get(lb);
     if (sv !== undefined) {
       lo = lo * sv.size + sv.phase;
@@ -853,6 +881,20 @@ globalThis.__rt.ptr_eq = (a, b) => {
           rb = bev.buf;
           continue;
         }
+      }
+    }
+    if (globalThis.__rt._pod_view_of !== null) {
+      const pv = globalThis.__rt._pod_view_of.get(rb);
+      if (pv !== undefined) {
+        rb = pv.buf;
+        continue;
+      }
+    }
+    if (globalThis.__rt._sign_view_of !== null) {
+      const sgn = globalThis.__rt._sign_view_of.get(rb);
+      if (sgn !== undefined) {
+        rb = sgn;
+        continue;
       }
     }
     const sv = globalThis.__rt._scalar_view_of.get(rb);
@@ -1084,7 +1126,8 @@ globalThis.__rt.copy = (dst, src, count, clone, plain) => {
         && doff + count <= db.length && soff + count <= sb.length) {
       if (db === sb) {
         if (doff === soff) return;
-        if (ArrayBuffer.isView(db) || ((plain || globalThis.__rt._boxes === null) && Array.isArray(db))) {
+        if ((ArrayBuffer.isView(db) && db[globalThis.__rt._retyped] !== true && db[globalThis.__rt._freed] !== true)
+            || ((plain || globalThis.__rt._boxes === null) && Array.isArray(db))) {
           if (count <= 8) {
             if (doff > soff) {
               for (let i = count - 1; i >= 0; i--) db[doff + i] = db[soff + i];
@@ -1096,7 +1139,9 @@ globalThis.__rt.copy = (dst, src, count, clone, plain) => {
           }
           return;
         }
-      } else if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
+      } else if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor
+          && db[globalThis.__rt._retyped] !== true && db[globalThis.__rt._freed] !== true
+          && sb[globalThis.__rt._retyped] !== true && sb[globalThis.__rt._freed] !== true) {
         if (count <= 32) {
           for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
         } else {
@@ -1118,7 +1163,7 @@ globalThis.__rt.copy = (dst, src, count, clone, plain) => {
   const d = globalThis.__rt._run(dst, count, "copy");
   const s = globalThis.__rt._run(src, count, "copy");
   if (effCl === undefined && d.buf === s.buf && (Array.isArray(d.buf) || ArrayBuffer.isView(d.buf))
-      && (globalThis.__rt._bv === null || !globalThis.__rt._bv.is_bv(d.buf))) {
+      && (ArrayBuffer.isView(d.buf) || globalThis.__rt._bv === null || !globalThis.__rt._bv.is_bv(d.buf))) {
     d.buf.copyWithin(d.off, s.off, s.off + s.n);
     return;
   }
@@ -1256,7 +1301,9 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
     const db = dst.$b, sb = src.$b, doff = dst.$o, soff = src.$o;
     if (db !== undefined && sb !== undefined && doff >= 0 && soff >= 0
         && doff + count <= db.length && soff + count <= sb.length) {
-      if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
+      if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor
+          && db[globalThis.__rt._retyped] !== true && db[globalThis.__rt._freed] !== true
+          && sb[globalThis.__rt._retyped] !== true && sb[globalThis.__rt._freed] !== true) {
         if (count <= 32) {
           for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
         } else {
@@ -1333,7 +1380,8 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
       && dst !== null && dst.$s === undefined) {
     const db = dst.$b, doff = dst.$o;
     if (db !== undefined && doff >= 0 && doff + count <= db.length) {
-      if (zero === undefined && db instanceof Uint8Array) {
+      if (zero === undefined && db instanceof Uint8Array
+          && db[globalThis.__rt._retyped] !== true && db[globalThis.__rt._freed] !== true) {
         const blk = globalThis.__rt._blk_get(db);
         if (blk === undefined || (!blk.freed && blk.typed === undefined && blk.es === 1)) {
           db.fill(value, doff, doff + count);
@@ -1389,8 +1437,10 @@ globalThis.__rt.compare_bytes = (a, b, count) => {
       && globalThis.__rt._flatten_view_of === null
       && a !== null && b !== null && a.$s === undefined && b.$s === undefined) {
     const ab = a.$b, bb = b.$b;
-    if ((ab instanceof Uint8Array || (Array.isArray(ab) && globalThis.__rt._blk_get(ab) === undefined))
-        && (bb instanceof Uint8Array || (Array.isArray(bb) && globalThis.__rt._blk_get(bb) === undefined))) {
+    if (((ab instanceof Uint8Array && ab[globalThis.__rt._retyped] !== true && ab[globalThis.__rt._freed] !== true)
+            || (Array.isArray(ab) && globalThis.__rt._blk_get(ab) === undefined))
+        && ((bb instanceof Uint8Array && bb[globalThis.__rt._retyped] !== true && bb[globalThis.__rt._freed] !== true)
+            || (Array.isArray(bb) && globalThis.__rt._blk_get(bb) === undefined))) {
       const ao = a.$o, bo = b.$o;
       if (ao >= 0 && bo >= 0 && ao + count <= ab.length && bo + count <= bb.length) {
         for (let i = 0; i < count; i++) {
@@ -1813,9 +1863,17 @@ globalThis.__rt._byte_view = (buf, size, kind, signed, key, pr, ps) => {
   }
   let view = views.get(cacheKey);
   if (view !== undefined) return view;
+  const single = key !== undefined;
+  if (!single && pr === undefined && globalThis.__rt._is_le && ArrayBuffer.isView(buf)
+      && !(buf instanceof DataView) && buf.BYTES_PER_ELEMENT === size) {
+    view = new (signed ? Int8Array : Uint8Array)(buf.buffer, buf.byteOffset, buf.byteLength);
+    views.set(cacheKey, view);
+    globalThis.__rt._byte_view_of.set(view, { buf, size, kind, signed, key });
+    _has_byte_views = true;
+    return view;
+  }
   const load = globalThis.__rt._byte_load;
   const store = globalThis.__rt._byte_store;
-  const single = key !== undefined;
   view = new Proxy([], {
     get(target, prop, receiver) {
       if (typeof prop === "string") {
@@ -1940,6 +1998,20 @@ globalThis.__rt._unwrap_view = (p) => {
         }
       }
     }
+    if (globalThis.__rt._pod_view_of !== null) {
+      const pv = globalThis.__rt._pod_view_of.get(buf);
+      if (pv !== undefined) {
+        buf = pv.buf;
+        continue;
+      }
+    }
+    if (globalThis.__rt._sign_view_of !== null) {
+      const sv = globalThis.__rt._sign_view_of.get(buf);
+      if (sv !== undefined) {
+        buf = sv;
+        continue;
+      }
+    }
     const scalar = globalThis.__rt._scalar_view_of.get(buf);
     if (scalar !== undefined) {
       off = off * scalar.size + scalar.phase;
@@ -2008,7 +2080,7 @@ globalThis.__rt._prep_copy = (p, otherSc, otherCl, count) => {
   }
   const bv = _has_byte_views ? globalThis.__rt._byte_view_of.get(p.$b) : undefined;
   if (bv !== undefined) {
-    if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
+    if (bv.buf.length === 0 || bv.buf[globalThis.__rt._freed] === true) globalThis.__rt._heap_block(bv.buf);
     return { p, cl: undefined, ns: false };
   }
   if (p.$b !== undefined && p.$b !== null) {
@@ -2032,7 +2104,8 @@ globalThis.__rt._prep_copy = (p, otherSc, otherCl, count) => {
         count % otherSc === 0
       ) {
         const typed = new Array(Math.floor(block.bytes / otherSc));
-        p.$b.length = 0;
+        if (Array.isArray(p.$b)) p.$b.length = 0;
+        else p.$b[globalThis.__rt._retyped] = true;
         block.raw = p.$b;
         block.typed = typed;
         block.es = otherSc;
@@ -2440,7 +2513,7 @@ globalThis.__rt._bv_enable = (() => {
       return { $b: block.typed, $o: p.$o, $s: block.es };
     },
     raw_buf(buf) {
-      if (buf !== null && typeof buf === "object" && buf.length === 0) {
+      if (buf !== null && typeof buf === "object" && (buf.length === 0 || buf[globalThis.__rt._retyped] === true)) {
         const blk = globalThis.__rt._heap_block(buf);
         if (blk !== undefined && blk.typed !== undefined && buf !== blk.typed && blk.hdr === undefined) {
           if (blk.sk === undefined) {
@@ -2456,7 +2529,7 @@ globalThis.__rt._bv_enable = (() => {
     unscale_scalar(p, size, mk, kind) {
       const bv = _has_byte_views ? globalThis.__rt._byte_view_of.get(p.$b) : undefined;
       if (bv !== undefined) {
-        if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
+        if (bv.buf.length === 0 || bv.buf[globalThis.__rt._freed] === true) globalThis.__rt._heap_block(bv.buf);
         if (bv.kind === kind) {
           if (p.$pv !== undefined) {
             if (p.$o !== p.$po) {
@@ -2477,15 +2550,28 @@ globalThis.__rt._bv_enable = (() => {
       }
       const block = globalThis.__rt._heap_block(p.$b);
       if (block !== undefined && block.typed !== undefined && p.$b !== block.typed && block.hdr === undefined) {
+        if (block.sk === undefined) {
+          if (block.es !== size) {
+            throw __rt.abort_error(new Error(
+              "rustc_codegen_js: this heap block already holds " + block.es +
+                "-byte elements, so it cannot be read as " + size + "-byte ones",
+            ));
+          }
+          throw __rt.abort_error(new Error(
+            "rustc_codegen_js: cannot view " + block.es + "-byte non-scalar elements as " + kind,
+          ));
+        }
         if (block.es !== size) {
+          if (ArrayBuffer.isView(block.typed)) {
+            return globalThis.__rt._scalar_view(
+              { $b: globalThis.__rt._byte_view(block.typed, block.es, block.sk, false), $o: p.$o },
+              size,
+              kind,
+            );
+          }
           throw __rt.abort_error(new Error(
             "rustc_codegen_js: this heap block already holds " + block.es +
               "-byte elements, so it cannot be read as " + size + "-byte ones",
-          ));
-        }
-        if (block.sk === undefined) {
-          throw __rt.abort_error(new Error(
-            "rustc_codegen_js: cannot view " + block.es + "-byte non-scalar elements as " + kind,
           ));
         }
         if (block.sk !== kind || p.$o % size !== 0) {
@@ -2509,7 +2595,7 @@ globalThis.__rt._bv_enable = (() => {
           }
           return p;
         }
-        if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
+        if (bv.buf.length === 0 || bv.buf[globalThis.__rt._freed] === true) globalThis.__rt._heap_block(bv.buf);
         if (bv.size !== size) {
           throw __rt.abort_error(new Error(
             "rustc_codegen_js: this pointer is a byte view of " + bv.size +
@@ -2605,7 +2691,7 @@ globalThis.__rt._bv_enable = (() => {
 
 globalThis.__rt.read_byte = (p, signed) => {
   globalThis.__rt._bv_enable;
-  if (p.$s === undefined) {
+  if (p.$s === undefined && p.$b[globalThis.__rt._retyped] !== true && p.$b[globalThis.__rt._freed] !== true) {
     const v = p.$b[p.$o];
     if (v !== undefined) return v;
   }
@@ -2614,7 +2700,7 @@ globalThis.__rt.read_byte = (p, signed) => {
 
 globalThis.__rt.write_byte = (p, value) => {
   globalThis.__rt._bv_enable;
-  if (p.$s === undefined && p.$b.length !== 0) {
+  if (p.$s === undefined && p.$b.length !== 0 && p.$b[globalThis.__rt._retyped] !== true && p.$b[globalThis.__rt._freed] !== true) {
     p.$b[p.$o] = value;
     return;
   }
@@ -2623,14 +2709,16 @@ globalThis.__rt.write_byte = (p, value) => {
 
 globalThis.__rt.read_byte_at = (buf, off, signed) => {
   globalThis.__rt._bv_enable;
-  const v = buf[off];
-  if (v !== undefined) return v;
+  if (buf[globalThis.__rt._retyped] !== true && buf[globalThis.__rt._freed] !== true) {
+    const v = buf[off];
+    if (v !== undefined) return v;
+  }
   return globalThis.__rt._bv_read(buf, off, undefined, !!signed);
 };
 
 globalThis.__rt.write_byte_at = (buf, off, value) => {
   globalThis.__rt._bv_enable;
-  if (buf.length !== 0) {
+  if (buf.length !== 0 && buf[globalThis.__rt._retyped] !== true && buf[globalThis.__rt._freed] !== true) {
     buf[off] = value;
     return;
   }
@@ -2681,8 +2769,12 @@ globalThis.__rt.scale_scalar = (p, size, kind, signed) => {
   return { $b: globalThis.__rt._byte_view(p.$b, size, kind, !!signed), $o: p.$o * size };
 };
 
-// Switches signedness (`u8` <-> `i8`) on a wider-scalar byte view (`_byte_view`
-// or retyped allocation raw pointer), leaving ordinary byte buffers unchanged.
+globalThis.__rt._sign_views = null;
+globalThis.__rt._sign_view_of = null;
+
+// Switches signedness (`u8` <-> `i8`) on a wider-scalar byte view (`_byte_view`,
+// `Uint8Array`/`Int8Array` buffers, or retyped allocation raw pointers), leaving
+// ordinary plain-JS byte arrays unchanged.
 globalThis.__rt.byte_sign = (p, signed) => {
   globalThis.__rt._bv_enable;
   if (p !== null && typeof p === "object") {
@@ -2696,6 +2788,49 @@ globalThis.__rt.byte_sign = (p, signed) => {
     const block = p.$b !== undefined && p.$b !== null ? globalThis.__rt._blk_get(p.$b) : undefined;
     if (block !== undefined && block.typed !== undefined && p.$b !== block.typed && block.hdr === undefined && block.sk !== undefined) {
       return { $b: globalThis.__rt._byte_view(block.typed, block.es, block.sk, signed), $o: p.$o };
+    }
+    if ((signed && p.$b instanceof Uint8Array) || (!signed && p.$b instanceof Int8Array)) {
+      if (block !== undefined && block.es === 1 && block.hdr === undefined) {
+        if (signed && block.typed instanceof Int8Array) {
+          return { $b: block.typed, $o: p.$o };
+        }
+        if (!signed && block.raw instanceof Uint8Array && block.raw.buffer === p.$b.buffer) {
+          return { $b: block.raw, $o: p.$o };
+        }
+        if (block.fresh && block.typed === undefined) {
+          const next = new (signed ? Int8Array : Uint8Array)(p.$b.buffer, p.$b.byteOffset, p.$b.byteLength);
+          block.raw = p.$b;
+          block.typed = next;
+          block.fresh = false;
+          globalThis.__rt._blocks.set(next, block);
+          _blkK = next;
+          _blkV = block;
+          if (_has_minted_addrs) {
+            const base = globalThis.__rt._addrs.get(p.$b);
+            if (base !== undefined) {
+              globalThis.__rt._addrs.set(next, base);
+              const k = globalThis.__rt._addrHeap.get(p.$b);
+              if (k !== undefined) { globalThis.__rt._addrHeap.set(next, k); globalThis.__rt._addrHeap.delete(p.$b); }
+            }
+          }
+          return { $b: next, $o: p.$o };
+        }
+      }
+      if (globalThis.__rt._sign_view_of !== null) {
+        const orig = globalThis.__rt._sign_view_of.get(p.$b);
+        if (orig !== undefined && ((signed && orig instanceof Int8Array) || (!signed && orig instanceof Uint8Array))) {
+          return { $b: orig, $o: p.$o };
+        }
+      }
+      if (globalThis.__rt._sign_views === null) globalThis.__rt._sign_views = new WeakMap();
+      if (globalThis.__rt._sign_view_of === null) globalThis.__rt._sign_view_of = new WeakMap();
+      let view = globalThis.__rt._sign_views.get(p.$b);
+      if (view === undefined) {
+        view = new (signed ? Int8Array : Uint8Array)(p.$b.buffer, p.$b.byteOffset, p.$b.byteLength);
+        globalThis.__rt._sign_views.set(p.$b, view);
+        globalThis.__rt._sign_view_of.set(view, p.$b);
+      }
+      return { $b: view, $o: p.$o };
     }
   }
   return p;
@@ -2758,6 +2893,101 @@ globalThis.__rt._scalar_store = (buf, off, parts, value) => {
   }
 };
 
+globalThis.__rt._is_le = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+globalThis.__rt._pod_ta_ctor = (kind) => {
+  switch (kind) {
+    case "u8": return Uint8Array;
+    case "i8": return Int8Array;
+    case "u16": return Uint16Array;
+    case "i16": return Int16Array;
+    case "u32": return Uint32Array;
+    case "i32": return Int32Array;
+    case "f32": return Float32Array;
+    case "f64": return Float64Array;
+    default: return null;
+  }
+};
+
+// Lightweight O(1) DataView-backed Proxy for unaligned or 64/128-bit scalar views over an
+// ArrayBuffer-backed TypedArray. Shares the underlying ArrayBuffer for both reads and writes
+// using ES2018-safe 32-bit word pairs for BigInt widths.
+globalThis.__rt._dv_view = (buf, size, kind, parts, phase) => {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const len = Math.floor((buf.byteLength - phase) / size);
+  const readAt = (at) => {
+    if (parts.kind === "f") {
+      return parts.bits === 32 ? dv.getFloat32(at, true) : dv.getFloat64(at, true);
+    }
+    if (parts.bits === 16) return parts.kind === "i" ? dv.getInt16(at, true) : dv.getUint16(at, true);
+    if (parts.bits === 32) return parts.kind === "i" ? dv.getInt32(at, true) : dv.getUint32(at, true);
+    const words = parts.bits / 32;
+    let out = BigInt(dv.getUint32(at, true));
+    for (let w = 1; w < words; w++) {
+      const word = parts.kind === "i" && w + 1 === words
+        ? dv.getInt32(at + w * 4, true)
+        : dv.getUint32(at + w * 4, true);
+      out |= BigInt(word) << BigInt(w * 32);
+    }
+    return out;
+  };
+  const writeAt = (at, value) => {
+    if (parts.kind === "f") {
+      if (parts.bits === 32) dv.setFloat32(at, value, true);
+      else dv.setFloat64(at, value, true);
+      return;
+    }
+    if (parts.bits === 16) {
+      if (parts.kind === "i") dv.setInt16(at, value, true);
+      else dv.setUint16(at, value, true);
+      return;
+    }
+    if (parts.bits === 32) {
+      if (parts.kind === "i") dv.setInt32(at, value, true);
+      else dv.setUint32(at, value, true);
+      return;
+    }
+    const raw = BigInt.asUintN(parts.bits, BigInt(value));
+    const words = parts.bits / 32;
+    for (let w = 0; w < words; w++) {
+      dv.setUint32(at + w * 4, Number(BigInt.asUintN(32, raw >> BigInt(w * 32))), true);
+    }
+  };
+  return new Proxy([], {
+    get(_t, prop, receiver) {
+      if (prop === "length") return len;
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          if (idx >= len) return undefined;
+          return readAt(idx * size + phase);
+        }
+      }
+      return Reflect.get(_t, prop, receiver);
+    },
+    set(_t, prop, value, receiver) {
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          if (idx >= len) return true;
+          writeAt(idx * size + phase, value);
+          return true;
+        }
+      }
+      return Reflect.set(_t, prop, value, receiver);
+    },
+    has(_t, prop) {
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          return idx < len;
+        }
+      }
+      return Reflect.has(_t, prop);
+    },
+  });
+};
+
 // A byte offset that is not a multiple of the width is as good a place for a scalar as any other:
 // `read_unaligned`, and the first and last words of `<[u8]>::is_ascii`, read one there. Its view
 // is the one whose element `i` starts at byte `i * size + phase`, so an unaligned pointer is an
@@ -2780,6 +3010,20 @@ globalThis.__rt._scalar_view = (p, size, kind) => {
   const phase = p.$o % size;
   const key = phase === 0 ? kind : kind + "@" + phase;
   let view = views.get(key);
+  if (ArrayBuffer.isView(p.$b) && !(p.$b instanceof DataView)) {
+    if (view === undefined) {
+      const absOff = p.$b.byteOffset + phase;
+      const Ctor = globalThis.__rt._is_le && absOff % size === 0
+        ? globalThis.__rt._pod_ta_ctor(kind)
+        : null;
+      view = Ctor !== null
+        ? new Ctor(p.$b.buffer, absOff, Math.floor((p.$b.byteLength - phase) / size))
+        : globalThis.__rt._dv_view(p.$b, size, kind, parts, phase);
+      views.set(key, view);
+      globalThis.__rt._scalar_view_of.set(view, { buf: p.$b, size, kind, phase });
+    }
+    return { $b: view, $o: (p.$o - phase) / size };
+  }
   if (view === undefined) {
     view = [];
     views.set(key, view);
@@ -2796,6 +3040,93 @@ globalThis.__rt._scalar_view = (p, size, kind) => {
     });
   }
   return { $b: view, $o: (p.$o - phase) / size };
+};
+
+// Equal-size POD pointer view (e.g. `*const semver::Identifier -> *const NonZero<u64>`).
+// Reads convert `From -> To` via `readFn`; writes convert `To -> From` via `writeFn` and store
+// in place via `_put` so boxed locals see the mutation.
+globalThis.__rt._pod_view_of = null;
+globalThis.__rt.pod_view = (p, readFn, writeFn) => {
+  if (p === null || typeof p !== "object" || p.$b === undefined) return p;
+  if (globalThis.__rt._pod_view_of === null) globalThis.__rt._pod_view_of = new WeakMap();
+  const srcBuf = p.$b;
+  const view = new Proxy([], {
+    get(_t, prop, receiver) {
+      if (prop === "length") return srcBuf.length;
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          return readFn(srcBuf[idx]);
+        }
+      }
+      return Reflect.get(_t, prop, receiver);
+    },
+    set(_t, prop, value, receiver) {
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          if (typeof writeFn !== "function") {
+            throw __rt.abort_error(new Error(
+              "rustc_codegen_js: cannot write through a read-only POD pointer view",
+            ));
+          }
+          globalThis.__rt._put(srcBuf, idx, writeFn(value));
+          return true;
+        }
+      }
+      return Reflect.set(_t, prop, value, receiver);
+    },
+    has(_t, prop) {
+      if (typeof prop === "string") {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx >= 0 && String(idx) === prop) {
+          return idx < srcBuf.length;
+        }
+      }
+      return Reflect.has(_t, prop);
+    },
+  });
+  globalThis.__rt._pod_view_of.set(view, { buf: srcBuf });
+  return { $b: view, $o: p.$o };
+};
+
+// Uninitialized stack scratch buffer cast (e.g. `core::slice::rotate`'s
+// `MaybeUninit::<([usize; 32], [T; 0])>::uninit().as_mut_ptr() as *mut T`).
+// Lazily allocates and memoizes a typed scratch buffer when the underlying slot is uninitialized,
+// and falls back to the normal initialized cast (or refuses) if the slot holds a real value.
+globalThis.__rt._uninit_scratch = null;
+globalThis.__rt.uninit_cast = (p, fromSize, toSize, fallback) => {
+  if (p !== null && typeof p === "object" && p.$b !== undefined) {
+    const held = p.$b[p.$o];
+    let isUninit = held === undefined;
+    if (!isUninit && Array.isArray(held)) {
+      isUninit = true;
+      for (let i = 0; i < held.length; i++) {
+        if (held[i] !== undefined) { isUninit = false; break; }
+      }
+    }
+    if (isUninit) {
+      if (globalThis.__rt._uninit_scratch === null) globalThis.__rt._uninit_scratch = new WeakMap();
+      let byOff = globalThis.__rt._uninit_scratch.get(p.$b);
+      if (byOff === undefined) {
+        byOff = new Map();
+        globalThis.__rt._uninit_scratch.set(p.$b, byOff);
+      }
+      const key = p.$o + ":" + toSize;
+      let scratch = byOff.get(key);
+      if (scratch === undefined) {
+        const cap = toSize > 0 ? Math.floor(fromSize / toSize) : 0;
+        scratch = new Array(cap);
+        byOff.set(key, scratch);
+      }
+      return { $b: scratch, $o: 0 };
+    }
+  }
+  if (typeof fallback === "function") return fallback(p);
+  throw __rt.abort_error(new Error(
+    "rustc_codegen_js: cannot reinterpret an initialized " + fromSize +
+      "-byte aggregate pointer as a " + toSize + "-byte element pointer",
+  ));
 };
 
 // unscale(p, size, mk): turns a byte-granular pointer into a slot over
@@ -2894,6 +3225,14 @@ globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
     const block = globalThis.__rt._heap_block(p.$b);
     if (block === undefined || (block.es === 1 && !block.fresh)) {
       return globalThis.__rt._scalar_view(p, size, kind);
+    }
+    if (block.typed !== undefined && p.$b !== block.typed && block.hdr === undefined
+        && block.sk !== undefined && ArrayBuffer.isView(block.typed)
+        && block.raw instanceof Uint8Array && block.raw.buffer === block.typed.buffer) {
+      if (block.es === size && block.sk === kind && p.$o % size === 0) {
+        return { $b: block.typed, $o: p.$o / size };
+      }
+      return globalThis.__rt._scalar_view({ $b: block.raw, $o: p.$o }, size, kind);
     }
     if (globalThis.__rt._bv === null && block.es === size && !block.fresh && block.typed === undefined && p.$o === 0) {
       return p;
@@ -5321,6 +5660,7 @@ let _blkV;
 let _blkK2 = null;
 let _blkV2;
 globalThis.__rt._freed = Symbol("rustc_codegen_js.freed");
+globalThis.__rt._retyped = Symbol("rustc_codegen_js.retyped");
 // Stack arrays reached through `MaybeUninit<u8>` need the same one-time scale
 // bookkeeping without becoming heap blocks. In particular, `_put` must not
 // attach heap ownership metadata to values stored in sort scratch space.
@@ -5386,7 +5726,74 @@ globalThis.__rt._retype = (p, block, size, mk, kind, cl) => {
   }
   const byte_off = isRaw || fromBv ? p.$o : p.$o * block.es;
   if (byte_off % size !== 0) throw __rt.abort_error(new Error("rustc_codegen_js: byte offset " + byte_off + " is not a multiple of " + size + ", so it does not name an element"));
+  if (block.zeroed && mk == null) {
+    throw __rt.abort_error(new Error("rustc_codegen_js: a zeroed heap block cannot be read as " + size + "-byte elements, because this backend cannot spell a zero one"));
+  }
   const length = Math.floor(block.bytes / size);
+  // Zeroed TypedArray backing (`alloc_zeroed` -> `Uint8Array`):
+  // - For POD scalar targets >= 64 bytes, create a zero-copy TypedArray over the same OS-zeroed
+  //   ArrayBuffer (O(1), zero fill loop, live byte aliasing).
+  // - For non-TypedArray targets (or small < 64B blocks or 1-byte non-zero values like `bool`),
+  //   materialize a JS Array and mark `raw[_retyped] = true` so byte reads/writes still fail closed.
+  if (ArrayBuffer.isView(raw)) {
+    const Ctor = !same && block.zeroed && raw instanceof Uint8Array && block.bytes >= 64 && kind !== undefined && globalThis.__rt._is_le
+      ? globalThis.__rt._pod_ta_ctor(kind)
+      : null;
+    if (Ctor !== null) {
+      const typed = new Ctor(raw.buffer, raw.byteOffset, length);
+      block.raw = raw; block.typed = typed; block.es = size;
+      block.sk = kind;
+      if (cl !== undefined) block.cl = cl;
+      block.fresh = false;
+      block.zeroed = false;
+      if (block.uninit) {
+        globalThis.__rt._uninit_blocks.set(typed, block);
+      } else {
+        globalThis.__rt._blocks.set(typed, block);
+        _blkK = typed; _blkV = block;
+        if (_has_minted_addrs) {
+          const base = globalThis.__rt._addrs.get(raw);
+          if (base !== undefined) {
+            globalThis.__rt._addrs.set(typed, base);
+            const k = globalThis.__rt._addrHeap.get(raw);
+            if (k !== undefined) { globalThis.__rt._addrHeap.set(typed, k); globalThis.__rt._addrHeap.delete(raw); }
+          }
+        }
+      }
+      return { $b: typed, $o: byte_off / size };
+    }
+    const typed = new Array(length);
+    raw[globalThis.__rt._retyped] = true;
+    block.raw = raw; block.typed = typed; block.es = size;
+    if (kind !== undefined) block.sk = kind;
+    if (cl !== undefined) block.cl = cl;
+    if (block.uninit) {
+      globalThis.__rt._uninit_blocks.set(typed, block);
+    } else {
+      globalThis.__rt._blocks.set(typed, block);
+      _blkK = typed; _blkV = block;
+      if (_has_minted_addrs) {
+        const base = globalThis.__rt._addrs.get(raw);
+        if (base !== undefined) {
+          globalThis.__rt._addrs.set(typed, base);
+          const k = globalThis.__rt._addrHeap.get(raw);
+          if (k !== undefined) { globalThis.__rt._addrHeap.set(typed, k); globalThis.__rt._addrHeap.delete(raw); }
+        }
+      }
+    }
+    block.fresh = false;
+    if (block.zeroed) {
+      for (let i = 0; i < length; i++) {
+        const v = mk();
+        typed[i] = v;
+        if (v !== null && typeof v === "object" && !block.uninit && globalThis.__rt._boxes !== null) globalThis.__rt._boxes.set(v, { $b: typed, $o: i });
+      }
+    } else if (block.bytes === size && typeof mk === "function") {
+      const shell = mk();
+      if (shell !== null && typeof shell === "object") globalThis.__rt._put(typed, 0, shell);
+    }
+    return { $b: typed, $o: byte_off / size };
+  }
   let target = active;
   if (!same) {
     if (bv === null) {
@@ -5428,7 +5835,6 @@ globalThis.__rt._retype = (p, block, size, mk, kind, cl) => {
   } else if (cl !== undefined && block.cl === undefined) block.cl = cl;
   block.fresh = false;
   if (block.zeroed) {
-    if (mk == null) throw __rt.abort_error(new Error("rustc_codegen_js: a zeroed heap block cannot be read as " + size + "-byte elements, because this backend cannot spell a zero one"));
     for (let i = 0; i < length; i++) {
       const v = mk();
       target[i] = v;
@@ -5633,12 +6039,13 @@ globalThis.__rt._register = (buf, bytes, zeroed) => {
 globalThis.__rt.alloc = (size, align) =>
   globalThis.__rt._register(new Array(size), size, false);
 
-// alloc_zeroed(size, align): `__rust_alloc_zeroed`. The bytes really are zero,
-// which is what `vec![0; n]` and `vec![false; n]` read back; the block also
-// remembers that it was zeroed, so a later retype refills it at the new element
-// size rather than leaving bytes where elements belong.
+// alloc_zeroed(size, align): `__rust_alloc_zeroed`. Allocates an OS-zeroed
+// `Uint8Array(size)` (O(1) zeroing, 1 byte/elem, avoiding V8's 2^27 JSArray cap
+// and double-zeroing); `_retype` creates a zero-copy TypedArray over the same
+// `ArrayBuffer` for POD scalar buffers >= 64 bytes or materializes a JS Array
+// for non-TypedArray types (`bool`, structs, refs).
 globalThis.__rt.alloc_zeroed = (size, align) =>
-  globalThis.__rt._register(new Array(size).fill(0), size, true);
+  globalThis.__rt._register(new Uint8Array(size), size, true);
 
 // dealloc(ptr, size, align): `__rust_dealloc`. The block is unregistered and
 // poisoned: emptying the array makes every stale pointer into it read
@@ -5678,6 +6085,46 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
     throw __rt.abort_error(new Error("rustc_codegen_js: a heap block of " + new_size + " bytes is not a whole number of " + block.es + "-byte elements"));
   }
   const active = block.typed !== undefined ? block.typed : buf;
+  if (ArrayBuffer.isView(active)) {
+    const newLen = new_size / block.es;
+    const oldRaw = block.raw;
+    let nextRaw = oldRaw;
+    let nextActive;
+    if (oldRaw !== undefined && oldRaw instanceof Uint8Array && block.typed === active && active.buffer === oldRaw.buffer) {
+      nextRaw = new Uint8Array(new_size);
+      nextActive = new active.constructor(nextRaw.buffer, 0, newLen);
+    } else {
+      nextActive = new active.constructor(newLen);
+    }
+    nextActive.set(active.length <= newLen ? active : active.subarray(0, newLen));
+    globalThis.__rt._blocks.delete(active);
+    globalThis.__rt._blocks.set(nextActive, block);
+    if (nextRaw !== oldRaw) {
+      globalThis.__rt._blocks.delete(oldRaw);
+      oldRaw[globalThis.__rt._freed] = true;
+      globalThis.__rt._blocks.set(nextRaw, block);
+      block.raw = nextRaw;
+    }
+    if (block.typed === active) block.typed = nextActive;
+    block.bytes = new_size;
+    if (_blkK === active || _blkK === oldRaw) { _blkK = nextActive; _blkV = block; }
+    if (_blkK2 === active || _blkK2 === oldRaw) { _blkK2 = null; _blkV2 = undefined; }
+    if (_has_minted_addrs) globalThis.__rt._addr_release(active);
+    active[globalThis.__rt._freed] = true;
+    if (p.$s !== undefined) {
+      if (globalThis.__rt._bv === null && p.$o === 0) return { $b: nextActive, $o: 0 };
+      let raw = block.raw;
+      if (raw === undefined) {
+        raw = [];
+        block.raw = raw;
+        block.typed = nextActive;
+        globalThis.__rt._blocks.set(raw, block);
+      }
+      return { $b: raw, $o: p.$o };
+    }
+    if (oldRaw !== undefined && p.$b === oldRaw) return { $b: nextRaw, $o: p.$o };
+    return { $b: nextActive, $o: p.$o };
+  }
   block.bytes = new_size;
   active.length = new_size / block.es;
   globalThis.__rt._addr_release(active, new_size);
