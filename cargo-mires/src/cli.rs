@@ -157,6 +157,122 @@ impl fmt::Display for PanicMode {
     }
 }
 
+/// Output message format for `cargo mires build`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MessageFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+impl MessageFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "human" => Some(Self::Human),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MessageFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Automatic chunk discovery mode (`js-discover-chunks=<auto|on|off>`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiscoverChunks {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl DiscoverChunks {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DiscoverChunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Returns true when `ident` is a valid ASCII Rust `cfg` identifier.
+pub fn is_valid_cfg_ident(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate and normalize a `--cfg <SPEC>` value (e.g. `topcoat_client` or `foo="bar"`).
+pub fn normalize_cfg_spec(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("option `--cfg` requires a non-empty cfg specification".to_owned());
+    }
+    if let Some((key, value)) = trimmed.split_once('=') {
+        let key = key.trim();
+        let value = value.trim();
+        if !is_valid_cfg_ident(key) || value.is_empty() {
+            return Err(format!(
+                "invalid value `{raw}` for `--cfg` (expected `<ident>` or `<ident>=\"<value>\"`)"
+            ));
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "invalid value `{raw}` for `--cfg`: whitespace inside cfg value is not supported"
+            ));
+        }
+        Ok(format!("{key}={value}"))
+    } else if is_valid_cfg_ident(trimmed) {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(format!(
+            "invalid value `{raw}` for `--cfg` (expected `<ident>` or `<ident>=\"<value>\"`)"
+        ))
+    }
+}
+
+/// Derive a `rustc --check-cfg=<expr>` expression for a cfg specification so crates using
+/// `#[cfg(...)]` emit zero `unexpected_cfgs` warnings.
+pub fn check_cfg_expr(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    if let Some((key, _)) = trimmed.split_once('=') {
+        let key = key.trim();
+        is_valid_cfg_ident(key).then(|| format!("cfg({key},values(any()))"))
+    } else {
+        is_valid_cfg_ident(trimmed).then(|| format!("cfg({trimmed})"))
+    }
+}
+
 /// Explicit Cargo target selection from CLI flags.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TargetSelection {
@@ -186,6 +302,13 @@ pub struct BuildCliOptions {
     pub no_default_features: bool,
     pub target_dir: Option<PathBuf>,
     pub target_selection: TargetSelection,
+    pub cfgs: Vec<String>,
+    pub chunks: Vec<String>,
+    pub islands: Vec<String>,
+    pub shared_chunk: Option<String>,
+    pub discover_chunks: Option<DiscoverChunks>,
+    pub shim_module: Option<String>,
+    pub message_format: Option<MessageFormat>,
     pub verbose: bool,
 }
 
@@ -492,6 +615,56 @@ fn parse_build_like(args: &[String]) -> Result<ParsedSubcommand<BuildCliOptions>
                 }
                 opts.target_selection = TargetSelection::Bin(name);
             }
+            "--cfg" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                opts.cfgs.push(normalize_cfg_spec(&raw)?);
+            }
+            "--chunk" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                validate_chunk_arg(&raw)?;
+                opts.chunks.push(raw);
+            }
+            "--island" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                validate_island_arg(&raw)?;
+                opts.islands.push(raw);
+            }
+            "--shared-chunk" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                if raw.trim().is_empty() {
+                    return Err(
+                        "option `--shared-chunk` requires a non-empty chunk name".to_owned()
+                    );
+                }
+                opts.shared_chunk = Some(raw);
+            }
+            "--discover-chunks" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                let mode = DiscoverChunks::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid value `{raw}` for `--discover-chunks` (expected `auto`, `on`, or `off`)"
+                    )
+                })?;
+                opts.discover_chunks = Some(mode);
+            }
+            "--shim-module" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                if raw.trim().is_empty() {
+                    return Err(
+                        "option `--shim-module` requires a non-empty module specifier".to_owned(),
+                    );
+                }
+                opts.shim_module = Some(raw);
+            }
+            "--message-format" => {
+                let raw = take_value(args, &mut index, flag, inline_value)?;
+                let format = MessageFormat::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid value `{raw}` for `--message-format` (expected `human` or `json`)"
+                    )
+                })?;
+                opts.message_format = Some(format);
+            }
             "-v" | "--verbose" => {
                 reject_value(flag, inline_value)?;
                 opts.verbose = true;
@@ -504,6 +677,41 @@ fn parse_build_like(args: &[String]) -> Result<ParsedSubcommand<BuildCliOptions>
     }
 
     Ok(ParsedSubcommand::Opts(opts))
+}
+
+fn validate_chunk_arg(raw: &str) -> Result<(), String> {
+    let Some((name, entry)) = raw.split_once(':') else {
+        return Err(format!(
+            "invalid value `{raw}` for `--chunk` (expected `<name>:<entry>`)"
+        ));
+    };
+    if name.trim().is_empty() || entry.trim().is_empty() {
+        return Err(format!(
+            "invalid value `{raw}` for `--chunk` (expected `<name>:<entry>`)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_island_arg(raw: &str) -> Result<(), String> {
+    match raw.split_once(':') {
+        Some((name, entry)) => {
+            if name.trim().is_empty() || entry.trim().is_empty() {
+                return Err(format!(
+                    "invalid value `{raw}` for `--island` (expected `<name>` or `<name>:<entry>`)"
+                ));
+            }
+        }
+        None => {
+            if raw.trim().is_empty() {
+                return Err(
+                    "option `--island` requires a non-empty island name (`<name>` or `<name>:<entry>`)"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_test(args: &[String]) -> Result<ParsedSubcommand<TestCliOptions>, String> {
@@ -1053,12 +1261,19 @@ Options:
       --profile <PROFILE>     Profile: dev|report|release-size|release-balanced|release-speed
       --format <FORMAT>       Output module format: esm|script (default: esm)
       --runtime <MODE>        Runtime shim mode: inline|external|none (default: inline)
+      --shim-module <SPEC>    External runtime specifier (e.g. `./runtime.mjs` or `topcoat-dom`)
       --out-dir <DIR>         Output directory (default: <target_dir>/mires)
       --dts / --no-dts        Emit TypeScript .d.ts declarations (default: on for esm)
       --source-map / --no-source-map
                               Emit source map .map files (default: on)
       --npm / --no-npm        Emit package.json in --out-dir
       --panic <MODE>          Panic strategy: unwind|abort (default: unwind)
+      --cfg <SPEC>            Add target `--cfg <SPEC>` (repeatable; e.g. `topcoat_client`)
+      --chunk <NAME:ENTRY>    Emit a named code-split chunk (repeatable; role=main)
+      --island <NAME[:ENTRY]> Emit an island chunk (repeatable; default entry `__island_<NAME>`)
+      --shared-chunk <NAME>   Name for the shared chunk holding common items
+      --discover-chunks <M>   Auto-discover `#[js_export(chunk = ...)]`: auto|on|off (default: auto)
+      --message-format <FMT>  Build output format: human|json (default: human)
       --mires-root <PATH>     Path to the Mires toolchain checkout or installed bundle
   -F, --features <LIST>       Space or comma separated Cargo features
       --all-features          Activate all available features
@@ -1415,5 +1630,62 @@ mod tests {
         assert!(parse_args(["cargo-mires", "toolchain", "package"]).is_err());
         assert!(parse_args(["cargo-mires", "toolchain", "bogus"]).is_err());
         assert!(parse_args(["cargo-mires", "bogus"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--discover-chunks", "maybe"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--message-format", "xml"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--chunk", "missing_colon"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--island", "bad:"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--cfg", "123bad"]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--shim-module", ""]).is_err());
+        assert!(parse_args(["cargo-mires", "build", "--shared-chunk", ""]).is_err());
+    }
+
+    #[test]
+    fn parses_framework_cfg_chunk_island_and_message_format_flags() {
+        let cmd = parse_args([
+            "cargo-mires",
+            "mires",
+            "build",
+            "--cfg",
+            "topcoat_client",
+            "--cfg=mode=\"hydrate\"",
+            "--chunk",
+            "app:boot",
+            "--island",
+            "counter",
+            "--island=search:init_search",
+            "--shared-chunk",
+            "common",
+            "--discover-chunks=on",
+            "--shim-module",
+            "topcoat-dom",
+            "--message-format=json",
+        ])
+        .unwrap();
+
+        let Command::Build(opts) = cmd else {
+            panic!("expected Build");
+        };
+        assert_eq!(
+            opts.cfgs,
+            vec!["topcoat_client".to_owned(), "mode=\"hydrate\"".to_owned()]
+        );
+        assert_eq!(opts.chunks, vec!["app:boot".to_owned()]);
+        assert_eq!(
+            opts.islands,
+            vec!["counter".to_owned(), "search:init_search".to_owned()]
+        );
+        assert_eq!(opts.shared_chunk.as_deref(), Some("common"));
+        assert_eq!(opts.discover_chunks, Some(DiscoverChunks::On));
+        assert_eq!(opts.shim_module.as_deref(), Some("topcoat-dom"));
+        assert_eq!(opts.message_format, Some(MessageFormat::Json));
+
+        assert_eq!(
+            check_cfg_expr("topcoat_client").as_deref(),
+            Some("cfg(topcoat_client)")
+        );
+        assert_eq!(
+            check_cfg_expr("mode=\"hydrate\"").as_deref(),
+            Some("cfg(mode,values(any()))")
+        );
     }
 }

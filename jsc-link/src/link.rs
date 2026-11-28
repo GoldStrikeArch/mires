@@ -51,7 +51,7 @@ use crate::jir::summary::{MergeDecision, Side};
 use crate::jsast;
 use crate::lane_report::{ItemLane, LaneAvailability, LaneItem};
 use crate::manifest::{Manifest, Mode};
-use crate::opts::{Modules, RuntimeMode};
+use crate::opts::{DiscoverChunks, Modules, Opts, RuntimeMode};
 
 // `pub(crate)`: the representation planner (`plan/representation.rs`, W4b) fills the sidecar's
 // `ReprBlock`, which is defined beside the sidecar it is rendered into.
@@ -269,6 +269,117 @@ fn read_archive_into(dcx: &Sink, path: &Path, out: &mut Read) {
 // The graph walk
 // -------------------------------------------------------------------------------------------
 
+/// Whether attribute-discovered chunks are active for `opts` and `table`.
+pub(crate) fn has_discovered_chunks(opts: &Opts, table: &BTreeMap<JsName, LinkItem>) -> bool {
+    let discover = match opts.discover_chunks {
+        DiscoverChunks::On => opts.modules == Modules::Esm,
+        DiscoverChunks::Auto => opts.modules == Modules::Esm,
+        DiscoverChunks::Off => false,
+    };
+    discover
+        && table
+            .values()
+            .any(|item| item.linkage.exported && item.linkage.chunk.is_some())
+}
+
+/// Whether this link splits output into chunks (explicit `js-chunk` or attribute-discovered chunks).
+pub(crate) fn is_chunked(opts: &Opts, table: &BTreeMap<JsName, LinkItem>) -> bool {
+    !opts.chunks.is_empty() || has_discovered_chunks(opts, table)
+}
+
+/// Resolves effective chunks and roles by combining explicit `-Cllvm-args=js-chunk` flags with
+/// attribute-discovered `Linkage::chunk` entries in `table`.
+///
+/// Returns `None` after reporting diagnostics if any chunk declaration is invalid or conflicting.
+fn resolve_effective_opts(
+    dcx: &Sink,
+    opts: &Opts,
+    table: &BTreeMap<JsName, LinkItem>,
+) -> Option<Opts> {
+    let discover = match opts.discover_chunks {
+        DiscoverChunks::On => {
+            if opts.modules != Modules::Esm {
+                dcx.err(
+                    "`-Cllvm-args=js-discover-chunks=on` needs `-Cllvm-args=js-modules=esm`: a \
+                     chunk imports what the other chunks hold, and a plain script cannot",
+                );
+                return None;
+            }
+            true
+        }
+        DiscoverChunks::Auto => opts.modules == Modules::Esm,
+        DiscoverChunks::Off => false,
+    };
+
+    if !discover {
+        return Some(opts.clone());
+    }
+
+    let mut chunks = opts.chunks.clone();
+    let mut roles: BTreeMap<String, EntryRole> = opts.chunk_roles.iter().cloned().collect();
+    let mut by_name: BTreeMap<String, (String, bool)> = opts
+        .chunks
+        .iter()
+        .map(|(name, entry)| (name.clone(), (entry.clone(), true)))
+        .collect();
+
+    let mut discovered: Vec<(&str, &str, EntryRole)> = table
+        .values()
+        .filter_map(|item| {
+            if !item.linkage.exported {
+                return None;
+            }
+            let chunk = item.linkage.chunk.as_ref()?;
+            Some((chunk.name.as_str(), export_name_of(item), chunk.role))
+        })
+        .collect();
+    discovered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+    let mut had_error = false;
+    for (chunk_name, entry_name, role) in discovered {
+        if chunk_name == opts.shared_chunk {
+            dcx.err(format!(
+                "the attribute-discovered chunk `{chunk_name}` (on `{entry_name}`) has the same \
+                 name as the shared chunk; rename it or pass \
+                 `-Cllvm-args=js-chunk-shared=<other name>`"
+            ));
+            had_error = true;
+            continue;
+        }
+        if let Some((existing_entry, is_explicit)) = by_name.get(chunk_name) {
+            if existing_entry == entry_name {
+                roles.entry(chunk_name.to_owned()).or_insert(role);
+            } else if *is_explicit {
+                dcx.err(format!(
+                    "chunk `{chunk_name}` is pinned to `{existing_entry}` by \
+                     `-Cllvm-args=js-chunk`, conflicting with attribute-discovered chunk \
+                     `{chunk_name}` on `{entry_name}`"
+                ));
+                had_error = true;
+            } else {
+                dcx.err(format!(
+                    "attribute-discovered chunk `{chunk_name}` is claimed by multiple exported \
+                     items: `{existing_entry}` and `{entry_name}`"
+                ));
+                had_error = true;
+            }
+            continue;
+        }
+        by_name.insert(chunk_name.to_owned(), (entry_name.to_owned(), false));
+        chunks.push((chunk_name.to_owned(), entry_name.to_owned()));
+        roles.entry(chunk_name.to_owned()).or_insert(role);
+    }
+
+    if had_error {
+        return None;
+    }
+
+    let mut effective = opts.clone();
+    effective.chunks = chunks;
+    effective.chunk_roles = roles.into_iter().collect();
+    Some(effective)
+}
+
 /// Deduplicates, walks, reports and prints. The whole link step, once the items are in hand.
 ///
 /// `path` is where the program is about to be written, which is what a source map is named after
@@ -289,12 +400,15 @@ fn resolve(
 
     let mut conflicts: Vec<ConflictRecord> = Vec::new();
     let mut table = dedup(dcx, items, &mut conflicts);
-    let split = !opts.chunks.is_empty();
-    if split && !validate_split_output(dcx, opts, path) {
+    let Some(effective_opts) = resolve_effective_opts(dcx, opts, &table) else {
+        return String::new();
+    };
+    let split = !effective_opts.chunks.is_empty();
+    if split && !validate_split_output(dcx, &effective_opts, path) {
         return String::new();
     }
 
-    let analysis = analyze_reachable_graph(dcx, &mut table, conflicts, split);
+    let analysis = analyze_reachable_graph(dcx, &mut table, conflicts, &effective_opts);
 
     let stubs = stub_missing(&table, &analysis.reachable);
     let placed = layout(&table, &analysis.reachable);
@@ -310,20 +424,34 @@ fn resolve(
     };
     let wide_byte_views = analysis.lane_run.wide_byte_views();
     let mut printed = crate::profile::time("link.print", || {
-        print_units(dcx, sources, std::slice::from_ref(&unit), wide_byte_views)
+        print_units_with_opts(
+            dcx,
+            &effective_opts,
+            sources,
+            std::slice::from_ref(&unit),
+            wide_byte_views,
+        )
     });
-    let mut deployment = build_deployment_manifest(opts, &unit, &printed, label, path, split);
+    let mut deployment =
+        build_deployment_manifest(&effective_opts, &unit, &printed, label, path, split);
 
-    write_reports_and_sidecars(dcx, label, path, &table, &analysis, printed.first());
+    write_reports_and_sidecars(dcx, label, path, &table, &analysis, printed.first(), split);
 
     if split {
         match path {
-            Some(path) => {
-                write_chunks(dcx, sources, &table, path, &mut deployment, wide_byte_views)
-            }
+            Some(path) => write_chunks(
+                dcx,
+                &effective_opts,
+                sources,
+                &table,
+                path,
+                &mut deployment,
+                wide_byte_views,
+            ),
             None => {
                 dcx.err(
-                    "`-Cllvm-args=js-chunk` needs an output path to write the chunk files beside",
+                    "`-Cllvm-args=js-chunk` (or attribute-discovered chunks) needs an output path \
+                     to write the chunk files beside",
                 );
             }
         }
@@ -371,12 +499,13 @@ fn analyze_reachable_graph(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
     mut conflicts: Vec<ConflictRecord>,
-    split: bool,
+    opts: &Opts,
 ) -> LinkAnalysis {
+    let split = !opts.chunks.is_empty();
     let (mut reachable, mut parents) = reach(dcx, table);
     let initial_count = reachable.len();
     decode_reachable_bodies(dcx, table, &mut reachable, true);
-    let mut lane_run = lane::run(dcx, table, &reachable);
+    let mut lane_run = lane::run(dcx, table, &reachable, opts);
     if table.values().any(|item| {
         item.jir
             .body
@@ -495,9 +624,9 @@ fn write_reports_and_sidecars(
     table: &BTreeMap<JsName, LinkItem>,
     analysis: &LinkAnalysis,
     program: Option<&PrintedUnit>,
+    split: bool,
 ) {
     let opts = crate::opts::get();
-    let split = !opts.chunks.is_empty();
     if !split {
         if let (Some(report_path), Some(program)) = (&opts.optimization_report, program) {
             crate::report::write(&crate::report::ReportInput {
@@ -1214,15 +1343,6 @@ fn refuse_hybrid_strings(dcx: &Sink, table: &BTreeMap<JsName, LinkItem>, reachab
     }
 }
 
-fn print_units(
-    dcx: &Sink,
-    sources: &BTreeMap<String, String>,
-    units: &[Unit<'_>],
-    wide_byte_views: bool,
-) -> Vec<PrintedUnit> {
-    print_units_with_opts(dcx, crate::opts::get(), sources, units, wide_byte_views)
-}
-
 fn print_units_with_opts(
     dcx: &Sink,
     opts: &crate::opts::Opts,
@@ -1504,6 +1624,7 @@ fn shim_import() -> LinkItem {
             fixed_name: Some(SHIM_NAMESPACE.to_owned()),
             root: false,
             exported: false,
+            chunk: None,
         },
         debug_path: source,
         crate_name: "generated".to_owned(),
@@ -2370,14 +2491,13 @@ struct ChunkPlan<'a> {
 /// emission, which is what keeps `--emit=obj` runnable and leaves an unsplit build untouched.
 fn write_chunks(
     dcx: &Sink,
+    opts: &Opts,
     sources: &BTreeMap<String, String>,
     table: &BTreeMap<JsName, LinkItem>,
     path: &Path,
     deployment: &mut ArtifactManifest,
     wide_byte_views: bool,
 ) {
-    let opts = crate::opts::get();
-
     let mut plans: Vec<ChunkPlan<'_>> = Vec::with_capacity(opts.chunks.len());
     for (name, entry) in &opts.chunks {
         let Some(root) = entry_item(table, entry) else {
@@ -2533,10 +2653,13 @@ fn write_chunks(
         });
     }
 
-    for (unit, printed) in units
-        .iter()
-        .zip(print_units(dcx, sources, &units, wide_byte_views))
-    {
+    for (unit, printed) in units.iter().zip(print_units_with_opts(
+        dcx,
+        opts,
+        sources,
+        &units,
+        wide_byte_views,
+    )) {
         let Some(path) = &unit.path else { continue };
         if let Err(err) = fs::write(path, printed.text.as_bytes()) {
             dcx.err(format!("error writing `{}`: {err}", path.display()));
@@ -3907,6 +4030,7 @@ mod tests {
             fixed_name: Some("$drops".to_owned()),
             root: false,
             exported: false,
+            chunk: None,
         };
 
         let cls_drop = make_exported(
@@ -4103,6 +4227,187 @@ assert.strictEqual(get_drops(), 2);
             String::from_utf8_lossy(&out_s.stdout),
             String::from_utf8_lossy(&out_s.stderr),
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_and_writes_attribute_discovered_chunks_with_roles_and_validation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jsc-link-discover-chunks-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut shared_helper = duplicate(
+            "shared_helper",
+            "function shared_helper() { return 42; }\n",
+            Some(1),
+            Some(1),
+        );
+        shared_helper.linkage = Linkage::internal();
+
+        let mut counter_fn = duplicate(
+            "mount_counter",
+            "function mount_counter() { return shared_helper() + 1; }\n",
+            Some(2),
+            Some(2),
+        );
+        counter_fn
+            .refs
+            .insert(JsName::new("shared_helper".to_owned()));
+        counter_fn.linkage = Linkage::exported("mount_counter".to_owned())
+            .with_chunk("counter".to_owned(), EntryRole::Island);
+
+        let mut worker_fn = duplicate(
+            "run_worker",
+            "function run_worker() { return shared_helper() + 2; }\n",
+            Some(3),
+            Some(3),
+        );
+        worker_fn
+            .refs
+            .insert(JsName::new("shared_helper".to_owned()));
+        worker_fn.linkage = Linkage::exported("run_worker".to_owned())
+            .with_chunk("bg".to_owned(), EntryRole::Worker);
+
+        let table: BTreeMap<JsName, LinkItem> = [shared_helper, counter_fn, worker_fn]
+            .into_iter()
+            .map(|item| (item.name.clone(), item))
+            .collect();
+
+        // 1. Auto + Script silently ignores discovered chunks.
+        let script_opts = Opts {
+            modules: Modules::Script,
+            discover_chunks: DiscoverChunks::Auto,
+            ..Opts::default()
+        };
+        assert!(!is_chunked(&script_opts, &table));
+        let dcx = Sink::new();
+        let eff = resolve_effective_opts(&dcx, &script_opts, &table).expect("valid script opts");
+        assert_eq!(dcx.errors(), 0);
+        assert!(eff.chunks.is_empty());
+
+        // 2. Off + ESM ignores discovered chunks.
+        let off_opts = Opts {
+            modules: Modules::Esm,
+            discover_chunks: DiscoverChunks::Off,
+            ..Opts::default()
+        };
+        assert!(!is_chunked(&off_opts, &table));
+        let dcx = Sink::new();
+        let eff = resolve_effective_opts(&dcx, &off_opts, &table).expect("valid off opts");
+        assert_eq!(dcx.errors(), 0);
+        assert!(eff.chunks.is_empty());
+
+        // 3. Auto + ESM discovers both chunks in deterministic `(chunk.name, export_name)` order
+        //    and writes per-chunk files + shared chunk + manifest roles.
+        let esm_opts = Opts {
+            modules: Modules::Esm,
+            runtime: RuntimeMode::None,
+            discover_chunks: DiscoverChunks::Auto,
+            ..Opts::default()
+        };
+        assert!(is_chunked(&esm_opts, &table));
+        let dcx = Sink::new();
+        let eff = resolve_effective_opts(&dcx, &esm_opts, &table).expect("discovered chunks");
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(
+            eff.chunks,
+            vec![
+                ("bg".to_owned(), "run_worker".to_owned()),
+                ("counter".to_owned(), "mount_counter".to_owned()),
+            ]
+        );
+        let out_path = dir.join("app.js");
+        let mut deployment = ArtifactManifest {
+            schema: ARTIFACT_SCHEMA,
+            object_format: FORMAT_VERSION,
+            jir_schema: crate::jir::JIR_SCHEMA,
+            semantic_policy: "faithful".to_owned(),
+            syntax_ceiling: "latest".to_owned(),
+            entries: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+        };
+        write_chunks(
+            &dcx,
+            &eff,
+            &BTreeMap::new(),
+            &table,
+            &out_path,
+            &mut deployment,
+            false,
+        );
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(deployment.entries["counter"].role, EntryRole::Island);
+        assert_eq!(deployment.entries["bg"].role, EntryRole::Worker);
+        assert_eq!(deployment.entries["shared"].role, EntryRole::Shared);
+        assert!(dir.join("counter.js").exists());
+        assert!(dir.join("bg.js").exists());
+        assert!(dir.join("shared.js").exists());
+
+        // 4. Explicit `js-chunk=` matching discovered `(name, entry)` deduplicates cleanly and
+        //    preserves discovered role unless explicit `js-chunk-role=` overrides it.
+        let mut dedup_opts = esm_opts.clone();
+        dedup_opts
+            .chunks
+            .push(("counter".to_owned(), "mount_counter".to_owned()));
+        let dcx = Sink::new();
+        let eff = resolve_effective_opts(&dcx, &dedup_opts, &table).expect("dedup succeeds");
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(eff.chunks.len(), 2);
+        assert_eq!(
+            eff.chunk_roles
+                .iter()
+                .find(|(name, _)| name == "counter")
+                .map(|(_, role)| *role),
+            Some(EntryRole::Island)
+        );
+        dedup_opts
+            .chunk_roles
+            .push(("counter".to_owned(), EntryRole::Procedure));
+        let dcx = Sink::new();
+        let eff = resolve_effective_opts(&dcx, &dedup_opts, &table).expect("override succeeds");
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(
+            eff.chunk_roles
+                .iter()
+                .find(|(name, _)| name == "counter")
+                .map(|(_, role)| *role),
+            Some(EntryRole::Procedure)
+        );
+
+        // 5. Explicit `js-chunk=` pinning the same name to a different entry errors.
+        let mut conflict_opts = esm_opts.clone();
+        conflict_opts
+            .chunks
+            .push(("counter".to_owned(), "run_worker".to_owned()));
+        let dcx = Sink::new();
+        assert!(resolve_effective_opts(&dcx, &conflict_opts, &table).is_none());
+        assert_eq!(dcx.errors(), 1);
+
+        // 6. Discovered chunk name colliding with `shared_chunk` errors.
+        let mut shared_clash_opts = esm_opts.clone();
+        shared_clash_opts.shared_chunk = "counter".to_owned();
+        let dcx = Sink::new();
+        assert!(resolve_effective_opts(&dcx, &shared_clash_opts, &table).is_none());
+        assert_eq!(dcx.errors(), 1);
+
+        // 7. Two different exported items claiming the same discovered chunk name errors.
+        let mut dup_table = table.clone();
+        dup_table
+            .get_mut(&JsName::new("run_worker".to_owned()))
+            .unwrap()
+            .linkage = Linkage::exported("run_worker".to_owned())
+            .with_chunk("counter".to_owned(), EntryRole::Worker);
+        let dcx = Sink::new();
+        assert!(resolve_effective_opts(&dcx, &esm_opts, &dup_table).is_none());
+        assert_eq!(dcx.errors(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

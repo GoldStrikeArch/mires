@@ -2894,12 +2894,30 @@ fn sentinel_result_plans_recursive_needs_drop_invoke_and_escaping_callers() {
     assert!(!bal_plan.has_sentinel_result());
 
     // Chunked mode must not select SentinelResult.
-    let mut chunked_opts = speed_opts;
+    let mut chunked_opts = speed_opts.clone();
     chunked_opts
         .chunks
         .push(("extra".to_owned(), "entry".to_owned()));
     let chunked_plan = plan_excluding(&table, &funcs, &chunked_opts, &BTreeSet::new());
     assert!(!chunked_plan.has_sentinel_result());
+
+    // Attribute-discovered chunks in ESM mode must also disable SentinelResult.
+    let mut discovered_opts = speed_opts;
+    discovered_opts.modules = crate::opts::Modules::Esm;
+    let mut discovered_table = table;
+    if let Some(entry_item) = discovered_table.get_mut(&JsName::new("entry".to_owned())) {
+        entry_item.linkage = Linkage::exported("entry".to_owned()).with_chunk(
+            "island".to_owned(),
+            rcgjs_object::artifact::EntryRole::Island,
+        );
+    }
+    let discovered_plan = plan_excluding(
+        &discovered_table,
+        &funcs,
+        &discovered_opts,
+        &BTreeSet::new(),
+    );
+    assert!(!discovered_plan.has_sentinel_result());
 }
 
 #[test]

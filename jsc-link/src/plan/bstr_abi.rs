@@ -94,7 +94,7 @@ struct ConsistencySolution {
 pub(crate) fn augment_plan(cx: BstrAugmentCx<'_>, pool: &mut NamePool, plan: &mut AbiPlan) {
     if cx.opts.profile != Some(Profile::ReleaseSpeed)
         || !crate::lower::bstr::enabled()
-        || !cx.opts.chunks.is_empty()
+        || crate::link::is_chunked(cx.opts, cx.table)
     {
         return;
     }

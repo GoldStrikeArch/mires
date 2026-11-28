@@ -21,7 +21,7 @@ Code that queries `TyCtxt` stays in `backend/`; code that links or optimizes who
 | `jir/codec.rs` | Raw deflate (`miniz_oxide`) + `postcard` serialization helpers for per-item blobs. |
 | `jir/dependencies.rs` | Scans decoded JIR bodies for potential item dependencies (including cleanup-only callees). |
 | `jir/interp.rs` | Reference interpreters (`run_body` for JIR-S, `run_func` for JIR-R) over a shared abstract heap; gated behind `#[cfg(any(test, feature = "interp"))]`. |
-| `object.rs` | Object format `28` (`Header`, section table, `Writer`, `read`, `Object`). See `object.rs` module docs for the binary section layout (S1–S7). |
+| `object.rs` | Object format `29` (`Header`, section table, `Writer`, `read`, `Object`). See `object.rs` module docs for the binary section layout (S1–S7). |
 
 ## Shared compiler modules
 
@@ -32,7 +32,7 @@ Code that queries `TyCtxt` stays in `backend/`; code that links or optimizes who
 | `optimizer.rs`, `sroa.rs` | Item-local JS AST simplification and scalar replacement helpers. |
 | `item.rs` | `JsName`, `ItemKind`, `Linkage`, `Zombie`, `OptimizationInfo`, `JsItem`, `LinkItem`/`LinkJir`, `ObjectIdentity`, and `normalized_emit_args`. |
 | `opts.rs` | `Opts`, `Profile`, `OptimizerMode`, `OptimizerPass`, `EcmaTarget`, `Modules`, `StrRepr`, and `-Cllvm-args` parsing. |
-| `manifest.rs` | Postcard `Manifest` (`MANIFEST_VERSION = 4`) passed from the backend dylib to `jsc-link`. |
+| `manifest.rs` | Postcard `Manifest` (`MANIFEST_VERSION = 6`) passed from the backend dylib to `jsc-link`. |
 | `artifact.rs`, `lane_report.rs` | Linker-owned artifact manifests and per-item lane availability reports. |
 | `sourcemap.rs` | Source Map v3 builder. |
 | `dts.rs` | TypeScript `.d.ts` representation and writer. |
@@ -45,7 +45,7 @@ Inspection examples in `examples/`:
 
 ## Schema rules
 
-- `JIR_SCHEMA` (`jir/mod.rs`, currently `24`) and `FORMAT_VERSION` (`object.rs`, currently `28`) version serialized objects strictly. Mismatched objects fail with a rebuild diagnostic.
+- `JIR_SCHEMA` (`jir/mod.rs`, currently `25`) and `FORMAT_VERSION` (`object.rs`, currently `29`) version serialized objects strictly. Mismatched objects fail with a rebuild diagnostic.
 - Postcard enums and structs are positional: adding or changing variants or fields requires bumping the schema version.
 - Semantic types (`semantic.rs`, `types.rs`) carry identities only, with no source paths, spans, or diagnostic strings. `Body: Eq` represents semantic equality, and `OriginTable` lives beside the body.
 - All serialized maps and sets use `BTreeMap` or sorted `Vec` for deterministic output (`DefaultHasher` and `HashMap` are excluded from serialized data).

@@ -411,14 +411,31 @@ pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> Item
     }
 }
 
-/// Link section emitted by `#[js_export]` to request automatic JS↔Rust boundary marshaling.
-pub(crate) const JS_EXPORT_SECTION: &str = "rcgjs.export.v1";
+/// Decodes the `#[js_export]` `link_section` of a function item, if present.
+pub(crate) fn fn_export_section<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Option<mires_marker_abi::export::ExportSection> {
+    let ty::InstanceKind::Item(def_id) = instance.def else {
+        return None;
+    };
+    if !matches!(
+        tcx.def_kind(def_id),
+        rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+    ) {
+        return None;
+    }
+    let section = tcx.codegen_fn_attrs(def_id).link_section?;
+    mires_marker_abi::export::parse_export_section(section.as_str())
+}
 
-/// Link section emitted for the internal return-marshaling helper of `#[js_export] async fn`.
-pub(crate) const JS_EXPORT_OUT_SECTION: &str = "rcgjs.export.out.v1";
+/// Whether `instance` is a function tagged with marshaled `#[js_export]`.
+pub(crate) fn is_js_export_fn<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    fn_export_section(tcx, instance).is_some_and(|section| section.marshal)
+}
 
-/// Whether `instance` is a function tagged with `link_section == expected`.
-fn has_fn_link_section<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, expected: &str) -> bool {
+/// Whether `instance` is an internal return-marshaling helper for `#[js_export] async fn`.
+pub(crate) fn is_js_export_out_fn<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let ty::InstanceKind::Item(def_id) = instance.def else {
         return false;
     };
@@ -430,18 +447,7 @@ fn has_fn_link_section<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, expect
     }
     tcx.codegen_fn_attrs(def_id)
         .link_section
-        .is_some_and(|section| section.as_str() == expected)
-}
-
-/// Whether `instance` is a function tagged with `#[js_export]` (`link_section = "rcgjs.export.v1"`).
-pub(crate) fn is_js_export_fn<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    has_fn_link_section(tcx, instance, JS_EXPORT_SECTION)
-}
-
-/// Whether `instance` is an internal return-marshaling helper for `#[js_export] async fn`
-/// (`link_section = "rcgjs.export.out.v1"`).
-pub(crate) fn is_js_export_out_fn<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    has_fn_link_section(tcx, instance, JS_EXPORT_OUT_SECTION)
+        .is_some_and(|section| section.as_str() == mires_marker_abi::export::EXPORT_OUT_SECTION)
 }
 
 /// Emitted parameter names of `instance` for `.d.ts` signature synthesis.

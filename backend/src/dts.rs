@@ -36,6 +36,11 @@
 
 use std::collections::BTreeMap;
 
+use rustc_abi::Size;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::def_id::DefId;
+use rustc_middle::mir::interpret::GlobalAlloc;
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 
 use crate::value::{enum_repr, EnumRepr, TAG};
@@ -45,6 +50,70 @@ pub(crate) use rcgjs_object::dts::Dts;
 /// How deep a type is followed before it is called opaque. A type that nests further than this is
 /// not one an island entry point takes.
 const MAX_DEPTH: u32 = 8;
+
+/// TypeScript spelling discovered from a `#[js_opaque]` associated constant (`__MIRES_TS_TYPE`).
+enum OpaqueTs {
+    /// Non-empty explicit TS type spelling (e.g. `"JSX.Element"`), emitted inline.
+    Explicit(String),
+    /// Empty `__MIRES_TS_TYPE`, emitted as a branded unique-symbol type alias.
+    Branded(String),
+}
+
+/// Per-signature `.d.ts` synthesis state: tracks named type bodies and resolves clean short names
+/// with automatic full-path disambiguation on intra-signature collisions.
+struct DtsState<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    types: BTreeMap<String, String>,
+    name_owners: BTreeMap<String, Ty<'tcx>>,
+    resolved_names: FxHashMap<Ty<'tcx>, String>,
+}
+
+impl<'tcx> DtsState<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            types: BTreeMap::new(),
+            name_owners: BTreeMap::new(),
+            resolved_names: FxHashMap::default(),
+        }
+    }
+
+    /// Resolves a TypeScript alias name for `ty`, returning `(name, already_registered)`.
+    fn resolve_nominal_name(&mut self, ty: Ty<'tcx>, is_js_export: bool) -> (String, bool) {
+        if let Some(existing) = self.resolved_names.get(&ty) {
+            return (existing.clone(), true);
+        }
+        let preferred = if is_js_export {
+            ts_short_name(self.tcx, ty)
+        } else {
+            ts_name(self.tcx, ty)
+        };
+        let chosen = self.claim_name(ty, preferred);
+        self.resolved_names.insert(ty, chosen.clone());
+        (chosen, false)
+    }
+
+    fn claim_name(&mut self, ty: Ty<'tcx>, preferred: String) -> String {
+        if !self.name_owners.contains_key(&preferred) {
+            self.name_owners.insert(preferred.clone(), ty);
+            return preferred;
+        }
+        let full = ts_name(self.tcx, ty);
+        if !self.name_owners.contains_key(&full) {
+            self.name_owners.insert(full.clone(), ty);
+            return full;
+        }
+        let mut suffix = 2u32;
+        loop {
+            let candidate = format!("{full}_{suffix}");
+            if !self.name_owners.contains_key(&candidate) {
+                self.name_owners.insert(candidate.clone(), ty);
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+}
 
 /// The signature of `instance`, whose emitted parameters are `params`.
 ///
@@ -72,7 +141,7 @@ pub(crate) fn signature<'tcx>(
         return None;
     }
 
-    let mut types = BTreeMap::new();
+    let mut state = DtsState::new(tcx);
     let optional_tail_start = if is_js_export {
         sig.inputs()
             .iter()
@@ -88,10 +157,10 @@ pub(crate) fn signature<'tcx>(
         .map(|(idx, (name, ty))| {
             if is_js_export && idx >= optional_tail_start {
                 if let Some(inner) = option_inner_ty(tcx, *ty) {
-                    return (format!("{name}?"), ts_type(tcx, inner, &mut types, 0, true));
+                    return (format!("{name}?"), ts_type(&mut state, inner, 0, true));
                 }
             }
-            (name.clone(), ts_type(tcx, *ty, &mut types, 0, is_js_export))
+            (name.clone(), ts_type(&mut state, *ty, 0, is_js_export))
         })
         .collect();
     let mut rust = format!("{sig}");
@@ -101,43 +170,73 @@ pub(crate) fn signature<'tcx>(
                 let ok_ts = if ok_ty.is_unit() {
                     "void".to_owned()
                 } else {
-                    ts_type(tcx, ok_ty, &mut types, 0, true)
+                    ts_type(&mut state, ok_ty, 0, true)
                 };
-                let err_ts = ts_type(tcx, err_ty, &mut types, 0, true);
+                let err_ts = ts_type(&mut state, err_ty, 0, true);
                 rust = format!("{sig}\n@throws {{{err_ts}}}");
                 format!("Promise<{ok_ts}>")
             } else if inner_ty.is_unit() {
                 "Promise<void>".to_owned()
             } else {
-                format!("Promise<{}>", ts_type(tcx, inner_ty, &mut types, 0, true))
+                format!("Promise<{}>", ts_type(&mut state, inner_ty, 0, true))
             }
         } else if let Some((ok_ty, err_ty)) = result_type_args(tcx, sig.output()) {
             let ok_ts = if ok_ty.is_unit() {
                 "void".to_owned()
             } else {
-                ts_type(tcx, ok_ty, &mut types, 0, true)
+                ts_type(&mut state, ok_ty, 0, true)
             };
-            let err_ts = ts_type(tcx, err_ty, &mut types, 0, true);
+            let err_ts = ts_type(&mut state, err_ty, 0, true);
             rust = format!("{sig}\n@throws {{{err_ts}}}");
             ok_ts
         } else if sig.output().is_unit() {
             "void".to_owned()
         } else {
-            ts_type(tcx, sig.output(), &mut types, 0, true)
+            ts_type(&mut state, sig.output(), 0, true)
         }
     } else {
         match sig.output().is_unit() {
             true => "void".to_owned(),
-            false => ts_type(tcx, sig.output(), &mut types, 0, false),
+            false => ts_type(&mut state, sig.output(), 0, false),
         }
     };
 
     Some(Dts {
         params: named,
         ret,
-        types: types.into_iter().collect(),
+        types: state.types.into_iter().collect(),
         rust,
+        doc: extract_doc(tcx, instance),
     })
+}
+
+/// Extracts `///` doc comments from an exported function item, if any.
+fn extract_doc<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<String> {
+    let ty::InstanceKind::Item(def_id) = instance.def else {
+        return None;
+    };
+    let mut lines = Vec::new();
+    #[allow(
+        deprecated,
+        reason = "collects all doc attributes on a DefId in declaration order"
+    )]
+    let attrs = tcx.get_all_attrs(def_id);
+    for attr in attrs {
+        let Some(doc) = attr.doc_str() else {
+            continue;
+        };
+        for line in doc.as_str().lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.replace("*/", "*\\/"));
+            }
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Formats `inner` as a TypeScript array type, parenthesizing unions (`(A | B)[]`).
@@ -303,9 +402,8 @@ fn is_string_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
 
 /// Formats a map-like `(K, V)` generic type as `Record<string, V>` or `Map<K, V>`.
 fn ts_map_type<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    state: &mut DtsState<'tcx>,
     args: ty::GenericArgsRef<'tcx>,
-    types: &mut BTreeMap<String, String>,
     depth: u32,
 ) -> String {
     let mut type_args = args.types();
@@ -314,24 +412,24 @@ fn ts_map_type<'tcx>(
     };
     let val_ts = type_args
         .next()
-        .map(|val_ty| ts_type(tcx, val_ty, types, depth + 1, true))
+        .map(|val_ty| ts_type(state, val_ty, depth + 1, true))
         .unwrap_or_else(|| "unknown".to_owned());
-    if is_string_key_ty(tcx, key_ty) {
+    if is_string_key_ty(state.tcx, key_ty) {
         format!("Record<string, {val_ts}>")
     } else {
-        let key_ts = ts_type(tcx, key_ty, types, depth + 1, true);
+        let key_ts = ts_type(state, key_ty, depth + 1, true);
         format!("Map<{key_ts}, {val_ts}>")
     }
 }
 
 /// Recognized `mires_js` host handle and boundary adapter types for `#[js_export]` `.d.ts` output.
 fn mires_js_host_type<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    did: rustc_hir::def_id::DefId,
+    state: &mut DtsState<'tcx>,
+    did: DefId,
     args: ty::GenericArgsRef<'tcx>,
-    types: &mut BTreeMap<String, String>,
     depth: u32,
 ) -> Option<String> {
+    let tcx = state.tcx;
     if is_mires_js_type(tcx, did, "JsValue", "mires_js::host::JsValue") {
         return Some("unknown".to_owned());
     }
@@ -342,7 +440,7 @@ fn mires_js_host_type<'tcx>(
         let elem = args
             .types()
             .next()
-            .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+            .map(|inner| ts_type(state, inner, depth + 1, true))
             .unwrap_or_else(|| "unknown".to_owned());
         return Some(ts_array_type(elem));
     }
@@ -357,7 +455,7 @@ fn mires_js_host_type<'tcx>(
             let ok_ts = if ok_ty.is_unit() {
                 "void".to_owned()
             } else {
-                ts_type(tcx, ok_ty, types, depth + 1, true)
+                ts_type(state, ok_ty, depth + 1, true)
             };
             return Some(format!("Promise<{ok_ts}>"));
         }
@@ -366,7 +464,7 @@ fn mires_js_host_type<'tcx>(
         }
         return Some(format!(
             "Promise<{}>",
-            ts_type(tcx, inner_ty, types, depth + 1, true)
+            ts_type(state, inner_ty, depth + 1, true)
         ));
     }
     if is_mires_js_type(
@@ -381,22 +479,22 @@ fn mires_js_host_type<'tcx>(
         "mires_js::map_entries::JsBTreeMapEntries",
     ) || is_mires_js_type(tcx, did, "HashMap", "mires_js::collections::map::HashMap")
     {
-        return Some(ts_map_type(tcx, args, types, depth));
+        return Some(ts_map_type(state, args, depth));
     }
     None
 }
 
-/// The TypeScript for `ty`, registering any named types it needs in `types`.
+/// The TypeScript for `ty`, registering any named types it needs in `state`.
 fn ts_type<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    state: &mut DtsState<'tcx>,
     ty: Ty<'tcx>,
-    types: &mut BTreeMap<String, String>,
     depth: u32,
     is_js_export: bool,
 ) -> String {
     if depth > MAX_DEPTH {
         return "unknown".to_owned();
     }
+    let tcx = state.tcx;
     match ty.kind() {
         ty::Bool => "boolean".to_owned(),
         // A `char` is a code POINT in the value model, not a one-character string.
@@ -411,7 +509,7 @@ fn ts_type<'tcx>(
         ty::Ref(_, pointee, mutbl) => {
             if is_js_export && !mutbl.is_mut() {
                 if let ty::Slice(elem) = pointee.kind() {
-                    let elem_ts = ts_type(tcx, *elem, types, depth + 1, true);
+                    let elem_ts = ts_type(state, *elem, depth + 1, true);
                     return ts_array_type(elem_ts);
                 }
             }
@@ -422,20 +520,20 @@ fn ts_type<'tcx>(
                 // a pointer into a buffer, which has no useful TypeScript type: it is the model's
                 // own bookkeeping.
                 true => "unknown".to_owned(),
-                false => ts_type(tcx, *pointee, types, depth + 1, is_js_export),
+                false => ts_type(state, *pointee, depth + 1, is_js_export),
             }
         }
         ty::Tuple(fields) if fields.is_empty() => "undefined".to_owned(),
         ty::Tuple(fields) => {
             let members: Vec<String> = fields
                 .iter()
-                .map(|field| ts_type(tcx, field, types, depth + 1, is_js_export))
+                .map(|field| ts_type(state, field, depth + 1, is_js_export))
                 .collect();
             format!("[{}]", members.join(", "))
         }
         ty::Adt(def, args) => {
             if is_js_export {
-                if let Some(host_ts) = mires_js_host_type(tcx, def.did(), args, types, depth) {
+                if let Some(host_ts) = mires_js_host_type(state, def.did(), args, depth) {
                     return host_ts;
                 }
                 if is_string_def(tcx, def.did()) {
@@ -445,18 +543,18 @@ fn ts_type<'tcx>(
                     let elem = args
                         .types()
                         .next()
-                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .map(|inner| ts_type(state, inner, depth + 1, true))
                         .unwrap_or_else(|| "unknown".to_owned());
                     return ts_array_type(elem);
                 }
                 if is_std_map_def(tcx, def.did()) {
-                    return ts_map_type(tcx, args, types, depth);
+                    return ts_map_type(state, args, depth);
                 }
                 if is_option_def(tcx, def.did()) {
                     let inner = args
                         .types()
                         .next()
-                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .map(|inner| ts_type(state, inner, depth + 1, true))
                         .unwrap_or_else(|| "unknown".to_owned());
                     return format!("{inner} | undefined");
                 }
@@ -464,11 +562,11 @@ fn ts_type<'tcx>(
                     let mut type_args = args.types();
                     let ok_ts = type_args
                         .next()
-                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .map(|inner| ts_type(state, inner, depth + 1, true))
                         .unwrap_or_else(|| "unknown".to_owned());
                     let err_ts = type_args
                         .next()
-                        .map(|inner| ts_type(tcx, inner, types, depth + 1, true))
+                        .map(|inner| ts_type(state, inner, depth + 1, true))
                         .unwrap_or_else(|| "unknown".to_owned());
                     return format!(
                         "{{ {TAG}: \"Ok\"; _0: {ok_ts} }} | {{ {TAG}: \"Err\"; _0: {err_ts} }}"
@@ -476,59 +574,112 @@ fn ts_type<'tcx>(
                 }
             }
             if let Some(opaque) = opaque_handle(tcx, def.did()) {
-                types.insert(
-                    type_key(opaque, is_js_export),
-                    format!("{{ readonly __{opaque}: unique symbol }}"),
-                );
-                return opaque.to_owned();
+                return match opaque {
+                    OpaqueTs::Explicit(ts) => ts,
+                    OpaqueTs::Branded(preferred) => {
+                        let existing_same_def = state.name_owners.get(&preferred).is_some_and(
+                            |owner| matches!(owner.kind(), ty::Adt(d, _) if d.did() == def.did()),
+                        );
+                        let name = if existing_same_def {
+                            preferred
+                        } else {
+                            state.claim_name(ty, preferred)
+                        };
+                        state.types.insert(
+                            type_key(&name, is_js_export),
+                            format!("{{ readonly __{name}: unique symbol }}"),
+                        );
+                        name
+                    }
+                };
             }
             match def.is_enum() {
-                true => ts_enum(tcx, ty, *def, args, types, depth, is_js_export),
-                false => ts_struct(tcx, ty, *def, args, types, depth, is_js_export),
+                true => ts_enum(state, ty, *def, args, depth, is_js_export),
+                false => ts_struct(state, ty, *def, args, depth, is_js_export),
             }
         }
         _ => "unknown".to_owned(),
     }
 }
 
-/// The opaque type name for a one-word runtime handle, or `None` for anything else.
+/// Evaluates `#[js_opaque]`'s hidden `__MIRES_TS_TYPE: &'static str` associated constant on
+/// `def_id`, if present.
 ///
-/// Matched by def path rather than by shape: a `repr(transparent)` wrapper around a `u32` is a
-/// number to the value model, and these four are the cases where that is true of the Rust type and
-/// false of the value the runtime actually keeps there.
-fn opaque_handle(_tcx: TyCtxt<'_>, _def_id: rustc_hir::def_id::DefId) -> Option<&'static str> {
+/// Checked before [`ts_struct`] so a `#[js_opaque]` `#[repr(transparent)]` wrapper around
+/// `HostHandle` never peels down to `number`.
+fn opaque_handle(tcx: TyCtxt<'_>, def_id: DefId) -> Option<OpaqueTs> {
+    for &impl_id in tcx.inherent_impls(def_id) {
+        for item in tcx.associated_items(impl_id).in_definition_order() {
+            if !matches!(item.kind, ty::AssocKind::Const { .. }) {
+                continue;
+            }
+            if item
+                .opt_name()
+                .is_none_or(|name| name.as_str() != mires_marker_abi::export::OPAQUE_TS_CONST_NAME)
+            {
+                continue;
+            }
+            let Ok(value) = tcx.const_eval_poly(item.def_id) else {
+                return None;
+            };
+            let text = const_value_str(tcx, value)?;
+            return if text.is_empty() {
+                let raw = pascal_ident(tcx.item_name(def_id).as_str());
+                let name =
+                    if raw.is_empty() || raw.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        format!("T{raw}")
+                    } else {
+                        raw
+                    };
+                Some(OpaqueTs::Branded(name))
+            } else {
+                Some(OpaqueTs::Explicit(text))
+            };
+        }
+    }
     None
+}
+
+/// Extracts a UTF-8 string from an evaluated `&'static str` constant value.
+fn const_value_str(tcx: TyCtxt<'_>, value: ConstValue) -> Option<String> {
+    let ConstValue::Slice { alloc_id, meta } = value else {
+        return None;
+    };
+    if meta == 0 {
+        return Some(String::new());
+    }
+    let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else {
+        return None;
+    };
+    crate::const_raw::read_str(allocation.inner(), Size::ZERO, meta)
+        .ok()
+        .map(str::to_owned)
 }
 
 /// A struct, as an object type keyed by field name.
 fn ts_struct<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    state: &mut DtsState<'tcx>,
     ty: Ty<'tcx>,
     def: ty::AdtDef<'tcx>,
     args: ty::GenericArgsRef<'tcx>,
-    types: &mut BTreeMap<String, String>,
     depth: u32,
     is_js_export: bool,
 ) -> String {
+    let tcx = state.tcx;
     let variant = def.non_enum_variant();
-    // A `repr(transparent)` struct IS its field in the value model, so it is that field's type.
-    if def.repr().transparent() && variant.fields.len() == 1 {
-        let field = variant.fields.iter().next().expect("one field");
-        return ts_type(
-            tcx,
-            tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
-            types,
-            depth + 1,
-            is_js_export,
-        );
+    // A `repr(transparent)` struct IS its single non-ZST field in the value model.
+    if def.repr().transparent() {
+        if let Some(field_ty) = crate::value::transparent_field(tcx, ty) {
+            return ts_type(state, field_ty, depth + 1, is_js_export);
+        }
     }
-    let name = ts_name(tcx, ty);
-    let key = type_key(&name, is_js_export);
-    if types.contains_key(&key) {
+    let (name, already_registered) = state.resolve_nominal_name(ty, is_js_export);
+    if already_registered {
         return name;
     }
+    let key = type_key(&name, is_js_export);
     // Registered before the fields are walked, so a struct that mentions itself terminates.
-    types.insert(key.clone(), "unknown".to_owned());
+    state.types.insert(key.clone(), "unknown".to_owned());
     let members: Vec<String> = variant
         .fields
         .iter()
@@ -538,15 +689,15 @@ fn ts_struct<'tcx>(
             let field_name = ts_field_name(field.name.as_str(), is_js_export);
             if is_js_export {
                 if let Some(inner) = option_inner_ty(tcx, rust_field_ty) {
-                    let inner_ts = ts_type(tcx, inner, types, depth + 1, true);
+                    let inner_ts = ts_type(state, inner, depth + 1, true);
                     return format!("{field_name}?: {inner_ts}");
                 }
             }
-            let field_ty = ts_type(tcx, rust_field_ty, types, depth + 1, is_js_export);
+            let field_ty = ts_type(state, rust_field_ty, depth + 1, is_js_export);
             format!("{field_name}: {field_ty}")
         })
         .collect();
-    types.insert(key, object(&members));
+    state.types.insert(key, object(&members));
     name
 }
 
@@ -572,14 +723,14 @@ fn object(members: &[String]) -> String {
 
 /// An enum, as whatever its runtime representation is.
 fn ts_enum<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    state: &mut DtsState<'tcx>,
     ty: Ty<'tcx>,
     def: ty::AdtDef<'tcx>,
     args: ty::GenericArgsRef<'tcx>,
-    types: &mut BTreeMap<String, String>,
     depth: u32,
     is_js_export: bool,
 ) -> String {
+    let tcx = state.tcx;
     let Some(repr) = enum_repr(tcx, ty) else {
         return "unknown".to_owned();
     };
@@ -595,12 +746,12 @@ fn ts_enum<'tcx>(
         return "never".to_owned();
     }
 
-    let name = ts_name(tcx, ty);
-    let key = type_key(&name, is_js_export);
-    if types.contains_key(&key) {
+    let (name, already_registered) = state.resolve_nominal_name(ty, is_js_export);
+    if already_registered {
         return name;
     }
-    types.insert(key.clone(), "unknown".to_owned());
+    let key = type_key(&name, is_js_export);
+    state.types.insert(key.clone(), "unknown".to_owned());
 
     let fieldless = matches!(repr, EnumRepr::Tag { fieldless: true });
     let arms: Vec<String> = def
@@ -620,27 +771,25 @@ fn ts_enum<'tcx>(
                 let field_name = ts_field_name(field.name.as_str(), is_js_export);
                 if is_js_export {
                     if let Some(inner) = option_inner_ty(tcx, rust_field_ty) {
-                        let inner_ts = ts_type(tcx, inner, types, depth + 1, true);
+                        let inner_ts = ts_type(state, inner, depth + 1, true);
                         return format!("{field_name}?: {inner_ts}");
                     }
                 }
-                let field_ty = ts_type(tcx, rust_field_ty, types, depth + 1, is_js_export);
+                let field_ty = ts_type(state, rust_field_ty, depth + 1, is_js_export);
                 format!("{field_name}: {field_ty}")
             }));
             object(&members)
         })
         .collect();
-    types.insert(key, arms.join(" | "));
+    state.types.insert(key, arms.join(" | "));
     name
 }
 
-/// The TypeScript name for a named type: its Rust path, with everything TypeScript will not take
-/// replaced.
-fn ts_name<'tcx>(_tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
-    let printed = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{ty}"));
-    let mut out = String::with_capacity(printed.len());
+/// Converts an arbitrary Rust identifier or path string into a PascalCase TypeScript fragment.
+fn pascal_ident(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
     let mut fresh = true;
-    for character in printed.chars() {
+    for character in raw.chars() {
         match character.is_ascii_alphanumeric() {
             true => {
                 out.push(match fresh {
@@ -652,6 +801,53 @@ fn ts_name<'tcx>(_tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
             false => fresh = true,
         }
     }
+    out
+}
+
+/// Clean short TypeScript name for a `#[js_export]` type: the item's own ident plus PascalCase
+/// generic type arguments (e.g. `shared::TaskItem` -> `TaskItem`, `Page<User>` -> `PageUser`).
+fn ts_short_name<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
+    let out = ts_short_fragment(tcx, ty, 0);
+    match out.chars().next().is_some_and(|c| c.is_ascii_digit()) || out.is_empty() {
+        true => format!("T{out}"),
+        false => out,
+    }
+}
+
+fn ts_short_fragment<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> String {
+    if depth > MAX_DEPTH {
+        return "Unknown".to_owned();
+    }
+    match ty.kind() {
+        ty::Adt(def, args) => {
+            let mut out = pascal_ident(tcx.item_name(def.did()).as_str());
+            for arg in args.types() {
+                out.push_str(&ts_short_fragment(tcx, arg, depth + 1));
+            }
+            out
+        }
+        ty::Ref(_, pointee, _) => ts_short_fragment(tcx, *pointee, depth + 1),
+        ty::Slice(elem) => format!("Slice{}", ts_short_fragment(tcx, *elem, depth + 1)),
+        ty::Array(elem, _) => format!("Array{}", ts_short_fragment(tcx, *elem, depth + 1)),
+        ty::Tuple(fields) if fields.is_empty() => "Unit".to_owned(),
+        ty::Tuple(fields) => {
+            let mut out = String::from("Tuple");
+            for field in fields.iter() {
+                out.push_str(&ts_short_fragment(tcx, field, depth + 1));
+            }
+            out
+        }
+        _ => pascal_ident(&rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+            "{ty}"
+        ))),
+    }
+}
+
+/// The TypeScript name for a named type: its full Rust path, with everything TypeScript will not
+/// take replaced. Used for raw exports and as the collision fallback for short names.
+fn ts_name<'tcx>(_tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
+    let printed = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{ty}"));
+    let out = pascal_ident(&printed);
     match out.chars().next().is_some_and(|c| c.is_ascii_digit()) || out.is_empty() {
         true => format!("T{out}"),
         false => out,

@@ -167,11 +167,12 @@ impl Js {
         let unreachable = "a `js!` block is only something rustc_codegen_js can lower";
 
         Ok(quote! {{
-            #[cfg_attr(target_arch = "wasm32", link_section = #section)]
+            #![allow(unexpected_cfgs, reason = "mires target cfg is supplied by cargo-mires")]
+            #[cfg_attr(mires, link_section = #section)]
             #[inline(never)]
             // The body names no parameter and never can: it stands in for an emission, and the
             // signature exists only to carry the captures across.
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "marker body is a placeholder lowered by rustc_codegen_js")]
             fn __mires_js_block<__JsBlock #(, #types)*>(
                 #(#parameters: #types),*
             ) -> __JsBlock {
@@ -438,7 +439,8 @@ b"#"##
         assert!(text.contains("__JsCapture2"), "{text}");
         assert!(!text.contains("__JsCapture3"), "{text}");
         assert!(text.contains("inline (never)"), "{text}");
-        assert!(text.contains("target_arch = \"wasm32\""), "{text}");
+        assert!(text.contains("allow (unexpected_cfgs"), "{text}");
+        assert!(text.contains("cfg_attr (mires , link_section"), "{text}");
     }
 
     #[test]

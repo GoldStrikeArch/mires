@@ -2697,6 +2697,7 @@ mod tests {
                     root: true,
                     exported: true,
                     fixed_name: None,
+                    chunk: None,
                 }
             } else {
                 Linkage::internal()

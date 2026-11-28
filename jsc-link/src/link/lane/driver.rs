@@ -53,8 +53,8 @@ pub(crate) fn run(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
     reachable: &[JsName],
+    opts: &Opts,
 ) -> LaneRun {
-    let opts = crate::opts::get();
     let fault = abi_fault();
     run_with_opts(dcx, table, reachable, opts, fault.as_deref())
 }

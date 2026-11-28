@@ -4,7 +4,7 @@ use alloc::rc::Rc;
 use core::cell::Cell;
 use core::future::{Future, IntoFuture};
 use core::pin::Pin;
-use core::task::{Context, LocalWaker, Poll};
+use core::task::{Context, Poll, Waker};
 
 use crate::{
     js_bindings, native_promise_from_future, on_settled, promise_from_future, task, HostHandle,
@@ -176,7 +176,7 @@ js_bindings! {
 /// How far a host value has settled.
 enum PromiseState {
     Fresh,
-    Waiting(LocalWaker),
+    Waiting(Waker),
     Settled(Result<JsValue, JsValue>),
     Done,
 }
@@ -209,7 +209,7 @@ where
 {
     match state_cell.replace(PromiseState::Done) {
         PromiseState::Fresh => {
-            state_cell.set(PromiseState::Waiting(context.local_waker().clone()));
+            state_cell.set(PromiseState::Waiting(context.waker().clone()));
             if let Err(error) = subscribe(Rc::clone(state_cell)) {
                 state_cell.set(PromiseState::Done);
                 return Poll::Ready(Err(error));
@@ -217,7 +217,7 @@ where
             Poll::Pending
         }
         PromiseState::Waiting(mut waker) => {
-            waker.clone_from(context.local_waker());
+            waker.clone_from(context.waker());
             state_cell.set(PromiseState::Waiting(waker));
             Poll::Pending
         }
@@ -287,7 +287,7 @@ where
 
 /// Shared completion state between a [`YieldTask`] and its scheduled browser task.
 enum YieldSlot {
-    Waiting(LocalWaker),
+    Waiting(Waker),
     Fired,
 }
 
@@ -317,14 +317,14 @@ where
 {
     match state {
         YieldState::Fresh => {
-            let slot = Rc::new(Cell::new(YieldSlot::Waiting(context.local_waker().clone())));
+            let slot = Rc::new(Cell::new(YieldSlot::Waiting(context.waker().clone())));
             *state = YieldState::Waiting(Rc::clone(&slot));
             schedule(slot);
             Poll::Pending
         }
         YieldState::Waiting(slot) => match slot.replace(YieldSlot::Fired) {
             YieldSlot::Waiting(mut waker) => {
-                waker.clone_from(context.local_waker());
+                waker.clone_from(context.waker());
                 slot.set(YieldSlot::Waiting(waker));
                 Poll::Pending
             }
@@ -357,42 +357,41 @@ pub fn yield_task() -> YieldTask {
 
 #[cfg(test)]
 mod tests {
-    use alloc::task::LocalWake;
-    use core::task::{ContextBuilder, Waker};
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     struct CountWake {
-        wakes: Cell<usize>,
+        wakes: AtomicUsize,
     }
 
     impl CountWake {
-        fn new() -> Rc<Self> {
-            Rc::new(Self {
-                wakes: Cell::new(0),
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                wakes: AtomicUsize::new(0),
             })
         }
 
         fn count(&self) -> usize {
-            self.wakes.get()
+            self.wakes.load(Ordering::Relaxed)
         }
     }
 
-    impl LocalWake for CountWake {
-        fn wake(self: Rc<Self>) {
-            self.wakes.set(self.wakes.get() + 1);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn wake_by_ref(self: &Rc<Self>) {
-            self.wakes.set(self.wakes.get() + 1);
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn with_local_context<R>(wake: &Rc<CountWake>, f: impl FnOnce(&mut Context<'_>) -> R) -> R {
-        let local = LocalWaker::from(Rc::clone(wake));
-        let mut context = ContextBuilder::from_waker(Waker::noop())
-            .local_waker(&local)
-            .build();
+    fn with_local_context<R>(wake: &Arc<CountWake>, f: impl FnOnce(&mut Context<'_>) -> R) -> R {
+        let waker = Waker::from(Arc::clone(wake));
+        let mut context = Context::from_waker(&waker);
         f(&mut context)
     }
 

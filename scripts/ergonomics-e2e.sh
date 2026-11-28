@@ -207,18 +207,25 @@ for (const mode of ['v3-dev', 'v3-rel']) {
 console.log('ERGONOMICS_E2E_NODE_OK');
 "
 
+tsc_bin=""
 if [ -x "$root/node_modules/.bin/tsc" ]; then
-	echo "==> TypeScript strict nodenext declaration checks"
+	tsc_bin="$root/node_modules/.bin/tsc"
+elif [ -x "$root/../../../node_modules/.bin/tsc" ]; then
+	tsc_bin="$root/../../../node_modules/.bin/tsc"
+fi
+
+if [ -n "$tsc_bin" ]; then
+	echo "==> TypeScript strict nodenext declaration checks ($tsc_bin)"
 	cat >"$tmp/check.mts" <<'EOF'
 import { filterTasks, summarizeTasks, validateTitle } from "./fs/client.mjs";
-import type { SharedTaskItem, SharedFilterOptions } from "./fs/client.mjs";
+import type { TaskItem, FilterOptions } from "./fs/client.mjs";
 import { renderMarkdown } from "./md/npm_markdown.mjs";
 import type { RenderOptions, RenderOutput } from "./md/npm_markdown.mjs";
 import { tallyWords, invertIds, asyncGreet, Counter } from "./v3-rel/v3_e2e.mjs";
 import type { CountReport } from "./v3-rel/v3_e2e.mjs";
 
-const opts: SharedFilterOptions = { done: true };
-const tasks: SharedTaskItem[] = [{ id: 1, title: "a", done: false, priority: "High", tags: ["x"] }];
+const opts: FilterOptions = { done: true };
+const tasks: TaskItem[] = [{ id: 1, title: "a", done: false, priority: "High", tags: ["x"] }];
 const a = filterTasks(tasks);
 const b = filterTasks(tasks, opts);
 const s = summarizeTasks(a);
@@ -241,7 +248,7 @@ z.free();
 const moved: number = c.into_value();
 console.log(b.length, s.total, v, m1.html, m2.word_count, total, map.size, p, p2, n, d, moved);
 EOF
-	"$root/node_modules/.bin/tsc" --noEmit --strict --module nodenext --moduleResolution nodenext "$tmp/check.mts"
+	"$tsc_bin" --noEmit --strict --module nodenext --moduleResolution nodenext "$tmp/check.mts"
 	echo "ERGONOMICS_E2E_TSC_OK"
 fi
 

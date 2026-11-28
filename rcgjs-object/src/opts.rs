@@ -27,6 +27,7 @@
 //! -Cllvm-args=js-chunk=NAME:ENTRY repeatable         split the program per entry point (link.rs)
 //! -Cllvm-args=js-chunk-shared=... a chunk name       where two chunks' common items go
 //! -Cllvm-args=js-chunk-registry=off on|off           register each chunk's entry for a loader
+//! -Cllvm-args=js-discover-chunks=auto auto|on|off    discover `#[js_export(chunk = ...)]` splits
 //! -Cllvm-args=js-opt=off          off|report|on      whole-program optimizer mode
 //! -Cllvm-args=js-opt-passes=all   a comma list       developer-only optimizer pass mask
 //! -Cllvm-args=js-opt-warnings=on  on|off             warn for reachable workspace misses
@@ -518,6 +519,42 @@ impl RuntimeMode {
     }
 }
 
+/// Whether the linker auto-discovers code-split chunks from `#[js_export(chunk = "...")]` items
+/// (`js-discover-chunks`).
+///
+/// Link-only: object files always carry any attribute-declared chunk target metadata, so this
+/// option never joins [`crate::item::normalized_emit_args`] or the sysroot cache key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DiscoverChunks {
+    /// Automatically discover attribute-declared chunks when `js-modules=esm`; ignore them in
+    /// plain script builds.
+    #[default]
+    Auto,
+    /// Require attribute-discovered chunk splitting (requires `js-modules=esm`).
+    On,
+    /// Disable attribute chunk discovery; split only on explicit `-Cllvm-args=js-chunk=...`.
+    Off,
+}
+
+impl DiscoverChunks {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Opts {
     pub names: NameStyle,
@@ -560,6 +597,9 @@ pub struct Opts {
     /// Whether each named chunk registers its entry in `globalThis.__rcgjsChunks`.
     #[serde(default)]
     pub chunk_registry: bool,
+    /// Whether the linker auto-discovers `#[js_export(chunk = "...")]` splits. Link-only.
+    #[serde(default)]
+    pub discover_chunks: DiscoverChunks,
     /// Whether the link step writes a `.d.ts` beside each output file. See `dts.rs`.
     ///
     /// NOT emit affecting: it is synthesized at the link step from what the object files already
@@ -673,6 +713,7 @@ impl Default for Opts {
             dts: false,
             shared_chunk: "shared".to_owned(),
             chunk_registry: false,
+            discover_chunks: DiscoverChunks::Auto,
             optimizer: OptimizerMode::Off,
             optimizer_passes: OptimizerPassMask::default(),
             optimization_warnings: true,
@@ -947,6 +988,10 @@ fn parse_flag(arg: &str, opts: &mut Opts, dcx: &dyn Diagnostics) {
             other => bad_value(dcx, key, other, "a chunk name"),
         },
         "js-chunk-registry" => set_on_off(dcx, key, value, &mut opts.chunk_registry),
+        "js-discover-chunks" => match value.and_then(DiscoverChunks::parse) {
+            Some(mode) => opts.discover_chunks = mode,
+            None => bad_value(dcx, key, value, "auto`, `on`, `off"),
+        },
         "js-opt" => match value.and_then(OptimizerMode::parse) {
             Some(mode) => opts.optimizer = mode,
             None => bad_value(dcx, key, value, "off`, `report`, `on"),
@@ -1045,6 +1090,13 @@ fn validate_opts(opts: &mut Opts, dcx: &dyn Diagnostics) {
                 dcx.err(&format!("`-Cllvm-args=js-chunk={name}:..` was given twice"));
             }
         }
+    }
+
+    if opts.discover_chunks == DiscoverChunks::On && opts.modules != Modules::Esm {
+        dcx.err(
+            "`-Cllvm-args=js-discover-chunks=on` needs `-Cllvm-args=js-modules=esm`: a chunk \
+             imports what the other chunks hold, and a plain script cannot",
+        );
     }
 
     for (index, (name, _)) in opts.chunk_roles.iter().enumerate() {
@@ -1655,6 +1707,50 @@ mod tests {
 
         // Link-only: `js-runtime` must never join normalized emit args or sysroot keys.
         let args = ["js-runtime=inline".to_owned(), "js-opt=on".to_owned()];
+        assert_eq!(crate::item::normalized_emit_args(&args), "js-opt=on");
+    }
+
+    #[test]
+    fn discover_chunks_is_parsed_validated_and_link_only() {
+        assert_eq!(opts_of("").discover_chunks, DiscoverChunks::Auto);
+        assert_eq!(
+            opts_of("js-discover-chunks=auto").discover_chunks,
+            DiscoverChunks::Auto
+        );
+        assert_eq!(
+            opts_of("js-discover-chunks=off").discover_chunks,
+            DiscoverChunks::Off
+        );
+        assert_eq!(
+            opts_of("js-modules=esm js-discover-chunks=on").discover_chunks,
+            DiscoverChunks::On
+        );
+
+        assert_eq!(DiscoverChunks::Auto.as_str(), "auto");
+        assert_eq!(DiscoverChunks::On.as_str(), "on");
+        assert_eq!(DiscoverChunks::Off.as_str(), "off");
+        assert_eq!(DiscoverChunks::parse("auto"), Some(DiscoverChunks::Auto));
+        assert_eq!(DiscoverChunks::parse("on"), Some(DiscoverChunks::On));
+        assert_eq!(DiscoverChunks::parse("off"), Some(DiscoverChunks::Off));
+        assert_eq!(DiscoverChunks::parse("always"), None);
+
+        // `on` requires `js-modules=esm`.
+        let (_, collected) = parse_line("js-discover-chunks=on");
+        let errors = collected.errors.borrow();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("js-modules=esm"), "{errors:?}");
+
+        for line in [
+            "js-discover-chunks=always",
+            "js-discover-chunks=",
+            "js-discover-chunks",
+        ] {
+            let (_, collected) = parse_line(line);
+            assert_eq!(collected.errors.borrow().len(), 1, "{line}");
+        }
+
+        // Link-only: `js-discover-chunks` must never join normalized emit args or sysroot keys.
+        let args = ["js-discover-chunks=on".to_owned(), "js-opt=on".to_owned()];
         assert_eq!(crate::item::normalized_emit_args(&args), "js-opt=on");
     }
 }

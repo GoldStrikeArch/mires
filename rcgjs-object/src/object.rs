@@ -1,4 +1,4 @@
-//! The object file: format 27.
+//! The object file: format 29.
 //!
 //! An object is what one codegen unit becomes and what the link step reads back out of an rlib. It
 //! has two halves. The **text section** comes first: the codegen unit's prologue and every item's
@@ -52,7 +52,7 @@ use crate::jir::summary::{self, Availability, ItemClass, ItemSummary, SemanticKe
 use crate::jir::JIR_SCHEMA;
 
 /// The object format. Every object in a program has to carry this one.
-pub const FORMAT_VERSION: u16 = 28;
+pub const FORMAT_VERSION: u16 = 29;
 
 /// The marker that opens the member and the trailer.
 pub const MAGIC: [u8; 6] = *b"RCGJS\0";
@@ -120,6 +120,13 @@ pub struct SourceOrder {
     pub within: u32,
 }
 
+/// Attribute-declared code-split chunk target attached to an exported item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChunkTarget {
+    pub name: String,
+    pub role: crate::artifact::EntryRole,
+}
+
 /// How an item joins the program: its name, its rooting and its visibility.
 ///
 /// The three are separate facts and only look like one because a `#[no_mangle]` item in the crate
@@ -135,6 +142,8 @@ pub struct Linkage {
     pub root: bool,
     /// Whether the module's export clause names it. Only ES module output has one.
     pub exported: bool,
+    /// Optional attribute-declared code-split chunk target (e.g. `#[js_export(chunk = "...")]`).
+    pub chunk: Option<ChunkTarget>,
 }
 
 impl Linkage {
@@ -149,6 +158,7 @@ impl Linkage {
             fixed_name: Some(name),
             root: true,
             exported: true,
+            chunk: None,
         }
     }
 
@@ -158,6 +168,7 @@ impl Linkage {
             fixed_name: Some(name),
             root: true,
             exported: false,
+            chunk: None,
         }
     }
 
@@ -171,7 +182,14 @@ impl Linkage {
             fixed_name: Some(name),
             root: false,
             exported: false,
+            chunk: None,
         }
+    }
+
+    /// Attaches an attribute-declared code-split chunk target to this linkage.
+    pub fn with_chunk(mut self, name: String, role: crate::artifact::EntryRole) -> Self {
+        self.chunk = Some(ChunkTarget { name, role });
+        self
     }
 
     /// Turns this into the linkage of the same item seen from a dependency.
@@ -182,6 +200,7 @@ impl Linkage {
     pub fn demote(&mut self) {
         self.root = false;
         self.exported = false;
+        self.chunk = None;
     }
 }
 
@@ -1326,5 +1345,32 @@ mod tests {
             ItemClass::of(&static_body, &interns.types),
             ItemClass::STATIC
         );
+    }
+
+    #[test]
+    fn chunk_target_round_trips_and_clears_on_demote() {
+        let mut linkage = Linkage::exported("mount_counter".to_owned())
+            .with_chunk("counter".to_owned(), crate::artifact::EntryRole::Island);
+        assert_eq!(
+            linkage.chunk,
+            Some(ChunkTarget {
+                name: "counter".to_owned(),
+                role: crate::artifact::EntryRole::Island,
+            })
+        );
+
+        let mut writer = Writer::new(test_header("crate"), "", Interns::new());
+        let mut entry = input("mount_counter", &[], None);
+        entry.linkage = linkage.clone();
+        writer.push_item("function mount_counter() {}\n", entry);
+        let bytes = writer.finish(b"", &BTreeMap::new());
+        let object = read(&bytes).unwrap().unwrap();
+        assert_eq!(object.summaries[0].linkage, linkage);
+
+        linkage.demote();
+        assert_eq!(linkage.fixed_name.as_deref(), Some("mount_counter"));
+        assert!(!linkage.root);
+        assert!(!linkage.exported);
+        assert_eq!(linkage.chunk, None);
     }
 }

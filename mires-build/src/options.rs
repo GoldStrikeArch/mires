@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fmt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -119,6 +119,47 @@ impl RuntimeMode {
             "none" => Some(Self::None),
             _ => None,
         }
+    }
+}
+
+/// Automatic chunk discovery mode (`js-discover-chunks=<auto|on|off>`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiscoverChunks {
+    /// Discover chunks from `#[js_export(chunk = ...)]` when no explicit chunks override them.
+    #[default]
+    Auto,
+    /// Always enable automatic chunk discovery.
+    On,
+    /// Disable automatic chunk discovery.
+    Off,
+}
+
+impl DiscoverChunks {
+    /// The CLI spelling of this mode (`"auto"`, `"on"`, or `"off"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse a chunk discovery mode from its CLI spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DiscoverChunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -292,5 +333,20 @@ mod tests {
         assert_eq!(PanicMode::Abort.as_str(), "abort");
         assert_eq!(PanicMode::Abort.target_name(), "wasm32-unknown-unknown");
         assert_eq!(PanicMode::Unwind.target_name(), "mires32-unwind");
+    }
+
+    #[test]
+    fn discover_chunks_strings_and_parsing_match_cli_contract() {
+        assert_eq!(DiscoverChunks::default(), DiscoverChunks::Auto);
+        for (mode, name) in [
+            (DiscoverChunks::Auto, "auto"),
+            (DiscoverChunks::On, "on"),
+            (DiscoverChunks::Off, "off"),
+        ] {
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(mode.to_string(), name);
+            assert_eq!(DiscoverChunks::parse(name), Some(mode));
+        }
+        assert_eq!(DiscoverChunks::parse("invalid"), None);
     }
 }

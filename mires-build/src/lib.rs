@@ -10,7 +10,12 @@
 //!   `--target-dir` under `$OUT_DIR`:
 //!
 //!   ```rust,no_run
+//!   if mires_build::is_target_build() {
+//!       return;
+//!   }
 //!   let client = mires_build::Crate::new("../client")
+//!       .release()
+//!       .emit_rust_module("client_assets.rs")
 //!       .build()
 //!       .unwrap();
 //!   ```

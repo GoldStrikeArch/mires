@@ -30,7 +30,7 @@
 //!
 //! `TAG`: crate::value::TAG
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,9 @@ pub struct Dts {
     /// The Rust signature, for the doc comment. What the TypeScript came from, so a surprising
     /// type can be traced back without recompiling.
     pub rust: String,
+    /// Extracted Rust `///` doc comments, when present on the exported item.
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 // -------------------------------------------------------------------------------------------
 
@@ -104,16 +107,17 @@ pub fn parse_class_export(name: &str) -> Option<(&str, ClassExportOp<'_>)> {
 
 #[derive(Default)]
 struct ClassDts<'a> {
-    ctor: Option<&'a Dts>,
-    methods: Vec<(&'a str, &'a Dts)>,
-    static_members: Vec<(&'a str, &'a Dts, bool)>,
+    ctor: Option<(&'a Dts, &'a BTreeMap<String, String>)>,
+    methods: Vec<(&'a str, &'a Dts, &'a BTreeMap<String, String>)>,
+    static_members: Vec<(&'a str, &'a Dts, &'a BTreeMap<String, String>, bool)>,
     has_drop: bool,
 }
 
-fn format_params(params: &[(String, String)]) -> String {
+fn format_params(params: &[(String, String)], renames: &BTreeMap<String, String>) -> String {
     params
         .iter()
         .map(|(param, ty)| {
+            let ty = rename_ts_type_idents(ty, renames);
             if let Some(base) = param.strip_suffix('?') {
                 format!("{}?: {ty}", crate::jsast::sanitize_ident(base))
             } else {
@@ -124,9 +128,274 @@ fn format_params(params: &[(String, String)]) -> String {
         .join(", ")
 }
 
-fn push_member_throws_jsdoc(out: &mut String, dts: &Dts) {
-    if let Some((sig, rest)) = dts.rust.split_once('\n') {
-        out.push_str(&format!("  /**\n   * `{sig}`\n   * {rest}\n   */\n"));
+fn push_jsdoc(
+    out: &mut String,
+    indent: &str,
+    dts: &Dts,
+    renames: &BTreeMap<String, String>,
+    always_emit_sig: bool,
+) {
+    let (sig, extra) = match dts.rust.split_once('\n') {
+        Some((sig, rest)) => (sig, Some(rest)),
+        None => (dts.rust.as_str(), None),
+    };
+    let format_extra = |line: &str| -> String {
+        if let Some(inner) = line
+            .strip_prefix("@throws {")
+            .and_then(|s| s.strip_suffix('}'))
+        {
+            format!("@throws {{{}}}", rename_ts_type_idents(inner, renames))
+        } else {
+            line.to_owned()
+        }
+    };
+    match &dts.doc {
+        Some(doc) if !doc.trim().is_empty() => {
+            out.push_str(&format!("{indent}/**\n"));
+            for line in doc.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    out.push_str(&format!("{indent} *\n"));
+                } else {
+                    let safe = trimmed.replace("*/", "*\\/");
+                    out.push_str(&format!("{indent} * {safe}\n"));
+                }
+            }
+            if !sig.is_empty() || extra.is_some() {
+                out.push_str(&format!("{indent} *\n"));
+            }
+            if !sig.is_empty() {
+                out.push_str(&format!("{indent} * `{sig}`\n"));
+            }
+            if let Some(rest) = extra {
+                for line in rest.lines() {
+                    out.push_str(&format!("{indent} * {}\n", format_extra(line)));
+                }
+            }
+            out.push_str(&format!("{indent} */\n"));
+        }
+        _ => {
+            if let Some(rest) = extra {
+                out.push_str(&format!("{indent}/**\n{indent} * `{sig}`\n"));
+                for line in rest.lines() {
+                    out.push_str(&format!("{indent} * {}\n", format_extra(line)));
+                }
+                out.push_str(&format!("{indent} */\n"));
+            } else if always_emit_sig {
+                out.push_str(&format!("{indent}/** `{sig}` */\n"));
+            }
+        }
+    }
+}
+
+/// Whether `rest` (immediately following an identifier token) marks that identifier as an object
+/// type property name (`name: T` or `name?: T`).
+fn is_property_key(rest: &str) -> bool {
+    let trimmed = rest.trim_start();
+    trimmed.starts_with(':')
+        || trimmed
+            .strip_prefix('?')
+            .is_some_and(|after_q| after_q.trim_start().starts_with(':'))
+}
+
+fn is_ts_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
+}
+
+fn is_ts_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+/// Rewrites TypeScript type references according to `renames`, preserving string literals,
+/// object property keys, and member segments (such as `JSX.Element`).
+fn rename_ts_type_idents(ty: &str, renames: &BTreeMap<String, String>) -> String {
+    if renames.is_empty() {
+        return ty.to_owned();
+    }
+    let bytes = ty.as_bytes();
+    let mut out = String::with_capacity(ty.len());
+    let mut i = 0;
+    let mut last_non_ws: Option<u8> = None;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&ty[start..i]);
+            last_non_ws = Some(b'"');
+            continue;
+        }
+        if is_ts_ident_start(byte) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ts_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            let ident = &ty[start..i];
+            if last_non_ws != Some(b'.') && !is_property_key(&ty[i..]) {
+                if let Some(renamed) = renames.get(ident) {
+                    out.push_str(renamed);
+                } else {
+                    out.push_str(ident);
+                }
+            } else {
+                out.push_str(ident);
+            }
+            last_non_ws = Some(bytes[i - 1]);
+            continue;
+        }
+        let ch = ty[i..].chars().next().expect("valid utf-8 boundary");
+        out.push(ch);
+        if !ch.is_ascii_whitespace() {
+            last_non_ws = Some(byte);
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn alloc_disambiguated(reserved: &mut BTreeSet<String>, base: &str) -> String {
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if reserved.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+struct CollectedTypes {
+    types: BTreeMap<String, (bool, String)>,
+    per_item_renames: Vec<BTreeMap<String, String>>,
+}
+
+/// Collects and deduplicates named types across all exported items in one module, disambiguating
+/// any short-name collisions whose definitions differ (`Item`, `Item_2`, ...).
+fn collect_module_types(items: &[&crate::item::LinkItem]) -> CollectedTypes {
+    let mut types: BTreeMap<String, (bool, String)> = BTreeMap::new();
+    let mut by_bare: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut reserved: BTreeSet<String> = BTreeSet::new();
+
+    for item in items {
+        if !item.linkage.exported {
+            continue;
+        }
+        let Some(dts) = &item.dts else { continue };
+        for (name, _) in &dts.types {
+            let bare = name.strip_prefix("export ").unwrap_or(name.as_str());
+            reserved.insert(bare.to_owned());
+        }
+    }
+
+    let mut per_item_renames = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.linkage.exported {
+            per_item_renames.push(BTreeMap::new());
+            continue;
+        }
+        let Some(dts) = &item.dts else {
+            per_item_renames.push(BTreeMap::new());
+            continue;
+        };
+        let entries: Vec<(bool, &str, &str)> = dts
+            .types
+            .iter()
+            .map(|(name, body)| match name.strip_prefix("export ") {
+                Some(rest) => (true, rest, body.as_str()),
+                None => (false, name.as_str(), body.as_str()),
+            })
+            .collect();
+
+        let mut item_renames: BTreeMap<String, String> = BTreeMap::new();
+        let mut allocated: BTreeSet<String> = BTreeSet::new();
+
+        for _ in 0..=entries.len() {
+            let mut changed = false;
+            for &(_, bare, body) in &entries {
+                if allocated.contains(bare) {
+                    continue;
+                }
+                let Some(existing_list) = by_bare.get(bare) else {
+                    continue;
+                };
+                let rewritten = rename_ts_type_idents(body, &item_renames);
+                let matched = existing_list
+                    .iter()
+                    .find_map(|(existing_name, existing_body)| {
+                        if *existing_body == rewritten {
+                            return Some(existing_name.clone());
+                        }
+                        if existing_name != bare {
+                            let mut probe = item_renames.clone();
+                            probe.insert(bare.to_owned(), existing_name.clone());
+                            if rename_ts_type_idents(body, &probe) == *existing_body {
+                                return Some(existing_name.clone());
+                            }
+                        }
+                        None
+                    });
+                match matched {
+                    Some(existing_name) => {
+                        if existing_name == bare {
+                            if item_renames.remove(bare).is_some() {
+                                changed = true;
+                            }
+                        } else if item_renames.get(bare) != Some(&existing_name) {
+                            item_renames.insert(bare.to_owned(), existing_name);
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        let fresh = alloc_disambiguated(&mut reserved, bare);
+                        allocated.insert(bare.to_owned());
+                        item_renames.insert(bare.to_owned(), fresh);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for &(exported, bare, body) in &entries {
+            let final_name = item_renames
+                .get(bare)
+                .cloned()
+                .unwrap_or_else(|| bare.to_owned());
+            let final_body = rename_ts_type_idents(body, &item_renames);
+            types
+                .entry(final_name.clone())
+                .and_modify(|(was_exported, _)| {
+                    if exported {
+                        *was_exported = true;
+                    }
+                })
+                .or_insert_with(|| (exported, final_body.clone()));
+            let list = by_bare.entry(bare.to_owned()).or_default();
+            if !list.iter().any(|(name, _)| *name == final_name) {
+                list.push((final_name, final_body));
+            }
+        }
+
+        per_item_renames.push(item_renames);
+    }
+
+    CollectedTypes {
+        types,
+        per_item_renames,
     }
 }
 
@@ -144,30 +413,10 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
          // Generated by `-Cllvm-args=js-dts=on`. Do not edit: it is rewritten on every build.\n"
     );
 
-    // One definition per bare name, preferring `export type` whenever any `#[js_export]` entry
-    // refers to it. Two items describing one Rust type describe it the same way, because both came
-    // from the same walk over that type.
-    let mut types: BTreeMap<&str, (bool, &str)> = BTreeMap::new();
-    for item in items {
-        if !item.linkage.exported {
-            continue;
-        }
-        let Some(dts) = &item.dts else { continue };
-        for (name, body) in &dts.types {
-            let (exported, bare) = match name.strip_prefix("export ") {
-                Some(rest) => (true, rest),
-                None => (false, name.as_str()),
-            };
-            types
-                .entry(bare)
-                .and_modify(|(was_exported, _)| {
-                    if exported {
-                        *was_exported = true;
-                    }
-                })
-                .or_insert((exported, body.as_str()));
-        }
-    }
+    let CollectedTypes {
+        types,
+        per_item_renames,
+    } = collect_module_types(items);
     if !types.is_empty() {
         out.push('\n');
         for (name, (exported, body)) in &types {
@@ -181,15 +430,23 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
 
     // What the module reaches out to. A consumer needs this to build an import map, and it is the
     // declared-interface surface: every `#[js_extern]` that named a module is one of these.
+    // Linker-synthesized imports (runtime shim namespace and cross-chunk wiring, `crate_name ==
+    // "generated"`) are internal plumbing rather than declared external modules; emitting
+    // `declare module "./shim.mjs"` in a `.d.mts` file also fails TypeScript module augmentation
+    // checks (`TS2665`).
     let mut modules: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for item in items {
-        if item.kind != ItemKind::Import {
+        if item.kind != ItemKind::Import || item.crate_name == "generated" {
+            continue;
+        }
+        let names = imported_names(&item.js);
+        if names.is_empty() {
             continue;
         }
         modules
             .entry(item.debug_path.as_str())
             .or_default()
-            .extend(imported_names(&item.js));
+            .extend(names);
     }
     if !modules.is_empty() {
         out.push('\n');
@@ -206,8 +463,8 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
     }
 
     let mut classes: BTreeMap<&str, ClassDts<'_>> = BTreeMap::new();
-    let mut free_fns: Vec<(&str, &Dts)> = Vec::new();
-    for item in items {
+    let mut free_fns: Vec<(&str, &Dts, &BTreeMap<String, String>)> = Vec::new();
+    for (item, renames) in items.iter().zip(&per_item_renames) {
         if !item.linkage.exported {
             continue;
         }
@@ -222,70 +479,83 @@ pub fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
                 ClassExportOp::Drop => entry.has_drop = true,
                 ClassExportOp::Ctor => {
                     if let Some(dts) = &item.dts {
-                        entry.ctor = Some(dts);
+                        entry.ctor = Some((dts, renames));
                     }
                 }
                 ClassExportOp::Method(method) | ClassExportOp::ConsumingMethod(method) => {
                     if let Some(dts) = &item.dts {
-                        entry.methods.push((method, dts));
+                        entry.methods.push((method, dts, renames));
                     }
                 }
                 ClassExportOp::StaticCtor(method) => {
                     if let Some(dts) = &item.dts {
-                        entry.static_members.push((method, dts, true));
+                        entry.static_members.push((method, dts, renames, true));
                     }
                 }
                 ClassExportOp::StaticMethod(method) => {
                     if let Some(dts) = &item.dts {
-                        entry.static_members.push((method, dts, false));
+                        entry.static_members.push((method, dts, renames, false));
                     }
                 }
             }
             continue;
         }
         if let Some(dts) = &item.dts {
-            free_fns.push((name, dts));
+            free_fns.push((name, dts, renames));
         }
     }
 
     if !free_fns.is_empty() || classes.is_empty() {
         out.push('\n');
     }
-    for (name, dts) in free_fns {
-        let params = format_params(&dts.params);
-        if let Some((sig, rest)) = dts.rust.split_once('\n') {
-            out.push_str(&format!("/**\n * `{sig}`\n * {rest}\n */\n"));
-        } else {
-            out.push_str(&format!("/** `{}` */\n", dts.rust));
-        }
+    for (name, dts, renames) in free_fns {
+        let params = format_params(&dts.params, renames);
+        let ret = rename_ts_type_idents(&dts.ret, renames);
+        push_jsdoc(&mut out, "", dts, renames, true);
         out.push_str(&format!(
-            "export declare function {name}({params}): {};\n",
-            dts.ret
+            "export declare function {name}({params}): {ret};\n"
         ));
+    }
+
+    if classes.values().any(|cls| cls.has_drop) {
+        out.push_str(
+            "\ndeclare const __MiresDisposableBase: {\n  \
+             new (...args: never[]): SymbolConstructor extends { readonly dispose: infer S extends symbol }\n    \
+             ? { [K in S]: () => void }\n    \
+             : {};\n\
+             };\n",
+        );
     }
 
     for (class_name, cls) in classes {
         out.push('\n');
-        out.push_str(&format!("export declare class {class_name} {{\n"));
-        if let Some(ctor) = cls.ctor {
-            push_member_throws_jsdoc(&mut out, ctor);
+        if cls.has_drop {
+            out.push_str(&format!(
+                "export declare class {class_name} extends __MiresDisposableBase {{\n"
+            ));
+        } else {
+            out.push_str(&format!("export declare class {class_name} {{\n"));
+        }
+        if let Some((ctor, renames)) = cls.ctor {
+            push_jsdoc(&mut out, "  ", ctor, renames, false);
             out.push_str(&format!(
                 "  constructor({});\n",
-                format_params(&ctor.params)
+                format_params(&ctor.params, renames)
             ));
         }
-        for (method, dts) in cls.methods {
-            push_member_throws_jsdoc(&mut out, dts);
-            let params = format_params(dts.params.get(1..).unwrap_or(&[]));
-            out.push_str(&format!("  {method}({params}): {};\n", dts.ret));
+        for (method, dts, renames) in cls.methods {
+            push_jsdoc(&mut out, "  ", dts, renames, false);
+            let params = format_params(dts.params.get(1..).unwrap_or(&[]), renames);
+            let ret = rename_ts_type_idents(&dts.ret, renames);
+            out.push_str(&format!("  {method}({params}): {ret};\n"));
         }
-        for (method, dts, is_ctor) in cls.static_members {
-            push_member_throws_jsdoc(&mut out, dts);
-            let params = format_params(&dts.params);
+        for (method, dts, renames, is_ctor) in cls.static_members {
+            push_jsdoc(&mut out, "  ", dts, renames, false);
+            let params = format_params(&dts.params, renames);
             let ret = if is_ctor {
-                class_name
+                class_name.to_owned()
             } else {
-                dts.ret.as_str()
+                rename_ts_type_idents(&dts.ret, renames)
             };
             out.push_str(&format!("  static {method}({params}): {ret};\n"));
         }
@@ -368,6 +638,7 @@ mod tests {
                 ret: "string".to_owned(),
                 types: Vec::new(),
                 rust: "fn(&str) -> String".to_owned(),
+                doc: None,
             },
         );
         let throwing = make_item(
@@ -377,14 +648,31 @@ mod tests {
                 ret: "string".to_owned(),
                 types: vec![("ParseOptions".to_owned(), "{ gfm?: boolean }".to_owned())],
                 rust: "fn(&str) -> Result<String, String>\n@throws {string}".to_owned(),
+                doc: None,
             },
         );
-        let text = module_dts("demo", &[&plain, &throwing]);
+        let documented = make_item(
+            "render",
+            Dts {
+                params: vec![("src".to_owned(), "string".to_owned())],
+                ret: "string".to_owned(),
+                types: Vec::new(),
+                rust: "fn(&str) -> Result<String, String>\n@throws {string}".to_owned(),
+                doc: Some("Renders markdown to HTML.\nSupports /* block */ notes.".to_owned()),
+            },
+        );
+        let text = module_dts("demo", &[&plain, &throwing, &documented]);
         assert!(text.contains("type ParseOptions = { gfm?: boolean };\n"));
         assert!(text.contains(
             "/** `fn(&str) -> String` */\nexport declare function greet(name: string): string;\n"
         ));
         assert!(text.contains("/**\n * `fn(&str) -> Result<String, String>`\n * @throws {string}\n */\nexport declare function parse(input: string): string;\n"));
+        assert!(
+            text.contains(
+                "/**\n * Renders markdown to HTML.\n * Supports /* block *\\/ notes.\n *\n * `fn(&str) -> Result<String, String>`\n * @throws {string}\n */\nexport declare function render(src: string): string;\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -418,6 +706,7 @@ mod tests {
                     ("InternalOnly".to_owned(), "{ x: number }".to_owned()),
                 ],
                 rust: "fn(SharedOpts) -> InternalOnly".to_owned(),
+                doc: None,
             },
         );
         let export_item = make_item(
@@ -436,6 +725,7 @@ mod tests {
                     ),
                 ],
                 rust: "fn(SharedOpts) -> RenderResult".to_owned(),
+                doc: None,
             },
         );
 
@@ -456,6 +746,105 @@ mod tests {
             !text.contains("\ntype SharedOpts ="),
             "duplicate bare type must be upgraded to export type:\n{text}"
         );
+    }
+
+    #[test]
+    fn module_dts_disambiguates_colliding_short_names_across_functions() {
+        use crate::item::{ItemKind, JsName, LinkItem, Linkage};
+
+        let make_item = |name: &str, dts: Dts| LinkItem {
+            name: JsName::new(name.to_owned()),
+            kind: ItemKind::Fn,
+            js: String::new(),
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: Linkage::exported(name.to_owned()),
+            debug_path: name.to_owned(),
+            crate_name: "demo".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: Some(dts),
+            optimization: Default::default(),
+            allocator_provider: Default::default(),
+            jir: Default::default(),
+        };
+
+        let fn_a = make_item(
+            "get_a",
+            Dts {
+                params: Vec::new(),
+                ret: "Outer".to_owned(),
+                types: vec![
+                    ("export Item".to_owned(), "{ a: number }".to_owned()),
+                    (
+                        "export Outer".to_owned(),
+                        "{ TAG: \"Item\"; Item?: Item }".to_owned(),
+                    ),
+                ],
+                rust: "fn() -> mod_a::Outer".to_owned(),
+                doc: None,
+            },
+        );
+        let fn_b = make_item(
+            "get_b",
+            Dts {
+                params: vec![("item".to_owned(), "Item".to_owned())],
+                ret: "Outer".to_owned(),
+                types: vec![
+                    ("export Item".to_owned(), "{ b: string }".to_owned()),
+                    (
+                        "export Outer".to_owned(),
+                        "{ TAG: \"Item\"; Item?: Item }".to_owned(),
+                    ),
+                ],
+                rust: "fn(mod_b::Item) -> Result<mod_b::Outer, mod_b::Item>\n@throws {Item}"
+                    .to_owned(),
+                doc: None,
+            },
+        );
+        let fn_b2 = make_item(
+            "get_b_again",
+            Dts {
+                params: Vec::new(),
+                ret: "Item".to_owned(),
+                types: vec![("export Item".to_owned(), "{ b: string }".to_owned())],
+                rust: "fn() -> mod_b::Item".to_owned(),
+                doc: None,
+            },
+        );
+
+        let text = module_dts("demo", &[&fn_a, &fn_b, &fn_b2]);
+        assert!(
+            text.contains("export type Item = { a: number };\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("export type Item_2 = { b: string };\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("export type Outer = { TAG: \"Item\"; Item?: Item };\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("export type Outer_2 = { TAG: \"Item\"; Item?: Item_2 };\n"),
+            "property key and string tag must stay untouched while field type renames:\n{text}"
+        );
+        assert!(
+            text.contains("export declare function get_a(): Outer;\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "* @throws {Item_2}\n */\nexport declare function get_b(item: Item_2): Outer_2;\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("export declare function get_b_again(): Item_2;\n"),
+            "third function sharing mod_b::Item should reuse Item_2:\n{text}"
+        );
+        assert!(!text.contains("Item_3"), "{text}");
     }
 
     #[test]
@@ -490,6 +879,7 @@ mod tests {
                     "{ step?: number }".to_owned(),
                 )],
                 rust: "fn(i32) -> Result<*mut Counter, String>\n@throws {string}".to_owned(),
+                doc: None,
             }),
         );
         let inc_fn = make_item(
@@ -502,6 +892,7 @@ mod tests {
                 ret: "number".to_owned(),
                 types: Vec::new(),
                 rust: "fn(*mut Counter, Option<i32>) -> i32".to_owned(),
+                doc: None,
             }),
         );
         let take_fn = make_item(
@@ -511,6 +902,7 @@ mod tests {
                 ret: "number".to_owned(),
                 types: Vec::new(),
                 rust: "fn(*mut Counter) -> i32".to_owned(),
+                doc: None,
             }),
         );
         let static_ctor = make_item(
@@ -520,6 +912,7 @@ mod tests {
                 ret: "unknown".to_owned(),
                 types: Vec::new(),
                 rust: "fn() -> *mut Counter".to_owned(),
+                doc: None,
             }),
         );
         let static_fn = make_item(
@@ -529,6 +922,7 @@ mod tests {
                 ret: "string".to_owned(),
                 types: Vec::new(),
                 rust: "fn() -> String".to_owned(),
+                doc: None,
             }),
         );
         let free_fn = make_item(
@@ -538,6 +932,7 @@ mod tests {
                 ret: "Promise<void>".to_owned(),
                 types: Vec::new(),
                 rust: "fn() -> TypedPromise<()>".to_owned(),
+                doc: None,
             }),
         );
 
@@ -566,7 +961,13 @@ mod tests {
             "{text}"
         );
         let expected_class = "\
-export declare class Counter {
+declare const __MiresDisposableBase: {
+  new (...args: never[]): SymbolConstructor extends { readonly dispose: infer S extends symbol }
+    ? { [K in S]: () => void }
+    : {};
+};
+
+export declare class Counter extends __MiresDisposableBase {
   /**
    * `fn(i32) -> Result<*mut Counter, String>`
    * @throws {string}
@@ -582,6 +983,69 @@ export declare class Counter {
         assert!(
             text.contains(expected_class),
             "expected class declaration not found:\n{text}"
+        );
+    }
+
+    #[test]
+    fn module_dts_skips_linker_generated_imports_and_keeps_extern_modules() {
+        use crate::item::{ItemKind, JsName, LinkItem, Linkage};
+
+        let shim = LinkItem {
+            name: JsName::new("__rt".to_owned()),
+            kind: ItemKind::Import,
+            js: "import * as __rt from \"./shim.mjs\";\n".to_owned(),
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: Linkage::internal(),
+            debug_path: "./shim.mjs".to_owned(),
+            crate_name: "generated".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: None,
+            optimization: Default::default(),
+            allocator_provider: Default::default(),
+            jir: Default::default(),
+        };
+        let chunk = LinkItem {
+            name: JsName::new("$chunk$shared".to_owned()),
+            kind: ItemKind::Import,
+            js: "import { a } from \"./shared.js\";\n".to_owned(),
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: Linkage::internal(),
+            debug_path: "./shared.js".to_owned(),
+            crate_name: "generated".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: None,
+            optimization: Default::default(),
+            allocator_provider: Default::default(),
+            jir: Default::default(),
+        };
+        let ext = LinkItem {
+            name: JsName::new("ext$Chart$h1".to_owned()),
+            kind: ItemKind::Import,
+            js: "import { Chart as ext$Chart$h1 } from \"chart.js\";\n".to_owned(),
+            refs: Default::default(),
+            zombies: Vec::new(),
+            linkage: Linkage::internal(),
+            debug_path: "chart.js".to_owned(),
+            crate_name: "demo".to_owned(),
+            order: None,
+            map: Default::default(),
+            dts: None,
+            optimization: Default::default(),
+            allocator_provider: Default::default(),
+            jir: Default::default(),
+        };
+
+        let text = module_dts("demo", &[&shim, &chunk, &ext]);
+        assert!(!text.contains("./shim.mjs"), "{text}");
+        assert!(!text.contains("./shared.js"), "{text}");
+        assert!(text.contains("declare module \"chart.js\""), "{text}");
+        assert!(
+            text.contains("export const ext$Chart$h1: unknown;"),
+            "{text}"
         );
     }
 }

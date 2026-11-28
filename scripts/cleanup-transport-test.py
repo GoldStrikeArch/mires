@@ -85,6 +85,7 @@ base = [
     "-Ccodegen-units=1", "-Cpanic=unwind" if unwind else "-Cpanic=abort", "-Coverflow-checks=off",
     "-Cdebug-assertions=off", "-Cdebuginfo=0", "-Zquery-dep-graph", "-Zprint-mono-items=yes",
     "-Cllvm-args=js-producer=" + hashlib.sha256(backend.read_bytes()).hexdigest(),
+    "--cfg", "mires", "--check-cfg=cfg(mires)",
     "--remap-path-prefix", str(root) + "/=",
 ]
 env = dict(os.environ, JSC_LINK_BIN=str(root / "target/release/jsc-link"), JSC_JIR_SELFCHECK="1")

@@ -294,12 +294,24 @@ impl<'tcx> Namer<'tcx> {
     /// How an item joins the program: exported under its exact name, or internal.
     ///
     /// An exported item is also a DCE root, and is reachable by definition: something outside this
-    /// program may call it.
+    /// program may call it. When its `link_section` declares a code-split chunk via
+    /// `#[js_export(chunk = "...")]`, that target rides along in the linkage metadata.
     pub(crate) fn linkage_of(&self, instance: Instance<'tcx>) -> Linkage {
-        match self.is_exported(instance.def_id()) {
-            true => Linkage::exported(self.tcx.symbol_name(instance).name.to_owned()),
-            false => Linkage::internal(),
+        if !self.is_exported(instance.def_id()) {
+            return Linkage::internal();
         }
+        let mut linkage = Linkage::exported(self.tcx.symbol_name(instance).name.to_owned());
+        if let ty::InstanceKind::Item(def_id) = instance.def {
+            if let Some(chunk) = self.export_chunk(def_id) {
+                linkage = linkage.with_chunk(chunk.name, map_chunk_role(chunk.role));
+            }
+        }
+        linkage
+    }
+
+    fn export_chunk(&self, def_id: DefId) -> Option<mires_marker_abi::export::ChunkSpec> {
+        let section = self.tcx.codegen_fn_attrs(def_id).link_section?;
+        mires_marker_abi::export::parse_export_section(section.as_str())?.chunk
     }
 
     /// Whether the item's JavaScript name is its symbol name, spelled exactly.
@@ -381,6 +393,17 @@ impl<'tcx> Namer<'tcx> {
             }
             NameStyle::Readable => JsName::new(readable(&self.stem(def_id), symbol)),
         }
+    }
+}
+
+fn map_chunk_role(role: mires_marker_abi::export::ChunkRole) -> rcgjs_object::artifact::EntryRole {
+    use mires_marker_abi::export::ChunkRole;
+    use rcgjs_object::artifact::EntryRole;
+    match role {
+        ChunkRole::Main => EntryRole::Main,
+        ChunkRole::Island => EntryRole::Island,
+        ChunkRole::Worker => EntryRole::Worker,
+        ChunkRole::Procedure => EntryRole::Procedure,
     }
 }
 

@@ -32,13 +32,14 @@ pub mod prelude;
 pub use error::JsError;
 pub use js_macro::js;
 pub use mires_js::{
-    abort, await_promise, callback0, callback1, callback2, callback3, callback4, class_handle,
-    collections, construct, future_to_promise, invoke, js_bindings, js_export, js_extern,
-    spawn_local, throw_value, try_host, web, yield_task, HostValue, JsArray, JsBTreeMapEntries,
-    JsMapEntries, JsString, JsUint8Array, JsValue, Promise, PromiseFuture, TypedPromise, YieldTask,
+    abort, await_promise, callback, callback0, callback1, callback2, callback3, callback4,
+    class_handle, collections, construct, future_to_promise, invoke, js_bindings, js_export,
+    js_extern, js_opaque, spawn_local, throw_value, try_host, web, yield_task, HostHandle,
+    HostReturn, HostValue, IntoJsCallback, JsArray, JsBTreeMapEntries, JsMapEntries, JsString,
+    JsUint8Array, JsValue, Promise, PromiseFuture, TypedPromise, YieldTask,
 };
 
-/// Internal runtime support items referenced by `#[js_export]` macro expansions.
+/// Internal runtime support items referenced by `#[js_export]` and `#[js_opaque]` macro expansions.
 #[doc(hidden)]
 pub use mires_js::__export;
 
@@ -180,7 +181,7 @@ mod tests {
 
     // Two separate modules exporting identical symbol names verify that native host `cargo test`
     // builds emit no `no_mangle` / `export_name` attributes and therefore never collide.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(mires))]
     mod first_module {
         use crate::js_export;
 
@@ -195,7 +196,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(mires))]
     mod second_module {
         use crate::js_export;
 
@@ -271,7 +272,7 @@ mod tests {
         assert_eq!(raw_diff(10, 5), 5);
         assert_eq!(divide_checked(10, 2), Ok(5));
         assert_eq!(divide_checked(10, 0), Err(JsError::new("division by zero")));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(mires))]
         {
             assert_eq!(first_module::collide(), 1);
             assert_eq!(second_module::collide(), 2);
@@ -380,5 +381,105 @@ mod tests {
         pub async fn forbid_unsafe_async(msg: &str, tags: BTreeMap<String, u32>) -> usize {
             msg.len() + tags.len()
         }
+
+        #[js_export(chunk = "counter", role = "island", rename_all = "camelCase")]
+        pub fn render_island(count: i32) -> i32 {
+            count + 1
+        }
+
+        #[js_export(raw, chunk = "worker-a", role = "worker")]
+        pub fn worker_tick(n: u32) -> u32 {
+            n * 3
+        }
+
+        #[js_export(chunk = "rpc", role = "procedure", rename_all = "camelCase")]
+        pub async fn fetch_score(name: &str) -> usize {
+            name.len()
+        }
+
+        #[js_export]
+        pub struct AsyncSession {
+            seed: u32,
+        }
+
+        #[js_export(rename_all = "camelCase")]
+        impl AsyncSession {
+            pub fn new(seed: u32) -> Self {
+                Self { seed }
+            }
+
+            #[js_export(skip)]
+            pub fn generic_helper<T>(&self, value: T) -> T {
+                value
+            }
+
+            pub async fn static_fetch(tag: &str) -> usize {
+                tag.len()
+            }
+
+            pub async fn consume_into(self, bonus: u32) -> u32 {
+                self.seed + bonus
+            }
+        }
+
+        #[crate::js_opaque]
+        #[derive(Clone, Copy)]
+        pub struct BrandedHandle(crate::HostHandle);
+
+        #[crate::js_opaque(ts = "JSX.Element")]
+        #[derive(Clone, Copy)]
+        pub struct Node(crate::HostHandle);
+
+        #[crate::js_opaque(ts = "Signal<T>")]
+        pub struct Signal<T>(crate::HostHandle, core::marker::PhantomData<T>);
+    }
+
+    #[test]
+    fn framework_sdk_features_work_natively_under_forbid_unsafe() {
+        assert_eq!(forbid_unsafe_v3::render_island(41), 42);
+        assert_eq!(forbid_unsafe_v3::worker_tick(7), 21);
+        assert_eq!(poll_ready(forbid_unsafe_v3::fetch_score("mires")), 5);
+
+        let session = forbid_unsafe_v3::AsyncSession::new(10);
+        assert_eq!(session.generic_helper("kept"), "kept");
+        assert_eq!(
+            poll_ready(forbid_unsafe_v3::AsyncSession::static_fetch("ping")),
+            4
+        );
+        assert_eq!(poll_ready(session.consume_into(5)), 15);
+
+        assert_eq!(forbid_unsafe_v3::BrandedHandle::__MIRES_TS_TYPE, "");
+        assert_eq!(forbid_unsafe_v3::Node::__MIRES_TS_TYPE, "JSX.Element");
+        assert_eq!(
+            forbid_unsafe_v3::Signal::<i32>::__MIRES_TS_TYPE,
+            "Signal<T>"
+        );
+        assert_eq!(
+            core::mem::size_of::<forbid_unsafe_v3::Node>(),
+            core::mem::size_of::<crate::HostHandle>()
+        );
+        assert_eq!(
+            core::mem::size_of::<forbid_unsafe_v3::Signal<i32>>(),
+            core::mem::size_of::<crate::HostHandle>()
+        );
+
+        // Compile-time type inference check for ergonomic `callback` helper across 0..=4 args.
+        fn check_callbacks() {
+            let _ = crate::callback(|| {});
+            let _ = crate::callback(|x: i32| x + 1);
+            let _ = crate::callback(|ev: JsValue| {
+                let _ = ev;
+            });
+            let _ = crate::callback(|a: f64, b: f64| a + b);
+            let _ =
+                crate::callback(|a: i32, b: bool, c: &str| if b { a + c.len() as i32 } else { 0 });
+            let _ = crate::callback(|a: i32, b: i32, c: i32, d: i32| a + b + c + d);
+            let _ = crate::callback(|h: crate::HostHandle| h);
+            let _ = crate::callback(|v: JsValue| {
+                let node = forbid_unsafe_v3::Node::from_value_unchecked(v);
+                JsValue::from(node)
+            });
+        }
+        let _keep: fn() = check_callbacks;
     }
 }

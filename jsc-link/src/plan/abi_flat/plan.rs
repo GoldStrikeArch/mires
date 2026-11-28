@@ -928,7 +928,8 @@ pub fn plan_excluding(
         return plan;
     }
     let speed_profile = matches!(opts.profile, Some(Profile::ReleaseSpeed));
-    let allow_sentinel = speed_profile && opts.chunks.is_empty();
+    let chunked = crate::link::is_chunked(opts, table);
+    let allow_sentinel = speed_profile && !chunked;
 
     record_physical_summaries(table, funcs, allow_sentinel, &mut plan);
     let call_scan = scan_program_refs_and_callers(table, funcs, excluded, &mut plan);
@@ -987,7 +988,7 @@ pub fn plan_excluding(
                 non_call_named: &call_scan.scan.named,
                 ineligible: &call_scan.ineligible,
                 pinned_by_tracked_caller: &call_scan.pinned_by_tracked_caller,
-                chunked: !opts.chunks.is_empty(),
+                chunked,
             },
             &mut plan,
         );
@@ -1275,6 +1276,7 @@ fn build_candidates(cx: &CandidateBuildCx<'_>, plan: &mut AbiPlan) -> BTreeMap<I
         potential_params,
         effects,
     } = *cx;
+    let chunked = crate::link::is_chunked(opts, table);
     let mut candidates: BTreeMap<ItemId, Candidate> = BTreeMap::new();
     for (name, func) in funcs {
         let Ok(func) = func else { continue };
@@ -1307,7 +1309,7 @@ fn build_candidates(cx: &CandidateBuildCx<'_>, plan: &mut AbiPlan) -> BTreeMap<I
             item.map(|item| &item.linkage),
             semantic,
             func,
-            !opts.chunks.is_empty(),
+            chunked,
             &call_scan.ineligible,
         )
         .or_else(|| {
@@ -1323,7 +1325,7 @@ fn build_candidates(cx: &CandidateBuildCx<'_>, plan: &mut AbiPlan) -> BTreeMap<I
             ) && canonical_clone_allowed(
                 semantic,
                 func,
-                !opts.chunks.is_empty(),
+                chunked,
                 excluded.contains(&func.item),
                 call_scan.pinned_by_tracked_caller.contains(&func.item),
             ) && call_scan

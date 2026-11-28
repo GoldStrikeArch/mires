@@ -1,15 +1,19 @@
 //! Build & check orchestration, Cargo invocation, and artifact publishing.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::cli::{BuildCliOptions, OutputFormat, PanicMode, RuntimeMode};
+use crate::cli::{
+    check_cfg_expr, BuildCliOptions, DiscoverChunks, MessageFormat, OutputFormat, PanicMode,
+    RuntimeMode,
+};
 use crate::metadata::{self, PackageContext, ResolvedConfig, SelectedTarget};
 use crate::npm::{self, NpmPackageInput};
 use crate::sysroot::{self, SysrootRequest, ToolchainInfo};
@@ -42,6 +46,51 @@ struct EmittedFile {
     bytes: u64,
 }
 
+/// Structured chunk metadata emitted in `--message-format=json`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JsonChunkInfo {
+    pub name: String,
+    pub role: String,
+    pub path: PathBuf,
+    pub source_map: Option<PathBuf>,
+    pub dts: Option<PathBuf>,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedArtifacts {
+    emitted: Vec<EmittedFile>,
+    program: PathBuf,
+    source_map: Option<PathBuf>,
+    dts: Option<PathBuf>,
+    runtime_file: Option<PathBuf>,
+    package_json: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    manifest: Option<serde_json::Value>,
+    chunks: Vec<JsonChunkInfo>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BuildJsonOutput {
+    schema: u32,
+    package: String,
+    profile: String,
+    format: String,
+    runtime: String,
+    out_dir: PathBuf,
+    program: PathBuf,
+    source_map: Option<PathBuf>,
+    dts: Option<PathBuf>,
+    runtime_file: Option<PathBuf>,
+    package_json: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    manifest: Option<serde_json::Value>,
+    chunks: Vec<JsonChunkInfo>,
+    dep_files: Vec<PathBuf>,
+    elapsed_secs: f64,
+}
+
 /// Run `cargo mires build`: ensure sysroot, invoke `cargo rustc`, publish artifacts.
 pub fn run_build(opts: &BuildCliOptions) -> Result<(), String> {
     let started = Instant::now();
@@ -67,9 +116,36 @@ pub fn run_build(opts: &BuildCliOptions) -> Result<(), String> {
         .filter(|p| !p.as_os_str().is_empty());
     let _ = fs::remove_file(&record_file);
 
-    let emitted = publish_artifacts(&ctx, &toolchain, &artifact_path, recorded_raw.as_deref())?;
+    let published = publish_artifacts(&ctx, &toolchain, &artifact_path, recorded_raw.as_deref())?;
+    let elapsed_secs = started.elapsed().as_secs_f64();
 
-    print_build_summary(&ctx, &emitted, started.elapsed().as_secs_f64());
+    match ctx.config.message_format {
+        MessageFormat::Human => print_build_summary(&ctx, &published.emitted, elapsed_secs),
+        MessageFormat::Json => {
+            let dep_files = metadata::collect_dep_files(&ctx, opts);
+            let output = BuildJsonOutput {
+                schema: 1,
+                package: ctx.package.name,
+                profile: ctx.config.profile.as_str().to_owned(),
+                format: ctx.config.format.as_str().to_owned(),
+                runtime: ctx.config.runtime.as_str().to_owned(),
+                out_dir: ctx.config.out_dir,
+                program: published.program,
+                source_map: published.source_map,
+                dts: published.dts,
+                runtime_file: published.runtime_file,
+                package_json: published.package_json,
+                manifest_path: published.manifest_path,
+                manifest: published.manifest,
+                chunks: published.chunks,
+                dep_files,
+                elapsed_secs,
+            };
+            let json = serde_json::to_string(&output)
+                .map_err(|err| format!("failed to serialize build JSON output: {err}"))?;
+            println!("{json}");
+        }
+    }
     Ok(())
 }
 
@@ -86,6 +162,11 @@ pub fn run_check(opts: &BuildCliOptions) -> Result<(), String> {
 
     let wrapper_exe = env::current_exe()
         .map_err(|err| format!("failed to locate current `cargo-mires` executable: {err}"))?;
+
+    let rustflags_env = target_rustflags_env_name(&toolchain.target_name);
+    let existing_rustflags = env::var(&rustflags_env).ok();
+    let target_rustflags =
+        build_target_rustflags(existing_rustflags.as_deref(), None, &ctx.config.cfgs);
 
     let mut cmd = Command::new("cargo");
     cmd.arg(format!("+{}", toolchain.channel)).arg("check");
@@ -111,6 +192,7 @@ pub fn run_check(opts: &BuildCliOptions) -> Result<(), String> {
     append_common_cargo_flags(&mut cmd, opts, &ctx.config);
     cmd.env_remove("RUSTUP_TOOLCHAIN")
         .env("RUSTC_WRAPPER", &wrapper_exe)
+        .env(&rustflags_env, &target_rustflags)
         .env(wrapper::ENV_WRAPPER_ACTIVE, "1")
         .env(wrapper::ENV_MODE, "check")
         .env(wrapper::ENV_TARGET, &toolchain.target_arg)
@@ -121,6 +203,7 @@ pub fn run_check(opts: &BuildCliOptions) -> Result<(), String> {
         )
         .env(wrapper::ENV_SYSROOT, &toolchain.sysroot_dir)
         .env(wrapper::ENV_PANIC, ctx.config.panic.as_str())
+        .env(wrapper::ENV_CFGS, ctx.config.cfgs.join("\n"))
         .env(wrapper::ENV_VERBOSE, if opts.verbose { "1" } else { "0" })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -153,22 +236,48 @@ fn build_link_args(ctx: &PackageContext) -> Vec<String> {
             if config.source_map { "on" } else { "off" }
         ),
         format!("js-workspace-root={}", ctx.workspace_root.display()),
+        format!("js-discover-chunks={}", config.discover_chunks.as_str()),
     ];
 
     if config.format == OutputFormat::Esm && config.runtime == RuntimeMode::External {
         args.push(format!("js-shim-module={}", config.shim_module));
     }
 
-    for (name, entry) in &config.chunks {
-        args.push(format!("js-chunk={name}:{entry}"));
+    for chunk in &config.chunks {
+        args.push(format!("js-chunk={}:{}", chunk.name, chunk.entry));
+        if let Some(role) = &chunk.role {
+            args.push(format!("js-chunk-role={}:{role}", chunk.name));
+        }
     }
-    if !config.chunks.is_empty() {
-        if let Some(shared) = &config.shared_chunk {
+    if let Some(shared) = &config.shared_chunk {
+        if !config.chunks.is_empty() || config.discover_chunks != DiscoverChunks::Off {
             args.push(format!("js-chunk-shared={shared}"));
         }
     }
 
     args
+}
+
+fn build_target_rustflags(
+    existing: Option<&str>,
+    build_fp: Option<&str>,
+    cfgs: &[String],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(existing) = existing.filter(|s| !s.trim().is_empty()) {
+        parts.push(existing.to_owned());
+    }
+    parts.push("--cfg mires --check-cfg=cfg(mires)".to_owned());
+    if let Some(fp) = build_fp {
+        parts.push(format!("--cfg mires_build_fp=\"{fp}\""));
+    }
+    for spec in cfgs {
+        parts.push(format!("--cfg {spec}"));
+        if let Some(expr) = check_cfg_expr(spec) {
+            parts.push(format!("--check-cfg={expr}"));
+        }
+    }
+    parts.join(" ")
 }
 
 fn run_cargo_rustc(
@@ -182,22 +291,23 @@ fn run_cargo_rustc(
     let wrapper_exe = env::current_exe()
         .map_err(|err| format!("failed to locate current `cargo-mires` executable: {err}"))?;
 
+    let cfgs_joined = ctx.config.cfgs.join("\n");
     let build_fp = fingerprint(&[
         &toolchain.dylib_sha256,
         &toolchain.sysroot_dir.to_string_lossy(),
         ctx.config.panic.as_str(),
         &emit_args.join("\n"),
+        &cfgs_joined,
     ]);
     let link_fp = fingerprint(&[&link_args.join("\n")]);
 
     let rustflags_env = target_rustflags_env_name(&toolchain.target_name);
-    let mut target_rustflags = env::var(&rustflags_env).unwrap_or_default();
-    if !target_rustflags.is_empty() {
-        target_rustflags.push(' ');
-    }
-    target_rustflags.push_str(&format!(
-        "--cfg mires --check-cfg=cfg(mires) --cfg mires_build_fp=\"{build_fp}\""
-    ));
+    let existing_rustflags = env::var(&rustflags_env).ok();
+    let target_rustflags = build_target_rustflags(
+        existing_rustflags.as_deref(),
+        Some(&build_fp),
+        &ctx.config.cfgs,
+    );
 
     let mut cmd = Command::new("cargo");
     cmd.arg(format!("+{}", toolchain.channel)).arg("rustc");
@@ -243,6 +353,7 @@ fn run_cargo_rustc(
         .env(wrapper::ENV_PANIC, ctx.config.panic.as_str())
         .env(wrapper::ENV_EMIT_ARGS, emit_args.join("\n"))
         .env(wrapper::ENV_LINK_ARGS, link_args.join("\n"))
+        .env(wrapper::ENV_CFGS, &cfgs_joined)
         .env(wrapper::ENV_JSC_LINK, &toolchain.jsc_link_path)
         .env(wrapper::ENV_RECORD_FILE, record_file)
         .env(wrapper::ENV_VERBOSE, if opts.verbose { "1" } else { "0" })
@@ -352,7 +463,7 @@ fn publish_artifacts(
     toolchain: &ToolchainInfo,
     artifact_path: &Path,
     recorded_raw: Option<&Path>,
-) -> Result<Vec<EmittedFile>, String> {
+) -> Result<PublishedArtifacts, String> {
     let out_dir = &ctx.config.out_dir;
     fs::create_dir_all(out_dir).map_err(|err| {
         format!(
@@ -398,11 +509,12 @@ fn publish_artifacts(
         .map_err(|err| format!("failed to write `{}`: {err}", out_js_path.display()))?;
 
     let mut emitted = vec![EmittedFile {
-        path: out_js_path,
+        path: out_js_path.clone(),
         relative_name: out_js_name.clone(),
         bytes: final_js_bytes.len() as u64,
     }];
 
+    let mut published_map: Option<PathBuf> = None;
     if ctx.config.source_map {
         if let Some(src_map) = find_sidecar(&raw_artifact, artifact_path, |p| append_ext(p, ".map"))
         {
@@ -418,13 +530,15 @@ fn publish_artifacts(
                 )
             })?;
             emitted.push(EmittedFile {
-                path: out_map_path,
+                path: out_map_path.clone(),
                 relative_name: out_map_name,
                 bytes: rewritten.len() as u64,
             });
+            published_map = Some(out_map_path);
         }
     }
 
+    let mut published_dts: Option<PathBuf> = None;
     let mut emitted_dts_name: Option<String> = None;
     if ctx.config.dts {
         if let Some(src_dts) =
@@ -436,66 +550,62 @@ fn publish_artifacts(
             fs::write(&out_dts_path, &bytes)
                 .map_err(|err| format!("failed to write `{}`: {err}", out_dts_path.display()))?;
             emitted.push(EmittedFile {
-                path: out_dts_path,
+                path: out_dts_path.clone(),
                 relative_name: out_dts_name.clone(),
                 bytes: bytes.len() as u64,
             });
+            published_dts = Some(out_dts_path);
             emitted_dts_name = Some(out_dts_name);
         }
     }
 
-    if !ctx.config.chunks.is_empty() {
-        publish_chunk_artifacts(&raw_artifact, artifact_path, out_dir, &mut emitted)?;
-    }
+    let manifest_src = find_artifact_manifest(&raw_artifact, artifact_path);
 
+    let mut runtime_file: Option<PathBuf> = None;
+    let mut runtime_rel_name: Option<String> = None;
     if ctx.config.runtime == RuntimeMode::External {
         if let Some(shim_rel) = external_shim_relative_path(&ctx.config) {
-            let manifest_path = find_artifact_manifest(&raw_artifact, artifact_path).ok_or_else(
-                || {
-                    format!(
-                        "external runtime requested, but no artifact manifest was found beside `{}`",
-                        raw_artifact.display()
-                    )
-                },
-            )?;
-            let manifest_dir = manifest_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let staged_shim_path = manifest_dir.join(&shim_rel);
-            emit_external_runtime(
+            let manifest_path = manifest_src.as_ref().ok_or_else(|| {
+                format!(
+                    "external runtime requested, but no artifact manifest was found beside `{}`",
+                    raw_artifact.display()
+                )
+            })?;
+            let out_shim_path = publish_external_runtime_shim(
                 &toolchain.jsc_link_path,
                 ctx.config.format,
-                &manifest_path,
-                &staged_shim_path,
+                manifest_path,
+                out_dir,
+                &shim_rel,
             )?;
-
-            let out_shim_path = out_dir.join(&shim_rel);
-            if let Some(parent) = out_shim_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("failed to create `{}`: {err}", parent.display()))?;
-            }
-            let same_dest = fs::canonicalize(&staged_shim_path).ok()
-                == fs::canonicalize(&out_shim_path).ok()
-                && out_shim_path.exists();
-            if !same_dest {
-                fs::copy(&staged_shim_path, &out_shim_path).map_err(|err| {
-                    format!(
-                        "failed to copy emitted runtime `{}` to `{}`: {err}",
-                        staged_shim_path.display(),
-                        out_shim_path.display()
-                    )
-                })?;
-            }
             let shim_bytes = fs::metadata(&out_shim_path).map(|m| m.len()).unwrap_or(0);
             emitted.push(EmittedFile {
-                path: out_shim_path,
-                relative_name: shim_rel,
+                path: out_shim_path.clone(),
+                relative_name: shim_rel.clone(),
                 bytes: shim_bytes,
             });
+            runtime_file = Some(out_shim_path);
+            runtime_rel_name = Some(shim_rel);
         }
     }
 
+    // Always inspect the linker artifact manifest when present (even when no explicit CLI/metadata
+    // chunks were configured) so auto-discovered `#[js_export(chunk = ...)]` outputs and the
+    // deployment manifest itself are published to `out_dir`.
+    let published_manifest = if let Some(ref src_manifest) = manifest_src {
+        publish_manifest_and_chunks(
+            src_manifest,
+            &raw_artifact,
+            stem,
+            out_dir,
+            runtime_rel_name.as_deref(),
+            &mut emitted,
+        )?
+    } else {
+        PublishedManifest::default()
+    };
+
+    let mut package_json: Option<PathBuf> = None;
     if ctx.config.npm {
         let rel_files: Vec<String> = emitted.iter().map(|f| f.relative_name.clone()).collect();
         let pkg_path = npm::write_package_json(
@@ -513,13 +623,59 @@ fn publish_artifacts(
         )?;
         let pkg_bytes = fs::metadata(&pkg_path).map(|m| m.len()).unwrap_or(0);
         emitted.push(EmittedFile {
-            path: pkg_path,
+            path: pkg_path.clone(),
             relative_name: "package.json".to_owned(),
             bytes: pkg_bytes,
         });
+        package_json = Some(pkg_path);
     }
 
-    Ok(emitted)
+    Ok(PublishedArtifacts {
+        emitted,
+        program: out_js_path,
+        source_map: published_map,
+        dts: published_dts,
+        runtime_file,
+        package_json,
+        manifest_path: published_manifest.manifest_path,
+        manifest: published_manifest.manifest,
+        chunks: published_manifest.chunks,
+    })
+}
+
+fn publish_external_runtime_shim(
+    jsc_link: &Path,
+    format: OutputFormat,
+    manifest_path: &Path,
+    out_dir: &Path,
+    shim_rel: &str,
+) -> Result<PathBuf, String> {
+    let manifest_dir = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged_shim_path = manifest_dir.join(shim_rel);
+    emit_external_runtime(jsc_link, format, manifest_path, &staged_shim_path)?;
+
+    let out_shim_path = out_dir.join(shim_rel);
+    if let Some(parent) = out_shim_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create `{}`: {err}", parent.display()))?;
+    }
+    if !same_existing_file(&staged_shim_path, &out_shim_path) {
+        fs::copy(&staged_shim_path, &out_shim_path).map_err(|err| {
+            format!(
+                "failed to copy emitted runtime `{}` to `{}`: {err}",
+                staged_shim_path.display(),
+                out_shim_path.display()
+            )
+        })?;
+    }
+    Ok(out_shim_path)
+}
+
+fn same_existing_file(a: &Path, b: &Path) -> bool {
+    b.exists() && fs::canonicalize(a).ok() == fs::canonicalize(b).ok()
 }
 
 fn emit_external_runtime(
@@ -560,21 +716,13 @@ fn emit_external_runtime(
     Ok(())
 }
 
+/// Returns the relative output path when `shim_module` refers to a local `./` file to emit.
+///
+/// Bare external specifiers (e.g. `topcoat-dom`, `solid-js/web`) return `None` so local shim
+/// emission is cleanly skipped.
 fn external_shim_relative_path(config: &ResolvedConfig) -> Option<String> {
-    match config.format {
-        OutputFormat::Esm => {
-            let rel = config.shim_module.strip_prefix("./")?;
-            (!rel.is_empty()).then(|| rel.to_owned())
-        }
-        OutputFormat::Script => {
-            let rel = config.shim_module.trim_start_matches("./");
-            if rel.is_empty() {
-                Some("shim.js".to_owned())
-            } else {
-                Some(rel.to_owned())
-            }
-        }
-    }
+    let rel = config.shim_module.strip_prefix("./")?;
+    (!rel.is_empty()).then(|| rel.to_owned())
 }
 
 /// Locate the actual output path `rustc` / `jsc-link` wrote (usually inside `deps/`),
@@ -693,24 +841,48 @@ fn find_artifact_manifest(raw: &Path, uplifted: &Path) -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
-fn publish_chunk_artifacts(
+#[derive(Default)]
+struct PublishedManifest {
+    manifest_path: Option<PathBuf>,
+    manifest: Option<serde_json::Value>,
+    chunks: Vec<JsonChunkInfo>,
+}
+
+fn publish_manifest_and_chunks(
+    manifest_src: &Path,
     raw_artifact: &Path,
-    uplifted: &Path,
+    stem: &str,
     out_dir: &Path,
+    runtime_rel_name: Option<&str>,
     emitted: &mut Vec<EmittedFile>,
-) -> Result<(), String> {
-    let Some(manifest_path) = find_artifact_manifest(raw_artifact, uplifted) else {
-        return Ok(());
-    };
-    let Some(src_dir) = manifest_path.parent() else {
-        return Ok(());
-    };
-    let raw_bytes = fs::read(&manifest_path)
-        .map_err(|err| format!("failed to read `{}`: {err}", manifest_path.display()))?;
+) -> Result<PublishedManifest, String> {
+    let raw_bytes = fs::read(manifest_src)
+        .map_err(|err| format!("failed to read `{}`: {err}", manifest_src.display()))?;
     let parsed: serde_json::Value = serde_json::from_slice(&raw_bytes)
-        .map_err(|err| format!("failed to parse `{}`: {err}", manifest_path.display()))?;
-    let Some(artifacts) = parsed.get("artifacts").and_then(|v| v.as_object()) else {
-        return Ok(());
+        .map_err(|err| format!("failed to parse `{}`: {err}", manifest_src.display()))?;
+
+    let out_manifest_name = format!("{stem}.artifacts.json");
+    let out_manifest_path = out_dir.join(&out_manifest_name);
+    if !same_existing_file(manifest_src, &out_manifest_path) {
+        fs::write(&out_manifest_path, &raw_bytes).map_err(|err| {
+            format!(
+                "failed to write manifest `{}`: {err}",
+                out_manifest_path.display()
+            )
+        })?;
+    }
+    emitted.push(EmittedFile {
+        path: out_manifest_path.clone(),
+        relative_name: out_manifest_name,
+        bytes: raw_bytes.len() as u64,
+    });
+
+    let Some(src_dir) = manifest_src.parent() else {
+        return Ok(PublishedManifest {
+            manifest_path: Some(out_manifest_path),
+            manifest: Some(parsed),
+            chunks: Vec::new(),
+        });
     };
 
     let raw_name = raw_artifact.file_name().and_then(|n| n.to_str());
@@ -721,33 +893,140 @@ fn publish_chunk_artifacts(
         .and_then(|n| n.to_str())
         .map(str::to_owned);
 
-    for name in artifacts.keys() {
-        if Some(name.as_str()) == raw_name
-            || raw_map_name.as_deref() == Some(name.as_str())
-            || raw_dts_name.as_deref() == Some(name.as_str())
-        {
-            continue;
+    let mut copied: BTreeSet<String> = emitted.iter().map(|f| f.relative_name.clone()).collect();
+
+    if let Some(artifacts) = parsed.get("artifacts").and_then(|v| v.as_object()) {
+        for (name, artifact_val) in artifacts {
+            if Some(name.as_str()) == raw_name
+                || raw_map_name.as_deref() == Some(name.as_str())
+                || raw_dts_name.as_deref() == Some(name.as_str())
+                || runtime_rel_name == Some(name.as_str())
+            {
+                continue;
+            }
+            copy_extra_artifact(src_dir, out_dir, name, &mut copied, emitted)?;
+
+            if let Some(map_name) = artifact_val.get("source_map").and_then(|v| v.as_str()) {
+                copy_extra_artifact(src_dir, out_dir, map_name, &mut copied, emitted)?;
+            }
+            if let Some(dts_name) = artifact_val.get("declarations").and_then(|v| v.as_str()) {
+                copy_extra_artifact(src_dir, out_dir, dts_name, &mut copied, emitted)?;
+            }
         }
-        let src = src_dir.join(name);
-        if !src.is_file() {
-            continue;
-        }
-        let dst = out_dir.join(name);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create `{}`: {err}", parent.display()))?;
-        }
-        let bytes =
-            fs::read(&src).map_err(|err| format!("failed to read `{}`: {err}", src.display()))?;
+    }
+
+    let chunks = extract_published_chunks(&parsed, raw_name, out_dir);
+    Ok(PublishedManifest {
+        manifest_path: Some(out_manifest_path),
+        manifest: Some(parsed),
+        chunks,
+    })
+}
+
+fn copy_extra_artifact(
+    src_dir: &Path,
+    out_dir: &Path,
+    rel_name: &str,
+    copied: &mut BTreeSet<String>,
+    emitted: &mut Vec<EmittedFile>,
+) -> Result<(), String> {
+    if !copied.insert(rel_name.to_owned()) {
+        return Ok(());
+    }
+    let src = src_dir.join(rel_name);
+    if !src.is_file() {
+        return Ok(());
+    }
+    let dst = out_dir.join(rel_name);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create `{}`: {err}", parent.display()))?;
+    }
+    let bytes =
+        fs::read(&src).map_err(|err| format!("failed to read `{}`: {err}", src.display()))?;
+    if !same_existing_file(&src, &dst) {
         fs::write(&dst, &bytes)
             .map_err(|err| format!("failed to write `{}`: {err}", dst.display()))?;
-        emitted.push(EmittedFile {
-            path: dst,
-            relative_name: name.clone(),
-            bytes: bytes.len() as u64,
+    }
+    emitted.push(EmittedFile {
+        path: dst,
+        relative_name: rel_name.to_owned(),
+        bytes: bytes.len() as u64,
+    });
+    Ok(())
+}
+
+fn extract_published_chunks(
+    manifest: &serde_json::Value,
+    raw_name: Option<&str>,
+    out_dir: &Path,
+) -> Vec<JsonChunkInfo> {
+    let Some(entries) = manifest.get("entries").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let artifacts = manifest.get("artifacts").and_then(|v| v.as_object());
+
+    let mut chunks = Vec::new();
+    for (name, entry_val) in entries {
+        let Some(prog_rel) = entry_val.get("program").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if raw_name == Some(prog_rel) {
+            continue;
+        }
+        let path = out_dir.join(prog_rel);
+        if !path.is_file() {
+            continue;
+        }
+        let role = entry_val
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main")
+            .to_owned();
+        let art = artifacts.and_then(|map| map.get(prog_rel));
+
+        let source_map = art
+            .and_then(|a| a.get("source_map"))
+            .and_then(|v| v.as_str())
+            .map(|rel| out_dir.join(rel))
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let candidate = append_ext(&path, ".map");
+                candidate.is_file().then_some(candidate)
+            });
+
+        let dts = art
+            .and_then(|a| a.get("declarations"))
+            .and_then(|v| v.as_str())
+            .map(|rel| out_dir.join(rel))
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let candidate = path.with_extension("d.ts");
+                candidate.is_file().then_some(candidate)
+            });
+
+        let (bytes, sha256) = match (
+            art.and_then(|a| a.get("bytes")).and_then(|v| v.as_u64()),
+            art.and_then(|a| a.get("sha256")).and_then(|v| v.as_str()),
+        ) {
+            (Some(b), Some(h)) => (b, h.to_owned()),
+            _ => match fs::read(&path) {
+                Ok(raw) => (raw.len() as u64, format!("{:x}", Sha256::digest(&raw))),
+                Err(_) => (0, String::new()),
+            },
+        };
+
+        chunks.push(JsonChunkInfo {
+            name: name.clone(),
+            role,
+            path,
+            source_map,
+            dts,
+            sha256,
+            bytes,
         });
     }
-    Ok(())
+    chunks
 }
 
 fn append_ext(path: &Path, suffix: &str) -> PathBuf {
@@ -958,6 +1237,239 @@ export function add(a, b) { return a + b; }
 
         let located = locate_raw_artifact(&uplifted, None, body);
         assert_eq!(located, bare_dep);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn sample_context(out_dir: PathBuf) -> PackageContext {
+        PackageContext {
+            workspace_root: PathBuf::from("/ws"),
+            target_directory: PathBuf::from("/ws/target"),
+            package: metadata::PackageInfo {
+                id: "demo 0.1.0".to_owned(),
+                name: "demo".to_owned(),
+                version: "0.1.0".to_owned(),
+                description: None,
+                license: None,
+                edition: "2021".to_owned(),
+                manifest_path: PathBuf::from("/ws/demo/Cargo.toml"),
+                manifest_dir: PathBuf::from("/ws/demo"),
+            },
+            target: SelectedTarget::Lib {
+                name: "demo".to_owned(),
+            },
+            config: ResolvedConfig {
+                profile: crate::cli::Profile::Dev,
+                cargo_release: false,
+                format: OutputFormat::Esm,
+                runtime: RuntimeMode::Inline,
+                dts: true,
+                source_map: true,
+                npm: false,
+                panic: PanicMode::Unwind,
+                out_dir,
+                shim_module: "./shim.mjs".to_owned(),
+                chunks: Vec::new(),
+                shared_chunk: None,
+                discover_chunks: DiscoverChunks::Auto,
+                cfgs: Vec::new(),
+                message_format: MessageFormat::Human,
+            },
+        }
+    }
+
+    #[test]
+    fn build_link_args_emits_discover_chunks_roles_shared_and_shim_module() {
+        let mut ctx = sample_context(PathBuf::from("/ws/dist"));
+        ctx.config.runtime = RuntimeMode::External;
+        ctx.config.shim_module = "topcoat-dom".to_owned();
+        ctx.config.discover_chunks = DiscoverChunks::On;
+        ctx.config.shared_chunk = Some("common".to_owned());
+        ctx.config.chunks = vec![
+            metadata::ChunkRequest {
+                name: "app".to_owned(),
+                entry: "boot".to_owned(),
+                role: Some("main".to_owned()),
+            },
+            metadata::ChunkRequest {
+                name: "counter".to_owned(),
+                entry: "__island_counter".to_owned(),
+                role: Some("island".to_owned()),
+            },
+        ];
+
+        let args = build_link_args(&ctx);
+        assert!(args.contains(&"js-discover-chunks=on".to_owned()));
+        assert!(args.contains(&"js-shim-module=topcoat-dom".to_owned()));
+        assert!(args.contains(&"js-chunk=app:boot".to_owned()));
+        assert!(args.contains(&"js-chunk-role=app:main".to_owned()));
+        assert!(args.contains(&"js-chunk=counter:__island_counter".to_owned()));
+        assert!(args.contains(&"js-chunk-role=counter:island".to_owned()));
+        assert!(args.contains(&"js-chunk-shared=common".to_owned()));
+    }
+
+    #[test]
+    fn target_rustflags_includes_custom_cfgs_and_check_cfgs() {
+        let flags = build_target_rustflags(
+            Some("-C opt-level=2"),
+            Some("deadbeef"),
+            &["topcoat_client".to_owned(), "mode=\"csr\"".to_owned()],
+        );
+        assert!(flags.starts_with("-C opt-level=2 "));
+        assert!(flags.contains("--cfg mires --check-cfg=cfg(mires)"));
+        assert!(flags.contains("--cfg mires_build_fp=\"deadbeef\""));
+        assert!(flags.contains("--cfg topcoat_client --check-cfg=cfg(topcoat_client)"));
+        assert!(flags.contains("--cfg mode=\"csr\" --check-cfg=cfg(mode,values(any()))"));
+    }
+
+    #[test]
+    fn bare_external_shim_specifier_skips_local_shim_emission() {
+        let mut ctx = sample_context(PathBuf::from("/ws/dist"));
+        ctx.config.runtime = RuntimeMode::External;
+        ctx.config.shim_module = "./runtime.mjs".to_owned();
+        assert_eq!(
+            external_shim_relative_path(&ctx.config).as_deref(),
+            Some("runtime.mjs")
+        );
+
+        ctx.config.shim_module = "topcoat-dom".to_owned();
+        assert_eq!(external_shim_relative_path(&ctx.config), None);
+
+        ctx.config.format = OutputFormat::Script;
+        ctx.config.shim_module = "solid-js/web".to_owned();
+        assert_eq!(external_shim_relative_path(&ctx.config), None);
+    }
+
+    #[test]
+    fn publishes_auto_discovered_chunks_and_manifest_with_bare_external_shim() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cargo-mires-publish-auto-{}-{nanos}",
+            std::process::id()
+        ));
+        let deps = root.join("deps");
+        let out_dir = root.join("dist");
+        fs::create_dir_all(&deps).unwrap();
+
+        let primary_js = b"export function main() {}\n//# sourceMappingURL=demo-1234.map\n";
+        let raw_artifact = deps.join("demo-1234");
+        let uplifted = root.join("demo.wasm");
+        fs::write(&raw_artifact, primary_js).unwrap();
+        fs::write(&uplifted, primary_js).unwrap();
+        fs::write(
+            deps.join("demo-1234.map"),
+            r#"{"version":3,"file":"demo-1234","sources":[],"mappings":""}"#,
+        )
+        .unwrap();
+        fs::write(
+            deps.join("demo-1234.d.ts"),
+            "export function main(): void;\n",
+        )
+        .unwrap();
+
+        let island_bytes = b"export function __island_counter() {}\n";
+        let shared_bytes = b"export const SHARED = 1;\n";
+        fs::write(deps.join("counter.js"), island_bytes).unwrap();
+        fs::write(deps.join("counter.js.map"), r#"{"version":3}"#).unwrap();
+        fs::write(
+            deps.join("counter.d.ts"),
+            "export function __island_counter(): void;\n",
+        )
+        .unwrap();
+        fs::write(deps.join("shared.js"), shared_bytes).unwrap();
+
+        let island_sha = format!("{:x}", Sha256::digest(island_bytes));
+        let shared_sha = format!("{:x}", Sha256::digest(shared_bytes));
+        let manifest_json = serde_json::json!({
+            "schema": 2,
+            "entries": {
+                "demo": { "role": "main", "program": "demo-1234", "roots": {} },
+                "counter": { "role": "island", "program": "counter.js", "roots": {} },
+                "shared": { "role": "shared", "program": "shared.js", "roots": {} }
+            },
+            "artifacts": {
+                "demo-1234": { "kind": "program", "bytes": primary_js.len(), "sha256": "0".repeat(64) },
+                "demo-1234.map": { "kind": "source-map", "bytes": 10, "sha256": "0".repeat(64) },
+                "demo-1234.d.ts": { "kind": "declarations", "bytes": 10, "sha256": "0".repeat(64) },
+                "counter.js": {
+                    "kind": "program",
+                    "bytes": island_bytes.len(),
+                    "sha256": island_sha,
+                    "source_map": "counter.js.map",
+                    "declarations": "counter.d.ts"
+                },
+                "counter.js.map": { "kind": "source-map", "bytes": 13, "sha256": "0".repeat(64) },
+                "counter.d.ts": { "kind": "declarations", "bytes": 41, "sha256": "0".repeat(64) },
+                "shared.js": {
+                    "kind": "program",
+                    "bytes": shared_bytes.len(),
+                    "sha256": shared_sha
+                }
+            }
+        });
+        fs::write(
+            deps.join("demo-1234.artifacts.json"),
+            serde_json::to_vec_pretty(&manifest_json).unwrap(),
+        )
+        .unwrap();
+
+        // No explicit chunks configured; runtime is External with bare specifier (`topcoat-dom`).
+        let mut ctx = sample_context(out_dir.clone());
+        ctx.config.runtime = RuntimeMode::External;
+        ctx.config.shim_module = "topcoat-dom".to_owned();
+        let toolchain = ToolchainInfo {
+            channel: "nightly".to_owned(),
+            dylib_path: PathBuf::new(),
+            dylib_sha256: String::new(),
+            jsc_link_path: PathBuf::from("/nonexistent/jsc-link"),
+            sysroot_dir: PathBuf::new(),
+            target_arg: "mires32-unwind".to_owned(),
+            target_name: "mires32-unwind".to_owned(),
+            is_json_target: false,
+        };
+
+        let published =
+            publish_artifacts(&ctx, &toolchain, &uplifted, Some(&raw_artifact)).unwrap();
+        assert_eq!(published.program, out_dir.join("demo.mjs"));
+        assert_eq!(published.source_map, Some(out_dir.join("demo.mjs.map")));
+        assert_eq!(published.dts, Some(out_dir.join("demo.d.mts")));
+        assert_eq!(published.runtime_file, None);
+        assert_eq!(
+            published.manifest_path,
+            Some(out_dir.join("demo.artifacts.json"))
+        );
+        assert!(out_dir.join("demo.artifacts.json").is_file());
+        assert!(out_dir.join("counter.js").is_file());
+        assert!(out_dir.join("counter.js.map").is_file());
+        assert!(out_dir.join("counter.d.ts").is_file());
+        assert!(out_dir.join("shared.js").is_file());
+
+        assert_eq!(
+            published.chunks,
+            vec![
+                JsonChunkInfo {
+                    name: "counter".to_owned(),
+                    role: "island".to_owned(),
+                    path: out_dir.join("counter.js"),
+                    source_map: Some(out_dir.join("counter.js.map")),
+                    dts: Some(out_dir.join("counter.d.ts")),
+                    sha256: island_sha,
+                    bytes: island_bytes.len() as u64,
+                },
+                JsonChunkInfo {
+                    name: "shared".to_owned(),
+                    role: "shared".to_owned(),
+                    path: out_dir.join("shared.js"),
+                    source_map: None,
+                    dts: None,
+                    sha256: shared_sha,
+                    bytes: shared_bytes.len() as u64,
+                },
+            ]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

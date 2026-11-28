@@ -170,6 +170,7 @@ set +e
 			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
 			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
 			--remap-path-prefix "$root/=" \
+			--cfg mires --check-cfg='cfg(mires)' \
 			${backend_args[@]+"${backend_args[@]}"} \
 			-o "$out" "$src"
 ) >/dev/null 2>"$stderr_file"

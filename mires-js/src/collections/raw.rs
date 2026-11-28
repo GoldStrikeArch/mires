@@ -36,13 +36,13 @@ pub(crate) struct RawMap {
 
 /// `new Map()`.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.new"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.new"))]
 #[inline(never)]
 pub(crate) fn map_new() -> RawMap {
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
@@ -50,13 +50,13 @@ pub(crate) fn map_new() -> RawMap {
 
 /// `map.size`.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.len"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.len"))]
 #[inline(never)]
 pub(crate) fn map_len(map: RawMap) -> usize {
     let _ = map;
@@ -65,13 +65,13 @@ pub(crate) fn map_len(map: RawMap) -> usize {
 
 /// `map.clear()`.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.clear"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.clear"))]
 #[inline(never)]
 pub(crate) fn map_clear(map: RawMap) {
     let _ = map;
@@ -85,13 +85,13 @@ pub(crate) fn map_clear(map: RawMap) {
 /// is a `{ buf, off }` slot the backend reads through. Taking a key by value would leave the
 /// string class with nothing to pass.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.has"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.has"))]
 #[inline(never)]
 pub(crate) fn map_has<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
     let _ = (map, key);
@@ -100,13 +100,13 @@ pub(crate) fn map_has<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
 
 /// `map.set(key, value)`.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.set"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.set"))]
 #[inline(never)]
 pub(crate) fn map_set<Q: ?Sized, V>(map: RawMap, key: &Q, value: V) {
     let _ = (map, key, value);
@@ -115,13 +115,13 @@ pub(crate) fn map_set<Q: ?Sized, V>(map: RawMap, key: &Q, value: V) {
 
 /// `map.delete(key)`, answering whether the key was present.
 #[cfg_attr(
-    target_arch = "wasm32",
+    mires,
     allow(
         unsafe_code,
         reason = "host Map marker link_section lowered by rustc_codegen_js"
     )
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.del"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.del"))]
 #[inline(never)]
 pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
     let _ = (map, key);
@@ -139,7 +139,7 @@ pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
     unsafe_code,
     reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.try_get"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.try_get"))]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a V> {
     let _ = (map, key);
@@ -158,7 +158,7 @@ pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Opti
     unsafe_code,
     reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.try_getmut"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.try_getmut"))]
 #[inline(never)]
 pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a mut V> {
     let _ = (map, key);
@@ -181,7 +181,7 @@ pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> 
     unsafe_code,
     reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.keys"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.keys"))]
 #[inline(never)]
 pub(crate) unsafe fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
     let _ = map;
@@ -199,7 +199,7 @@ pub(crate) unsafe fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
     unsafe_code,
     reason = "declares unsafe host JS Map FFI marker whose contract is enforced by safe wrappers"
 )]
-#[cfg_attr(target_arch = "wasm32", unsafe(link_section = "rcgjs.map.values"))]
+#[cfg_attr(mires, unsafe(link_section = "rcgjs.map.values"))]
 #[inline(never)]
 pub(crate) unsafe fn map_values<'a, V>(map: RawMap) -> &'a [&'a V] {
     let _ = map;

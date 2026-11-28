@@ -22,20 +22,66 @@
 //! "Host collections".
 
 #![no_std]
-#![feature(local_waker)]
 
 extern crate alloc;
 
 /// One transparent word representing an opaque host-managed JavaScript value.
 ///
-/// Every handle wrapper in this crate is `#[repr(transparent)]` over `HostHandle`. The backend
-/// peels transparent layers down to the inner `u32` (never read by Rust code) while keeping each
-/// outer type's `PinnedBoundary::Host` identity.
+/// Every handle wrapper in this crate — and every framework handle annotated with [`js_opaque`] —
+/// is `#[repr(transparent)]` over `HostHandle`. The backend peels transparent layers down to the
+/// inner `u32` (never constructed or read directly by user Rust code) while keeping each outer
+/// type's host-handle identity.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub(crate) struct HostHandle(
+pub struct HostHandle(
     #[allow(dead_code, reason = "opaque host-side handle populated by JS lowering")] u32,
 );
+
+impl HostHandle {
+    /// Erases this opaque host handle to a [`JsValue`].
+    #[must_use]
+    pub fn as_value(self) -> JsValue {
+        #[cfg(mires)]
+        {
+            JsValue::erase(self)
+        }
+        #[cfg(not(mires))]
+        {
+            JsValue::from_handle(self)
+        }
+    }
+
+    /// Consumes this opaque host handle and returns it as a [`JsValue`].
+    #[must_use]
+    pub fn into_value(self) -> JsValue {
+        self.as_value()
+    }
+
+    /// Wraps a [`JsValue`] as an opaque [`HostHandle`] without performing runtime type checks.
+    #[must_use]
+    pub fn from_value(value: JsValue) -> Self {
+        #[cfg(mires)]
+        {
+            value.read()
+        }
+        #[cfg(not(mires))]
+        {
+            value.into_handle()
+        }
+    }
+}
+
+impl From<HostHandle> for JsValue {
+    fn from(handle: HostHandle) -> Self {
+        handle.as_value()
+    }
+}
+
+impl From<JsValue> for HostHandle {
+    fn from(value: JsValue) -> Self {
+        Self::from_value(value)
+    }
+}
 
 #[cfg(test)]
 impl HostHandle {
@@ -52,7 +98,7 @@ pub mod class_handle;
 pub mod collections;
 pub mod web;
 
-pub use js_extern_macro::{js_bindings, js_export, js_extern};
+pub use js_extern_macro::{js_bindings, js_export, js_extern, js_opaque};
 
 mod executor;
 mod host;
@@ -67,7 +113,7 @@ pub use map_entries::{JsBTreeMapEntries, JsMapEntries};
 pub use promise::*;
 pub use web::*;
 
-/// Internal runtime support items referenced by `#[js_export]` macro expansions.
+/// Internal runtime support items referenced by `#[js_export]` and `#[js_opaque]` macro expansions.
 #[doc(hidden)]
 pub mod __export {
     pub use alloc::string::String;
@@ -76,6 +122,7 @@ pub mod __export {
     pub use crate::host::JsValue;
     pub use crate::map_entries::{JsBTreeMapEntries, JsMapEntries};
     pub use crate::promise::TypedPromise;
+    pub use crate::HostHandle;
 }
 
 #[cfg(test)]
@@ -127,5 +174,42 @@ mod export_crate_override_tests {
         assert_eq!(acc.finish(), 7);
 
         let _async_fn = ping_from_mires_js("ok");
+    }
+
+    #[crate::js_opaque(crate = crate)]
+    #[derive(Clone, Copy)]
+    struct OpaqueNode(crate::HostHandle);
+
+    #[crate::js_opaque(ts = "Signal<T>", crate = crate)]
+    struct OpaqueSignal<T>(crate::HostHandle, core::marker::PhantomData<T>);
+
+    #[test]
+    fn host_handle_and_js_opaque_round_trip_on_host() {
+        let handle = crate::HostHandle::from_raw(77);
+        let value = handle.as_value();
+        assert_eq!(value.raw(), 77);
+        assert_eq!(handle.into_value().raw(), 77);
+        assert_eq!(crate::HostHandle::from_value(value).raw(), 77);
+        assert_eq!(crate::HostHandle::from(value).raw(), 77);
+        assert_eq!(crate::JsValue::from(handle).raw(), 77);
+
+        let node = OpaqueNode::from_value_unchecked(value);
+        assert_eq!(OpaqueNode::__MIRES_TS_TYPE, "");
+        assert_eq!(node.as_value().raw(), 77);
+        assert_eq!(crate::JsValue::from(node).raw(), 77);
+
+        let signal = OpaqueSignal::<u64>::from_value_unchecked(value);
+        assert_eq!(OpaqueSignal::<u64>::__MIRES_TS_TYPE, "Signal<T>");
+        assert_eq!(signal.as_value().raw(), 77);
+
+        fn check_callback_inference() {
+            let _ = crate::callback(|| {});
+            let _ = crate::callback(|x: i32| x + 1);
+            let _ = crate::callback(|ev: crate::JsValue| {
+                let _ = ev;
+            });
+            let _ = crate::callback(|a: f64, b: f64| a + b);
+        }
+        let _keep: fn() = check_callback_inference;
     }
 }

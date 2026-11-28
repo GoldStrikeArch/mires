@@ -43,6 +43,7 @@ use syn::{
 };
 
 mod export;
+mod opaque;
 
 /// Declares the JavaScript interface a foreign block describes. See the crate docs.
 #[proc_macro_attribute]
@@ -82,18 +83,37 @@ pub fn js_bindings(input: TokenStream) -> TokenStream {
 /// - `#[js_export]` — exports under the Rust item's name with JS boundary marshaling.
 /// - `#[js_export(name = "parseMarkdown")]` — exports under `"parseMarkdown"` with JS boundary
 ///   marshaling.
-/// - `#[js_export(raw)]` — exports a synchronous function under its Rust name using the raw
-///   internal ABI without boundary marshaling.
-/// - `#[js_export(name = "foo", raw)]` or `#[js_export(raw, name = "foo")]` — exports under
-///   `"foo"` using the raw internal ABI.
+/// - `#[js_export(rename_all = "camelCase")]` — converts snake_case function or `impl` method
+///   names to camelCase (`new` remains the constructor; method-level `name = ".."` overrides).
+/// - `#[js_export(chunk = "counter")]` / `#[js_export(chunk = "counter", role = "island")]` —
+///   declares an attribute-discovered code-split chunk (`role` is `"main"`, `"island"`, `"worker"`,
+///   or `"procedure"`, defaulting to `"main"`).
+/// - `#[js_export(raw)]` — exports a synchronous function using the raw internal ABI without
+///   boundary marshaling (combinable with `name = ".."` and `chunk = ".."` / `role = ".."`).
+/// - `#[js_export(skip)]` — skips exporting a `pub fn` method inside a `#[js_export] impl` block.
 /// - `#[js_export(crate = mires_js)]` — overrides the support crate path (defaults to `::mires`).
 ///
-/// On native host targets (`not(target_arch = "wasm32")`), no symbol-export or `link_section`
-/// attributes are emitted so exported items can be tested normally with `cargo test` without
-/// symbol collisions.
+/// On native host targets (`not(mires)`), no symbol-export or `link_section` attributes are
+/// emitted so exported items can be tested normally with `cargo test` without symbol collisions.
 #[proc_macro_attribute]
 pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     match export::expand_export(attr.into(), item.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Declares a framework-extensible opaque JavaScript host handle wrapper over `HostHandle`.
+///
+/// Supported attribute forms:
+///
+/// - `#[js_opaque]` — emits a distinct branded opaque TypeScript type (`__MIRES_TS_TYPE = ""`).
+/// - `#[js_opaque(ts = "JSX.Element")]` — maps the handle to the given TypeScript type spelling.
+/// - `#[js_opaque(ts = "Signal<T>", crate = mires_js)]` — overrides the support crate path
+///   (defaults to `::mires`).
+#[proc_macro_attribute]
+pub fn js_opaque(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match opaque::expand_opaque(attr.into(), item.into()) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -655,6 +675,11 @@ impl<'a> ParsedDecl<'a> {
 }
 
 /// Emits the placeholder marker function carrying `descriptor` in its `link_section`.
+///
+/// Places the marker inside a private module carrying `#[allow(unexpected_cfgs, ...)]` and
+/// re-exports it under the caller's exact visibility. Enclosing `#[allow(unexpected_cfgs)]`
+/// suppresses `unexpected_cfgs` on `#[cfg_attr(mires, ...)]` under Cargo's `--check-cfg` in
+/// external crates without adding any wrapper function to MIR.
 fn emit_marker(
     kept_attrs: &[&Attribute],
     visibility: &Visibility,
@@ -663,20 +688,48 @@ fn emit_marker(
 ) -> proc_macro2::TokenStream {
     let section = descriptor.encode();
     let ident = &signature.ident;
+    let mod_ident = quote::format_ident!("__mires_binding_{ident}");
     let unreachable =
         format!("mires JS binding '{ident}' is only available on the mires JS target");
+    let inner_vis = match visibility {
+        Visibility::Inherited => quote! { pub(super) },
+        Visibility::Public(_) => quote! { pub },
+        Visibility::Restricted(res) if res.path.is_ident("self") => quote! { pub(super) },
+        Visibility::Restricted(res) if res.path.is_ident("crate") => quote! { pub(crate) },
+        Visibility::Restricted(_) => quote! { pub },
+    };
+    let use_allow = if matches!(visibility, Visibility::Inherited) {
+        quote! { #[allow(unused_imports, reason = "re-exports marker binding into declaring scope")] }
+    } else {
+        quote! {}
+    };
     quote! {
-        #(#kept_attrs)*
-        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = #section))]
-        #[inline(never)]
-        // The body names none of the parameters and never can: it is a placeholder for an
-        // emission, and the signature is the declaration's own.
-        #[allow(unused_variables)]
-        #visibility #signature {
-            // Never runs: the backend replaces every call by its `link_section`. Reaching this
-            // body means the crate was compiled by a backend that does not know the declaration.
-            ::core::unreachable!(#unreachable)
+        #[allow(
+            unexpected_cfgs,
+            non_snake_case,
+            reason = "mires target cfg is supplied by cargo-mires and binding preserves JS identifier"
+        )]
+        mod #mod_ident {
+            #[allow(unused_imports, reason = "brings declaring scope types into marker module")]
+            use super::*;
+
+            #(#kept_attrs)*
+            #[cfg_attr(mires, unsafe(link_section = #section))]
+            #[inline(never)]
+            // The body names none of the parameters and never can: it is a placeholder for an
+            // emission, and the signature is the declaration's own.
+            #[allow(
+                unused_variables,
+                reason = "marker body is a placeholder lowered by rustc_codegen_js"
+            )]
+            #inner_vis #signature {
+                // Never runs: the backend replaces every call by its `link_section`. Reaching this
+                // body means the crate was compiled by a backend that does not know the declaration.
+                ::core::unreachable!(#unreachable)
+            }
         }
+        #use_allow
+        #visibility use #mod_ident::#ident;
     }
 }
 
@@ -909,23 +962,22 @@ mod tests {
     }
 
     #[test]
-    fn js_export_default_emits_no_mangle_and_marshal_section() {
+    fn js_export_default_emits_export_name_and_marshal_section() {
         let attr = proc_macro2::TokenStream::new();
         let item: proc_macro2::TokenStream = "pub fn add(a: i32, b: i32) -> i32 { a + b }"
             .parse()
             .unwrap();
         let expanded = expand_export(attr, item).unwrap().to_string();
+        assert!(expanded.contains("allow (unexpected_cfgs"), "{expanded}");
+        assert!(expanded.contains("# [cfg (mires)]"), "{expanded}");
         assert!(
-            expanded.contains(r#"cfg_attr (target_arch = "wasm32" , unsafe (no_mangle))"#),
+            expanded.contains(r#"unsafe (export_name = "add")"#),
             "{expanded}"
         );
         assert!(
-            expanded.contains(
-                r#"cfg_attr (target_arch = "wasm32" , unsafe (link_section = "rcgjs.export.v1"))"#
-            ),
+            expanded.contains(r#"unsafe (link_section = "rcgjs.export.v1")"#),
             "{expanded}"
         );
-        assert!(!expanded.contains("export_name"), "{expanded}");
         assert!(expanded.contains("pub fn add"), "{expanded}");
     }
 
@@ -937,15 +989,11 @@ mod tests {
             let item: proc_macro2::TokenStream = "pub fn parse() {}".parse().unwrap();
             let expanded = expand_export(attr, item).unwrap().to_string();
             assert!(
-                expanded.contains(&format!(
-                    r#"cfg_attr (target_arch = "wasm32" , unsafe (export_name = "{valid_name}"))"#
-                )),
+                expanded.contains(&format!(r#"unsafe (export_name = "{valid_name}")"#)),
                 "{expanded}"
             );
             assert!(
-                expanded.contains(
-                    r#"cfg_attr (target_arch = "wasm32" , unsafe (link_section = "rcgjs.export.v1"))"#
-                ),
+                expanded.contains(r#"unsafe (link_section = "rcgjs.export.v1")"#),
                 "{expanded}"
             );
             assert!(!expanded.contains("no_mangle"), "{expanded}");
@@ -958,7 +1006,7 @@ mod tests {
         let item: proc_macro2::TokenStream = "pub fn fast_entry() {}".parse().unwrap();
         let expanded = expand_export(attr, item).unwrap().to_string();
         assert!(
-            expanded.contains(r#"cfg_attr (target_arch = "wasm32" , unsafe (no_mangle))"#),
+            expanded.contains(r#"unsafe (export_name = "fast_entry")"#),
             "{expanded}"
         );
         assert!(!expanded.contains("rcgjs.export.v1"), "{expanded}");
@@ -976,9 +1024,7 @@ mod tests {
             let item: proc_macro2::TokenStream = "pub fn f() {}".parse().unwrap();
             let expanded = expand_export(attr, item).unwrap().to_string();
             assert!(
-                expanded.contains(
-                    r#"cfg_attr (target_arch = "wasm32" , unsafe (export_name = "foo"))"#
-                ),
+                expanded.contains(r#"unsafe (export_name = "foo")"#),
                 "`{attr_src}` -> {expanded}"
             );
             assert!(
@@ -1257,8 +1303,11 @@ mod tests {
         );
         assert!(text.contains("doc"), "{text}");
         assert!(text.contains("inline (never)"), "{text}");
-        assert!(text.contains("target_arch = \"wasm32\""), "{text}");
-        assert!(text.contains("unsafe (link_section"), "{text}");
+        assert!(text.contains("allow (unexpected_cfgs"), "{text}");
+        assert!(
+            text.contains("cfg_attr (mires , unsafe (link_section"),
+            "{text}"
+        );
         assert!(text.contains(":: core :: unreachable !"), "{text}");
         assert!(
             text.contains("mires JS binding 'Chart' is only available on the mires JS target"),

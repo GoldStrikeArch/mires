@@ -5,6 +5,6 @@
 //! ```
 
 pub use crate::{
-    js, js_bindings, js_export, js_extern, JsArray, JsError, JsString, JsValue, Promise,
-    TypedPromise,
+    callback, js, js_bindings, js_export, js_extern, js_opaque, JsArray, JsError, JsString,
+    JsValue, Promise, TypedPromise,
 };

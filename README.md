@@ -37,10 +37,13 @@ For `build.rs` integration, `mires-build` stays slim by default and delegates to
 
 ## Ergonomic Workflow (`cargo mires`, `mires-std`, Zero-Macro `#[js_export]`)
 
-Compile ordinary Rust crates — using `std` (`std::collections::HashMap`, `Vec`, `String`, `Result`) with no `#![no_std]`, no `extern crate alloc`, no `#[panic_handler]`, and no serialization derives — directly into self-contained ES modules, TypeScript `.d.ts` declarations, source maps, and npm packages:
+Compile ordinary Rust crates — using `std` (`std::collections::HashMap`, `Vec`, `String`, `Result`) with no `#![no_std]`, no `extern crate alloc`, no `#[panic_handler]`, and no serialization derives — directly into self-contained ES modules, code-split islands, TypeScript `.d.ts` declarations, source maps, and npm packages:
 
 ```rust
-use mires::js_export;
+use mires::{js_export, js_opaque};
+
+#[js_opaque(ts = "HTMLElement")]
+pub struct DomElement(mires_js::JsValue);
 
 pub struct RenderOptions { pub heading_ids: Option<bool>, pub strict: Option<bool> }
 pub struct RenderOutput { pub html: String, pub headings: Vec<String>, pub word_count: u32 }
@@ -53,26 +56,58 @@ pub fn render_markdown(input: &str, options: Option<RenderOptions>) -> Result<Re
     // Ordinary `std` code; structs, enums, Vec, String, Option, and Result marshal automatically.
     Ok(RenderOutput { html: format!("<p>{}</p>\n", input.trim()), headings: vec![], word_count: 1 })
 }
+
+#[js_export(chunk = "counter", role = "island")]
+pub fn mount_counter(root: DomElement, initial: i32) {
+    // Auto-discovered by `jsc-link` into its own `counter.js` island chunk + `.artifacts.json`.
+    let _ = (root, initial);
+}
 ```
 
 Build and publish with `cargo-mires` (defaults: ESM, self-contained inline runtime, `.d.ts`, and `.mjs.map`):
 
 ```sh
-# Standalone Rust -> npm/TypeScript package (emits .mjs, .d.ts, .mjs.map, package.json)
+# Standalone Rust -> npm/TypeScript package (emits .mjs, .d.mts, .mjs.map, package.json)
 cargo mires build --manifest-path examples/npm-markdown/Cargo.toml --release --npm
 
 # Multi-crate workspace sharing domain types between native server & JS client
 cargo mires build --manifest-path examples/fullstack-workspace/Cargo.toml -p client --release
+
+# Machine-readable build output for frameworks & build scripts (includes chunks, manifest, dep_files)
+cargo mires build -p client --cfg my_client --message-format=json
 ```
 
-Or compile a workspace client crate automatically from a native server's `build.rs`:
+### Embedding & Fullstack Frameworks (`mires-build` + `cfg(mires)`)
+
+Compile a workspace client crate automatically from a native server's `build.rs` — or compile the **current** crate to JavaScript in single-crate fullstack apps by gating `build.rs` with `mires_build::is_target_build()` and gating client-only Rust code with `#[cfg(mires)]`:
 
 ```rust
-mires_build::Crate::new("../client")
-    .release()
-    .build()
-    .expect("compile client crate to JS");
+// build.rs (runs on stable Rust)
+fn main() {
+    // Prevent recursion when cargo-mires compiles the current crate for JS (`cfg(mires)`).
+    if mires_build::is_target_build() {
+        return;
+    }
+
+    mires_build::Crate::new("../client")
+        .release()
+        .cfg("my_client")
+        .emit_rust_module("client_assets.rs")
+        .build()
+        .expect("compile client crate to JS");
+}
 ```
+
+In your server crate, include the generated zero-dependency assets module (`ENTRY_NAME`, `ENTRY_JS`, `ENTRY_SHA256`, `SOURCE_MAP`, `CHUNKS`, `FILES`, `MANIFEST_JSON`):
+
+```rust
+#[cfg(not(mires))]
+mod client_assets {
+    include!(concat!(env!("OUT_DIR"), "/client_assets.rs"));
+}
+```
+
+For single-crate apps where server and client live in the same package, replace `Crate::new("../client")` with `mires_build::Crate::current()`. `mires-build` invokes `cargo-mires build --message-format=json`, automatically emits `cargo::rustc-check-cfg=cfg(mires)` (plus any custom `.cfg(...)`), and watches every transitive workspace/path dependency via `cargo:rerun-if-changed`.
 
 See the complete runnable examples:
 - [`examples/fullstack-workspace/`](examples/fullstack-workspace/) — 3-crate Cargo workspace (`shared`, `client`, `server`) sharing plain Rust domain types and `std::collections::HashMap` logic across native Rust and compiled ES modules.
@@ -232,6 +267,8 @@ Running the Node command prints `Hello from Rust 30`.
 Run `node scripts/mires.mjs --help` for profile and dependency flags (`--profile`, `--extern`, `--search`, `--skip-build`).
 
 ### Using `mires-build` from a stable Cargo crate
+
+For Cargo packages with their own `Cargo.toml`, use the default zero-heavy-dependency `mires_build::Crate` builder (shown above). For standalone single-file `.rs` compilation (optional `features = ["single-file"]`), run:
 
 ```sh
 cargo +stable run --manifest-path examples/standalone-consumer/Cargo.toml

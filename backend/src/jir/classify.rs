@@ -910,10 +910,10 @@ pub(crate) fn type_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMeta {
             } else {
                 NominalAbi::Rust
             };
-            let crate_name = tcx.crate_name(did.krate);
-            let boundary = match crate_name.as_str() {
-                "mires_js" => PinnedBoundary::Host,
-                _ => PinnedBoundary::None,
+            let boundary = if is_host_boundary_ty(tcx, ty) {
+                PinnedBoundary::Host
+            } else {
+                PinnedBoundary::None
             };
             let alloc_arg = match candidate {
                 RepresentationCandidate::BTreeMap => 2,
@@ -939,6 +939,55 @@ pub(crate) fn type_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMeta {
         allocator,
         iterator: iterator_identity(tcx, ty),
     }
+}
+
+/// Whether `ty` is a host-boundary type: either any ADT defined in `mires_js` or any
+/// `#[repr(transparent)]` struct from any crate whose single non-ZST field recursively resolves
+/// (through transparent single-field structs) to a host-boundary type.
+fn is_host_boundary_ty<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> bool {
+    let mut visited = rustc_data_structures::fx::FxHashSet::default();
+    for _ in 0..32 {
+        let peeled = crate::value::peel_pattern(ty);
+        if !visited.insert(peeled) {
+            return false;
+        }
+        let ty::Adt(definition, arguments) = peeled.kind() else {
+            return false;
+        };
+        if tcx.crate_name(definition.did().krate).as_str() == "mires_js" {
+            return true;
+        }
+        if !definition.is_struct() || !definition.repr().transparent() {
+            return false;
+        }
+        let Some(inner) = single_non_zst_field_ty(tcx, *definition, arguments) else {
+            return false;
+        };
+        ty = inner;
+    }
+    false
+}
+
+/// The sole non-ZST field type of struct `definition`, or `None` if it has zero or multiple
+/// non-ZST fields.
+fn single_non_zst_field_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    definition: ty::AdtDef<'tcx>,
+    arguments: ty::GenericArgsRef<'tcx>,
+) -> Option<Ty<'tcx>> {
+    let mut live = definition
+        .non_enum_variant()
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, arguments));
+            (!crate::value::is_zst(tcx, field_ty)).then_some(field_ty)
+        });
+    let field = live.next()?;
+    if live.next().is_some() {
+        return None;
+    }
+    Some(field)
 }
 
 fn allocator_matches_global<'tcx>(

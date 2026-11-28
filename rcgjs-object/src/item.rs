@@ -54,8 +54,8 @@ pub use crate::jir::semantic::Body;
 pub use crate::jir::summary::{Availability, ItemSummary, SemanticKey};
 pub use crate::jir::Decline;
 pub use crate::object::{
-    Header, ItemInput, ItemKind, ItemMap, Linkage, Object, ObjectError, SourceOrder, Writer,
-    FORMAT_VERSION,
+    ChunkTarget, Header, ItemInput, ItemKind, ItemMap, Linkage, Object, ObjectError, SourceOrder,
+    Writer, FORMAT_VERSION,
 };
 
 /// The allocator implementation selected for a final linked artifact.

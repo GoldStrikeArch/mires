@@ -254,6 +254,7 @@ set +e
 			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
 			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
 			${remap_args[@]+"${remap_args[@]}"} \
+			--cfg mires --check-cfg='cfg(mires)' \
 			${externs[@]+"${externs[@]}"} \
 			${cfgs[@]+"${cfgs[@]}"} \
 			${searches[@]+"${searches[@]}"} \

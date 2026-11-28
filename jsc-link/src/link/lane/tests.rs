@@ -85,7 +85,7 @@ fn an_item_without_a_body_is_never_offered() {
     let one = item("one$h1", &[]);
     table.insert(one.name.clone(), one);
     let reachable = vec![JsName::new("one$h1".to_owned())];
-    let run = run(&dcx, &mut table, &reachable);
+    let run = run(&dcx, &mut table, &reachable, crate::opts::get());
     assert_eq!(run.fallback_count(), 0);
     assert!(run.outcome(&JsName::new("one$h1".to_owned())).is_none());
     assert_eq!(dcx.errors(), 0);
@@ -356,6 +356,7 @@ fn a_lowering_without_a_signature_keeps_the_baseline_one() {
         ret: "number".to_owned(),
         types: Vec::new(),
         rust: "fn one(a: u32) -> u32".to_owned(),
+        doc: None,
     });
     apply(
         &dcx,

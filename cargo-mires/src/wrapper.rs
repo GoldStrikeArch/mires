@@ -27,6 +27,7 @@ pub const ENV_PRODUCER: &str = "MIRES_WRAPPER_PRODUCER";
 pub const ENV_PANIC: &str = "MIRES_WRAPPER_PANIC";
 pub const ENV_EMIT_ARGS: &str = "MIRES_WRAPPER_EMIT_ARGS";
 pub const ENV_LINK_ARGS: &str = "MIRES_WRAPPER_LINK_ARGS";
+pub const ENV_CFGS: &str = "MIRES_WRAPPER_CFGS";
 pub const ENV_JSC_LINK: &str = "MIRES_WRAPPER_JSC_LINK";
 pub const ENV_RECORD_FILE: &str = "MIRES_WRAPPER_RECORD";
 pub const ENV_VERBOSE: &str = "MIRES_WRAPPER_VERBOSE";
@@ -65,6 +66,7 @@ pub struct WrapperConfig {
     pub panic: PanicMode,
     pub emit_args: Vec<String>,
     pub link_args: Vec<String>,
+    pub cfgs: Vec<String>,
     pub jsc_link: PathBuf,
     pub record_file: Option<PathBuf>,
     pub verbose: bool,
@@ -209,6 +211,7 @@ impl WrapperConfig {
 
         let emit_args = parse_lines_env(ENV_EMIT_ARGS);
         let link_args = parse_lines_env(ENV_LINK_ARGS);
+        let cfgs = parse_lines_env(ENV_CFGS);
         let record_file = env::var_os(ENV_RECORD_FILE).map(PathBuf::from);
         let verbose = env::var(ENV_VERBOSE).as_deref() == Ok("1");
 
@@ -223,6 +226,7 @@ impl WrapperConfig {
             panic,
             emit_args,
             link_args,
+            cfgs,
             jsc_link,
             record_file,
             verbose,
@@ -284,9 +288,17 @@ pub fn rewrite_args(args: &[String], cfg: &WrapperConfig) -> RewrittenInvocation
                 if cfg.is_json_target && !has_unstable_options(&out) {
                     out.push("-Zunstable-options".to_owned());
                 }
-                if prints_cfg && !has_cfg_mires(&out) {
-                    out.push("--cfg".to_owned());
-                    out.push("mires".to_owned());
+                if prints_cfg {
+                    if !has_cfg(&out, "mires") {
+                        out.push("--cfg".to_owned());
+                        out.push("mires".to_owned());
+                    }
+                    for spec in &cfg.cfgs {
+                        if !has_cfg(&out, spec) {
+                            out.push("--cfg".to_owned());
+                            out.push(spec.clone());
+                        }
+                    }
                 }
             }
             RewrittenInvocation {
@@ -316,13 +328,7 @@ fn rewrite_check_target(
     }
     out.push(format!("--sysroot={}", cfg.sysroot.display()));
     out.push(format!("-Cpanic={}", cfg.panic.as_str()));
-    if !has_cfg_mires(&out) {
-        out.push("--cfg".to_owned());
-        out.push("mires".to_owned());
-    }
-    if !has_check_cfg_mires(&out) {
-        out.push("--check-cfg=cfg(mires)".to_owned());
-    }
+    inject_cfgs(&mut out, &cfg.cfgs);
     RewrittenInvocation {
         kind,
         args: out,
@@ -355,13 +361,7 @@ fn rewrite_build_target(
     out.push("-Cdebug-assertions=off".to_owned());
     out.push("-Cdebuginfo=0".to_owned());
 
-    if !has_cfg_mires(&out) {
-        out.push("--cfg".to_owned());
-        out.push("mires".to_owned());
-    }
-    if !has_check_cfg_mires(&out) {
-        out.push("--check-cfg=cfg(mires)".to_owned());
-    }
+    inject_cfgs(&mut out, &cfg.cfgs);
 
     out.push(format!("-Cllvm-args=js-producer={}", cfg.producer));
     for emit_arg in &cfg.emit_args {
@@ -846,14 +846,36 @@ fn has_unstable_options(args: &[String]) -> bool {
     false
 }
 
-fn has_cfg_mires(args: &[String]) -> bool {
+fn inject_cfgs(out: &mut Vec<String>, cfgs: &[String]) {
+    if !has_cfg(out, "mires") {
+        out.push("--cfg".to_owned());
+        out.push("mires".to_owned());
+    }
+    if !has_check_cfg(out, "cfg(mires)") {
+        out.push("--check-cfg=cfg(mires)".to_owned());
+    }
+    for spec in cfgs {
+        if !has_cfg(out, spec) {
+            out.push("--cfg".to_owned());
+            out.push(spec.clone());
+        }
+        if let Some(expr) = crate::cli::check_cfg_expr(spec) {
+            if !has_check_cfg(out, &expr) {
+                out.push(format!("--check-cfg={expr}"));
+            }
+        }
+    }
+}
+
+fn has_cfg(args: &[String], spec: &str) -> bool {
+    let inline = format!("--cfg={spec}");
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        if arg == "--cfg=mires" {
+        if arg == inline {
             return true;
         }
-        if arg == "--cfg" && args.get(index + 1).map(String::as_str) == Some("mires") {
+        if arg == "--cfg" && args.get(index + 1).map(String::as_str) == Some(spec) {
             return true;
         }
         index += 1;
@@ -861,14 +883,15 @@ fn has_cfg_mires(args: &[String]) -> bool {
     false
 }
 
-fn has_check_cfg_mires(args: &[String]) -> bool {
+fn has_check_cfg(args: &[String], expr: &str) -> bool {
+    let inline = format!("--check-cfg={expr}");
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        if arg == "--check-cfg=cfg(mires)" {
+        if arg == inline {
             return true;
         }
-        if arg == "--check-cfg" && args.get(index + 1).map(String::as_str) == Some("cfg(mires)") {
+        if arg == "--check-cfg" && args.get(index + 1).map(String::as_str) == Some(expr) {
             return true;
         }
         index += 1;
@@ -973,6 +996,7 @@ mod tests {
                 "js-dts=on".to_owned(),
                 "js-source-map=on".to_owned(),
             ],
+            cfgs: Vec::new(),
             jsc_link: PathBuf::from("/mires/target/release/jsc-link"),
             record_file: None,
             verbose: false,
@@ -1260,5 +1284,66 @@ Manifest {\n\
         assert!(res.args.contains(&"-Cpanic=unwind".to_owned()));
         assert!(res.args.windows(2).any(|w| w == ["--cfg", "mires"]));
         assert!(res.args.contains(&"--check-cfg=cfg(mires)".to_owned()));
+    }
+
+    #[test]
+    fn custom_cfgs_forward_to_probes_check_and_build_without_duplication() {
+        let mut cfg = sample_config(WrapperMode::Build);
+        cfg.cfgs = vec!["topcoat_client".to_owned(), "mode=\"csr\"".to_owned()];
+
+        let probe_args = strs(&[
+            "-",
+            "--target",
+            "/mires/targets/mires32-unwind.json",
+            "--print=cfg",
+        ]);
+        let probe_res = rewrite_args(&probe_args, &cfg);
+        assert!(probe_res
+            .args
+            .windows(2)
+            .any(|w| w == ["--cfg", "topcoat_client"]));
+        assert!(probe_res
+            .args
+            .windows(2)
+            .any(|w| w == ["--cfg", "mode=\"csr\""]));
+
+        let target_args = strs(&[
+            "--crate-name",
+            "app",
+            "--crate-type",
+            "cdylib",
+            "--target",
+            "/mires/targets/mires32-unwind.json",
+            "--cfg",
+            "topcoat_client",
+            "--check-cfg=cfg(topcoat_client)",
+            "src/lib.rs",
+        ]);
+        let build_res = rewrite_args(&target_args, &cfg);
+        assert_eq!(
+            build_res
+                .args
+                .windows(2)
+                .filter(|w| *w == ["--cfg", "topcoat_client"])
+                .count(),
+            1
+        );
+        assert!(build_res
+            .args
+            .windows(2)
+            .any(|w| w == ["--cfg", "mode=\"csr\""]));
+        assert!(build_res
+            .args
+            .contains(&"--check-cfg=cfg(mode,values(any()))".to_owned()));
+
+        cfg.mode = WrapperMode::Check;
+        let check_res = rewrite_args(&target_args, &cfg);
+        assert!(check_res
+            .args
+            .windows(2)
+            .any(|w| w == ["--cfg", "mode=\"csr\""]));
+        assert!(check_res
+            .args
+            .contains(&"--check-cfg=cfg(mode,values(any()))".to_owned()));
     }
 }

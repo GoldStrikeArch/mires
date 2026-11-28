@@ -658,6 +658,7 @@ impl<'a, 'tcx> FnEncoder<'a, 'tcx> {
                     fixed_name: Some(local.clone()),
                     root: false,
                     exported: false,
+                    chunk: None,
                 },
                 source.clone(),
             )

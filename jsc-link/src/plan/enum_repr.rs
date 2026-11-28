@@ -1240,9 +1240,7 @@ fn select_enum_reprs(
 
     // Pass B: NullNiche / SentinelNiche in ascending nesting depth so inner `Option<T>` is decided
     // before `Option<Option<T>>` / `Option<ManuallyDrop<Option<T>>>`.
-    let sentinel_candidate = opts
-        .chunks
-        .is_empty()
+    let sentinel_candidate = (!crate::link::is_chunked(opts, table))
         .then(|| NamePool::from_table(table).alloc_suffixed("$sn"))
         .flatten();
     niche_candidates.sort_by_key(|c| (c.depth, c.id));
@@ -3235,11 +3233,11 @@ mod tests {
         );
 
         // Chunked mode must disable SentinelNiche cleanly (falls back to IntTag, no sentinel item).
-        let mut chunked_opts = spd_opts;
+        let mut chunked_opts = spd_opts.clone();
         chunked_opts
             .chunks
             .push(("extra".to_owned(), "exported_fn".to_owned()));
-        let mut t_chunked = table;
+        let mut t_chunked = table.clone();
         let plan_chunked = specialize_table(
             &mut t_chunked,
             &reachable,
@@ -3257,5 +3255,30 @@ mod tests {
         );
         assert!(plan_chunked.sentinel_none.is_none());
         assert!(plan_chunked.sentinel_items().is_empty());
+
+        // Attribute-discovered chunks in ESM mode must also disable SentinelNiche.
+        let mut discovered_opts = spd_opts;
+        discovered_opts.modules = crate::opts::Modules::Esm;
+        let mut t_discovered = table;
+        t_discovered
+            .get_mut(&JsName::new("exported_fn".to_owned()))
+            .unwrap()
+            .linkage = crate::item::Linkage::exported("exported_fn".to_owned()).with_chunk(
+            "island".to_owned(),
+            rcgjs_object::artifact::EntryRole::Island,
+        );
+        let plan_discovered = specialize_table(
+            &mut t_discovered,
+            &reachable,
+            &reachable,
+            &BTreeSet::new(),
+            &discovered_opts,
+        );
+        assert_eq!(
+            plan_discovered.decisions.get(&t_opt_js),
+            Some(&EnumRepr::IntTag { fieldless: false })
+        );
+        assert!(plan_discovered.sentinel_none.is_none());
+        assert!(plan_discovered.sentinel_items().is_empty());
     }
 }

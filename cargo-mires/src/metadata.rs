@@ -1,12 +1,16 @@
 //! Cargo metadata discovery and `[package.metadata.mires]` resolution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::cli::{BuildCliOptions, OutputFormat, PanicMode, Profile, RuntimeMode, TargetSelection};
+use crate::cli::{
+    BuildCliOptions, DiscoverChunks, MessageFormat, OutputFormat, PanicMode, Profile, RuntimeMode,
+    TargetSelection,
+};
 
 /// Selected Cargo target to build or check.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +40,14 @@ pub struct PackageInfo {
     pub manifest_dir: PathBuf,
 }
 
+/// Explicit chunk request resolved from CLI flags or `[package.metadata.mires]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChunkRequest {
+    pub name: String,
+    pub entry: String,
+    pub role: Option<String>,
+}
+
 /// Fully merged build configuration after applying `CLI > [package.metadata.mires] > defaults`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedConfig {
@@ -49,8 +61,11 @@ pub struct ResolvedConfig {
     pub panic: PanicMode,
     pub out_dir: PathBuf,
     pub shim_module: String,
-    pub chunks: Vec<(String, String)>,
+    pub chunks: Vec<ChunkRequest>,
     pub shared_chunk: Option<String>,
+    pub discover_chunks: DiscoverChunks,
+    pub cfgs: Vec<String>,
+    pub message_format: MessageFormat,
 }
 
 /// Complete workspace + package + merged configuration context for a command.
@@ -79,6 +94,7 @@ pub struct MiresMetadata {
     pub chunks: Option<ChunksMetadata>,
     pub islands: Option<Vec<String>>,
     pub shared_chunk: Option<String>,
+    pub discover_chunks: Option<String>,
 }
 
 /// Flexible chunk specification in `[package.metadata.mires]`.
@@ -399,8 +415,14 @@ pub fn merge_config(
         PanicMode::parse,
         "unwind` or `abort",
     )?;
+    let meta_discover_chunks = parse_opt_field(
+        "discover-chunks",
+        meta.discover_chunks.as_deref(),
+        DiscoverChunks::parse,
+        "auto`, `on`, or `off",
+    )?;
 
-    let chunks = collect_chunks(meta)?;
+    let chunks = collect_chunks(cli, meta)?;
     let has_chunking = !chunks.is_empty();
 
     let format = cli.format.or(meta_format).unwrap_or(OutputFormat::Esm);
@@ -413,6 +435,10 @@ pub fn merge_config(
     let source_map = cli.source_map.or(meta.source_map).unwrap_or(true);
     let npm = cli.npm.or(meta.npm).unwrap_or(false);
     let panic = cli.panic.or(meta_panic).unwrap_or(PanicMode::Unwind);
+    let discover_chunks = cli
+        .discover_chunks
+        .or(meta_discover_chunks)
+        .unwrap_or(DiscoverChunks::Auto);
 
     let profile = if let Some(explicit) = cli.profile {
         explicit
@@ -440,10 +466,19 @@ pub fn merge_config(
         target_dir.join("mires")
     };
 
-    let shim_module = meta.shim_module.clone().unwrap_or_else(|| match format {
-        OutputFormat::Esm => "./shim.mjs".to_owned(),
-        OutputFormat::Script => "./shim.js".to_owned(),
-    });
+    let shim_module = cli
+        .shim_module
+        .clone()
+        .or_else(|| meta.shim_module.clone())
+        .unwrap_or_else(|| match format {
+            OutputFormat::Esm => "./shim.mjs".to_owned(),
+            OutputFormat::Script => "./shim.js".to_owned(),
+        });
+
+    let shared_chunk = cli
+        .shared_chunk
+        .clone()
+        .or_else(|| meta.shared_chunk.clone());
 
     Ok(ResolvedConfig {
         profile,
@@ -457,11 +492,17 @@ pub fn merge_config(
         out_dir,
         shim_module,
         chunks,
-        shared_chunk: meta.shared_chunk.clone(),
+        shared_chunk,
+        discover_chunks,
+        cfgs: cli.cfgs.clone(),
+        message_format: cli.message_format.unwrap_or(MessageFormat::Human),
     })
 }
 
-fn collect_chunks(meta: &MiresMetadata) -> Result<Vec<(String, String)>, String> {
+fn collect_chunks(
+    cli: &BuildCliOptions,
+    meta: &MiresMetadata,
+) -> Result<Vec<ChunkRequest>, String> {
     let mut chunks = Vec::new();
     if let Some(spec) = &meta.chunks {
         match spec {
@@ -473,7 +514,14 @@ fn collect_chunks(meta: &MiresMetadata) -> Result<Vec<(String, String)>, String>
                                 .to_owned(),
                         );
                     }
-                    chunks.push((name.clone(), entry.clone()));
+                    upsert_chunk(
+                        &mut chunks,
+                        ChunkRequest {
+                            name: name.clone(),
+                            entry: entry.clone(),
+                            role: None,
+                        },
+                    );
                 }
             }
             ChunksMetadata::List(list) => {
@@ -489,7 +537,14 @@ fn collect_chunks(meta: &MiresMetadata) -> Result<Vec<(String, String)>, String>
                             "invalid `[package.metadata.mires].chunks` entry `{item}`"
                         ));
                     }
-                    chunks.push((name.to_owned(), entry.to_owned()));
+                    upsert_chunk(
+                        &mut chunks,
+                        ChunkRequest {
+                            name: name.to_owned(),
+                            entry: entry.to_owned(),
+                            role: None,
+                        },
+                    );
                 }
             }
         }
@@ -505,10 +560,236 @@ fn collect_chunks(meta: &MiresMetadata) -> Result<Vec<(String, String)>, String>
                     "invalid `[package.metadata.mires].islands` entry `{item}`"
                 ));
             }
-            chunks.push((name.to_owned(), entry.to_owned()));
+            upsert_chunk(
+                &mut chunks,
+                ChunkRequest {
+                    name: name.to_owned(),
+                    entry: entry.to_owned(),
+                    role: Some("island".to_owned()),
+                },
+            );
         }
     }
+    for item in &cli.chunks {
+        let (name, entry) = item.split_once(':').ok_or_else(|| {
+            format!("invalid `--chunk` entry `{item}` (expected `<name>:<entry>`)")
+        })?;
+        if name.is_empty() || entry.is_empty() {
+            return Err(format!("invalid `--chunk` entry `{item}`"));
+        }
+        upsert_chunk(
+            &mut chunks,
+            ChunkRequest {
+                name: name.to_owned(),
+                entry: entry.to_owned(),
+                role: Some("main".to_owned()),
+            },
+        );
+    }
+    for item in &cli.islands {
+        let (name, entry) = match item.split_once(':') {
+            Some((n, e)) => (n.to_owned(), e.to_owned()),
+            None => (item.clone(), format!("__island_{item}")),
+        };
+        if name.is_empty() || entry.is_empty() {
+            return Err(format!("invalid `--island` entry `{item}`"));
+        }
+        upsert_chunk(
+            &mut chunks,
+            ChunkRequest {
+                name,
+                entry,
+                role: Some("island".to_owned()),
+            },
+        );
+    }
     Ok(chunks)
+}
+
+fn upsert_chunk(chunks: &mut Vec<ChunkRequest>, req: ChunkRequest) {
+    if let Some(existing) = chunks.iter_mut().find(|c| c.name == req.name) {
+        *existing = req;
+    } else {
+        chunks.push(req);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDepMetadata {
+    packages: Vec<CargoDepPackage>,
+    resolve: Option<CargoDepResolve>,
+    workspace_root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDepPackage {
+    id: String,
+    source: Option<String>,
+    manifest_path: PathBuf,
+    #[serde(default)]
+    targets: Vec<CargoDepTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDepTarget {
+    #[serde(default)]
+    src_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDepResolve {
+    #[serde(default)]
+    nodes: Vec<CargoDepNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDepNode {
+    id: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+/// Collect manifests, source directories, and `.rs` files for the target crate and every
+/// transitive local path/workspace dependency so downstream build scripts (`mires-build`)
+/// emit complete `cargo:rerun-if-changed` directives.
+pub fn collect_dep_files(ctx: &PackageContext, opts: &BuildCliOptions) -> Vec<PathBuf> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["metadata", "--format-version=1"]);
+    cmd.arg("--manifest-path").arg(&ctx.package.manifest_path);
+    if opts.no_default_features {
+        cmd.arg("--no-default-features");
+    }
+    if opts.all_features {
+        cmd.arg("--all-features");
+    }
+    for feat in &opts.features {
+        cmd.arg("--features").arg(feat);
+    }
+
+    if let Ok(output) = cmd.output() {
+        if output.status.success() {
+            if let Ok(files) = collect_dep_files_from_metadata_json(&output.stdout, &ctx.package.id)
+            {
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+    }
+
+    let mut fallback = BTreeSet::new();
+    collect_local_package_paths(&ctx.package.manifest_path, &[], &mut fallback);
+    collect_workspace_root_files(&ctx.workspace_root, &mut fallback);
+    fallback.into_iter().collect()
+}
+
+/// Parse `cargo metadata --format-version=1` JSON and collect watched files/directories for
+/// `root_pkg_id` and every transitive local path dependency (`source == null`).
+pub fn collect_dep_files_from_metadata_json(
+    bytes: &[u8],
+    root_pkg_id: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let meta: CargoDepMetadata = serde_json::from_slice(bytes)
+        .map_err(|err| format!("failed to parse `cargo metadata` dependency graph: {err}"))?;
+
+    let pkg_by_id: BTreeMap<&str, &CargoDepPackage> = meta
+        .packages
+        .iter()
+        .map(|pkg| (pkg.id.as_str(), pkg))
+        .collect();
+    let deps_by_id: BTreeMap<&str, &[String]> = meta
+        .resolve
+        .as_ref()
+        .map(|resolve| {
+            resolve
+                .nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.dependencies.as_slice()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(root_pkg_id);
+    visited.insert(root_pkg_id);
+
+    let mut watched = BTreeSet::new();
+    while let Some(id) = queue.pop_front() {
+        if let Some(pkg) = pkg_by_id.get(id) {
+            if pkg.source.is_none() {
+                let target_srcs: Vec<&Path> = pkg
+                    .targets
+                    .iter()
+                    .filter_map(|t| t.src_path.as_deref())
+                    .collect();
+                collect_local_package_paths(&pkg.manifest_path, &target_srcs, &mut watched);
+            }
+        }
+        if let Some(deps) = deps_by_id.get(id) {
+            for dep in *deps {
+                if visited.insert(dep.as_str()) {
+                    queue.push_back(dep.as_str());
+                }
+            }
+        }
+    }
+
+    collect_workspace_root_files(&meta.workspace_root, &mut watched);
+    Ok(watched.into_iter().collect())
+}
+
+fn collect_local_package_paths(
+    manifest_path: &Path,
+    target_srcs: &[&Path],
+    out: &mut BTreeSet<PathBuf>,
+) {
+    out.insert(manifest_path.to_path_buf());
+    if let Some(pkg_dir) = manifest_path.parent() {
+        let src_dir = pkg_dir.join("src");
+        if src_dir.is_dir() {
+            collect_source_tree(&src_dir, out);
+        }
+        let build_rs = pkg_dir.join("build.rs");
+        if build_rs.is_file() {
+            out.insert(build_rs);
+        }
+    }
+    for src in target_srcs {
+        if src.is_file() {
+            out.insert((*src).to_path_buf());
+        }
+    }
+}
+
+fn collect_source_tree(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+    out.insert(dir.to_path_buf());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name != "target" && !name.starts_with('.') {
+                collect_source_tree(&path, out);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.insert(path);
+        }
+    }
+}
+
+fn collect_workspace_root_files(workspace_root: &Path, out: &mut BTreeSet<PathBuf>) {
+    let ws_manifest = workspace_root.join("Cargo.toml");
+    if ws_manifest.is_file() {
+        out.insert(ws_manifest);
+    }
+    let ws_lock = workspace_root.join("Cargo.lock");
+    if ws_lock.is_file() {
+        out.insert(ws_lock);
+    }
 }
 
 fn parse_opt_field<T>(
@@ -574,6 +855,7 @@ mod tests {
             chunks: None,
             islands: None,
             shared_chunk: None,
+            discover_chunks: Some("off".to_owned()),
         };
 
         // Metadata beats defaults
@@ -595,6 +877,7 @@ mod tests {
         assert!(cfg.npm);
         assert_eq!(cfg.shim_module, "./runtime/rt.mjs");
         assert_eq!(cfg.panic, PanicMode::Abort);
+        assert_eq!(cfg.discover_chunks, DiscoverChunks::Off);
 
         // CLI beats metadata
         let cli_override = BuildCliOptions {
@@ -606,6 +889,11 @@ mod tests {
             out_dir: Some(PathBuf::from("override-out")),
             npm: Some(false),
             panic: Some(PanicMode::Unwind),
+            discover_chunks: Some(DiscoverChunks::On),
+            shim_module: Some("topcoat-dom".to_owned()),
+            shared_chunk: Some("common".to_owned()),
+            message_format: Some(MessageFormat::Json),
+            cfgs: vec!["topcoat_client".to_owned()],
             ..Default::default()
         };
         let cfg2 = merge_config(
@@ -624,6 +912,11 @@ mod tests {
         assert_eq!(cfg2.out_dir, PathBuf::from("override-out"));
         assert!(!cfg2.npm);
         assert_eq!(cfg2.panic, PanicMode::Unwind);
+        assert_eq!(cfg2.discover_chunks, DiscoverChunks::On);
+        assert_eq!(cfg2.shim_module, "topcoat-dom");
+        assert_eq!(cfg2.shared_chunk.as_deref(), Some("common"));
+        assert_eq!(cfg2.message_format, MessageFormat::Json);
+        assert_eq!(cfg2.cfgs, vec!["topcoat_client".to_owned()]);
     }
 
     #[test]
@@ -671,7 +964,7 @@ mod tests {
         .unwrap();
         assert!(!cfg_script.dts);
 
-        // islands/chunking defaults runtime to external
+        // islands/chunking defaults runtime to external and assigns island role
         let meta_islands = MiresMetadata {
             islands: Some(vec!["counter".to_owned(), "search:search_init".to_owned()]),
             ..Default::default()
@@ -687,8 +980,55 @@ mod tests {
         assert_eq!(
             cfg_islands.chunks,
             vec![
-                ("counter".to_owned(), "counter".to_owned()),
-                ("search".to_owned(), "search_init".to_owned()),
+                ChunkRequest {
+                    name: "counter".to_owned(),
+                    entry: "counter".to_owned(),
+                    role: Some("island".to_owned()),
+                },
+                ChunkRequest {
+                    name: "search".to_owned(),
+                    entry: "search_init".to_owned(),
+                    role: Some("island".to_owned()),
+                },
+            ]
+        );
+
+        // CLI --island defaults entry to `__island_<NAME>` and overrides metadata
+        let cli_chunks = BuildCliOptions {
+            chunks: vec!["app:boot".to_owned()],
+            islands: vec!["counter".to_owned(), "modal:open_modal".to_owned()],
+            ..Default::default()
+        };
+        let cfg_cli_chunks = merge_config(
+            &cli_chunks,
+            &meta_islands,
+            Path::new("/ws"),
+            Path::new("/ws/target"),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg_cli_chunks.chunks,
+            vec![
+                ChunkRequest {
+                    name: "counter".to_owned(),
+                    entry: "__island_counter".to_owned(),
+                    role: Some("island".to_owned()),
+                },
+                ChunkRequest {
+                    name: "search".to_owned(),
+                    entry: "search_init".to_owned(),
+                    role: Some("island".to_owned()),
+                },
+                ChunkRequest {
+                    name: "app".to_owned(),
+                    entry: "boot".to_owned(),
+                    role: Some("main".to_owned()),
+                },
+                ChunkRequest {
+                    name: "modal".to_owned(),
+                    entry: "open_modal".to_owned(),
+                    role: Some("island".to_owned()),
+                },
             ]
         );
     }
@@ -764,5 +1104,100 @@ mod tests {
             Path::new("/ws/target"),
         )
         .is_err());
+
+        let bad_discover = MiresMetadata {
+            discover_chunks: Some("never".to_owned()),
+            ..Default::default()
+        };
+        assert!(merge_config(
+            &BuildCliOptions::default(),
+            &bad_discover,
+            Path::new("/ws"),
+            Path::new("/ws/target"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collects_dep_files_across_transitive_local_path_dependencies_only() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let ws =
+            std::env::temp_dir().join(format!("cargo-mires-deps-{}-{nanos}", std::process::id()));
+        let client = ws.join("client");
+        let shared = ws.join("shared");
+        let unused = ws.join("server");
+        fs::create_dir_all(client.join("src")).unwrap();
+        fs::create_dir_all(shared.join("src/nested")).unwrap();
+        fs::create_dir_all(unused.join("src")).unwrap();
+
+        fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(ws.join("Cargo.lock"), "# lock\n").unwrap();
+        fs::write(client.join("Cargo.toml"), "[package]\nname = \"client\"\n").unwrap();
+        fs::write(client.join("src/lib.rs"), "").unwrap();
+        fs::write(shared.join("Cargo.toml"), "[package]\nname = \"shared\"\n").unwrap();
+        fs::write(shared.join("src/lib.rs"), "").unwrap();
+        fs::write(shared.join("src/nested/model.rs"), "").unwrap();
+        fs::write(unused.join("Cargo.toml"), "[package]\nname = \"server\"\n").unwrap();
+        fs::write(unused.join("src/main.rs"), "").unwrap();
+
+        let json = serde_json::json!({
+            "packages": [
+                {
+                    "id": "client 0.1.0",
+                    "source": null,
+                    "manifest_path": client.join("Cargo.toml"),
+                    "targets": [{ "src_path": client.join("src/lib.rs") }]
+                },
+                {
+                    "id": "shared 0.1.0",
+                    "source": null,
+                    "manifest_path": shared.join("Cargo.toml"),
+                    "targets": [{ "src_path": shared.join("src/lib.rs") }]
+                },
+                {
+                    "id": "server 0.1.0",
+                    "source": null,
+                    "manifest_path": unused.join("Cargo.toml"),
+                    "targets": [{ "src_path": unused.join("src/main.rs") }]
+                },
+                {
+                    "id": "serde 1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "manifest_path": "/registry/serde/Cargo.toml",
+                    "targets": []
+                }
+            ],
+            "resolve": {
+                "nodes": [
+                    { "id": "client 0.1.0", "dependencies": ["shared 0.1.0", "serde 1.0.0"] },
+                    { "id": "shared 0.1.0", "dependencies": [] },
+                    { "id": "server 0.1.0", "dependencies": ["shared 0.1.0"] },
+                    { "id": "serde 1.0.0", "dependencies": [] }
+                ]
+            },
+            "workspace_root": ws
+        });
+
+        let dep_files =
+            collect_dep_files_from_metadata_json(json.to_string().as_bytes(), "client 0.1.0")
+                .unwrap();
+
+        assert!(dep_files.contains(&ws.join("Cargo.toml")));
+        assert!(dep_files.contains(&ws.join("Cargo.lock")));
+        assert!(dep_files.contains(&client.join("Cargo.toml")));
+        assert!(dep_files.contains(&client.join("src")));
+        assert!(dep_files.contains(&client.join("src/lib.rs")));
+        assert!(dep_files.contains(&shared.join("Cargo.toml")));
+        assert!(dep_files.contains(&shared.join("src")));
+        assert!(dep_files.contains(&shared.join("src/lib.rs")));
+        assert!(dep_files.contains(&shared.join("src/nested")));
+        assert!(dep_files.contains(&shared.join("src/nested/model.rs")));
+        assert!(!dep_files.contains(&unused.join("Cargo.toml")));
+        assert!(!dep_files.iter().any(|p| p.starts_with("/registry")));
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

@@ -1,19 +1,52 @@
 use std::{
+    collections::BTreeSet,
     env,
     ffi::{OsStr, OsString},
+    fmt::Write as _,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
 
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
 use crate::{
-    checkout_root, dylib_filename, module_format_str, scrub, BuildError, ModuleFormat, PanicMode,
-    Profile, Result, RuntimeMode, AUTO_INSTALL_ENV, TOOLCHAIN_ROOT_ENV,
+    checkout_root, dylib_filename, module_format_str, scrub, BuildError, DiscoverChunks,
+    ModuleFormat, PanicMode, Profile, Result, RuntimeMode, AUTO_INSTALL_ENV, TOOLCHAIN_ROOT_ENV,
 };
 
 /// Default nested Cargo target directory inside `out_dir`, isolated from any outer
 /// workspace `target/` lock during `build.rs` execution.
 const DEFAULT_TARGET_SUBDIR: &str = "mires-target";
+
+/// Expected JSON schema version produced by `cargo-mires build --message-format=json`.
+const CARGO_MIRES_JSON_SCHEMA: u32 = 1;
+
+/// Returns `true` when the enclosing Cargo build script is running for a Mires JS target build.
+///
+/// Always emits `cargo::rustc-check-cfg=cfg(mires)` so `#[cfg(mires)]` in the crate produces
+/// zero `unexpected_cfgs` warnings. Call this at the top of `build.rs` in single-crate fullstack
+/// packages (before [`Crate::current`]) to prevent recursive `cargo-mires` invocations:
+///
+/// ```rust,no_run
+/// if mires_build::is_target_build() {
+///     return;
+/// }
+/// mires_build::Crate::current()
+///     .emit_rust_module("client_assets.rs")
+///     .build()
+///     .unwrap();
+/// ```
+#[must_use]
+pub fn is_target_build() -> bool {
+    println!("cargo::rustc-check-cfg=cfg(mires)");
+    is_target_build_from(env::var_os("CARGO_CFG_MIRES").as_deref())
+}
+
+fn is_target_build_from(cargo_cfg_mires: Option<&OsStr>) -> bool {
+    cargo_cfg_mires.is_some()
+}
 
 /// Select a Mires [`Profile`] from Cargo's `PROFILE` build-script environment variable.
 ///
@@ -31,6 +64,25 @@ fn profile_from_env(profile: Option<&str>) -> Profile {
     }
 }
 
+/// Metadata and paths for one code-split chunk emitted by [`Crate::build`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateChunk {
+    /// Chunk name (e.g., `"counter"`, `"shared"`).
+    pub name: String,
+    /// Deployment role (e.g., `"island"`, `"main"`, `"worker"`, `"procedure"`, `"shared"`).
+    pub role: String,
+    /// Published JavaScript file path inside `out_dir`.
+    pub path: PathBuf,
+    /// Source map emitted beside this chunk, if present.
+    pub source_map: Option<PathBuf>,
+    /// TypeScript declarations emitted beside this chunk, if present.
+    pub dts: Option<PathBuf>,
+    /// Lowercase hexadecimal SHA-256 digest of the chunk bytes.
+    pub sha256: String,
+    /// Size of the chunk in bytes.
+    pub bytes: u64,
+}
+
 /// Artifacts emitted by [`Crate::build`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrateArtifacts {
@@ -40,12 +92,21 @@ pub struct CrateArtifacts {
     pub source_map: Option<PathBuf>,
     /// TypeScript declarations emitted beside `program`, when `dts` is enabled.
     pub dts: Option<PathBuf>,
-    /// External runtime shim emitted beside `program`, when `runtime` is [`RuntimeMode::External`].
+    /// External runtime shim emitted beside `program`, when `runtime` is [`RuntimeMode::External`]
+    /// with a local `./` shim specifier.
     pub runtime: Option<PathBuf>,
     /// Generated `package.json`, when `npm` packaging is enabled.
     pub package_json: Option<PathBuf>,
     /// Directory containing all emitted artifacts.
     pub out_dir: PathBuf,
+    /// Split chunk artifacts emitted alongside `program` (empty for unsplit builds).
+    pub chunks: Vec<CrateChunk>,
+    /// Path to the copied linker `.artifacts.json` deployment manifest, if present.
+    pub manifest_path: Option<PathBuf>,
+    /// Raw JSON contents of the linker `.artifacts.json` deployment manifest, if present.
+    pub manifest_json: Option<String>,
+    /// Path to the generated Rust assets module when [`Crate::emit_rust_module`] was configured.
+    pub rust_module: Option<PathBuf>,
 }
 
 /// Ergonomic builder for compiling a Cargo crate (with its own `Cargo.toml`, `std`,
@@ -53,7 +114,8 @@ pub struct CrateArtifacts {
 ///
 /// Defaults:
 /// * `format`: [`ModuleFormat::Esm`]
-/// * `runtime`: [`RuntimeMode::Inline`] (zero-dependency self-contained bundle)
+/// * `runtime`: [`RuntimeMode::Inline`] (or [`RuntimeMode::External`] when chunks/islands or
+///   `shim_module` are configured without an explicit `.runtime(...)`)
 /// * `dts`: `true`
 /// * `source_map`: `true`
 /// * `profile`: [`profile_from_cargo()`] (`ReleaseBalanced` in release builds, `Dev` otherwise)
@@ -63,6 +125,8 @@ pub struct CrateArtifacts {
 ///
 /// ```rust,no_run
 /// let artifacts = mires_build::Crate::new("../client")
+///     .release()
+///     .emit_rust_module("client_assets.rs")
 ///     .build()
 ///     .unwrap();
 /// println!("built {}", artifacts.program.display());
@@ -74,7 +138,7 @@ pub struct Crate {
     package: Option<String>,
     profile: Option<Profile>,
     format: ModuleFormat,
-    runtime: RuntimeMode,
+    runtime: Option<RuntimeMode>,
     dts: bool,
     source_map: bool,
     npm: Option<bool>,
@@ -86,6 +150,13 @@ pub struct Crate {
     features: Vec<String>,
     all_features: bool,
     no_default_features: bool,
+    cfgs: Vec<String>,
+    chunks: Vec<(String, String)>,
+    islands: Vec<String>,
+    shared_chunk: Option<String>,
+    discover_chunks: Option<DiscoverChunks>,
+    shim_module: Option<String>,
+    rust_module: Option<String>,
 }
 
 impl Crate {
@@ -103,7 +174,7 @@ impl Crate {
             package: None,
             profile: None,
             format: ModuleFormat::Esm,
-            runtime: RuntimeMode::Inline,
+            runtime: None,
             dts: true,
             source_map: true,
             npm: None,
@@ -115,7 +186,27 @@ impl Crate {
             features: Vec::new(),
             all_features: false,
             no_default_features: false,
+            cfgs: Vec::new(),
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            shared_chunk: None,
+            discover_chunks: None,
+            shim_module: None,
+            rust_module: None,
         }
+    }
+
+    /// Create a builder targeting the current Cargo package (`CARGO_MANIFEST_DIR`, falling back
+    /// to `.`).
+    ///
+    /// Pair with [`is_target_build`] at the top of `build.rs` to avoid infinite recursion when
+    /// compiling the current package to JavaScript.
+    #[must_use]
+    pub fn current() -> Self {
+        let dir = env::var_os("CARGO_MANIFEST_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        Self::new(dir)
     }
 
     /// Select a specific Cargo package name within a workspace (`--package`).
@@ -132,6 +223,20 @@ impl Crate {
         self
     }
 
+    /// Build with the default release profile ([`Profile::ReleaseBalanced`]).
+    #[must_use]
+    pub fn release(mut self) -> Self {
+        self.profile = Some(Profile::ReleaseBalanced);
+        self
+    }
+
+    /// Select the compiler profile automatically from Cargo's `PROFILE` environment variable.
+    #[must_use]
+    pub fn profile_from_cargo(mut self) -> Self {
+        self.profile = None;
+        self
+    }
+
     /// Select the output JavaScript module format (`--format`). Defaults to [`ModuleFormat::Esm`].
     #[must_use]
     pub fn format(mut self, format: ModuleFormat) -> Self {
@@ -139,10 +244,12 @@ impl Crate {
         self
     }
 
-    /// Select how the runtime shim is delivered (`--runtime`). Defaults to [`RuntimeMode::Inline`].
+    /// Select how the runtime shim is delivered (`--runtime`). Defaults to [`RuntimeMode::Inline`]
+    /// (or [`RuntimeMode::External`] when chunks/islands or [`shim_module`](Self::shim_module) are
+    /// configured).
     #[must_use]
     pub fn runtime(mut self, runtime: RuntimeMode) -> Self {
-        self.runtime = runtime;
+        self.runtime = Some(runtime);
         self
     }
 
@@ -227,14 +334,70 @@ impl Crate {
         self
     }
 
-    /// Compile the Cargo crate via `cargo-mires build`, emit Cargo rerun directives,
-    /// and return paths to the emitted artifacts.
+    /// Pass a target `--cfg <SPEC>` (e.g. `"topcoat_client"` or `"mode=\"csr\""`) to `cargo-mires`
+    /// and emit the corresponding `cargo::rustc-check-cfg` directive. Calls accumulate in order.
+    #[must_use]
+    pub fn cfg(mut self, cfg: impl Into<String>) -> Self {
+        self.cfgs.push(cfg.into());
+        self
+    }
+
+    /// Request a named code-split chunk (`--chunk <name>:<entry>`). Calls accumulate in order.
+    #[must_use]
+    pub fn chunk(mut self, name: impl Into<String>, entry: impl Into<String>) -> Self {
+        self.chunks.push((name.into(), entry.into()));
+        self
+    }
+
+    /// Request a code-split island chunk (`--island <name>`, default entry `__island_<name>`).
+    /// Calls accumulate in order.
+    #[must_use]
+    pub fn island(mut self, name: impl Into<String>) -> Self {
+        self.islands.push(name.into());
+        self
+    }
+
+    /// Set the shared chunk name holding items common to multiple chunks (`--shared-chunk`).
+    #[must_use]
+    pub fn shared_chunk(mut self, name: impl Into<String>) -> Self {
+        self.shared_chunk = Some(name.into());
+        self
+    }
+
+    /// Control automatic chunk discovery from `#[js_export(chunk = ...)]` (`--discover-chunks`).
+    #[must_use]
+    pub fn discover_chunks(mut self, mode: DiscoverChunks) -> Self {
+        self.discover_chunks = Some(mode);
+        self
+    }
+
+    /// Override the external runtime module specifier (`--shim-module`), such as `"./runtime.mjs"`
+    /// or a bare specifier like `"topcoat-dom"` or `"solid-js/web"`.
+    #[must_use]
+    pub fn shim_module(mut self, specifier: impl Into<String>) -> Self {
+        self.shim_module = Some(specifier.into());
+        self
+    }
+
+    /// Emit a zero-dependency Rust assets module `<out_dir>/<file_name>` exposing `ENTRY_NAME`,
+    /// `ENTRY_JS`, `ENTRY_SHA256`, `SOURCE_MAP`, `ChunkAsset`, `CHUNKS`, `FILES`, and
+    /// `MANIFEST_JSON` for inclusion via `include!(concat!(env!("OUT_DIR"), "/..."))`.
+    #[must_use]
+    pub fn emit_rust_module(mut self, file_name: impl Into<String>) -> Self {
+        self.rust_module = Some(file_name.into());
+        self
+    }
+
+    /// Compile the Cargo crate via `cargo-mires build --message-format=json`, emit Cargo
+    /// check-cfg and rerun directives (including transitive local path dependencies), and
+    /// return the emitted artifacts.
     ///
     /// # Errors
     ///
     /// Returns `Err` if `OUT_DIR` is unset (and [`out_dir`](Self::out_dir) was not called),
     /// if the client `Cargo.toml` is missing, if `cargo-mires` cannot be located, if
-    /// `cargo-mires build` fails, or if no primary JavaScript artifact was produced.
+    /// `cargo-mires build` fails, if its JSON output cannot be parsed, or if generating the
+    /// optional Rust assets module fails.
     pub fn build(self) -> Result<CrateArtifacts> {
         let out_dir = self
             .out_dir
@@ -244,8 +407,16 @@ impl Crate {
 
         let toolchain_root = resolve_toolchain_root(self.toolchain_root.as_deref());
 
-        // Emit rerun directives before any fallible check so Cargo knows when to retry.
+        for directive in self.check_cfg_directives() {
+            println!("{directive}");
+        }
+
+        // Emit baseline rerun directives before any fallible check so Cargo knows when to retry.
+        let mut emitted_paths = BTreeSet::new();
         for directive in self.rerun_directives(toolchain_root.as_deref()) {
+            if let Some(path) = directive.strip_prefix("cargo:rerun-if-changed=") {
+                emitted_paths.insert(PathBuf::from(path));
+            }
             println!("{directive}");
         }
 
@@ -285,7 +456,45 @@ impl Crate {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        self.discover_artifacts(&out_dir, &stdout)
+        let parsed = parse_cargo_mires_json(&stdout)?;
+
+        for dep in &parsed.dep_files {
+            if emitted_paths.insert(dep.clone()) {
+                println!("cargo:rerun-if-changed={}", dep.display());
+            }
+        }
+
+        let mut artifacts = build_artifacts_from_json(parsed)?;
+
+        if let Some(file_name) = &self.rust_module {
+            let module_path = write_rust_module(&artifacts, file_name)?;
+            artifacts.rust_module = Some(module_path);
+        }
+
+        Ok(artifacts)
+    }
+
+    fn resolved_runtime(&self) -> RuntimeMode {
+        self.runtime.unwrap_or_else(|| {
+            if !self.chunks.is_empty() || !self.islands.is_empty() || self.shim_module.is_some() {
+                RuntimeMode::External
+            } else {
+                RuntimeMode::Inline
+            }
+        })
+    }
+
+    fn check_cfg_directives(&self) -> Vec<String> {
+        let mut directives = vec!["cargo::rustc-check-cfg=cfg(mires)".to_owned()];
+        for spec in &self.cfgs {
+            if let Some(expr) = check_cfg_expr(spec) {
+                let directive = format!("cargo::rustc-check-cfg={expr}");
+                if !directives.contains(&directive) {
+                    directives.push(directive);
+                }
+            }
+        }
+        directives
     }
 
     /// Resolve the Cargo target directory used by `cargo-mires`, defaulting to an
@@ -345,7 +554,12 @@ impl Crate {
         args.push(OsString::from(module_format_str(self.format)));
 
         args.push(OsString::from("--runtime"));
-        args.push(OsString::from(self.runtime.as_str()));
+        args.push(OsString::from(self.resolved_runtime().as_str()));
+
+        if let Some(specifier) = &self.shim_module {
+            args.push(OsString::from("--shim-module"));
+            args.push(OsString::from(specifier));
+        }
 
         args.push(OsString::from(if self.dts { "--dts" } else { "--no-dts" }));
         args.push(OsString::from(if self.source_map {
@@ -361,6 +575,31 @@ impl Crate {
         if let Some(panic) = self.panic_mode {
             args.push(OsString::from("--panic"));
             args.push(OsString::from(panic.as_str()));
+        }
+
+        for cfg in &self.cfgs {
+            args.push(OsString::from("--cfg"));
+            args.push(OsString::from(cfg));
+        }
+
+        for (name, entry) in &self.chunks {
+            args.push(OsString::from("--chunk"));
+            args.push(OsString::from(format!("{name}:{entry}")));
+        }
+
+        for name in &self.islands {
+            args.push(OsString::from("--island"));
+            args.push(OsString::from(name));
+        }
+
+        if let Some(shared) = &self.shared_chunk {
+            args.push(OsString::from("--shared-chunk"));
+            args.push(OsString::from(shared));
+        }
+
+        if let Some(mode) = self.discover_chunks {
+            args.push(OsString::from("--discover-chunks"));
+            args.push(OsString::from(mode.as_str()));
         }
 
         args.push(OsString::from("--out-dir"));
@@ -385,10 +624,13 @@ impl Crate {
             args.push(OsString::from(feature));
         }
 
+        args.push(OsString::from("--message-format"));
+        args.push(OsString::from("json"));
+
         args
     }
 
-    /// Collect all `cargo:rerun-if-*` directives for this crate build.
+    /// Collect baseline `cargo:rerun-if-*` directives for this crate build.
     fn rerun_directives(&self, toolchain_root: Option<&Path>) -> Vec<String> {
         let mut directives = vec![
             format!("cargo:rerun-if-env-changed={TOOLCHAIN_ROOT_ENV}"),
@@ -417,70 +659,400 @@ impl Crate {
 
         directives
     }
+}
 
-    /// Locate the emitted artifacts in `out_dir` after `cargo-mires build` succeeds.
-    fn discover_artifacts(&self, out_dir: &Path, stdout: &str) -> Result<CrateArtifacts> {
-        let expected_ext = format_extension(self.format);
-        let reported = parse_reported_paths(stdout);
+#[derive(Debug, Deserialize)]
+struct CargoMiresBuildJson {
+    schema: u32,
+    out_dir: PathBuf,
+    program: PathBuf,
+    #[serde(default)]
+    source_map: Option<PathBuf>,
+    #[serde(default)]
+    dts: Option<PathBuf>,
+    #[serde(default)]
+    runtime_file: Option<PathBuf>,
+    #[serde(default)]
+    package_json: Option<PathBuf>,
+    #[serde(default)]
+    manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    manifest: Option<serde_json::Value>,
+    #[serde(default)]
+    chunks: Vec<CargoMiresChunkJson>,
+    #[serde(default)]
+    dep_files: Vec<PathBuf>,
+}
 
-        let program = reported
-            .iter()
-            .find(|path| {
-                path.is_file()
-                    && path.extension().and_then(OsStr::to_str) == Some(expected_ext)
-                    && !is_runtime_shim_name(path)
-            })
-            .cloned()
-            .or_else(|| find_program_in_dir(out_dir, expected_ext, self.package_stem().as_deref()))
-            .ok_or_else(|| BuildError::MissingOutput {
-                path: out_dir.join(format!("*.{expected_ext}")),
-            })?;
+#[derive(Debug, Deserialize)]
+struct CargoMiresChunkJson {
+    name: String,
+    role: String,
+    path: PathBuf,
+    #[serde(default)]
+    source_map: Option<PathBuf>,
+    #[serde(default)]
+    dts: Option<PathBuf>,
+    sha256: String,
+    bytes: u64,
+}
 
-        let source_map = self.source_map.then(|| append_suffix(&program, ".map"));
-        let source_map = source_map.filter(|path| path.is_file());
+fn parse_cargo_mires_json(stdout: &str) -> Result<CargoMiresBuildJson> {
+    let trimmed = stdout.trim();
+    let parsed: CargoMiresBuildJson = match serde_json::from_str(trimmed) {
+        Ok(val) => val,
+        Err(primary_err) => {
+            // Fall back to scanning from the end for a JSON line in case an upstream tool
+            // (e.g., auto-installer) emitted informational lines before the final JSON payload.
+            trimmed
+                .lines()
+                .rev()
+                .map(str::trim)
+                .filter(|line| line.starts_with('{'))
+                .find_map(|line| serde_json::from_str::<CargoMiresBuildJson>(line).ok())
+                .ok_or_else(|| BuildError::InvalidCargoMiresJson {
+                    detail: primary_err.to_string(),
+                })?
+        }
+    };
 
-        let dts = self.dts.then(|| {
-            let primary = if self.format == ModuleFormat::Esm {
-                program.with_extension("d.mts")
-            } else {
-                program.with_extension("d.ts")
-            };
-            if primary.is_file() {
-                primary
-            } else {
-                program.with_extension("d.ts")
-            }
+    if parsed.schema != CARGO_MIRES_JSON_SCHEMA {
+        return Err(BuildError::InvalidCargoMiresJson {
+            detail: format!(
+                "unsupported schema version {} (expected {CARGO_MIRES_JSON_SCHEMA})",
+                parsed.schema
+            ),
         });
-        let dts = dts.filter(|path| path.is_file());
-
-        let runtime = if self.runtime == RuntimeMode::External {
-            find_runtime_artifact(out_dir, &program, expected_ext, &reported)
-        } else {
-            None
-        };
-
-        let package_json = if self.npm == Some(false) {
-            None
-        } else {
-            let candidate = out_dir.join("package.json");
-            candidate.is_file().then_some(candidate)
-        };
-
-        Ok(CrateArtifacts {
-            program,
-            source_map,
-            dts,
-            runtime,
-            package_json,
-            out_dir: out_dir.to_path_buf(),
-        })
     }
 
-    fn package_stem(&self) -> Option<String> {
-        if let Some(pkg) = &self.package {
-            return Some(pkg.clone());
+    Ok(parsed)
+}
+
+fn build_artifacts_from_json(parsed: CargoMiresBuildJson) -> Result<CrateArtifacts> {
+    if !parsed.program.is_file() {
+        return Err(BuildError::MissingOutput {
+            path: parsed.program,
+        });
+    }
+
+    let manifest_json = if let Some(path) = &parsed.manifest_path {
+        if path.is_file() {
+            Some(fs::read_to_string(path).map_err(|source| BuildError::Io {
+                path: path.clone(),
+                source,
+            })?)
+        } else {
+            parsed
+                .manifest
+                .as_ref()
+                .and_then(|v| serde_json::to_string_pretty(v).ok())
         }
-        parse_manifest_package_name(&self.manifest_path)
+    } else {
+        parsed
+            .manifest
+            .as_ref()
+            .and_then(|v| serde_json::to_string_pretty(v).ok())
+    };
+
+    let chunks = parsed
+        .chunks
+        .into_iter()
+        .map(|chunk| CrateChunk {
+            name: chunk.name,
+            role: chunk.role,
+            path: chunk.path,
+            source_map: chunk.source_map,
+            dts: chunk.dts,
+            sha256: chunk.sha256,
+            bytes: chunk.bytes,
+        })
+        .collect();
+
+    Ok(CrateArtifacts {
+        program: parsed.program,
+        source_map: parsed.source_map,
+        dts: parsed.dts,
+        runtime: parsed.runtime_file,
+        package_json: parsed.package_json,
+        out_dir: parsed.out_dir,
+        chunks,
+        manifest_path: parsed.manifest_path,
+        manifest_json,
+        rust_module: None,
+    })
+}
+
+fn write_rust_module(artifacts: &CrateArtifacts, file_name: &str) -> Result<PathBuf> {
+    validate_relative_module_path(file_name)?;
+    let module_path = artifacts.out_dir.join(file_name);
+    if let Some(parent) = module_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| BuildError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let rendered = render_rust_module(artifacts, &module_path)?;
+    fs::write(&module_path, rendered.as_bytes()).map_err(|source| BuildError::Io {
+        path: module_path.clone(),
+        source,
+    })?;
+    Ok(module_path)
+}
+
+fn validate_relative_module_path(file_name: &str) -> Result<()> {
+    let trimmed = file_name.trim();
+    let path = Path::new(trimmed);
+    let valid = !trimmed.is_empty()
+        && path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if !valid {
+        return Err(BuildError::InvalidRustModulePath {
+            path: file_name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn render_rust_module(artifacts: &CrateArtifacts, module_path: &Path) -> Result<String> {
+    let module_dir = module_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(&artifacts.out_dir);
+
+    let entry_bytes = fs::read(&artifacts.program).map_err(|source| BuildError::Io {
+        path: artifacts.program.clone(),
+        source,
+    })?;
+    let entry_sha256 = format!("{:x}", Sha256::digest(&entry_bytes));
+    let entry_name = relative_asset_name(&artifacts.out_dir, &artifacts.program);
+    let entry_inc = include_path_for(module_dir, &artifacts.program);
+
+    let mut out = String::new();
+    out.push_str("// @generated by mires-build; do not edit.\n\n");
+
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    let _ = writeln!(
+        out,
+        "pub const ENTRY_NAME: &str = {};",
+        rust_str_lit(&entry_name)
+    );
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    let _ = writeln!(
+        out,
+        "pub const ENTRY_JS: &str = include_str!({});",
+        rust_str_lit(&entry_inc)
+    );
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    let _ = writeln!(
+        out,
+        "pub const ENTRY_SHA256: &str = {};",
+        rust_str_lit(&entry_sha256)
+    );
+
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    if let Some(map_path) = &artifacts.source_map {
+        let map_inc = include_path_for(module_dir, map_path);
+        let _ = writeln!(
+            out,
+            "pub const SOURCE_MAP: Option<&str> = Some(include_str!({}));",
+            rust_str_lit(&map_inc)
+        );
+    } else {
+        out.push_str("pub const SOURCE_MAP: Option<&str> = None;\n");
+    }
+
+    out.push_str(
+        "\n#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]\n\
+         #[derive(Clone, Copy, Debug, Eq, PartialEq)]\n\
+         pub struct ChunkAsset {\n\
+             pub name: &'static str,\n\
+             pub role: &'static str,\n\
+             pub file_name: &'static str,\n\
+             pub sha256: &'static str,\n\
+             pub bytes: &'static [u8],\n\
+             pub source_map: Option<&'static [u8]>,\n\
+         }\n\n",
+    );
+
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    out.push_str("pub const CHUNKS: &[ChunkAsset] = &[\n");
+    for chunk in &artifacts.chunks {
+        let chunk_file = relative_asset_name(&artifacts.out_dir, &chunk.path);
+        let chunk_inc = include_path_for(module_dir, &chunk.path);
+        let map_expr = match &chunk.source_map {
+            Some(map) => format!(
+                "Some(include_bytes!({}))",
+                rust_str_lit(&include_path_for(module_dir, map))
+            ),
+            None => "None".to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            "    ChunkAsset {{\n\
+             \x20       name: {},\n\
+             \x20       role: {},\n\
+             \x20       file_name: {},\n\
+             \x20       sha256: {},\n\
+             \x20       bytes: include_bytes!({}),\n\
+             \x20       source_map: {map_expr},\n\
+             \x20   }},",
+            rust_str_lit(&chunk.name),
+            rust_str_lit(&chunk.role),
+            rust_str_lit(&chunk_file),
+            rust_str_lit(&chunk.sha256),
+            rust_str_lit(&chunk_inc),
+        );
+    }
+    out.push_str("];\n\n");
+
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut seen_files = BTreeSet::new();
+    let mut push_file = |path: &Path| {
+        let rel = relative_asset_name(&artifacts.out_dir, path);
+        if seen_files.insert(rel.clone()) {
+            let inc = include_path_for(module_dir, path);
+            files.push((rel, inc));
+        }
+    };
+
+    push_file(&artifacts.program);
+    if let Some(map_path) = &artifacts.source_map {
+        push_file(map_path);
+    }
+    if let Some(runtime_path) = &artifacts.runtime {
+        push_file(runtime_path);
+    }
+    for chunk in &artifacts.chunks {
+        push_file(&chunk.path);
+        if let Some(map_path) = &chunk.source_map {
+            push_file(map_path);
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    out.push_str("pub const FILES: &[(&str, &[u8])] = &[\n");
+    for (rel, inc) in &files {
+        let _ = writeln!(
+            out,
+            "    ({}, include_bytes!({})),",
+            rust_str_lit(rel),
+            rust_str_lit(inc)
+        );
+    }
+    out.push_str("];\n\n");
+
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code, reason = \"generated asset constants may be used selectively\")]"
+    );
+    if let Some(manifest_path) = &artifacts.manifest_path {
+        if manifest_path.is_file() {
+            let manifest_inc = include_path_for(module_dir, manifest_path);
+            let _ = writeln!(
+                out,
+                "pub const MANIFEST_JSON: Option<&str> = Some(include_str!({}));",
+                rust_str_lit(&manifest_inc)
+            );
+        } else if let Some(json) = &artifacts.manifest_json {
+            let _ = writeln!(
+                out,
+                "pub const MANIFEST_JSON: Option<&str> = Some({});",
+                rust_str_lit(json)
+            );
+        } else {
+            out.push_str("pub const MANIFEST_JSON: Option<&str> = None;\n");
+        }
+    } else if let Some(json) = &artifacts.manifest_json {
+        let _ = writeln!(
+            out,
+            "pub const MANIFEST_JSON: Option<&str> = Some({});",
+            rust_str_lit(json)
+        );
+    } else {
+        out.push_str("pub const MANIFEST_JSON: Option<&str> = None;\n");
+    }
+
+    Ok(out)
+}
+
+fn relative_asset_name(out_dir: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(out_dir) {
+        return to_forward_slash(rel);
+    }
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .map_or_else(|| to_forward_slash(path), str::to_owned)
+}
+
+fn include_path_for(module_dir: &Path, asset_path: &Path) -> String {
+    if let Ok(rel) = asset_path.strip_prefix(module_dir) {
+        return to_forward_slash(rel);
+    }
+    let resolved = fs::canonicalize(asset_path).unwrap_or_else(|_| asset_path.to_path_buf());
+    to_forward_slash(&resolved)
+}
+
+fn to_forward_slash(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+        .replace("//", "/")
+}
+
+fn rust_str_lit(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn is_valid_cfg_ident(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn check_cfg_expr(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    if let Some((key, _)) = trimmed.split_once('=') {
+        let key = key.trim();
+        is_valid_cfg_ident(key).then(|| format!("cfg({key},values(any()))"))
+    } else {
+        is_valid_cfg_ident(trimmed).then(|| format!("cfg({trimmed})"))
     }
 }
 
@@ -647,122 +1219,6 @@ fn collect_rs_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn format_extension(format: ModuleFormat) -> &'static str {
-    match format {
-        ModuleFormat::Esm => "mjs",
-        ModuleFormat::Script => "js",
-    }
-}
-
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
-fn parse_reported_paths(stdout: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for line in stdout.lines() {
-        let Some(rest) = line.strip_prefix("  ") else {
-            continue;
-        };
-        let Some((path_part, size_part)) = rest.rsplit_once("  ") else {
-            continue;
-        };
-        if !size_part.trim().ends_with("KB") {
-            continue;
-        }
-        let candidate = path_part.trim();
-        if !candidate.is_empty() {
-            paths.push(PathBuf::from(candidate));
-        }
-    }
-    paths
-}
-
-fn is_runtime_shim_name(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(OsStr::to_str),
-        Some("shim.mjs" | "shim.js")
-    )
-}
-
-fn find_program_in_dir(out_dir: &Path, ext: &str, package_hint: Option<&str>) -> Option<PathBuf> {
-    if let Some(pkg) = package_hint {
-        for stem in [pkg.replace('-', "_"), pkg.to_owned()] {
-            let candidate = out_dir.join(format!("{stem}.{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    let mut candidates: Vec<PathBuf> = fs::read_dir(out_dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path.extension().and_then(OsStr::to_str) == Some(ext)
-                && !is_runtime_shim_name(path)
-        })
-        .collect();
-    candidates.sort();
-    candidates.into_iter().next()
-}
-
-fn find_runtime_artifact(
-    out_dir: &Path,
-    program: &Path,
-    expected_ext: &str,
-    reported: &[PathBuf],
-) -> Option<PathBuf> {
-    // Prefer an explicitly reported runtime file from cargo-mires stdout (handles custom shim_module).
-    if let Some(path) = reported.iter().find(|path| {
-        path.is_file()
-            && *path != program
-            && matches!(path.extension().and_then(OsStr::to_str), Some("mjs" | "js"))
-    }) {
-        return Some(path.clone());
-    }
-
-    let primary = out_dir.join(format!("shim.{expected_ext}"));
-    if primary.is_file() {
-        return Some(primary);
-    }
-    let secondary = out_dir.join(if expected_ext == "mjs" {
-        "shim.js"
-    } else {
-        "shim.mjs"
-    });
-    secondary.is_file().then_some(secondary)
-}
-
-fn parse_manifest_package_name(manifest_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(manifest_path).ok()?;
-    let mut in_package = false;
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "name" {
-            let name = value.trim().trim_matches('"').trim_matches('\'');
-            if !name.is_empty() {
-                return Some(name.to_owned());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,7 +1231,14 @@ mod tests {
     }
 
     #[test]
-    fn new_accepts_crate_directory_or_direct_manifest_path() {
+    fn is_target_build_detects_cargo_cfg_mires() {
+        assert!(!is_target_build_from(None));
+        assert!(is_target_build_from(Some(OsStr::new(""))));
+        assert!(is_target_build_from(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn new_and_current_resolve_manifest_and_release_profile_helpers() {
         let from_dir = Crate::new("../client");
         assert_eq!(
             from_dir.manifest_path,
@@ -793,6 +1256,17 @@ mod tests {
         let bare_manifest = Crate::new("Cargo.toml");
         assert_eq!(bare_manifest.manifest_path, PathBuf::from("Cargo.toml"));
         assert_eq!(bare_manifest.crate_dir, PathBuf::from("."));
+
+        let current = Crate::current();
+        assert_eq!(
+            current.manifest_path.file_name(),
+            Some(OsStr::new("Cargo.toml"))
+        );
+
+        let released = Crate::new("../client").release();
+        assert_eq!(released.profile, Some(Profile::ReleaseBalanced));
+        let auto_profile = released.profile_from_cargo();
+        assert_eq!(auto_profile.profile, None);
     }
 
     #[test]
@@ -801,6 +1275,22 @@ mod tests {
         assert_eq!(profile_from_env(Some("debug")), Profile::Dev);
         assert_eq!(profile_from_env(Some("")), Profile::Dev);
         assert_eq!(profile_from_env(None), Profile::Dev);
+    }
+
+    #[test]
+    fn check_cfg_directives_cover_mires_and_custom_cfgs() {
+        let builder = Crate::new("../client")
+            .cfg("topcoat_client")
+            .cfg("mode=\"csr\"")
+            .cfg("topcoat_client");
+        assert_eq!(
+            builder.check_cfg_directives(),
+            vec![
+                "cargo::rustc-check-cfg=cfg(mires)".to_owned(),
+                "cargo::rustc-check-cfg=cfg(topcoat_client)".to_owned(),
+                "cargo::rustc-check-cfg=cfg(mode,values(any()))".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -841,6 +1331,8 @@ mod tests {
                 expected_target.as_str(),
                 "--mires-root",
                 "/opt/mires",
+                "--message-format",
+                "json",
             ]
         );
 
@@ -855,10 +1347,17 @@ mod tests {
             .profile(Profile::ReleaseSize)
             .format(ModuleFormat::Script)
             .runtime(RuntimeMode::External)
+            .shim_module("topcoat-dom")
             .dts(false)
             .source_map(false)
             .npm(true)
             .panic_mode(PanicMode::Abort)
+            .cfg("topcoat_client")
+            .cfg("mode=\"hydrate\"")
+            .chunk("app", "boot")
+            .island("counter")
+            .shared_chunk("common")
+            .discover_chunks(DiscoverChunks::On)
             .out_dir("/custom/out")
             .target_dir("/custom/target")
             .toolchain_root("/custom/mires")
@@ -893,11 +1392,25 @@ mod tests {
                 "script",
                 "--runtime",
                 "external",
+                "--shim-module",
+                "topcoat-dom",
                 "--no-dts",
                 "--no-source-map",
                 "--npm",
                 "--panic",
                 "abort",
+                "--cfg",
+                "topcoat_client",
+                "--cfg",
+                "mode=\"hydrate\"",
+                "--chunk",
+                "app:boot",
+                "--island",
+                "counter",
+                "--shared-chunk",
+                "common",
+                "--discover-chunks",
+                "on",
                 "--out-dir",
                 "/custom/out",
                 "--target-dir",
@@ -910,6 +1423,8 @@ mod tests {
                 "feat-a",
                 "--features",
                 "feat-b",
+                "--message-format",
+                "json",
             ]
         );
     }
@@ -953,12 +1468,10 @@ mod tests {
         fs::write(checkout.path().join("rust-toolchain.toml"), "").unwrap();
         fs::write(checkout.path().join("scripts/build_sysroot.sh"), "").unwrap();
 
-        // Installed crate (not inside a Mires checkout) with no overrides => None.
         assert_eq!(
             resolve_toolchain_root_from(None, None, None, non_checkout.path()),
             None
         );
-        // Empty env vars are ignored.
         assert_eq!(
             resolve_toolchain_root_from(
                 None,
@@ -968,12 +1481,10 @@ mod tests {
             ),
             None
         );
-        // Inside a local checkout => checkout path.
         assert_eq!(
             resolve_toolchain_root_from(None, None, None, checkout.path()),
             Some(checkout.path().to_path_buf())
         );
-        // MIRES_ROOT overrides checkout.
         assert_eq!(
             resolve_toolchain_root_from(
                 None,
@@ -983,7 +1494,6 @@ mod tests {
             ),
             Some(PathBuf::from("/env/mires"))
         );
-        // Explicit `.toolchain_root(...)` wins over everything.
         assert_eq!(
             resolve_toolchain_root_from(
                 Some(Path::new("/explicit/mires")),
@@ -1037,7 +1547,6 @@ mod tests {
             "{msg}"
         );
 
-        // 5. Found on PATH when no higher-precedence location exists.
         let on_path = path_dir.path().join(bin);
         fs::write(&on_path, "").unwrap();
         assert_eq!(
@@ -1049,17 +1558,7 @@ mod tests {
             .unwrap(),
             on_path
         );
-        assert_eq!(
-            locate_cargo_mires_in(
-                None,
-                Some(cargo_bin.path()),
-                Some(path_dir.path().as_os_str())
-            )
-            .unwrap(),
-            on_path
-        );
 
-        // 4. $CARGO_HOME/bin (or ~/.cargo/bin) beats PATH.
         let in_cargo_bin = cargo_bin.path().join(bin);
         fs::write(&in_cargo_bin, "").unwrap();
         assert_eq!(
@@ -1071,17 +1570,7 @@ mod tests {
             .unwrap(),
             in_cargo_bin
         );
-        assert_eq!(
-            locate_cargo_mires_in(
-                None,
-                Some(cargo_bin.path()),
-                Some(path_dir.path().as_os_str())
-            )
-            .unwrap(),
-            in_cargo_bin
-        );
 
-        // 3. Standalone unpacked bundle `<toolchain_root>/bin/cargo-mires` beats cargo bin.
         let bundle_bin = root.path().join("bin").join(bin);
         fs::create_dir_all(bundle_bin.parent().unwrap()).unwrap();
         fs::write(&bundle_bin, "").unwrap();
@@ -1095,7 +1584,6 @@ mod tests {
             bundle_bin
         );
 
-        // 2. Debug binary under toolchain root beats bundle bin.
         let debug_bin = root.path().join("target/debug").join(bin);
         fs::create_dir_all(debug_bin.parent().unwrap()).unwrap();
         fs::write(&debug_bin, "").unwrap();
@@ -1109,7 +1597,6 @@ mod tests {
             debug_bin
         );
 
-        // 1. Release binary under toolchain root beats debug.
         let release_bin = root.path().join("target/release").join(bin);
         fs::create_dir_all(release_bin.parent().unwrap()).unwrap();
         fs::write(&release_bin, "").unwrap();
@@ -1162,7 +1649,6 @@ mod tests {
         )));
         assert!(!directives.iter().any(|line| line.contains("notes.txt")));
 
-        // Standalone unpacked bundle binaries are watched when toolchain_root is set.
         let bundle = TempDir::new("crate-rerun-bundle");
         let linker = bundle.path().join("bin").join(jsc_link_bin_name());
         fs::create_dir_all(linker.parent().unwrap()).unwrap();
@@ -1172,49 +1658,48 @@ mod tests {
     }
 
     #[test]
-    fn discover_artifacts_finds_program_and_sidecars() {
-        let dir = TempDir::new("crate-discover");
-        let out = dir.path().join("out");
-        fs::create_dir_all(&out).unwrap();
-        fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"my-client\"\n",
-        )
-        .unwrap();
-
-        let program = out.join("my_client.mjs");
-        let map = out.join("my_client.mjs.map");
-        let dts = out.join("my_client.d.ts");
-        let shim = out.join("shim.mjs");
-        let pkg = out.join("package.json");
-        for path in [&program, &map, &dts, &shim, &pkg] {
-            fs::write(path, "// artifact\n").unwrap();
-        }
-
-        let artifacts = Crate::new(dir.path())
-            .runtime(RuntimeMode::External)
-            .npm(true)
-            .discover_artifacts(&out, "")
-            .unwrap();
+    fn parse_cargo_mires_json_validates_schema_and_tolerates_prefixed_lines() {
+        let payload = serde_json::json!({
+            "schema": 1,
+            "package": "demo",
+            "profile": "dev",
+            "format": "esm",
+            "runtime": "inline",
+            "out_dir": "/tmp/out",
+            "program": "/tmp/out/demo.mjs",
+            "chunks": [],
+            "dep_files": ["/ws/shared/src/lib.rs"],
+            "elapsed_secs": 0.1
+        });
+        let noisy = format!("Installed Mires toolchain v0.1.0\n{payload}\n");
+        let parsed = parse_cargo_mires_json(&noisy).unwrap();
+        assert_eq!(parsed.program, PathBuf::from("/tmp/out/demo.mjs"));
         assert_eq!(
-            artifacts,
-            CrateArtifacts {
-                program,
-                source_map: Some(map),
-                dts: Some(dts),
-                runtime: Some(shim),
-                package_json: Some(pkg),
-                out_dir: out,
-            }
+            parsed.dep_files,
+            vec![PathBuf::from("/ws/shared/src/lib.rs")]
         );
+
+        let wrong_schema = serde_json::json!({
+            "schema": 99,
+            "out_dir": "/tmp/out",
+            "program": "/tmp/out/demo.mjs"
+        });
+        assert!(matches!(
+            parse_cargo_mires_json(&wrong_schema.to_string()),
+            Err(BuildError::InvalidCargoMiresJson { .. })
+        ));
+        assert!(matches!(
+            parse_cargo_mires_json("not json at all"),
+            Err(BuildError::InvalidCargoMiresJson { .. })
+        ));
     }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn build_invokes_cargo_mires_with_isolated_target_dir_and_auto_install() {
+    fn build_parses_json_chunks_manifest_and_emits_compilable_rust_module() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = TempDir::new("crate-build-e2e");
+        let dir = TempDir::new("crate-build-e2e-json");
         let client_dir = dir.path().join("client");
         fs::create_dir_all(client_dir.join("src")).unwrap();
         fs::write(
@@ -1231,37 +1716,84 @@ mod tests {
         let recorded_args = dir.path().join("recorded-args.txt");
         let recorded_env = dir.path().join("recorded-env.txt");
         let fake_cargo_mires = bundle_bin_dir.join("cargo-mires");
-        fs::write(
-            &fake_cargo_mires,
-            format!(
-                concat!(
-                    "#!/usr/bin/env bash\n",
-                    "set -euo pipefail\n",
-                    "printf '%s\\n' \"$@\" >'{}'\n",
-                    "printf '%s' \"${{MIRES_AUTO_INSTALL:-unset}}\" >'{}'\n",
-                    "out='{}'\n",
-                    "mkdir -p \"$out\"\n",
-                    "printf 'export function hi() {{}}\\n' >\"$out/demo_client.mjs\"\n",
-                    "printf '{{\"version\":3}}' >\"$out/demo_client.mjs.map\"\n",
-                    "printf 'export function hi(): void;\\n' >\"$out/demo_client.d.ts\"\n",
-                    "printf 'Built `demo-client` (esm, inline runtime, profile=dev) in 0.01s:\\n'\n",
-                    "printf '  %s/demo_client.mjs  0.03 KB\\n' \"$out\"\n",
-                    "printf '  %s/demo_client.mjs.map  0.01 KB\\n' \"$out\"\n",
-                    "printf '  %s/demo_client.d.ts  0.03 KB\\n' \"$out\"\n",
-                ),
-                recorded_args.display(),
-                recorded_env.display(),
-                out_dir.display(),
+
+        let entry_js = "export function hi() {}\n";
+        let entry_sha = format!("{:x}", Sha256::digest(entry_js.as_bytes()));
+        let chunk_js = "export function __island_counter() {}\n";
+        let chunk_sha = format!("{:x}", Sha256::digest(chunk_js.as_bytes()));
+        let manifest_text = r#"{"schema":2,"entries":{},"artifacts":{}}"#;
+
+        let json_payload = serde_json::json!({
+            "schema": 1,
+            "package": "demo-client",
+            "profile": "dev",
+            "format": "esm",
+            "runtime": "external",
+            "out_dir": out_dir,
+            "program": out_dir.join("demo_client.mjs"),
+            "source_map": out_dir.join("demo_client.mjs.map"),
+            "dts": out_dir.join("demo_client.d.mts"),
+            "runtime_file": out_dir.join("shim.mjs"),
+            "package_json": null,
+            "manifest_path": out_dir.join("demo_client.artifacts.json"),
+            "manifest": { "schema": 2, "entries": {}, "artifacts": {} },
+            "chunks": [
+                {
+                    "name": "counter",
+                    "role": "island",
+                    "path": out_dir.join("counter.js"),
+                    "source_map": out_dir.join("counter.js.map"),
+                    "dts": out_dir.join("counter.d.ts"),
+                    "sha256": chunk_sha,
+                    "bytes": chunk_js.len()
+                }
+            ],
+            "dep_files": [
+                client_dir.join("Cargo.toml"),
+                dir.path().join("shared/src/lib.rs")
+            ],
+            "elapsed_secs": 0.02
+        });
+
+        let script = format!(
+            concat!(
+                "#!/usr/bin/env bash\n",
+                "set -euo pipefail\n",
+                "printf '%s\\n' \"$@\" >'{}'\n",
+                "printf '%s' \"${{MIRES_AUTO_INSTALL:-unset}}\" >'{}'\n",
+                "out='{}'\n",
+                "mkdir -p \"$out\"\n",
+                "printf '%s' '{}' >\"$out/demo_client.mjs\"\n",
+                "printf '{{\"version\":3}}' >\"$out/demo_client.mjs.map\"\n",
+                "printf 'export function hi(): void;\\n' >\"$out/demo_client.d.mts\"\n",
+                "printf 'export const __rt = {{}};\\n' >\"$out/shim.mjs\"\n",
+                "printf '%s' '{}' >\"$out/counter.js\"\n",
+                "printf '{{\"version\":3}}' >\"$out/counter.js.map\"\n",
+                "printf 'export function __island_counter(): void;\\n' >\"$out/counter.d.ts\"\n",
+                "printf '%s' '{}' >\"$out/demo_client.artifacts.json\"\n",
+                "printf '%s\\n' '{}'\n",
             ),
-        )
-        .unwrap();
+            recorded_args.display(),
+            recorded_env.display(),
+            out_dir.display(),
+            entry_js,
+            chunk_js,
+            manifest_text,
+            json_payload,
+        );
+        fs::write(&fake_cargo_mires, script).unwrap();
         fs::set_permissions(&fake_cargo_mires, fs::Permissions::from_mode(0o755)).unwrap();
 
         let artifacts = Crate::new(&client_dir)
             .profile(Profile::Dev)
+            .runtime(RuntimeMode::External)
+            .cfg("topcoat_client")
+            .island("counter")
+            .discover_chunks(DiscoverChunks::On)
             .out_dir(&out_dir)
             .toolchain_root(&toolchain_dir)
             .auto_install(true)
+            .emit_rust_module("client_assets.rs")
             .build()
             .unwrap();
 
@@ -1270,12 +1802,74 @@ mod tests {
             artifacts.source_map,
             Some(out_dir.join("demo_client.mjs.map"))
         );
-        assert_eq!(artifacts.dts, Some(out_dir.join("demo_client.d.ts")));
-        assert_eq!(artifacts.runtime, None);
+        assert_eq!(artifacts.dts, Some(out_dir.join("demo_client.d.mts")));
+        assert_eq!(artifacts.runtime, Some(out_dir.join("shim.mjs")));
         assert_eq!(artifacts.package_json, None);
         assert_eq!(artifacts.out_dir, out_dir);
-        assert_eq!(fs::read_to_string(&recorded_env).unwrap(), "1");
+        assert_eq!(
+            artifacts.manifest_path,
+            Some(out_dir.join("demo_client.artifacts.json"))
+        );
+        assert_eq!(artifacts.manifest_json.as_deref(), Some(manifest_text));
+        assert_eq!(artifacts.chunks.len(), 1);
+        assert_eq!(artifacts.chunks[0].name, "counter");
+        assert_eq!(artifacts.chunks[0].role, "island");
+        assert_eq!(artifacts.chunks[0].sha256, chunk_sha);
 
+        let module_path = artifacts.rust_module.as_ref().expect("rust_module emitted");
+        assert_eq!(module_path, &out_dir.join("client_assets.rs"));
+        let generated = fs::read_to_string(module_path).unwrap();
+        assert!(generated.contains("pub const ENTRY_NAME: &str = \"demo_client.mjs\";"));
+        assert!(generated.contains(&format!("pub const ENTRY_SHA256: &str = \"{entry_sha}\";")));
+        assert!(generated.contains("pub const CHUNKS: &[ChunkAsset]"));
+        assert!(generated.contains("pub const FILES: &[(&str, &[u8])]"));
+        assert!(generated.contains("pub const MANIFEST_JSON: Option<&str>"));
+
+        // Verify the generated Rust module compiles cleanly with `rustc --deny warnings`.
+        let wrapper_rs = dir.path().join("check_assets.rs");
+        fs::write(
+            &wrapper_rs,
+            format!(
+                "#![deny(warnings)]\n\
+                 pub mod assets {{\n\
+                     include!({});\n\
+                 }}\n\
+                 pub fn check() -> (&'static str, &'static str, &'static str, usize, usize, bool) {{\n\
+                     (\n\
+                         assets::ENTRY_NAME,\n\
+                         assets::ENTRY_JS,\n\
+                         assets::ENTRY_SHA256,\n\
+                         assets::CHUNKS.len(),\n\
+                         assets::FILES.len(),\n\
+                         assets::SOURCE_MAP.is_some() && assets::MANIFEST_JSON.is_some(),\n\
+                     )\n\
+                 }}\n",
+                rust_str_lit(&module_path.display().to_string()),
+            ),
+        )
+        .unwrap();
+        let rmeta = dir.path().join("libcheck_assets.rmeta");
+        let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let compile = Command::new(&rustc)
+            .args([
+                "--crate-type",
+                "lib",
+                "--edition",
+                "2021",
+                "--emit=metadata",
+                "-o",
+            ])
+            .arg(&rmeta)
+            .arg(&wrapper_rs)
+            .output()
+            .expect("invoke rustc to check generated module");
+        assert!(
+            compile.status.success(),
+            "generated Rust module failed to compile:\n{}\n---\n{generated}",
+            String::from_utf8_lossy(&compile.stderr),
+        );
+
+        assert_eq!(fs::read_to_string(&recorded_env).unwrap(), "1");
         let recorded: Vec<String> = fs::read_to_string(&recorded_args)
             .unwrap()
             .lines()
@@ -1289,5 +1883,24 @@ mod tests {
             PathBuf::from(&recorded[target_idx + 1]),
             out_dir.join("mires-target")
         );
+        assert!(recorded
+            .windows(2)
+            .any(|w| w == ["--message-format", "json"]));
+        assert!(recorded
+            .windows(2)
+            .any(|w| w == ["--cfg", "topcoat_client"]));
+        assert!(recorded.windows(2).any(|w| w == ["--island", "counter"]));
+        assert!(recorded
+            .windows(2)
+            .any(|w| w == ["--discover-chunks", "on"]));
+    }
+
+    #[test]
+    fn rejects_escaping_rust_module_paths() {
+        assert!(validate_relative_module_path("").is_err());
+        assert!(validate_relative_module_path("../escape.rs").is_err());
+        assert!(validate_relative_module_path("/abs/path.rs").is_err());
+        assert!(validate_relative_module_path("client_assets.rs").is_ok());
+        assert!(validate_relative_module_path("gen/client_assets.rs").is_ok());
     }
 }

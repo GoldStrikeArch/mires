@@ -57,6 +57,12 @@ pub enum BuildError {
         stderr.trim()
     )]
     CargoMires { status: ExitStatus, stderr: String },
+    #[error("failed to parse `cargo-mires --message-format=json` output: {detail}")]
+    InvalidCargoMiresJson { detail: String },
+    #[error(
+        "invalid Rust module file name `{path}` (expected a non-empty relative path inside out_dir)"
+    )]
+    InvalidRustModulePath { path: String },
     #[cfg(feature = "single-file")]
     #[error("minimal runtime extraction exited with {status}:\n{stderr}")]
     MinimalShim { status: ExitStatus, stderr: String },

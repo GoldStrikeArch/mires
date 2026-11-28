@@ -31,11 +31,11 @@ impl JsError {
     ///
     /// On native host targets (such as `cargo test`), panics with the error message.
     pub fn throw(self) -> ! {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(mires)]
         {
             mires_js::throw_value(mires_js::JsValue::erase(self.message.as_str()))
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(mires))]
         {
             panic!("{}", self.message)
         }
