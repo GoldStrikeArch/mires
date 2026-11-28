@@ -51,7 +51,7 @@ Each test has an `.expected` file (exact stdout), a `.maxbytes` budget (to catch
 | `guard_as_chunks` | Verifies that `as_chunks` aborts at runtime via a guard instead of silently returning wrong elements |
 | `guard_heap_retype` | Reading a written heap block at a second element size triggers `__rt.unscale` to throw |
 | `guard_map_key` | Compile-time type error via the sealed `MapKey` trait when an aggregate is used as a host `Map` key |
-| `guard_rc_str` | Unsized heap tail boundary: slice tails work, while `Rc<str>` fails loudly |
+| `guard_rc_str` | Unsized heap tail boundary: `Rc<str>::from` works (`433_str_tail_dst`), while `Rc::<str>::from_raw` on a bare `*const str` fails loudly |
 | `guard_use_after_free` | `dealloc` poisons freed blocks so subsequent pointer casts fail explicitly |
 | `guard_zeroed_retype` | Retyping a zeroed allocation to a type with no valid all-zero JS form (such as a fat pointer `&[T]`) throws |
 

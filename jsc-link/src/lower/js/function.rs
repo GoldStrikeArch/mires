@@ -143,6 +143,7 @@ fn try_lower_noop_drop_glue(input: &LowerInput<'_>, func: &Func) -> Option<Lower
         dts: None,
         js_alloc_origins: Vec::new(),
         bigints: BTreeSet::new(),
+        hoisted_consts: std::collections::BTreeMap::new(),
     })
 }
 
@@ -174,6 +175,7 @@ fn lower_js_export_out(input: &LowerInput<'_>, func: &Func) -> Result<LoweredIte
         Vec::new(),
         input.bigints,
         &HashSet::new(),
+        std::collections::BTreeMap::new(),
     )
 }
 
@@ -596,6 +598,7 @@ fn build_function_decl(
         allocation_origins,
         input.bigints,
         &immutable_slices,
+        cx.take_hoisted_consts(),
     )
 }
 
@@ -649,6 +652,7 @@ fn try_lower_slice_sort(
             Vec::new(),
             input.bigints,
             &HashSet::new(),
+            std::collections::BTreeMap::new(),
         )
         .map(Some);
     }
@@ -699,6 +703,7 @@ fn try_lower_slice_sort(
         Vec::new(),
         input.bigints,
         &HashSet::new(),
+        std::collections::BTreeMap::new(),
     )
     .map(Some)
 }
@@ -746,6 +751,7 @@ pub fn lower_static(input: &LowerInput<'_>, plan: &Plan) -> Result<LoweredItem, 
         Vec::new(),
         None,
         &HashSet::new(),
+        cx.take_hoisted_consts(),
     )
 }
 
@@ -787,6 +793,7 @@ pub fn lower_vtable(input: &LowerInput<'_>) -> Result<LoweredItem, Decline> {
         Vec::new(),
         None,
         &HashSet::new(),
+        std::collections::BTreeMap::new(),
     )
 }
 
@@ -805,6 +812,10 @@ fn empty_func(input: &LowerInput<'_>) -> Func {
 /// The `LoweredItem` around a finished declaration: refs by `visit_free_idents`, the names table
 /// led by the item's own debug path, the root location. `bigints` names the declaration's BigInt
 /// constants when it is a function lowered for phase C on the ES2018 target.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "collects all lowering outputs into one LoweredItem"
+)]
 fn finish(
     input: &LowerInput<'_>,
     decl: Stmt,
@@ -813,6 +824,7 @@ fn finish(
     js_alloc_origins: Vec<crate::analysis::js_alloc::Origin>,
     bigints: Option<&crate::lower::bigint::BigIntNames>,
     immutable_slices: &HashSet<String>,
+    hoisted_consts: std::collections::BTreeMap<JsName, Expr>,
 ) -> Result<LoweredItem, Decline> {
     // A baseline item passes through the shared finished-JavaScript SROA and DCE pipeline in
     // `JsItem::new`. JIR replacements are installed directly by the linker, so run the same
@@ -891,6 +903,7 @@ fn finish(
         zombies,
         js_alloc_origins,
         bigints: hoisted,
+        hoisted_consts,
     })
 }
 

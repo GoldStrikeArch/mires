@@ -2795,6 +2795,7 @@ mod tests {
                             caller_location: func.sig.abi.caller_location,
                             caller_location_def: None,
                             is_core: false,
+                            is_zst_closure_receiver: false,
                             standard: None,
                         },
                     );
@@ -6283,6 +6284,7 @@ mod tests {
                 caller_location: false,
                 caller_location_def: None,
                 is_core: false,
+                is_zst_closure_receiver: false,
                 standard: Some(StandardOperation::NativeVecAsSlice),
             },
         );

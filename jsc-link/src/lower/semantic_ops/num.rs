@@ -140,6 +140,7 @@ pub(crate) fn lower_float_from_str(
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
         bigints: BTreeSet::new(),
+        hoisted_consts: std::collections::BTreeMap::new(),
     }))
 }
 

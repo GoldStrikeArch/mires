@@ -72,6 +72,7 @@ fn lowering(name: &str, callee: &str) -> LoweredItem {
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
         bigints: BTreeSet::new(),
+        hoisted_consts: BTreeMap::new(),
     }
 }
 

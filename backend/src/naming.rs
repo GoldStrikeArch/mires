@@ -133,20 +133,50 @@ impl<'tcx> Namer<'tcx> {
         ty: Ty<'tcx>,
         trait_ref: Option<ExistentialTraitRef<'tcx>>,
     ) -> JsName {
-        let ty = self.stable_ty(ty);
+        let normalized = self
+            .tcx
+            .normalize_erasing_regions(crate::value::typing_env(), ty::Unnormalized::new_wip(ty));
+        let type_hash = self.tcx.type_id_hash(normalized).as_u128();
+        let ty = self.stable_ty(normalized);
         let (path, key) = match trait_ref {
             Some(trait_ref) => {
                 let trait_ = self.stable_trait(trait_ref);
                 (
                     format!("vtable::{ty}::{trait_}"),
-                    format!("vtable\u{1}{ty}\u{1}{trait_}"),
+                    format!("vtable\u{1}{type_hash:032x}\u{1}{ty}\u{1}{trait_}"),
                 )
             }
-            None => (format!("vtable::{ty}"), format!("vtable\u{1}{ty}")),
+            None => (
+                format!("vtable::{ty}"),
+                format!("vtable\u{1}{type_hash:032x}\u{1}{ty}"),
+            ),
         };
         match self.style {
             // Even in mangled mode a vtable has no symbol to fall back on.
             NameStyle::Readable | NameStyle::Mangled => JsName::new(readable(&path, &key)),
+        }
+    }
+
+    fn stable_const(&self, c: ty::Const<'tcx>) -> String {
+        if let Some(n) = c.try_to_target_usize(self.tcx) {
+            return n.to_string();
+        }
+        with_no_trimmed_paths!(format!("{c}"))
+    }
+
+    fn stable_generic_args(&self, args: &[ty::GenericArg<'tcx>]) -> String {
+        let parts: Vec<String> = args
+            .iter()
+            .filter_map(|arg| match arg.kind() {
+                ty::GenericArgKind::Type(t) => Some(self.stable_ty(t)),
+                ty::GenericArgKind::Const(c) => Some(self.stable_const(c)),
+                ty::GenericArgKind::Lifetime(_) => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", parts.join(","))
         }
     }
 
@@ -163,32 +193,40 @@ impl<'tcx> Namer<'tcx> {
     /// spelled this way. What is left over -- the primitives, `str`, `!`, a function pointer -- has
     /// no def path in it at all and prints the same from anywhere.
     fn stable_ty(&self, ty: Ty<'tcx>) -> String {
-        let args = |args: &[ty::GenericArg<'tcx>]| {
-            let tys: Vec<String> = args
-                .iter()
-                .filter_map(|arg| arg.as_type())
-                .map(|arg| self.stable_ty(arg))
-                .collect();
-            if tys.is_empty() {
-                String::new()
-            } else {
-                format!("<{}>", tys.join(","))
-            }
-        };
         match ty.kind() {
-            ty::Adt(def, generics) => format!("{}{}", self.stem(def.did()), args(generics)),
+            ty::Adt(def, generics) => {
+                format!(
+                    "{}{}",
+                    self.stem(def.did()),
+                    self.stable_generic_args(generics)
+                )
+            }
             ty::Foreign(def_id) => self.stem(*def_id),
             ty::Closure(def_id, generics) => {
-                format!("{}{}", self.stem(*def_id), args(generics))
+                format!(
+                    "{}{}",
+                    self.stem(*def_id),
+                    self.stable_generic_args(generics)
+                )
             }
-            ty::FnDef(def_id, generics) => {
-                format!("{}{}", self.stem(*def_id), args(generics.skip_binder()))
-            }
+            ty::FnDef(def_id, generics) => format!(
+                "{}{}",
+                self.stem(*def_id),
+                self.stable_generic_args(generics.skip_binder())
+            ),
             ty::Coroutine(def_id, generics) => {
-                format!("{}{}", self.stem(*def_id), args(generics))
+                format!(
+                    "{}{}",
+                    self.stem(*def_id),
+                    self.stable_generic_args(generics)
+                )
             }
             ty::CoroutineClosure(def_id, generics) => {
-                format!("{}{}", self.stem(*def_id), args(generics))
+                format!(
+                    "{}{}",
+                    self.stem(*def_id),
+                    self.stable_generic_args(generics)
+                )
             }
             ty::Ref(_, inner, mutability) => {
                 format!("&{}{}", mutability.prefix_str(), self.stable_ty(*inner))
@@ -197,7 +235,9 @@ impl<'tcx> Namer<'tcx> {
                 format!("*{} {}", mutability.ptr_str(), self.stable_ty(*inner))
             }
             ty::Slice(element) => format!("[{}]", self.stable_ty(*element)),
-            ty::Array(element, _) => format!("[{};N]", self.stable_ty(*element)),
+            ty::Array(element, len) => {
+                format!("[{};{}]", self.stable_ty(*element), self.stable_const(*len))
+            }
             ty::Pat(base, _) => self.stable_ty(*base),
             ty::Tuple(elements) => {
                 let parts: Vec<String> = elements
@@ -217,18 +257,11 @@ impl<'tcx> Namer<'tcx> {
 
     /// The [stable spelling](Namer::stable_ty) of the trait half of a vtable.
     fn stable_trait(&self, trait_ref: ExistentialTraitRef<'tcx>) -> String {
-        let generics: Vec<String> = trait_ref
-            .args
-            .iter()
-            .filter_map(|arg| arg.as_type())
-            .map(|arg| self.stable_ty(arg))
-            .collect();
-        let stem = self.stem(trait_ref.def_id);
-        if generics.is_empty() {
-            stem
-        } else {
-            format!("{stem}<{}>", generics.join(","))
-        }
+        format!(
+            "{}{}",
+            self.stem(trait_ref.def_id),
+            self.stable_generic_args(trait_ref.args)
+        )
     }
 
     /// The name of a synthetic item that has no `DefId` and no type to describe it.

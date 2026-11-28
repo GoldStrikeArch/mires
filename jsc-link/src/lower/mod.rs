@@ -165,6 +165,9 @@ pub struct LoweredItem {
     /// ([`LowerInput::bigints`]): the bindings the driver adds to the program. Empty unless the
     /// constants were hoisted.
     pub bigints: BTreeSet<String>,
+    /// Pure immutable promoted constant references (`ConstTree::Reference`) hoisted to shared
+    /// module-level `const` bindings so repeated evaluations preserve pointer identity.
+    pub hoisted_consts: std::collections::BTreeMap<JsName, jsast::Expr>,
 }
 
 /// Lowers one item's JIR-S body to a JavaScript declaration.

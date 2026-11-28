@@ -604,6 +604,7 @@ impl<'a> JsCx<'a> {
             _ => {
                 let value = self.const_expr_at(inner, pointee, depth + 1)?;
                 if table.is_indirect(pointee) {
+                    let value = self.maybe_hoist_const_ref(inner, ty, value);
                     Ok(self.boxed_if_raw(ty, pointee, value))
                 } else {
                     // A reference to a primitive is a slot into a fresh single element array.
@@ -611,6 +612,37 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
+    }
+
+    /// Hoists a pure immutable promoted constant object (e.g. `&RawWakerVTable::new(...)`) to a
+    /// shared module-level `const $cr$h<hash>` binding so repeated calls and cross-function uses
+    /// observe identical JS object identity (`ptr::eq`, `Waker::will_wake`) without per-call
+    /// allocation.
+    fn maybe_hoist_const_ref(&self, inner: &ConstTree, ty: TypeId, value: Expr) -> Expr {
+        if self.items.is_empty() {
+            return value;
+        }
+        let is_immut_ptr = matches!(
+            value::kind(self.table, self.table.peeled(ty)),
+            Some(
+                TypeKind::Reference { mutable: false, .. }
+                    | TypeKind::RawPointer { mutable: false, .. }
+            )
+        );
+        if !is_immut_ptr
+            || !matches!(&value, Expr::Object(entries) if !entries.is_empty())
+            || !const_tree_pure_for_hoist(inner)
+            || !expr_hoistable_const_ref(&value)
+        {
+            return value;
+        }
+        let key = jsast::expr_to_string(&value);
+        let name = hoisted_name("$cr", &key);
+        self.hoisted_consts
+            .borrow_mut()
+            .entry(rcgjs_object::item::JsName::new(name.clone()))
+            .or_insert(value);
+        jsast::id(name)
     }
 
     /// Walks the last field of a constant unsized-tail struct aggregate to recover its tail length
@@ -753,9 +785,34 @@ impl<'a> JsCx<'a> {
     /// A pointer to a global (`constant.rs::pointer_expr`, `Function`/`Static`).
     fn global_expr(&self, target: &GlobalReference, offset: u64, ty: TypeId) -> Res<Expr> {
         match target {
-            GlobalReference::Function { link_name, .. } => Ok(jsast::id(
-                self.interns.str(*link_name).unwrap_or("").to_owned(),
-            )),
+            GlobalReference::Function { item, link_name } => {
+                let fn_ident = jsast::id(self.interns.str(*link_name).unwrap_or("").to_owned());
+                // A non-capturing closure coerced to a `fn` pointer inside CTFE (`const`/`static`,
+                // e.g. `RawWakerVTable::new(|p| ..., ...)`) resolves to its `FnOnce::call_once`
+                // shim whose first MIR parameter is the zero-sized closure environment. Mirror
+                // `rvalue.rs::ClosureFnPointer` by prepending `undefined` for the environment slot.
+                if let Some(TypeKind::FnPtr { sig }) =
+                    value::kind(self.table, self.table.peeled(ty))
+                {
+                    if let (Some(sig_desc), Some(entry)) =
+                        (self.interns.sig(*sig), self.items.get(item))
+                    {
+                        let arity = sig_desc.inputs.len();
+                        let expected_params = arity + 1 + usize::from(entry.caller_location);
+                        if entry.is_zst_closure_receiver
+                            && entry.abi_known
+                            && entry.params == expected_params
+                        {
+                            let params: Vec<String> =
+                                (0..arity).map(|index| format!("$a{index}")).collect();
+                            let mut arguments = vec![jsast::undefined()];
+                            arguments.extend(params.iter().cloned().map(jsast::id));
+                            return Ok(jsast::arrow(params, jsast::call(fn_ident, arguments)));
+                        }
+                    }
+                }
+                Ok(fn_ident)
+            }
             // A reference to a `static` is the module level binding it was emitted as. For an
             // indirect type the binding's own value *is* the reference; a primitive has no
             // identity to point at, so such a `static` is emitted **boxed** (`let S = [value]`,
@@ -1184,6 +1241,53 @@ pub(crate) fn resolve_location_field_keys(
     }
 
     Ok(LocationKeysOutcome::Ambiguous)
+}
+
+/// Returns `true` when `tree` depends only on literals and hoisted `function` declarations
+/// (never `let` statics), so it is safe to evaluate in a module-level `const`.
+fn const_tree_pure_for_hoist(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Unit
+        | ConstTree::Scalar { .. }
+        | ConstTree::Str(_)
+        | ConstTree::Address(_)
+        | ConstTree::SliceAddress { .. } => true,
+        ConstTree::Global { target, .. } => matches!(
+            target,
+            GlobalReference::Function { .. } | GlobalReference::Type(_)
+        ),
+        ConstTree::StaticField { .. } | ConstTree::StaticSlice { .. } => false,
+        ConstTree::Aggregate(fields) | ConstTree::Slice(fields) => {
+            fields.iter().all(const_tree_pure_for_hoist)
+        }
+        ConstTree::Variant { fields, .. } => fields.iter().all(const_tree_pure_for_hoist),
+        ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => {
+            const_tree_pure_for_hoist(inner)
+        }
+    }
+}
+
+/// Returns `true` when a lowered JS constant expression is pure, ES2018-load-safe (no `BigInt`),
+/// and free of runtime-helper calls so hoisting it to a top-level `const` is always safe.
+fn expr_hoistable_const_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Undefined
+        | Expr::Null
+        | Expr::Ident(_) => true,
+        Expr::Unary(_, inner) => expr_hoistable_const_ref(inner),
+        Expr::Object(entries) => entries.iter().all(|(_, v)| expr_hoistable_const_ref(v)),
+        Expr::Array(elems) => elems.iter().all(expr_hoistable_const_ref),
+        Expr::Arrow(_, jsast::ArrowBody::Expr(body)) => expr_hoistable_const_ref(body),
+        Expr::Call(callee, args) => {
+            matches!(callee.as_ref(), Expr::Ident(name) if name != "BigInt")
+                && args.iter().all(expr_hoistable_const_ref)
+        }
+        _ => false,
+    }
 }
 
 /// The tag key, re-exported for the constant tests.

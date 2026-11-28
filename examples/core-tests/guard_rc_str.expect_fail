@@ -1,2 +1,1 @@
-the size of a struct whose tail is not a slice is not known to rustc_codegen_js
 cannot cast a pointer to `str` into a pointer to `alloc::rc::RcInner<str>`

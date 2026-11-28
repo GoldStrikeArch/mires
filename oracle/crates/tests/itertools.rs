@@ -32,6 +32,19 @@ fn windows_tuples_and_combinatorics() {
 
     let sorted: Vec<i32> = [5, 2, 9, 1, 5, 6].into_iter().sorted().collect();
     assert_eq!(sorted, vec![1, 2, 5, 5, 6, 9]);
+
+    let perms: Vec<Vec<usize>> = (1..=3).permutations(3).collect();
+    assert_eq!(
+        perms,
+        vec![
+            vec![1, 2, 3],
+            vec![1, 3, 2],
+            vec![2, 1, 3],
+            vec![2, 3, 1],
+            vec![3, 1, 2],
+            vec![3, 2, 1],
+        ]
+    );
 }
 
 #[test]

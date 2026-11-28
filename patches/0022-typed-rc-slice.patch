@@ -95,6 +95,17 @@
      }
  }
  
+@@ -2931,6 +2971,8 @@
+     #[inline]
+     fn from(v: &str) -> Rc<str> {
+         let rc = Rc::<[u8]>::from(v.as_bytes());
+-        unsafe { Rc::from_raw(Rc::into_raw(rc) as *const str) }
++        let ptr = rc.ptr.as_ptr() as *mut RcInner<str>;
++        core::mem::forget(rc);
++        unsafe { Rc::from_ptr(ptr) }
+     }
+ }
+ 
 --- a/library/alloc/src/sync.rs
 +++ b/library/alloc/src/sync.rs
 @@ -2262,17 +2262,63 @@
@@ -192,3 +203,13 @@
      }
  }
  
+@@ -3989,6 +4029,8 @@
+     #[inline]
+     fn from(v: &str) -> Arc<str> {
+         let arc = Arc::<[u8]>::from(v.as_bytes());
+-        unsafe { Arc::from_raw(Arc::into_raw(arc) as *const str) }
++        let ptr = arc.ptr.as_ptr() as *mut ArcInner<str>;
++        core::mem::forget(arc);
++        unsafe { Arc::from_ptr(ptr) }
+     }
+ }

@@ -20,8 +20,10 @@
     "cmp",
     "hash",
     "macros",
+    "net",
     "nonzero",
     "ops",
+    "option",
     "panic",
     "result",
     "time"
@@ -40,6 +42,7 @@
     "clone",
     "cmp",
     "convert",
+    "ffi",
     "future",
     "hash",
     "hint",
@@ -47,8 +50,10 @@
     "io",
     "lazy",
     "macros",
+    "net",
     "nonzero",
     "ops",
+    "option",
     "panic",
     "pattern",
     "pin",
@@ -63,6 +68,7 @@
   ],
   "enabled_submodules": {
     "fmt": [
+      "builders",
       "num"
     ],
     "num": [
@@ -80,6 +86,7 @@
       "int_sqrt",
       "midpoint",
       "nan",
+      "niche_types",
       "ops",
       "wrapping",
       "cast",
@@ -91,12 +98,11 @@
       "include_mod_root": true,
       "include_range": true,
       "include_sources": true,
-      "excluded_adapters": [
-        "array_chunks"
-      ],
+      "excluded_adapters": [],
       "enabled_traits": [
         "accum",
         "double_ended",
+        "iterator",
         "step"
       ]
     }
@@ -105,58 +111,38 @@
     "array": "Uses std::sync::ReentrantLock and std::panic::take_hook (not in mires-std)",
     "atomic": "Requires multi-threaded atomic / OS synchronization primitives",
     "const_ptr": "Raw pointer provenance / const pointer casts beyond JS memory model",
-    "error": "JIR lowering declined: struct tail unsizing in core::error::request_by_type_tag",
-    "ffi": "JIR encoding declined: constants of type `[i8]` cannot be encoded from an allocation (ffi/cstr.rs)",
-    "fmt::builders": "JIR lowering declined: alloc::collections::btree::node::Handle::drop_key_val (address of direct value not in cell)",
-    "fmt::float": "Requires f16/f128 / float formatting internals and BTreeMap",
+    "error": "Depends on unstable error_generic_member_access / Provider API not enabled in mires-std",
+    "fmt::float": "Requires f16/f128 / float formatting internals",
     "intrinsics": "Tests target-specific LLVM/hardware intrinsics (SIMD, exact_div, etc.)",
-    "iter::adapters::array_chunks": "JIR encoding declined: array constant exceeds encoded-constant length limit (array_chunks.rs:59)",
-    "iter::traits::iterator": "JIR lowering declined: unsizing coercion to dyn whose vtable is unsupported",
-    "manually_drop": "JIR lowering declined: unsizing coercion with no known vtable in manually_drop::smoke",
-    "mem": "JIR lowering declined: core::mem::maybe_uninit::spec_fill (address of direct value not in cell)",
-    "net": "Unsupported transmute in core/src/net/ip_addr.rs:1499",
+    "manually_drop": "JIR lowering declined: unsizing coercion with no known row in manually_drop::smoke",
+    "mem": "JIR encoding declined: pointer to a vtable constant in mem::trait_info_of",
     "num::clamp_magnitude": "Uses unstable feature `clamp_magnitude` not listed in coretests/tests/lib.rs",
     "num::dec2flt": "Uses extern C / float internals and f16/f128",
     "num::float_ieee754_flt2dec_dec2flt": "Uses extern C ldexp and f16/f128",
     "num::float_iter_sum_identity": "Uses float internals / f16/f128",
     "num::floats": "Calls f32::asinh and extern \"C\" ldexp",
     "num::flt2dec": "Uses float formatting / extern C helpers",
-    "num::niche_types": "Unsupported transmute in core/src/num/nonzero.rs:391",
-    "option": "JIR lowering declined: slice constant whose pointee is not a slice in option::as_slice",
-    "ptr": "JIR lowering declined: raw `dyn` pointer built from parts in core::ptr::metadata::from_raw_parts",
+    "ptr": "Extern-type pointer cast (`test_is_null::Extern`) and vtable pointer constant (`ptr.rs:985`)",
     "simd": "Portable SIMD vectors are out of scope for JS backend",
-    "slice": "Unsupported pointer cast in core/src/slice/mod.rs:4537 (align_to_non_trivial)",
+    "slice": "Non-trivial struct align_to cast (`U64 -> U64U64U32`) and static sub-slice constant (`slice.rs:2501`)",
     "str": "Empty module in coretests (actual str tests live in alloctests)",
     "wtf8": "Internal-only module with 0 compiled tests on JS target"
   },
   "release_skipped_modules": {
-    "alloc": "Under -C opt-level=3 (release-balanced), constant-folded AlignmentEnum fails JIR encoding (src/alloc.rs:59: could not read the variant of std::mem::alignment::AlignmentEnum out of a constant)",
     "fmt::num": "jsc-link release-balanced optimizer exceeds 40s timeout on core::fmt formatting machinery",
     "num::int_and_uint_suites": "jsc-link release-balanced optimizer exceeds 40s timeout on large macro-expanded u*/i*/misc numeric suites (covered in dev; num::cast 288 tests run in both dev and release-balanced)",
     "iter::adapters": "jsc-link release-balanced optimizer exceeds 40s timeout on combined adapter suite (covered in dev; iter::range and iter::traits run in both dev and release-balanced)"
   },
   "skipped_tests": {
     "any::dyn_type_name": "Runtime mismatch on dyn Trait type_name formatting in Mires",
-    "char::test_encode_utf8": "Runtime refusal/failure on encode_utf8 buffer edge case",
+    "char::test_encode_utf8": "dev js-str=hybrid reborrow of &mut str -> &str allocates fresh buffer on as_ptr() (passes in release)",
     "future::test_join": "Future join! macro poll/waker runtime mismatch",
-    "future::test_join_function_like_value_arg_semantics::join_is_able_to_handle_temporaries": "Future join! macro temporary lifetime/poll mismatch",
-    "hint::select_unpredictable_drop_on_panic": "Unwind/drop semantics across select_unpredictable panic",
-    "iter::adapters::map_windows::output_n2": "Runtime failure in map_windows N=2 sliding window",
-    "iter::adapters::map_windows::test_unfused": "Runtime failure in map_windows unfused iterator",
+    "hint::select_unpredictable_drop_on_panic": "Unwind/drop semantics across select_unpredictable panic in dev",
+    "iter::adapters::map_windows::output_n2": "as_chunks through a pointer that names no buffer in map_windows N=2",
     "macros::cfg_select_no_duplication_on_64": "64-bit-only test (#[cfg(target_pointer_width = \"64\")]); Mires targets 32-bit mires32-unwind",
-    "num::int_sqrt::i8::isqrt": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic (i8::MIN.isqrt())",
-    "num::int_sqrt::i8::isqrt_extended": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i16::isqrt": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i16::isqrt_extended": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i32::isqrt": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i32::isqrt_extended": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i64::isqrt": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i64::isqrt_extended": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i128::isqrt": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "num::int_sqrt::i128::isqrt_extended": "Calls catch_unwind on #[rustc_nounwind] core::panicking::panic",
-    "pattern::double_ended_regression_test": "Reverse searcher byte-view pointer cast refusal",
-    "pattern::test_reverse_search_shared_bytes": "Reverse searcher byte-view pointer cast refusal",
-    "pattern::test_simple_search": "Pattern searcher runtime mismatch",
-    "waker::test_waker_getters": "RawWaker vtable/data getter mismatch in Mires"
+    "option::as_slice": "Byte view width mismatch on Option::as_slice pointer reinterpretation"
+  },
+  "release_skipped_tests": {
+    "option::test_get_str": "Under release-balanced native_string, String::as_ptr() allocates a temporary byte view per call rather than sharing a linear heap address (passes in dev)"
   }
 }

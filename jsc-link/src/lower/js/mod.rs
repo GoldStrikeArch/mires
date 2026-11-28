@@ -269,6 +269,8 @@ pub struct JsCx<'a> {
     temps: RefCell<Vec<String>>,
     /// The zombies this body carries.
     zombies: RefCell<Vec<FlatZombie>>,
+    /// Pure immutable promoted constant references hoisted to module-level `const` bindings.
+    pub(super) hoisted_consts: RefCell<BTreeMap<JsName, Expr>>,
     /// The origin lowering is currently at, for zombies and source map markers.
     origin: Cell<Option<OriginId>>,
     /// The payload the last returning block parked for the `Region::Return` that follows it.
@@ -372,6 +374,7 @@ impl<'a> JsCx<'a> {
             allocation_origins: RefCell::new(Vec::new()),
             temps: RefCell::new(Vec::new()),
             zombies: RefCell::new(Vec::new()),
+            hoisted_consts: RefCell::new(BTreeMap::new()),
             origin: Cell::new(None),
             pending_return: RefCell::new(None),
             virtual_sentinels: std::cell::OnceCell::new(),
@@ -1660,5 +1663,9 @@ impl<'a> JsCx<'a> {
     /// The zombies recorded so far.
     pub fn take_zombies(&self) -> Vec<FlatZombie> {
         std::mem::take(&mut *self.zombies.borrow_mut())
+    }
+
+    pub fn take_hoisted_consts(&self) -> BTreeMap<JsName, Expr> {
+        std::mem::take(&mut *self.hoisted_consts.borrow_mut())
     }
 }

@@ -187,3 +187,14 @@ fn ui_should_panic_from_core_bounds() {
     let idx = std::hint::black_box(5);
     let _ = arr[idx];
 }
+
+#[test]
+fn ui_catch_unwind_core_panics() {
+    assert!(catch_unwind(|| std::hint::black_box(i8::MIN).isqrt()).is_err());
+    assert!(catch_unwind(|| Option::<i32>::None.unwrap()).is_err());
+    assert!(catch_unwind(|| {
+        let a = [1, 2, 3];
+        a[std::hint::black_box(9)]
+    })
+    .is_err());
+}

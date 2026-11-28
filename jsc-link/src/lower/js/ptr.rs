@@ -1473,8 +1473,32 @@ impl<'a> JsCx<'a> {
         }
         match (value::kind(table, from), value::kind(table, to)) {
             (Some(TypeKind::Slice(from_element)), Some(TypeKind::Slice(to_element))) => {
-                return if size_of(table, *from_element) == size_of(table, *to_element) {
-                    Ok(value)
+                let from_el = table.peeled(*from_element);
+                let to_el = table.peeled(*to_element);
+                return if size_of(table, from_el) == size_of(table, to_el) {
+                    match (value::kind(table, from_el), value::kind(table, to_el)) {
+                        (
+                            Some(TypeKind::Integer {
+                                signed: false,
+                                bits: 8,
+                            }),
+                            Some(TypeKind::Integer {
+                                signed: true,
+                                bits: 8,
+                            }),
+                        ) => Ok(jsast::rt_call("byte_sign", vec![value, Expr::Bool(true)])),
+                        (
+                            Some(TypeKind::Integer {
+                                signed: true,
+                                bits: 8,
+                            }),
+                            Some(TypeKind::Integer {
+                                signed: false,
+                                bits: 8,
+                            }),
+                        ) => Ok(jsast::rt_call("byte_sign", vec![value, Expr::Bool(false)])),
+                        _ => Ok(value),
+                    }
                 } else {
                     unsupported()
                 };
@@ -1943,6 +1967,26 @@ impl<'a> JsCx<'a> {
                 )));
             }
         };
+        // Casting between two unsized-tail structs with equal sized prefix whose tails are both
+        // 1-byte/UTF-8 tails (e.g. `RcInner<[u8]> -> RcInner<str>`, `ArcInner<[u8]> ->
+        // ArcInner<str>`, `Pair<bool, [u8]> -> Pair<bool, str>`) is a zero-cost identity: both
+        // carry `{ $p: [header, b0, b1, ...], $m: byte_len }`.
+        let is_byte_tail = |ty: TypeId| match value::kind(table, ty) {
+            Some(TypeKind::Str) => true,
+            Some(TypeKind::Slice(el)) => size_of(table, *el) == Some(1) && !table.is_indirect(*el),
+            _ => false,
+        };
+        if let Some(from_tail) = table.unsized_tail(from) {
+            let from_prefix = table.get(from).and_then(|d| d.layout.unsized_prefix);
+            let to_prefix = table.get(to).and_then(|d| d.layout.unsized_prefix);
+            if from_prefix.is_some()
+                && from_prefix == to_prefix
+                && is_byte_tail(from_tail.ty)
+                && is_byte_tail(tail.ty)
+            {
+                return Ok(value);
+            }
+        }
         if !matches!(
             value::kind(table, from),
             Some(TypeKind::Slice(_) | TypeKind::Str)

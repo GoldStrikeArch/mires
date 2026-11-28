@@ -1043,6 +1043,7 @@ fn build_large_enum_clone_lowering(
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
         bigints: BTreeSet::new(),
+        hoisted_consts: BTreeMap::new(),
     })
 }
 

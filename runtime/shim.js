@@ -2273,6 +2273,10 @@ globalThis.__rt._bv_enable = (() => {
       return _has_byte_views && globalThis.__rt._byte_view_of.has(buf);
     },
     unwrap_buf(buf) {
+      if (globalThis.__rt._sign_view_of !== null) {
+        const sv = globalThis.__rt._sign_view_of.get(buf);
+        if (sv !== undefined) buf = sv;
+      }
       if (_has_byte_views) {
         const bv = globalThis.__rt._byte_view_of.get(buf);
         if (bv !== undefined) return bv.buf;
@@ -2844,24 +2848,27 @@ globalThis.__rt._sign_view_of = null;
 globalThis.__rt.byte_sign = (p, signed) => {
   globalThis.__rt._bv_enable;
   if (p !== null && typeof p === "object") {
+    const wrap = (view) =>
+      p.$l !== undefined ? { $b: view, $o: p.$o, $l: p.$l } : { $b: view, $o: p.$o };
     if (_has_byte_views) {
       const bv = globalThis.__rt._byte_view_of.get(p.$b);
       if (bv !== undefined && bv.signed !== signed) {
         const view = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, signed, bv.key, bv.pr, bv.ps);
+        if (p.$l !== undefined) return { $b: view, $o: p.$o, $l: p.$l };
         return p.$pv !== undefined ? { $b: view, $o: p.$o, $pv: p.$pv, $po: p.$po } : { $b: view, $o: p.$o };
       }
     }
     const block = p.$b !== undefined && p.$b !== null ? globalThis.__rt._blk_get(p.$b) : undefined;
     if (block !== undefined && block.typed !== undefined && p.$b !== block.typed && block.hdr === undefined && block.sk !== undefined) {
-      return { $b: globalThis.__rt._byte_view(block.typed, block.es, block.sk, signed), $o: p.$o };
+      return wrap(globalThis.__rt._byte_view(block.typed, block.es, block.sk, signed));
     }
     if ((signed && p.$b instanceof Uint8Array) || (!signed && p.$b instanceof Int8Array)) {
       if (block !== undefined && block.es === 1 && block.hdr === undefined) {
         if (signed && block.typed instanceof Int8Array) {
-          return { $b: block.typed, $o: p.$o };
+          return wrap(block.typed);
         }
         if (!signed && block.raw instanceof Uint8Array && block.raw.buffer === p.$b.buffer) {
-          return { $b: block.raw, $o: p.$o };
+          return wrap(block.raw);
         }
         if (block.fresh && block.typed === undefined) {
           const next = new (signed ? Int8Array : Uint8Array)(p.$b.buffer, p.$b.byteOffset, p.$b.byteLength);
@@ -2879,13 +2886,13 @@ globalThis.__rt.byte_sign = (p, signed) => {
               if (k !== undefined) { globalThis.__rt._addrHeap.set(next, k); globalThis.__rt._addrHeap.delete(p.$b); }
             }
           }
-          return { $b: next, $o: p.$o };
+          return wrap(next);
         }
       }
       if (globalThis.__rt._sign_view_of !== null) {
         const orig = globalThis.__rt._sign_view_of.get(p.$b);
         if (orig !== undefined && ((signed && orig instanceof Int8Array) || (!signed && orig instanceof Uint8Array))) {
-          return { $b: orig, $o: p.$o };
+          return wrap(orig);
         }
       }
       if (globalThis.__rt._sign_views === null) globalThis.__rt._sign_views = new WeakMap();
@@ -2896,7 +2903,49 @@ globalThis.__rt.byte_sign = (p, signed) => {
         globalThis.__rt._sign_views.set(p.$b, view);
         globalThis.__rt._sign_view_of.set(view, p.$b);
       }
-      return { $b: view, $o: p.$o };
+      return wrap(view);
+    }
+    if (Array.isArray(p.$b)) {
+      const wantSigned = !!signed;
+      if (globalThis.__rt._sign_view_of !== null) {
+        const orig = globalThis.__rt._sign_view_of.get(p.$b);
+        if (orig !== undefined && Array.isArray(orig)) {
+          const cached = globalThis.__rt._sign_views.get(orig);
+          if (cached !== undefined && ((wantSigned && cached.u === p.$b) || (!wantSigned && cached.s === p.$b))) {
+            return wrap(orig);
+          }
+        }
+      }
+      if (globalThis.__rt._sign_views === null) globalThis.__rt._sign_views = new WeakMap();
+      if (globalThis.__rt._sign_view_of === null) globalThis.__rt._sign_view_of = new WeakMap();
+      let entry = globalThis.__rt._sign_views.get(p.$b);
+      if (entry === undefined) {
+        entry = { s: undefined, u: undefined };
+        globalThis.__rt._sign_views.set(p.$b, entry);
+      }
+      const slotKey = wantSigned ? "s" : "u";
+      let view = entry[slotKey];
+      if (view === undefined) {
+        const target = p.$b;
+        view = new Proxy(target, {
+          get(t, prop, receiver) {
+            const v = Reflect.get(t, prop, receiver);
+            if (typeof prop === "string" && typeof v === "number" && (prop === "0" || /^[1-9]\d*$/.test(prop))) {
+              return wantSigned ? (v << 24) >> 24 : (v & 255);
+            }
+            return v;
+          },
+          set(t, prop, value, receiver) {
+            if (typeof prop === "string" && typeof value === "number" && (prop === "0" || /^[1-9]\d*$/.test(prop))) {
+              value = wantSigned ? (value & 255) : ((value << 24) >> 24);
+            }
+            return Reflect.set(t, prop, value, receiver);
+          },
+        });
+        entry[slotKey] = view;
+        globalThis.__rt._sign_view_of.set(view, target);
+      }
+      return wrap(view);
     }
   }
   return p;
@@ -6129,14 +6178,14 @@ globalThis.__rt.dealloc = (p, size, align) => {
   globalThis.__rt._blocks.delete(buf);
   if (block.raw !== undefined) {
     globalThis.__rt._blocks.delete(block.raw);
-    block.raw.length = 0;
+    if (Array.isArray(block.raw)) block.raw.length = 0;
     block.raw[globalThis.__rt._freed] = true;
   }
   if (block.typed !== undefined) globalThis.__rt._blocks.delete(block.typed);
   if (_blkK === buf || _blkK === block.raw || _blkK === block.typed) { _blkK = null; _blkV = undefined; }
   if (_blkK2 === buf || _blkK2 === block.raw || _blkK2 === block.typed) { _blkK2 = null; _blkV2 = undefined; }
   if (_has_minted_addrs) globalThis.__rt._addr_release(active);
-  active.length = 0;
+  if (Array.isArray(active)) active.length = 0;
   active[globalThis.__rt._freed] = true;
 };
 

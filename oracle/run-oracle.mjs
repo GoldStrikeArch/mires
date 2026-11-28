@@ -27,15 +27,18 @@ const ALL_SUITES = ["rustc-ui", "coretests", "alloctests", "crates"];
 const FAST_CRATES = [
   "serde_json",
   "base64",
+  "bytes",
   "miniz_oxide",
   "csv",
   "itertools",
   "pulldown_cmark",
+  "regex_lite",
 ];
 const ALL_CRATES = [
   "adler2",
   "base64",
   "bitflags",
+  "bytes",
   "crc32fast",
   "csv",
   "flate2",
@@ -46,9 +49,11 @@ const ALL_CRATES = [
   "ordered_float",
   "percent_encoding",
   "pulldown_cmark",
+  "regex_lite",
   "serde_json",
   "smallvec",
   "unicode_ident",
+  "url",
 ];
 
 function parseArgs(argv) {
@@ -244,9 +249,12 @@ function generateCoretestsHarness(workDir, sysroot, tier, profile) {
       "core_iter_range",
       "mod iter {\n    use core::iter::*;\n    pub fn is_trusted_len<I: TrustedLen>(_: I) {}\n    mod range;\n}",
     );
+    const releaseIterTraits = (skiplist.enabled_submodules.iter?.enabled_traits ?? [])
+      .map((t) => `mod ${t};`)
+      .join(" ");
     writeShard(
       "core_iter_traits",
-      "mod iter {\n    mod traits { mod accum; mod double_ended; mod step; }\n}",
+      `mod iter {\n    mod traits { ${releaseIterTraits} }\n}`,
     );
   } else {
     // Full dev tier: compile & run ALL enabled top-level + fmt/num/iter modules!
@@ -350,12 +358,16 @@ function generateCoretestsHarness(workDir, sysroot, tier, profile) {
     }
   }
 
+  const allSkippedTests = [
+    ...Object.keys(skiplist.skipped_tests),
+    ...(isRelease ? Object.keys(skiplist.release_skipped_tests ?? {}) : []),
+  ];
   const skipTests =
     tier === "fast"
-      ? Object.keys(skiplist.skipped_tests).filter((t) =>
+      ? allSkippedTests.filter((t) =>
           topMods.some((m) => t.startsWith(`${m}::`)),
         )
-      : Object.keys(skiplist.skipped_tests);
+      : allSkippedTests;
 
   return {
     manifestPath: path.join(pkgDir, "Cargo.toml"),

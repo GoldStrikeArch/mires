@@ -118,6 +118,7 @@ fn ui_any_downcast_and_type_id() {
     let mut items: Vec<Box<dyn Any>> = vec![
         Box::new(42_i32),
         Box::new(String::from("mires")),
+        Box::new(vec![1_u8, 2, 3, 4]),
         Box::new(Tag {
             code: 7,
             name: String::from("ok"),
@@ -133,13 +134,64 @@ fn ui_any_downcast_and_type_id() {
         items[1].downcast_ref::<String>().map(String::as_str),
         Some("mires!")
     );
+    assert_eq!(items[2].downcast_ref::<Vec<u8>>(), Some(&vec![1, 2, 3, 4]));
     assert_eq!(
-        items[2].downcast_ref::<Tag>(),
+        items[3].downcast_ref::<Tag>(),
         Some(&Tag {
             code: 7,
             name: String::from("ok"),
         })
     );
+    drop(items);
+}
+
+#[test]
+fn ui_dyn_supertrait_upcast_and_rc_arc_str() {
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    trait BaseA {
+        fn a(&self) -> i32;
+    }
+    trait BaseB {
+        fn b(&self) -> i32;
+    }
+    trait Combined: BaseA + BaseB {
+        fn c(&self) -> i32;
+    }
+    struct Item(i32, i32, i32);
+    impl BaseA for Item {
+        fn a(&self) -> i32 {
+            self.0
+        }
+    }
+    impl BaseB for Item {
+        fn b(&self) -> i32 {
+            self.1
+        }
+    }
+    impl Combined for Item {
+        fn c(&self) -> i32 {
+            self.2
+        }
+    }
+
+    let item = Item(10, 20, 30);
+    let sub: &dyn Combined = &item;
+    let a: &dyn BaseA = sub;
+    let b: &dyn BaseB = sub;
+    assert_eq!((a.a(), b.b(), sub.c()), (10, 20, 30));
+
+    let boxed: Box<dyn Combined> = Box::new(Item(1, 2, 3));
+    let up_b: Box<dyn BaseB> = boxed;
+    assert_eq!(up_b.b(), 2);
+
+    let r: Rc<str> = Rc::from("hello rc");
+    let r2 = Rc::clone(&r);
+    assert_eq!(&*r2, "hello rc");
+    let a_str: Arc<str> = Arc::from("hello arc café");
+    let a2 = Arc::clone(&a_str);
+    assert_eq!(&*a2, "hello arc café");
 }
 
 #[derive(Debug)]

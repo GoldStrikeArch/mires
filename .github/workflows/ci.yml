@@ -99,11 +99,14 @@ jobs:
         run: bash scripts/metamorphic-test.sh --fast --skip-build -j 4
       - name: Differential fuzz smoke check
         run: bash scripts/fuzz/run.sh --ci-smoke -j 4
-      - name: Run cargo mires test differential check on example workspace
+      - name: Run cargo mires test differential check on example workspaces
         run: |
           target/release/cargo-mires mires test --diff \
             --manifest-path examples/fullstack-workspace/Cargo.toml \
             -p shared --mires-root "$PWD"
+          target/release/cargo-mires mires test --diff \
+            --manifest-path examples/npm-markdown/Cargo.toml \
+            --mires-root "$PWD"
       - name: Run continuous differential oracle (fast tier)
         run: node oracle/run-oracle.mjs --tier fast
       - run: bash scripts/ergonomics-e2e.sh

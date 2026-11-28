@@ -839,6 +839,7 @@ fn universal_native_string_fmt_kernel_lowers_all_kinds_and_int_tag_result() {
                 caller_location: false,
                 caller_location_def: None,
                 is_core: false,
+                is_zst_closure_receiver: false,
                 standard: Some(standard),
             },
         );

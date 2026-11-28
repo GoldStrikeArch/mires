@@ -13,6 +13,8 @@ mod prelude;
 use prelude::*;
 
 use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::ptr;
 
 #[repr(C)]
@@ -55,4 +57,18 @@ pub fn rust_entry() {
         print_usize((&(*p2).text).len());
         dealloc(p2 as *mut u8, l2);
     }
+
+    let r1: Rc<str> = Rc::from("statue");
+    let r2 = Rc::clone(&r1);
+    print_str(&r1);
+    print_usize(r2.len());
+    drop(r1);
+    drop(r2);
+
+    let a1: Arc<str> = Arc::from("eggplant café");
+    let a2 = Arc::clone(&a1);
+    print_str(&a1);
+    print_usize(a2.len());
+    drop(a1);
+    drop(a2);
 }

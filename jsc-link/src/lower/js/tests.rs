@@ -3918,6 +3918,7 @@ fn a_call_inside_a_track_caller_body_forwards_its_own_location() {
             caller_location: true,
             caller_location_def: None,
             is_core: false,
+            is_zst_closure_receiver: false,
             standard: None,
         },
     );
@@ -6289,6 +6290,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             caller_location: true,
             caller_location_def: None,
             is_core: false,
+            is_zst_closure_receiver: false,
             standard: None,
         },
     );
@@ -6356,6 +6358,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             caller_location: true,
             caller_location_def: None,
             is_core: true,
+            is_zst_closure_receiver: false,
             standard: None,
         },
     );

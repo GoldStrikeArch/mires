@@ -474,7 +474,7 @@ impl Intrinsic<'_, '_> {
         }
     }
 
-    /// `size_of_val` / `align_of_val` of a struct with an unsized tail.
+    /// `size_of_val` / `align_of_val` of a struct with an unsized tail (`[T]`, `str`, or `dyn`).
     fn size_of_tail(&self, ty: TypeId, tail: TypeId, size: bool) -> Res<Outcome> {
         let table = self.cx.table;
         let Some(align) = value::align_of(table, ty) else {
@@ -483,34 +483,118 @@ impl Intrinsic<'_, '_> {
                 "`align_of_val` of a struct with an unsized tail the table records no layout for",
             ));
         };
-        if !size {
-            return Ok(Outcome::Value(self.usize_literal(align)?));
-        }
-        let Some(TypeKind::Slice(element)) = value::kind(table, table.peeled(tail)) else {
-            return Ok(self.unsupported(
-                "the size of a struct whose tail is not a slice is not known to rustc_codegen_js"
+        let round_up = |value: Expr, align_expr: Expr| -> Expr {
+            jsast::binary(
+                BinOp::Mul,
+                jsast::method_call(
+                    jsast::id("Math"),
+                    "ceil",
+                    vec![jsast::binary(BinOp::Div, value, align_expr.clone())],
+                ),
+                align_expr,
+            )
+        };
+        let prefix = || -> Res<u64> {
+            table
+                .get(ty)
+                .and_then(|descriptor| descriptor.layout.unsized_prefix)
+                .ok_or_else(|| {
+                    decline(
+                        OpClass::Intrinsic,
+                        "`size_of_val` of a struct with an unsized tail, whose sized prefix the \
+                         type table records no size for",
+                    )
+                })
+        };
+        match value::kind(table, table.peeled(tail)) {
+            Some(TypeKind::Slice(element)) => {
+                if !size {
+                    return Ok(Outcome::Value(self.usize_literal(align)?));
+                }
+                let prefix = prefix()?;
+                let Some(stride) = value::size_of(table, *element) else {
+                    return Err(decline(
+                        OpClass::Intrinsic,
+                        "`size_of_val` of a struct with a slice tail whose element has no size",
+                    ));
+                };
+                let elem_align = value::align_of(table, *element).unwrap_or(1);
+                let prefix_expr = self.usize_literal(prefix)?;
+                let meta = super::ptr::meta(self.arg(0)?);
+                let tail_bytes = match stride {
+                    1 => meta,
+                    stride => jsast::binary(BinOp::Mul, meta, jsast::num(stride as f64)),
+                };
+                let raw_total = jsast::binary(BinOp::Add, prefix_expr, tail_bytes);
+                let total = if align > elem_align {
+                    round_up(raw_total, self.usize_literal(align)?)
+                } else {
+                    raw_total
+                };
+                Ok(Outcome::Value(total))
+            }
+            Some(TypeKind::Str) => {
+                if !size {
+                    return Ok(Outcome::Value(self.usize_literal(align)?));
+                }
+                let prefix = prefix()?;
+                let meta = super::ptr::meta(self.arg(0)?);
+                let raw_total = if prefix == 0 {
+                    meta
+                } else {
+                    jsast::binary(BinOp::Add, self.usize_literal(prefix)?, meta)
+                };
+                let total = if align > 1 {
+                    round_up(raw_total, self.usize_literal(align)?)
+                } else {
+                    raw_total
+                };
+                Ok(Outcome::Value(total))
+            }
+            Some(TypeKind::Dynamic { .. }) => {
+                let meta = self.temp(super::ptr::meta(self.arg(0)?));
+                let tail_align = jsast::index(meta.clone(), jsast::num(VTABLE_ALIGN_SLOT));
+                if !size {
+                    let out = if align <= 1 {
+                        tail_align
+                    } else {
+                        jsast::method_call(
+                            jsast::id("Math"),
+                            "max",
+                            vec![self.usize_literal(align)?, tail_align],
+                        )
+                    };
+                    return Ok(Outcome::Value(out));
+                }
+                let prefix = prefix()?;
+                let tail_size = jsast::index(meta, jsast::num(VTABLE_SIZE_SLOT));
+                if prefix == 0 && align <= 1 {
+                    return Ok(Outcome::Value(tail_size));
+                }
+                let ta = self.temp(tail_align);
+                let total_align = if align <= 1 {
+                    ta.clone()
+                } else {
+                    self.temp(jsast::method_call(
+                        jsast::id("Math"),
+                        "max",
+                        vec![self.usize_literal(align)?, ta.clone()],
+                    ))
+                };
+                let raw_total = if prefix == 0 {
+                    tail_size
+                } else {
+                    let aligned_prefix = round_up(self.usize_literal(prefix)?, ta);
+                    jsast::binary(BinOp::Add, aligned_prefix, tail_size)
+                };
+                Ok(Outcome::Value(round_up(raw_total, total_align)))
+            }
+            _ => Ok(self.unsupported(
+                "the size of a struct whose tail is not a slice, `str`, or `dyn` is not known to \
+                 rustc_codegen_js"
                     .to_owned(),
-            ));
-        };
-        // The sized prefix ends where the tail begins, which is the layout's size for an unsized
-        // struct (`LayoutFacts::unsized_prefix`).
-        let prefix = table
-            .get(ty)
-            .and_then(|descriptor| descriptor.layout.unsized_prefix);
-        let (Some(prefix), Some(stride)) = (prefix, value::size_of(table, *element)) else {
-            return Err(decline(
-                OpClass::Intrinsic,
-                "`size_of_val` of a struct with an unsized tail, whose sized prefix the type \
-                 table records no size for",
-            ));
-        };
-        let prefix = self.usize_literal(prefix)?;
-        let meta = super::ptr::meta(self.arg(0)?);
-        let tail = match stride {
-            1 => meta,
-            stride => jsast::binary(BinOp::Mul, meta, jsast::num(stride as f64)),
-        };
-        Ok(Outcome::Value(jsast::binary(BinOp::Add, prefix, tail)))
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------------------------

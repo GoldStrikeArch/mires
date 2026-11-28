@@ -93,6 +93,21 @@ FAST_FIXTURES=(
 	413_bstr_chars_bytes_cursor
 	419_native_vec_typed_array
 	421_safe_rust_regressions
+	422_seam2_btreemap_maybe_uninit_zst_box
+	423_binary_heap_pop_and_field_copy
+	424_seam4_box_dyn_dealloc_const_vec
+	426_union_clone_map_windows_arc_zst
+	430_track_caller_explicit_abi
+	431_dyn_trait_upcast
+	432_ptr_from_raw_parts_and_rc_unsized
+	433_str_tail_dst
+	434_const_decoding_completeness
+	440_ipv6_pod_transmute
+	441_slice_rotate_vecdeque
+	442_nested_array_raw_eq
+	443_scalar_memrchr_rsplit
+	444_linked_list_box_transmute
+	445_nonzero_niche_and_prefix_casts
 	guard_custom_allocator
 	guard_heap_retype
 )

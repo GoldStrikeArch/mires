@@ -863,6 +863,60 @@ impl<'a> LaneDriver<'a> {
                 added_items = true;
             }
         }
+        // Synthesize shared module-level `const` bindings for pure immutable promoted constant
+        // references (`ConstTree::Reference`, e.g. `&RawWakerVTable::new(...)`) BEFORE
+        // `hoist_consts::run` so internal tag encoding and `apply` process them in lockstep.
+        let mut const_refs: BTreeMap<JsName, jsast::Expr> = BTreeMap::new();
+        for (_, res, _, _) in lowered.iter_mut() {
+            if let Ok(lowering) = res {
+                for (const_name, expr) in std::mem::take(&mut lowering.hoisted_consts) {
+                    const_refs.entry(const_name).or_insert(expr);
+                }
+            }
+        }
+        for (const_name, expr) in const_refs {
+            let decl = jsast::const_(const_name.as_str(), expr);
+            let refs = refs_of(&decl, &const_name);
+            self.defined.insert(const_name.clone());
+            self.live.insert(const_name.clone());
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.table.entry(const_name.clone())
+            {
+                slot.insert(LinkItem {
+                    name: const_name.clone(),
+                    kind: ItemKind::Const,
+                    js: String::new(),
+                    refs: refs.clone(),
+                    zombies: Vec::new(),
+                    linkage: Linkage::internal(),
+                    debug_path: "hoisted constant reference".to_owned(),
+                    crate_name: "generated".to_owned(),
+                    order: None,
+                    map: ItemMap::default(),
+                    dts: None,
+                    optimization: Default::default(),
+                    allocator_provider: Default::default(),
+                    jir: Default::default(),
+                });
+                lowered.push((
+                    const_name,
+                    Ok(LoweredItem {
+                        decl,
+                        refs,
+                        names: Vec::new(),
+                        loc: None,
+                        dts: None,
+                        zombies: Vec::new(),
+                        js_alloc_origins: Vec::new(),
+                        bigints: BTreeSet::new(),
+                        hoisted_consts: BTreeMap::new(),
+                    }),
+                    OptStats::default(),
+                    None,
+                ));
+                added_items = true;
+            }
+        }
         if self.opts.optimizer == OptimizerMode::On {
             added_items |= crate::link::hoist_consts::run(
                 self.table,
@@ -1820,6 +1874,7 @@ fn native_body_item(
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
         bigints,
+        hoisted_consts: BTreeMap::new(),
     }
 }
 
@@ -1860,6 +1915,19 @@ pub(super) fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, Drop
             .as_ref()
             .zip(item.jir.interns())
             .and_then(|(body, interns)| crate::link::item_caller_location_def(body, interns));
+        let is_zst_closure_receiver = item
+            .jir
+            .body
+            .as_ref()
+            .and_then(|body| body.signature.arguments.first().copied())
+            .zip(item.jir.interns())
+            .is_some_and(|(first, interns)| {
+                interns.types.is_zst(first)
+                    && matches!(
+                        crate::lower::js::value::kind(&interns.types, interns.types.peeled(first)),
+                        Some(crate::jir::types::TypeKind::Closure { .. })
+                    )
+            });
         index.insert(
             id,
             ItemEntry {
@@ -1876,6 +1944,7 @@ pub(super) fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, Drop
                 caller_location: abi.caller_location,
                 caller_location_def,
                 is_core: core_crate_ids.contains(&id.definition.crate_id),
+                is_zst_closure_receiver,
                 standard: match item.jir.body.as_ref().map(|body| body.semantic) {
                     Some(BodySemantic::Standard(operation)) => Some(operation),
                     _ => None,

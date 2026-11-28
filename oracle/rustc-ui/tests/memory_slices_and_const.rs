@@ -1,6 +1,6 @@
 //! `rustc/tests/ui`-style tests for ZSTs, slices, UTF-8 `str`, `const` eval/promotion, numerics, and collections.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
 use std::marker::PhantomData;
 
 use mires_oracle_rustc_ui::SplitMix64;
@@ -102,6 +102,10 @@ fn ui_utf8_str_operations() {
     assert_eq!(s.replace("世界", "world"), "hello 🌍 world café!");
     assert_eq!("  \tαβγ\n ".trim(), "αβγ");
     assert_eq!("abc_def_ghi".split_once('_'), Some(("abc", "def_ghi")));
+    assert_eq!("abc_def_ghi".rsplit_once('_'), Some(("abc_def", "ghi")));
+    assert_eq!("a/b/c/d".rfind('/'), Some(5));
+    let rev: Vec<&str> = "one,two,three".rsplit(',').collect();
+    assert_eq!(rev, vec!["three", "two", "one"]);
 }
 
 #[test]
@@ -188,6 +192,45 @@ fn ui_std_collections_roundtrip() {
     assert_eq!(dq.pop_back(), Some(3));
     assert_eq!(dq.pop_front(), Some(2));
     assert_eq!(dq.pop_front(), None);
+
+    let mut heap = BinaryHeap::from([4, 1, 7, 3, 9, 2]);
+    let mut ordered = Vec::new();
+    while let Some(x) = heap.pop() {
+        ordered.push(x);
+    }
+    assert_eq!(ordered, vec![9, 7, 4, 3, 2, 1]);
+
+    let mut bmap = BTreeMap::new();
+    for i in 0..32_i32 {
+        bmap.insert(i, format!("v{i}"));
+    }
+    assert_eq!(bmap.get(&15).map(String::as_str), Some("v15"));
+    drop(bmap);
+
+    let bset: BTreeSet<String> = ["beta", "alpha", "gamma"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(bset.len(), 3);
+    drop(bset);
+
+    let mut list = LinkedList::new();
+    list.push_back(10);
+    list.push_front(5);
+    list.push_back(20);
+    assert_eq!(list.into_iter().collect::<Vec<_>>(), vec![5, 10, 20]);
+
+    let mut rot = [1, 2, 3, 4, 5, 6];
+    rot.rotate_left(2);
+    assert_eq!(rot, [3, 4, 5, 6, 1, 2]);
+    rot.rotate_right(3);
+    assert_eq!(rot, [6, 1, 2, 3, 4, 5]);
+
+    let a2d = [[1_u32, 2], [3, 4], [5, 6]];
+    let b2d = [[1_u32, 2], [3, 4], [5, 6]];
+    let c2d = [[1_u32, 2], [3, 9], [5, 6]];
+    assert_eq!(a2d, b2d);
+    assert_ne!(a2d, c2d);
 }
 
 #[test]

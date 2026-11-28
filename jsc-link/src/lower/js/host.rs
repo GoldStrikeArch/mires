@@ -1335,6 +1335,9 @@ pub struct ItemEntry {
     pub caller_location_def: Option<DefinitionId>,
     /// Whether this item belongs to an authenticated `core` crate (`crate_name == "core"`).
     pub is_core: bool,
+    /// Whether the callee's first MIR parameter is a zero-sized closure environment
+    /// (`ClosureOnceShim` coerced to a `fn` pointer in CTFE needs `undefined` prepended).
+    pub is_zst_closure_receiver: bool,
     /// The body's `BodySemantic::Standard` tag, when it has one: the exact linked identity the
     /// call-site format kernel resolves a callee by (`lower/semantic_ops/fmt_kernel.rs`).
     pub standard: Option<crate::jir::semantic::StandardOperation>,
