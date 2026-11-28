@@ -31,6 +31,7 @@ pub mod i64_pair;
 pub mod intrinsics;
 pub mod loop_opt;
 pub mod place;
+pub(crate) mod pod_codec;
 pub mod post_opt;
 pub mod ptr;
 pub mod rvalue;

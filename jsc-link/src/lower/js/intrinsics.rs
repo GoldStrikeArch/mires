@@ -1999,19 +1999,38 @@ impl Intrinsic<'_, '_> {
                 )));
             }
         }
-        if !value::compares_by_value(table, pointee) {
-            return Ok(self.unsupported(
-                "`raw_eq` is not supported by rustc_codegen_js for this pointee: the bytes of a \
-                 value are not observable in a model where a value is a JavaScript object"
-                    .to_owned(),
-            ));
+        if value::compares_by_value(table, pointee) {
+            let (lhs, rhs) = (self.temp(self.arg(0)?), self.temp(self.arg(1)?));
+            return Ok(Outcome::Value(jsast::binary(
+                BinOp::StrictEq,
+                ptr::slot_element(lhs),
+                ptr::slot_element(rhs),
+            )));
         }
-        let (lhs, rhs) = (self.temp(self.arg(0)?), self.temp(self.arg(1)?));
-        Ok(Outcome::Value(jsast::binary(
-            BinOp::StrictEq,
-            ptr::slot_element(lhs),
-            ptr::slot_element(rhs),
-        )))
+        if let Some(node) = super::pod_codec::classify_pod(
+            table,
+            self.cx.interns,
+            pointee,
+            super::pod_codec::PodPolicy {
+                allow_thin_ptr: true,
+                for_unpack: false,
+            },
+        ) {
+            let (lhs_val, rhs_val) = if value::is_slot(table, self.arg_ty(0)?) {
+                let (lhs, rhs) = (self.temp(self.arg(0)?), self.temp(self.arg(1)?));
+                (ptr::slot_element(lhs), ptr::slot_element(rhs))
+            } else {
+                (self.temp(self.arg(0)?), self.temp(self.arg(1)?))
+            };
+            return Ok(Outcome::Value(super::pod_codec::emit_pod_raw_eq(
+                self.cx, &node, lhs_val, rhs_val,
+            )));
+        }
+        Ok(self.unsupported(
+            "`raw_eq` is not supported by rustc_codegen_js for this pointee: the bytes of a \
+             value are not observable in a model where a value is a JavaScript object"
+                .to_owned(),
+        ))
     }
 
     /// `aggregate_raw_ptr(data, meta)`: a pointer built from its two halves.
